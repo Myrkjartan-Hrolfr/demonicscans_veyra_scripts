@@ -1,6 +1,7 @@
 // ==UserScript==
 // @name         Auto Battle Extras
 // @namespace    local.autobattle.extras
+// @author       Myrkjartan Hrolfr
 // @version      0.4
 // @description  Modular Auto Battle addon
 // @match        https://demonicscans.org/occurrence_castle.php*
