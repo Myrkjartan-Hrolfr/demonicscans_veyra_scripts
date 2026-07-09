@@ -945,229 +945,455 @@
 
     AutoBattleExtras.registerModule({
         id: 'powerWishlist',
-        title: 'Power Wishlist',
+        title: 'Power Target List',
 
         defaults: {
             enabled: true,
-            wantedPowers: [],
-            protectedPowers: [],
-            protectLegendaryPowers: true,
 
-            // If no wanted new power can be picked, skip the power reward.
-            autoSkipUnwantedPowerRewards: true,
+            selectedPowerSlots: [
+                '', '', '', '', '',
+                '', '', '', '', ''
+            ],
 
+            autoSkipUnusablePowerRewards: true,
             submitDelay: 650
         },
 
         isChoosing: false,
 
-        presetPowerNames: [
-            'Witchfire Core',
-            'Execution Rhythm',
-            'Mana Leech',
+        allPowerNames: [
+            'Arcane Surge',
+            'Ashen Wand',
+            'Blood Alchemy',
             'Blood Frenzy',
             'Crimson Vitality',
-            'Blood Alchemy'
+            'Execution Rhythm',
+            'Frozen Blood',
+            'Glass Fang',
+            'Iron Veil',
+            'Mana Leech',
+            'Raven Eye',
+            'Serrated Vein',
+            'Stun',
+            'Thorns of the Crypt',
+            'Vampiric Edge',
+            'Venom Script',
+            'Witchfire Core'
         ],
+
+        rarityRank: {
+            common: 1,
+            epic: 2,
+            legendary: 3
+        },
 
         read(api) {
             const state = api.readState(this.id, this.defaults);
 
+            let selectedPowerSlots = Array.isArray(state.selectedPowerSlots)
+                ? state.selectedPowerSlots
+                : [];
+
+            selectedPowerSlots = selectedPowerSlots
+                .slice(0, 10)
+                .map((name) => this.isKnownPower(api, name) ? api.normalizePowerName(name) : '');
+
+            while (selectedPowerSlots.length < 10) {
+                selectedPowerSlots.push('');
+            }
+
             return {
                 ...this.defaults,
                 ...state,
-                wantedPowers: api.uniquePowerNames(state.wantedPowers || []),
-                protectedPowers: api.uniquePowerNames(state.protectedPowers || []),
-                protectLegendaryPowers: state.protectLegendaryPowers !== false
+                selectedPowerSlots,
+                autoSkipUnusablePowerRewards: state.autoSkipUnusablePowerRewards !== false
             };
         },
 
         write(api, state) {
+            const selectedPowerSlots = Array.isArray(state.selectedPowerSlots)
+                ? state.selectedPowerSlots
+                : [];
+
             api.saveState(this.id, {
                 ...this.defaults,
                 ...state,
-                wantedPowers: api.uniquePowerNames(state.wantedPowers || []),
-                protectedPowers: api.uniquePowerNames(state.protectedPowers || [])
+                selectedPowerSlots: selectedPowerSlots
+                    .slice(0, 10)
+                    .map((name) => this.isKnownPower(api, name) ? api.normalizePowerName(name) : '')
             });
+        },
+
+        isKnownPower(api, name) {
+            const key = api.powerNameKey(name);
+            return this.allPowerNames.some((powerName) => api.powerNameKey(powerName) === key);
+        },
+
+        getSelectedPowerNames(api, state) {
+            // Dropdown order is priority order. Duplicate selections are collapsed.
+            return api.uniquePowerNames(
+                (state.selectedPowerSlots || [])
+                    .map((name) => api.normalizePowerName(name))
+                    .filter(Boolean)
+            );
+        },
+
+        getSelectedPowerSet(api, state) {
+            return api.makePowerNameSet(this.getSelectedPowerNames(api, state));
+        },
+
+        getRarityRank(rarity) {
+            return this.rarityRank[String(rarity || '').toLowerCase()] || 0;
+        },
+
+        getRarityFromElement(element) {
+            if (!element) return '';
+
+            const text = String(element.textContent || '').toLowerCase();
+            const classText = String(element.className || '').toLowerCase();
+            const dataRarity = String(element.dataset?.rarity || '').toLowerCase();
+
+            for (const rarity of ['legendary', 'epic', 'common']) {
+                if (dataRarity === rarity) return rarity;
+                if (classText.includes(rarity)) return rarity;
+                if (text.includes('(' + rarity + ')')) return rarity;
+            }
+
+            return '';
+        },
+
+        parseMaxStacks(text) {
+            const clean = String(text || '');
+
+            // Examples:
+            // "Stacks: 0 / 3"
+            // "Slot 2 / 3"
+            const match = clean.match(/(?:stacks?|slot)\s*:?\s*\d+\s*\/\s*(\d+)/i);
+
+            if (match) {
+                const max = Number(match[1]);
+                if (Number.isFinite(max) && max > 0) return max;
+            }
+
+            return 1;
+        },
+
+        getCurrentPowerStacks(api) {
+            return Array.from(document.querySelectorAll('.power-list .power')).map((powerElement) => {
+                const nameElement = powerElement.querySelector('.power-slot-head strong');
+                const badgeElement = powerElement.querySelector('.power-slot-badge');
+
+                const name = api.normalizePowerName(nameElement?.textContent || '');
+                const rarity = this.getRarityFromElement(nameElement);
+                const maxStacks = this.parseMaxStacks(badgeElement?.textContent || '');
+
+                return {
+                    name,
+                    key: api.powerNameKey(name),
+                    rarity,
+                    rarityRank: this.getRarityRank(rarity),
+                    maxStacks
+                };
+            }).filter((power) => power.name);
+        },
+
+        getCurrentStacksForPower(api, powerName) {
+            const key = api.powerNameKey(powerName);
+
+            return this.getCurrentPowerStacks(api).filter((power) => {
+                return power.key === key;
+            });
+        },
+
+        getKnownMaxStacks(api, powerName, offeredMaxStacks) {
+            const currentStacks = this.getCurrentStacksForPower(api, powerName);
+
+            const currentMax = currentStacks.reduce((max, stack) => {
+                return Math.max(max, Number(stack.maxStacks) || 1);
+            }, 1);
+
+            return Math.max(1, Number(offeredMaxStacks) || 1, currentMax);
+        },
+
+        getPowerChoiceForms(api) {
+            return Array.from(document.querySelectorAll('form.power-choice-card')).map((form) => {
+                const titleElement = form.querySelector('h3');
+                const stackMetaElement = form.querySelector('.power-stack-meta');
+
+                const name = api.normalizePowerName(titleElement ? titleElement.textContent : '');
+
+                const rarity =
+                    String(form.dataset.rarity || '').toLowerCase() ||
+                    this.getRarityFromElement(titleElement);
+
+                const stackMetaText = api.normalizeText(stackMetaElement?.textContent || '');
+                const maxStacks = this.parseMaxStacks(stackMetaText);
+
+                return {
+                    form,
+                    name,
+                    key: api.powerNameKey(name),
+                    rarity,
+                    rarityRank: this.getRarityRank(rarity),
+                    maxStacks,
+                    stackMetaText
+                };
+            }).filter((choice) => choice.name);
         },
 
         getSkipPowerForm() {
             return document.querySelector('#skipPowerForm') || null;
         },
 
-        hasPowerChoiceScreen(api) {
-            return this.getPowerChoiceForms(api).length > 0;
-        },
-
-        shouldSkipPowerChoices(api, state) {
-            if (!state.autoSkipUnwantedPowerRewards) return false;
-            if (!this.hasPowerChoiceScreen(api)) return false;
-
-            const skipForm = this.getSkipPowerForm();
-            if (!skipForm) return false;
-
-            return true;
-        },
-
-        getCurrentPowerNames(api) {
-            return api.uniquePowerNames(
-                Array.from(document.querySelectorAll('.power-list .power .power-slot-head strong'))
-                    .map((el) => el.textContent)
-            );
-        },
-
-        getPowerChoiceForms(api) {
-            return Array.from(document.querySelectorAll('form.power-choice-card')).map((form) => {
-                const title = form.querySelector('h3');
-                const name = api.normalizePowerName(title ? title.textContent : '');
-                const rarity = String(form.dataset.rarity || '').toLowerCase();
-
-                return {
-                    form,
-                    name,
-                    rarity
-                };
-            }).filter((choice) => choice.name);
-        },
-
         parseReplacementOption(api, option) {
             const text = option ? option.textContent || '' : '';
-            const match = text.match(/from\s+(.+?)\s+\((common|rare|epic|legendary)\)\s*x?\d*/i);
+
+            // Example:
+            // Remove 1 stack from Blood Frenzy (common) x3
+            const match = text.match(/from\s+(.+?)\s+\((common|epic|legendary)\)\s*x?\d*/i);
 
             if (match) {
+                const name = api.normalizePowerName(match[1]);
+                const rarity = String(match[2] || '').toLowerCase();
+
                 return {
-                    name: api.normalizePowerName(match[1]),
-                    rarity: String(match[2] || '').toLowerCase()
+                    option,
+                    value: option.value,
+                    name,
+                    key: api.powerNameKey(name),
+                    rarity,
+                    rarityRank: this.getRarityRank(rarity),
+                    text: api.normalizeText(text)
                 };
             }
 
+            const fallbackName = api.normalizePowerName(text);
+
             return {
-                name: api.normalizePowerName(text),
-                rarity: ''
+                option,
+                value: option?.value || '',
+                name: fallbackName,
+                key: api.powerNameKey(fallbackName),
+                rarity: '',
+                rarityRank: 0,
+                text: api.normalizeText(text)
             };
         },
 
-        selectSafeReplacementIfNeeded(api, form, state) {
+        getReplacementOptions(api, form) {
+            const select = form.querySelector('select[name="replace_id"]');
+            if (!select) return [];
+
+            return Array.from(select.options).map((option) => {
+                return this.parseReplacementOption(api, option);
+            }).filter((info) => info.value);
+        },
+
+        applyReplacementOption(form, replacementInfo) {
             const select = form.querySelector('select[name="replace_id"]');
 
-            if (!select) return true;
+            if (!select || !replacementInfo) return false;
 
-            const wantedSet = api.makePowerNameSet(state.wantedPowers);
-            const protectedSet = api.makePowerNameSet(state.protectedPowers);
-
-            const options = Array.from(select.options);
-
-            const safeOption = options.find((option) => {
-                const info = this.parseReplacementOption(api, option);
-                const key = api.powerNameKey(info.name);
-
-                if (!key) return false;
-                if (wantedSet.has(key)) return false;
-                if (protectedSet.has(key)) return false;
-                if (state.protectLegendaryPowers && info.rarity === 'legendary') return false;
-
-                return true;
-            });
-
-            if (!safeOption) {
-                api.setModuleStatus(this.id, 'Wanted power found, but no safe replacement is available.');
-                return false;
-            }
-
-            select.value = safeOption.value;
+            select.value = replacementInfo.value;
             select.dispatchEvent(new Event('change', { bubbles: true }));
 
             return true;
         },
 
-        collectKnownPowerNames(api) {
-            const state = this.read(api);
+        findLowestLowerSamePowerReplacement(api, choice) {
+            const replacementOptions = this.getReplacementOptions(api, choice.form);
 
-            const fromCurrentPowers = this.getCurrentPowerNames(api);
-            const fromChoices = this.getPowerChoiceForms(api).map((choice) => choice.name);
-
-            return api.uniquePowerNames([
-                ...this.presetPowerNames,
-                ...state.wantedPowers,
-                ...state.protectedPowers,
-                ...fromCurrentPowers,
-                ...fromChoices
-            ]).sort((a, b) => a.localeCompare(b));
+            return replacementOptions
+                .filter((option) => {
+                    return (
+                        option.key === choice.key &&
+                        option.rarityRank > 0 &&
+                        option.rarityRank < choice.rarityRank
+                    );
+                })
+                .sort((a, b) => {
+                    // Replace the lowest rarity first:
+                    // common before epic.
+                    return a.rarityRank - b.rarityRank;
+                })[0] || null;
         },
 
-        renderPowerList(panel, api) {
-            const state = this.read(api);
-            const wantedSet = api.makePowerNameSet(state.wantedPowers);
-            const protectedSet = api.makePowerNameSet(state.protectedPowers);
-            const knownPowerNames = this.collectKnownPowerNames(api);
+        findUnselectedReplacement(api, choice, state) {
+            const selectedSet = this.getSelectedPowerSet(api, state);
+            const replacementOptions = this.getReplacementOptions(api, choice.form);
 
-            const list = panel.querySelector('#tmPowerWishlistList');
-            if (!list) return;
+            return replacementOptions
+                .filter((option) => {
+                    if (!option.key) return false;
 
-            list.textContent = '';
+                    // Target powers are protected from being replaced by a different power.
+                    // Same-power upgrades are handled separately.
+                    if (selectedSet.has(option.key)) return false;
 
-            for (const powerName of knownPowerNames) {
-                const key = api.powerNameKey(powerName);
+                    return true;
+                })
+                .sort((a, b) => {
+                    // Prefer replacing low rarity non-target powers first.
+                    if (a.rarityRank !== b.rarityRank) return a.rarityRank - b.rarityRank;
+                    return a.name.localeCompare(b.name);
+                })[0] || null;
+        },
 
-                const row = document.createElement('div');
-                row.style.display = 'grid';
-                row.style.gridTemplateColumns = '70px 95px 1fr';
-                row.style.gap = '8px';
-                row.style.alignItems = 'center';
-                row.style.margin = '4px 0';
+        analyzeChoice(api, choice, state) {
+            const selectedSet = this.getSelectedPowerSet(api, state);
 
-                const wantedLabel = document.createElement('label');
-                wantedLabel.style.display = 'flex';
-                wantedLabel.style.gap = '4px';
-                wantedLabel.style.alignItems = 'center';
-
-                const wantedCheckbox = api.createCheckbox(wantedSet.has(key), (checked) => {
-                    const latest = this.read(api);
-                    const set = api.makePowerNameSet(latest.wantedPowers);
-
-                    if (checked) set.add(key);
-                    else set.delete(key);
-
-                    const allNames = this.collectKnownPowerNames(api);
-                    latest.wantedPowers = allNames.filter((name) => set.has(api.powerNameKey(name)));
-
-                    this.write(api, latest);
-                    api.scheduleScan(100);
-                });
-
-                wantedLabel.appendChild(wantedCheckbox);
-                wantedLabel.appendChild(document.createTextNode('Want'));
-
-                const protectedLabel = document.createElement('label');
-                protectedLabel.style.display = 'flex';
-                protectedLabel.style.gap = '4px';
-                protectedLabel.style.alignItems = 'center';
-
-                const protectedCheckbox = api.createCheckbox(protectedSet.has(key), (checked) => {
-                    const latest = this.read(api);
-                    const set = api.makePowerNameSet(latest.protectedPowers);
-
-                    if (checked) set.add(key);
-                    else set.delete(key);
-
-                    const allNames = this.collectKnownPowerNames(api);
-                    latest.protectedPowers = allNames.filter((name) => set.has(api.powerNameKey(name)));
-
-                    this.write(api, latest);
-                });
-
-                protectedLabel.appendChild(protectedCheckbox);
-                protectedLabel.appendChild(document.createTextNode('Protect'));
-
-                const name = document.createElement('span');
-                name.textContent = powerName;
-
-                row.appendChild(wantedLabel);
-                row.appendChild(protectedLabel);
-                row.appendChild(name);
-
-                list.appendChild(row);
+            if (!selectedSet.has(choice.key)) {
+                return {
+                    usable: false,
+                    reason: 'not selected'
+                };
             }
+
+            const currentStacks = this.getCurrentStacksForPower(api, choice.name);
+            const maxStacks = this.getKnownMaxStacks(api, choice.name, choice.maxStacks);
+            const hasReplaceSelect = !!choice.form.querySelector('select[name="replace_id"]');
+
+            const lowerSamePowerReplacement = hasReplaceSelect
+                ? this.findLowestLowerSamePowerReplacement(api, choice)
+                : null;
+
+            // Case 1:
+            // Stack is not full yet.
+            // Take the power, regardless of rarity.
+            // Example:
+            // Blood Frenzy common 0/3 -> take common.
+            // Blood Frenzy epic 1/3 -> take epic as an additional stack.
+            if (currentStacks.length < maxStacks) {
+                if (!hasReplaceSelect) {
+                    return {
+                        usable: true,
+                        action: 'add-stack',
+                        replacement: null,
+                        reason:
+                            'adding stack ' +
+                            (currentStacks.length + 1) +
+                            ' / ' +
+                            maxStacks +
+                            ' for ' +
+                            choice.name +
+                            ' (' +
+                            choice.rarity +
+                            ')'
+                    };
+                }
+
+                // If the global power list is full, adding a stack needs a replacement.
+                // Prefer replacing a non-target power, because that truly adds this target stack.
+                const unselectedReplacement = this.findUnselectedReplacement(api, choice, state);
+
+                if (unselectedReplacement) {
+                    return {
+                        usable: true,
+                        action: 'add-stack-with-replacement',
+                        replacement: unselectedReplacement,
+                        reason:
+                            'adding stack ' +
+                            (currentStacks.length + 1) +
+                            ' / ' +
+                            maxStacks +
+                            ' for ' +
+                            choice.name +
+                            ' (' +
+                            choice.rarity +
+                            ') by replacing non-target power ' +
+                            unselectedReplacement.name
+                    };
+                }
+
+                // If there is no non-target replacement, a higher rarity same-power replacement
+                // is still useful, even though it does not increase the stack count.
+                if (lowerSamePowerReplacement) {
+                    return {
+                        usable: true,
+                        action: 'upgrade-while-not-full',
+                        replacement: lowerSamePowerReplacement,
+                        reason:
+                            'upgrading existing ' +
+                            choice.name +
+                            ' stack from ' +
+                            lowerSamePowerReplacement.rarity +
+                            ' to ' +
+                            choice.rarity +
+                            ' because no safe free slot replacement is available'
+                    };
+                }
+
+                return {
+                    usable: false,
+                    reason:
+                        choice.name +
+                        ' stack is not full, but no safe replacement is available'
+                };
+            }
+
+            // Case 2:
+            // Stack is full.
+            // Only take the offered power if it upgrades a lower rarity stack of the same power.
+            // Example:
+            // Blood Frenzy common x3, offered Blood Frenzy epic -> replace one common.
+            if (currentStacks.length >= maxStacks) {
+                if (lowerSamePowerReplacement) {
+                    return {
+                        usable: true,
+                        action: 'upgrade-full-stack',
+                        replacement: lowerSamePowerReplacement,
+                        reason:
+                            'full stack upgrade for ' +
+                            choice.name +
+                            ': replacing ' +
+                            lowerSamePowerReplacement.rarity +
+                            ' with ' +
+                            choice.rarity
+                    };
+                }
+
+                return {
+                    usable: false,
+                    reason:
+                        choice.name +
+                        ' stack is full and no lower rarity same-power stack can be upgraded'
+                };
+            }
+
+            return {
+                usable: false,
+                reason: 'not useful'
+            };
+        },
+
+        findBestChoice(api, state) {
+            const selectedPowerNames = this.getSelectedPowerNames(api, state);
+            const choices = this.getPowerChoiceForms(api);
+
+            // Dropdown order is priority order.
+            for (const selectedName of selectedPowerNames) {
+                const selectedKey = api.powerNameKey(selectedName);
+
+                const matchingChoices = choices
+                    .filter((choice) => choice.key === selectedKey)
+                    .sort((a, b) => {
+                        // If the same selected power appears more than once, prefer higher rarity.
+                        return b.rarityRank - a.rarityRank;
+                    });
+
+                for (const choice of matchingChoices) {
+                    const analysis = this.analyzeChoice(api, choice, state);
+
+                    if (analysis.usable) {
+                        return {
+                            choice,
+                            analysis
+                        };
+                    }
+                }
+            }
+
+            return null;
         },
 
         render(panel, api) {
@@ -1177,125 +1403,118 @@
             enabledLabel.style.display = 'flex';
             enabledLabel.style.gap = '8px';
             enabledLabel.style.alignItems = 'center';
-            enabledLabel.style.marginBottom = '8px';
+            enabledLabel.style.marginBottom = '10px';
 
             const enabledCheckbox = api.createCheckbox(state.enabled, (checked) => {
                 const latest = this.read(api);
                 latest.enabled = checked;
                 this.write(api, latest);
 
-                api.setModuleStatus(this.id, checked ? 'Power Wishlist enabled.' : 'Power Wishlist paused.');
+                api.setModuleStatus(this.id, checked ? 'Power Target List enabled.' : 'Power Target List paused.');
                 api.scheduleScan(100);
             });
 
             enabledLabel.appendChild(enabledCheckbox);
-            enabledLabel.appendChild(document.createTextNode('Automatically pick wanted powers if they do not exist yet'));
+            enabledLabel.appendChild(document.createTextNode('Auto collect selected powers'));
 
-            const protectLegendaryLabel = document.createElement('label');
-            protectLegendaryLabel.style.display = 'flex';
-            protectLegendaryLabel.style.gap = '8px';
-            protectLegendaryLabel.style.alignItems = 'center';
-            protectLegendaryLabel.style.marginBottom = '8px';
+            const skipLabel = document.createElement('label');
+            skipLabel.style.display = 'flex';
+            skipLabel.style.gap = '8px';
+            skipLabel.style.alignItems = 'center';
+            skipLabel.style.marginBottom = '10px';
 
-            const protectLegendaryCheckbox = api.createCheckbox(state.protectLegendaryPowers, (checked) => {
+            const skipCheckbox = api.createCheckbox(state.autoSkipUnusablePowerRewards, (checked) => {
                 const latest = this.read(api);
-                latest.protectLegendaryPowers = checked;
-                this.write(api, latest);
-            });
-
-            protectLegendaryLabel.appendChild(protectLegendaryCheckbox);
-            protectLegendaryLabel.appendChild(document.createTextNode('Never auto-replace legendary powers'));
-
-            const addRow = document.createElement('div');
-            addRow.style.display = 'flex';
-            addRow.style.gap = '8px';
-            addRow.style.marginBottom = '10px';
-
-            const addInput = document.createElement('input');
-            addInput.type = 'text';
-            addInput.placeholder = 'Add power name, e.g. Witchfire Core';
-            addInput.style.flex = '1';
-
-            const addButton = document.createElement('button');
-            addButton.type = 'button';
-            addButton.textContent = 'Add';
-
-            addButton.addEventListener('click', () => {
-                const name = api.normalizePowerName(addInput.value);
-                if (!name) return;
-
-                const latest = this.read(api);
-                latest.wantedPowers = api.uniquePowerNames([...latest.wantedPowers, name]);
-
-                this.write(api, latest);
-                addInput.value = '';
-
-                this.renderPowerList(panel, api);
-                api.scheduleScan(100);
-            });
-
-            addInput.addEventListener('keydown', (event) => {
-                if (event.key === 'Enter') {
-                    event.preventDefault();
-                    addButton.click();
-                }
-            });
-
-            addRow.appendChild(addInput);
-            addRow.appendChild(addButton);
-
-            const hint = document.createElement('div');
-            hint.style.fontSize = '12px';
-            hint.style.opacity = '0.8';
-            hint.style.marginBottom = '8px';
-            hint.textContent = 'Want = pick automatically if offered and not owned. Protect = never auto-replace.';
-
-            const list = document.createElement('div');
-            list.id = 'tmPowerWishlistList';
-
-            const scanButton = document.createElement('button');
-            scanButton.type = 'button';
-            scanButton.textContent = 'Check now';
-            scanButton.style.marginTop = '10px';
-
-            scanButton.addEventListener('click', () => {
-                const didChoose = this.scan(api);
-                if (!didChoose) api.setModuleStatus(this.id, 'No matching new wanted power found.');
-            });
-
-            const autoSkipLabel = document.createElement('label');
-            autoSkipLabel.style.display = 'flex';
-            autoSkipLabel.style.gap = '8px';
-            autoSkipLabel.style.alignItems = 'center';
-            autoSkipLabel.style.marginBottom = '8px';
-
-            const autoSkipCheckbox = api.createCheckbox(state.autoSkipUnwantedPowerRewards, (checked) => {
-                const latest = this.read(api);
-                latest.autoSkipUnwantedPowerRewards = checked;
+                latest.autoSkipUnusablePowerRewards = checked;
                 this.write(api, latest);
 
                 api.setModuleStatus(
                     this.id,
                     checked
-                        ? 'Auto-skip unwanted power rewards enabled.'
-                        : 'Auto-skip unwanted power rewards disabled.'
+                        ? 'Auto-skip unusable power rewards enabled.'
+                        : 'Auto-skip unusable power rewards disabled.'
                 );
 
                 api.scheduleScan(100);
             });
 
-            autoSkipLabel.appendChild(autoSkipCheckbox);
-            autoSkipLabel.appendChild(document.createTextNode('Skip power reward if no wanted new power is available'));
+            skipLabel.appendChild(skipCheckbox);
+            skipLabel.appendChild(document.createTextNode('Skip reward if no useful selected power is available'));
+
+            const grid = document.createElement('div');
+            grid.style.display = 'grid';
+            grid.style.gridTemplateColumns = 'repeat(2, minmax(220px, 1fr))';
+            grid.style.gap = '8px';
+            grid.style.marginBottom = '10px';
+
+            for (let index = 0; index < 10; index += 1) {
+                const row = document.createElement('label');
+                row.style.display = 'grid';
+                row.style.gridTemplateColumns = '80px 1fr';
+                row.style.gap = '6px';
+                row.style.alignItems = 'center';
+
+                const label = document.createElement('span');
+                label.textContent = 'Target ' + (index + 1);
+
+                const select = document.createElement('select');
+
+                const emptyOption = document.createElement('option');
+                emptyOption.value = '';
+                emptyOption.textContent = 'None';
+                select.appendChild(emptyOption);
+
+                for (const powerName of this.allPowerNames) {
+                    const option = document.createElement('option');
+                    option.value = powerName;
+                    option.textContent = powerName;
+                    select.appendChild(option);
+                }
+
+                select.value = state.selectedPowerSlots[index] || '';
+
+                select.addEventListener('change', () => {
+                    const latest = this.read(api);
+                    latest.selectedPowerSlots[index] = select.value;
+                    this.write(api, latest);
+
+                    api.setModuleStatus(
+                        this.id,
+                        'Target ' + (index + 1) + ' set to: ' + (select.value || 'None') + '.'
+                    );
+
+                    api.scheduleScan(100);
+                });
+
+                row.appendChild(label);
+                row.appendChild(select);
+                grid.appendChild(row);
+            }
+
+            const hint = document.createElement('div');
+            hint.style.fontSize = '12px';
+            hint.style.opacity = '0.8';
+            hint.style.marginBottom = '8px';
+            hint.textContent =
+                'Dropdown order is priority order. Selected powers are collected until their stack cap is full. If a stack is full, only higher rarity versions of the same power are taken. Rarity order: common < epic < legendary.';
+
+            const scanButton = document.createElement('button');
+            scanButton.type = 'button';
+            scanButton.textContent = 'Check now';
+
+            scanButton.addEventListener('click', () => {
+                const didChoose = this.scan(api);
+
+                if (!didChoose) {
+                    api.setModuleStatus(this.id, 'No useful selected power found.');
+                }
+            });
 
             panel.appendChild(enabledLabel);
-            panel.appendChild(protectLegendaryLabel);
-            panel.appendChild(autoSkipLabel);
-            panel.appendChild(addRow);
+            panel.appendChild(skipLabel);
+            panel.appendChild(grid);
             panel.appendChild(hint);
-            panel.appendChild(list);
             panel.appendChild(scanButton);
-
-            this.renderPowerList(panel, api);
         },
 
         scan(api) {
@@ -1304,66 +1523,63 @@
             const state = this.read(api);
             if (!state.enabled) return false;
 
-            const currentPowerSet = api.makePowerNameSet(this.getCurrentPowerNames(api));
-            const wantedPowerNames = api.uniquePowerNames(state.wantedPowers);
             const choices = this.getPowerChoiceForms(api);
-
             if (!choices.length) return false;
 
-            for (const wantedName of wantedPowerNames) {
-                const wantedKey = api.powerNameKey(wantedName);
+            const best = this.findBestChoice(api, state);
 
-                // Already owned means: do not pick it again.
-                if (currentPowerSet.has(wantedKey)) continue;
+            if (best) {
+                const { choice, analysis } = best;
 
-                const match = choices.find((choice) => api.powerNameKey(choice.name) === wantedKey);
-                if (!match) continue;
-
-                const canReplace = this.selectSafeReplacementIfNeeded(api, match.form, state);
-                if (!canReplace) continue;
+                if (analysis.replacement) {
+                    this.applyReplacementOption(choice.form, analysis.replacement);
+                }
 
                 this.isChoosing = true;
 
-                api.setModuleStatus(this.id, 'Automatically picking: ' + match.name);
+                api.setModuleStatus(
+                    this.id,
+                    'Choosing automatically: ' +
+                    choice.name +
+                    ' (' +
+                    choice.rarity +
+                    ') | ' +
+                    analysis.reason
+                );
 
                 window.setTimeout(() => {
-                    api.submitForm(match.form, {
+                    api.submitForm(choice.form, {
                         restartAutoBattle: true,
-                        restartReason: 'Power Wishlist'
+                        restartReason: 'Power Target List'
                     });
                 }, Number(state.submitDelay) || 650);
 
                 return true;
             }
 
-            // No wanted new power was found.
-            // This includes:
-            // - offered powers are not wanted
-            // - offered powers are wanted but already owned
-            // - wanted power could not be safely replaced
-            if (this.shouldSkipPowerChoices(api, state)) {
+            if (state.autoSkipUnusablePowerRewards) {
                 const skipForm = this.getSkipPowerForm();
 
                 if (!skipForm) {
-                    api.setModuleStatus(this.id, 'No wanted new power found, but Skip Power form was not found.');
+                    api.setModuleStatus(this.id, 'No useful selected power found, but Skip Power form was not found.');
                     return false;
                 }
 
                 this.isChoosing = true;
 
-                api.setModuleStatus(this.id, 'No wanted new power available. Skipping power reward automatically.');
+                api.setModuleStatus(this.id, 'No useful selected power available. Skipping power reward automatically.');
 
                 window.setTimeout(() => {
                     api.submitForm(skipForm, {
                         restartAutoBattle: true,
-                        restartReason: 'Power Wishlist skip'
+                        restartReason: 'Power Target List skip'
                     });
                 }, Number(state.submitDelay) || 650);
 
                 return true;
             }
 
-            api.setModuleStatus(this.id, 'No wanted new power available. Waiting because auto-skip is disabled.');
+            api.setModuleStatus(this.id, 'No useful selected power available. Waiting because auto-skip is disabled.');
             return false;
         }
     });
