@@ -1801,324 +1801,382 @@
     });
 
     AutoBattleExtras.registerModule({
-        id: 'hungryMerchantPicker',
-        title: 'Hungry Merchant Picker',
-
-        defaults: {
-            enabled: true,
-
-            buyOffers: {
-                first: false,
-                second: false,
-                third: false,
-                fourth: false
-            },
-
-            autoContinueAfterBuying: true,
-            submitDelay: 450
-        },
-
-        isResolving: false,
-
-        read(api) {
-            const state = api.readState(this.id, this.defaults);
-
-            return {
-                ...this.defaults,
-                ...state,
-                buyOffers: {
-                    ...this.defaults.buyOffers,
-                    ...(state.buyOffers || {})
-                }
-            };
-        },
-
-        write(api, state) {
-            api.saveState(this.id, {
-                ...this.defaults,
-                ...state,
-                buyOffers: {
-                    ...this.defaults.buyOffers,
-                    ...(state.buyOffers || {})
-                }
-            });
-        },
-
-        getEventCard(api) {
-            const cards = Array.from(document.querySelectorAll('.castle-event-card'));
-
-            return cards.find((card) => {
-                const title = api.normalizeText(card.querySelector('.event-title')?.textContent);
-                return title === 'The Hungry Merchant';
-            }) || null;
-        },
-
-        getOfferForms(api) {
-            const card = this.getEventCard(api);
-            if (!card) return [];
-
-            return Array.from(card.querySelectorAll('.merchant-offers form.merchant-offer')).map((form, index) => {
-                const name = api.normalizeText(form.querySelector('strong')?.textContent || '');
-                const rarity =
-                      form.querySelector('strong')?.className ||
-                      String(form.dataset.rarity || '');
-
-                const choiceInput = form.querySelector('input[name="choice"]');
-                const logs = Array.from(form.querySelectorAll('.log')).map((el) => api.normalizeText(el.textContent));
-
-                const costLog = logs.find((text) => /cost:/i.test(text)) || '';
-
-                return {
-                    form,
-                    index,
-                    positionKey: ['first', 'second', 'third', 'fourth'][index] || String(index),
-                    choiceValue: choiceInput ? choiceInput.value : '',
-                    name,
-                    rarity,
-                    costLog
-                };
-            });
-        },
-
-        getContinueForm(api) {
-            const card = this.getEventCard(api);
-            if (!card) return null;
-
-            return Array.from(card.querySelectorAll('form.event-option-form')).find((form) => {
-                const input = form.querySelector('input[name="choice"]');
-                return input && input.value === 'leave';
-            }) || null;
-        },
-
-        getEventSignature(api) {
-            const offers = this.getOfferForms(api);
-
-            return offers.map((offer) => {
-                return [
-                    offer.index,
-                    offer.choiceValue,
-                    offer.name,
-                    offer.costLog
-                ].join(':');
-            }).join('|');
-        },
-
-        getProgressStorageKey(api) {
-            return 'tmAutoBattleExtras:' + this.id + ':progress:v1';
-        },
-
-        readProgress(api) {
-            try {
-                const raw = localStorage.getItem(this.getProgressStorageKey(api));
-                return JSON.parse(raw || '{}');
-            } catch {
-                return {};
-            }
-        },
-
-        writeProgress(api, progress) {
-            localStorage.setItem(this.getProgressStorageKey(api), JSON.stringify(progress || {}));
-        },
-
-        resetProgressIfNewMerchant(api) {
-            const signature = this.getEventSignature(api);
-            const progress = this.readProgress(api);
-
-            if (progress.signature !== signature) {
-                const next = {
-                    signature,
-                    boughtPositions: {}
-                };
-
-                this.writeProgress(api, next);
-                return next;
-            }
-
-            return {
-                signature,
-                boughtPositions: progress.boughtPositions || {}
-            };
-        },
-
-        getNextSelectedOffer(api, state, progress) {
-            const offers = this.getOfferForms(api);
-
-            for (const offer of offers) {
-                if (!state.buyOffers[offer.positionKey]) continue;
-                if (progress.boughtPositions[offer.positionKey]) continue;
-
-                return offer;
-            }
-
-            return null;
-        },
-
-        markOfferAsBought(api, offer) {
-            const progress = this.readProgress(api);
-
-            const next = {
-                signature: this.getEventSignature(api),
-                boughtPositions: {
-                    ...(progress.boughtPositions || {}),
-                    [offer.positionKey]: true
-                }
-            };
-
-            this.writeProgress(api, next);
-        },
-
-        render(panel, api) {
-            const state = this.read(api);
-
-            const enabledLabel = document.createElement('label');
-            enabledLabel.style.display = 'flex';
-            enabledLabel.style.gap = '8px';
-            enabledLabel.style.alignItems = 'center';
-            enabledLabel.style.marginBottom = '10px';
-
-            const enabledCheckbox = api.createCheckbox(state.enabled, (checked) => {
-                const latest = this.read(api);
-                latest.enabled = checked;
-                this.write(api, latest);
-
-                api.setModuleStatus(this.id, checked ? 'Hungry Merchant Picker enabled.' : 'Hungry Merchant Picker paused.');
-                api.scheduleScan(100);
-            });
-
-            enabledLabel.appendChild(enabledCheckbox);
-            enabledLabel.appendChild(document.createTextNode('Automatically handle The Hungry Merchant'));
-
-            const offerGrid = document.createElement('div');
-            offerGrid.style.display = 'grid';
-            offerGrid.style.gridTemplateColumns = 'repeat(2, minmax(160px, 1fr))';
-            offerGrid.style.gap = '8px';
-            offerGrid.style.marginBottom = '10px';
-
-            const offerLabels = [
-                ['first', 'Buy first offer'],
-                ['second', 'Buy second offer'],
-                ['third', 'Buy third offer'],
-                ['fourth', 'Buy fourth offer']
-            ];
-
-            for (const [key, labelText] of offerLabels) {
-                const label = document.createElement('label');
-                label.style.display = 'flex';
-                label.style.gap = '6px';
-                label.style.alignItems = 'center';
-
-                const checkbox = api.createCheckbox(state.buyOffers[key], (checked) => {
-                    const latest = this.read(api);
-                    latest.buyOffers[key] = checked;
-                    this.write(api, latest);
-
-                    api.setModuleStatus(this.id, labelText + (checked ? ' enabled.' : ' disabled.'));
-                    api.scheduleScan(100);
-                });
-
-                label.appendChild(checkbox);
-                label.appendChild(document.createTextNode(labelText));
-                offerGrid.appendChild(label);
-            }
-
-            const continueLabel = document.createElement('label');
-            continueLabel.style.display = 'flex';
-            continueLabel.style.gap = '8px';
-            continueLabel.style.alignItems = 'center';
-            continueLabel.style.marginBottom = '10px';
-
-            const continueCheckbox = api.createCheckbox(state.autoContinueAfterBuying, (checked) => {
-                const latest = this.read(api);
-                latest.autoContinueAfterBuying = checked;
-                this.write(api, latest);
-
-                api.setModuleStatus(this.id, checked ? 'Auto-continue enabled.' : 'Auto-continue disabled.');
-                api.scheduleScan(100);
-            });
-
-            continueLabel.appendChild(continueCheckbox);
-            continueLabel.appendChild(document.createTextNode('Continue automatically after selected purchases'));
-
-            const hint = document.createElement('div');
-            hint.style.fontSize = '12px';
-            hint.style.opacity = '0.8';
-            hint.style.marginBottom = '8px';
-            hint.textContent = 'Selected offer positions are bought from top to bottom. After that, the module clicks Continue.';
-
-            const scanButton = document.createElement('button');
-            scanButton.type = 'button';
-            scanButton.textContent = 'Check now';
-
-            scanButton.addEventListener('click', () => {
-                const didResolve = this.scan(api);
-
-                if (!didResolve) {
-                    api.setModuleStatus(this.id, 'No Hungry Merchant event found or nothing to do.');
-                }
-            });
-
-            panel.appendChild(enabledLabel);
-            panel.appendChild(offerGrid);
-            panel.appendChild(continueLabel);
-            panel.appendChild(hint);
-            panel.appendChild(scanButton);
-        },
-
-        scan(api) {
-            if (this.isResolving) return false;
-
-            const state = this.read(api);
-            if (!state.enabled) return false;
-
-            const card = this.getEventCard(api);
-            if (!card) return false;
-
-            const progress = this.resetProgressIfNewMerchant(api);
-            const nextOffer = this.getNextSelectedOffer(api, state, progress);
-
-            if (nextOffer) {
-                this.isResolving = true;
-                this.markOfferAsBought(api, nextOffer);
-
-                api.setModuleStatus(
-                    this.id,
-                    'Buying automatically: ' +
-                    (nextOffer.positionKey || 'selected') +
-                    ' offer' +
-                    (nextOffer.name ? ' | ' + nextOffer.name : '') +
-                    (nextOffer.costLog ? ' | ' + nextOffer.costLog : '')
-                );
-
-                window.setTimeout(() => {
-                    api.submitForm(nextOffer.form);
-                }, Number(state.submitDelay) || 450);
-
-                return true;
-            }
-
-            if (state.autoContinueAfterBuying) {
-                const continueForm = this.getContinueForm(api);
-
-                if (!continueForm) {
-                    api.setModuleStatus(this.id, 'All selected offers handled, but Continue form was not found.');
-                    return false;
-                }
-
-                this.isResolving = true;
-
-                api.setModuleStatus(this.id, 'All selected offers handled. Continuing automatically.');
-
-                window.setTimeout(() => {
-                    api.submitForm(continueForm);
-                }, Number(state.submitDelay) || 450);
-
-                return true;
-            }
-
-            api.setModuleStatus(this.id, 'All selected offers handled. Auto-continue is disabled.');
-            return false;
-        }
+  id: 'hungryMerchantPicker',
+  title: 'Hungry Merchant Picker',
+
+  defaults: {
+    enabled: true,
+
+    buyOffers: {
+      first: false,
+      second: false,
+      third: false,
+      fourth: false
+    },
+
+    autoContinueAfterBuying: true,
+    submitDelay: 450
+  },
+
+  isResolving: false,
+
+  read(api) {
+    const state = api.readState(this.id, this.defaults);
+
+    return {
+      ...this.defaults,
+      ...state,
+      buyOffers: {
+        ...this.defaults.buyOffers,
+        ...(state.buyOffers || {})
+      }
+    };
+  },
+
+  write(api, state) {
+    api.saveState(this.id, {
+      ...this.defaults,
+      ...state,
+      buyOffers: {
+        ...this.defaults.buyOffers,
+        ...(state.buyOffers || {})
+      }
     });
+  },
+
+  getEventCard(api) {
+    const cards = Array.from(document.querySelectorAll('.castle-event-card'));
+
+    return cards.find((card) => {
+      const title = api.normalizeText(card.querySelector('.event-title')?.textContent);
+      return title === 'The Hungry Merchant';
+    }) || null;
+  },
+
+  getOfferForms(api) {
+    const card = this.getEventCard(api);
+    if (!card) return [];
+
+    return Array.from(card.querySelectorAll('.merchant-offers form.merchant-offer')).map((form, index) => {
+      const name = api.normalizeText(form.querySelector('strong')?.textContent || '');
+      const rarity =
+        form.querySelector('strong')?.className ||
+        String(form.dataset.rarity || '');
+
+      const choiceInput = form.querySelector('input[name="choice"]');
+      const logs = Array.from(form.querySelectorAll('.log')).map((el) => api.normalizeText(el.textContent));
+      const costLog = logs.find((text) => /cost:/i.test(text)) || '';
+
+      return {
+        form,
+        index,
+        positionKey: ['first', 'second', 'third', 'fourth'][index] || String(index),
+        choiceValue: choiceInput ? choiceInput.value : '',
+        name,
+        rarity,
+        costLog
+      };
+    }).filter((offer) => offer.choiceValue);
+  },
+
+  getContinueForm(api) {
+    const card = this.getEventCard(api);
+    if (!card) return null;
+
+    return Array.from(card.querySelectorAll('form.event-option-form')).find((form) => {
+      const input = form.querySelector('input[name="choice"]');
+      return input && input.value === 'leave';
+    }) || null;
+  },
+
+  getProgressStorageKey() {
+    return 'tmAutoBattleExtras:' + this.id + ':progress:v2';
+  },
+
+  readProgress() {
+    try {
+      return JSON.parse(localStorage.getItem(this.getProgressStorageKey()) || '{}');
+    } catch {
+      return {};
+    }
+  },
+
+  writeProgress(progress) {
+    localStorage.setItem(this.getProgressStorageKey(), JSON.stringify(progress || {}));
+  },
+
+  clearProgress() {
+    localStorage.removeItem(this.getProgressStorageKey());
+  },
+
+  buildInitialTargetChoices(api, state) {
+    const offers = this.getOfferForms(api);
+
+    return offers
+      .filter((offer) => !!state.buyOffers[offer.positionKey])
+      .map((offer) => ({
+        positionKey: offer.positionKey,
+        choiceValue: offer.choiceValue,
+        name: offer.name,
+        costLog: offer.costLog
+      }));
+  },
+
+  ensureProgressForCurrentMerchant(api, state) {
+    const card = this.getEventCard(api);
+
+    if (!card) {
+      this.clearProgress();
+      return {
+        targetChoices: [],
+        boughtChoiceValues: {}
+      };
+    }
+
+    const progress = this.readProgress();
+
+    if (Array.isArray(progress.targetChoices)) {
+      return {
+        targetChoices: progress.targetChoices,
+        boughtChoiceValues: progress.boughtChoiceValues || {}
+      };
+    }
+
+    const targetChoices = this.buildInitialTargetChoices(api, state);
+
+    const nextProgress = {
+      createdAt: Date.now(),
+      targetChoices,
+      boughtChoiceValues: {}
+    };
+
+    this.writeProgress(nextProgress);
+
+    return nextProgress;
+  },
+
+  getNextTargetOffer(api, progress) {
+    const currentOffers = this.getOfferForms(api);
+
+    for (const target of progress.targetChoices || []) {
+      if (progress.boughtChoiceValues?.[target.choiceValue]) continue;
+
+      const currentOffer = currentOffers.find((offer) => {
+        return offer.choiceValue === target.choiceValue;
+      });
+
+      if (currentOffer) {
+        return {
+          ...currentOffer,
+          originalPositionKey: target.positionKey,
+          originalName: target.name,
+          originalCostLog: target.costLog
+        };
+      }
+
+      progress.boughtChoiceValues = {
+        ...(progress.boughtChoiceValues || {}),
+        [target.choiceValue]: true
+      };
+
+      this.writeProgress(progress);
+    }
+
+    return null;
+  },
+
+  markOfferAsBought(api, offer) {
+    const progress = this.readProgress();
+
+    const next = {
+      ...progress,
+      boughtChoiceValues: {
+        ...(progress.boughtChoiceValues || {}),
+        [offer.choiceValue]: true
+      }
+    };
+
+    this.writeProgress(next);
+  },
+
+  render(panel, api) {
+    const state = this.read(api);
+
+    const enabledLabel = document.createElement('label');
+    enabledLabel.style.display = 'flex';
+    enabledLabel.style.gap = '8px';
+    enabledLabel.style.alignItems = 'center';
+    enabledLabel.style.marginBottom = '10px';
+
+    const enabledCheckbox = api.createCheckbox(state.enabled, (checked) => {
+      const latest = this.read(api);
+      latest.enabled = checked;
+      this.write(api, latest);
+
+      api.setModuleStatus(this.id, checked ? 'Hungry Merchant Picker enabled.' : 'Hungry Merchant Picker paused.');
+      api.scheduleScan(100);
+    });
+
+    enabledLabel.appendChild(enabledCheckbox);
+    enabledLabel.appendChild(document.createTextNode('Automatically handle The Hungry Merchant'));
+
+    const offerGrid = document.createElement('div');
+    offerGrid.style.display = 'grid';
+    offerGrid.style.gridTemplateColumns = 'repeat(2, minmax(160px, 1fr))';
+    offerGrid.style.gap = '8px';
+    offerGrid.style.marginBottom = '10px';
+
+    const offerLabels = [
+      ['first', 'Buy first offer'],
+      ['second', 'Buy second offer'],
+      ['third', 'Buy third offer'],
+      ['fourth', 'Buy fourth offer']
+    ];
+
+    for (const [key, labelText] of offerLabels) {
+      const label = document.createElement('label');
+      label.style.display = 'flex';
+      label.style.gap = '6px';
+      label.style.alignItems = 'center';
+
+      const checkbox = api.createCheckbox(state.buyOffers[key], (checked) => {
+        const latest = this.read(api);
+        latest.buyOffers[key] = checked;
+        this.write(api, latest);
+
+        this.clearProgress();
+
+        api.setModuleStatus(this.id, labelText + (checked ? ' enabled.' : ' disabled.'));
+        api.scheduleScan(100);
+      });
+
+      label.appendChild(checkbox);
+      label.appendChild(document.createTextNode(labelText));
+      offerGrid.appendChild(label);
+    }
+
+    const continueLabel = document.createElement('label');
+    continueLabel.style.display = 'flex';
+    continueLabel.style.gap = '8px';
+    continueLabel.style.alignItems = 'center';
+    continueLabel.style.marginBottom = '10px';
+
+    const continueCheckbox = api.createCheckbox(state.autoContinueAfterBuying, (checked) => {
+      const latest = this.read(api);
+      latest.autoContinueAfterBuying = checked;
+      this.write(api, latest);
+
+      api.setModuleStatus(this.id, checked ? 'Auto-continue enabled.' : 'Auto-continue disabled.');
+      api.scheduleScan(100);
+    });
+
+    continueLabel.appendChild(continueCheckbox);
+    continueLabel.appendChild(document.createTextNode('Continue automatically after selected purchases'));
+
+    const hint = document.createElement('div');
+    hint.style.fontSize = '12px';
+    hint.style.opacity = '0.8';
+    hint.style.marginBottom = '8px';
+    hint.textContent = 'Selected offer positions are captured when the merchant first appears. The module then buys those exact offers, even if the list changes after a purchase.';
+
+    const resetButton = document.createElement('button');
+    resetButton.type = 'button';
+    resetButton.textContent = 'Reset merchant progress';
+    resetButton.style.marginRight = '8px';
+
+    resetButton.addEventListener('click', () => {
+      this.clearProgress();
+      api.setModuleStatus(this.id, 'Merchant progress reset.');
+      api.scheduleScan(100);
+    });
+
+    const scanButton = document.createElement('button');
+    scanButton.type = 'button';
+    scanButton.textContent = 'Check now';
+
+    scanButton.addEventListener('click', () => {
+      const didResolve = this.scan(api);
+
+      if (!didResolve) {
+        api.setModuleStatus(this.id, 'No Hungry Merchant event found or nothing to do.');
+      }
+    });
+
+    panel.appendChild(enabledLabel);
+    panel.appendChild(offerGrid);
+    panel.appendChild(continueLabel);
+    panel.appendChild(hint);
+    panel.appendChild(resetButton);
+    panel.appendChild(scanButton);
+  },
+
+  scan(api) {
+    if (this.isResolving) return false;
+
+    const state = this.read(api);
+    if (!state.enabled) return false;
+
+    const card = this.getEventCard(api);
+
+    if (!card) {
+      this.clearProgress();
+      return false;
+    }
+
+    const progress = this.ensureProgressForCurrentMerchant(api, state);
+    const nextOffer = this.getNextTargetOffer(api, progress);
+
+    if (nextOffer) {
+      this.isResolving = true;
+      this.markOfferAsBought(api, nextOffer);
+
+      api.setModuleStatus(
+        this.id,
+        'Buying automatically: ' +
+          (nextOffer.originalPositionKey || nextOffer.positionKey || 'selected') +
+          ' offer' +
+          (nextOffer.name ? ' | ' + nextOffer.name : '') +
+          (nextOffer.costLog ? ' | ' + nextOffer.costLog : '')
+      );
+
+      window.setTimeout(() => {
+        api.submitForm(nextOffer.form, {
+          restartAutoBattle: true,
+          restartReason: 'Hungry Merchant'
+        });
+      }, Number(state.submitDelay) || 450);
+
+      return true;
+    }
+
+    if (state.autoContinueAfterBuying) {
+      const continueForm = this.getContinueForm(api);
+
+      if (!continueForm) {
+        api.setModuleStatus(this.id, 'All selected offers handled, but Continue form was not found.');
+        return false;
+      }
+
+      this.isResolving = true;
+
+      api.setModuleStatus(this.id, 'All selected offers handled. Continuing automatically.');
+
+      window.setTimeout(() => {
+        this.clearProgress();
+
+        api.submitForm(continueForm, {
+          restartAutoBattle: true,
+          restartReason: 'Hungry Merchant'
+        });
+      }, Number(state.submitDelay) || 450);
+
+      return true;
+    }
+
+    api.setModuleStatus(this.id, 'All selected offers handled. Auto-continue is disabled.');
+    return false;
+  }
+});
 
     AutoBattleExtras.registerModule({
         id: 'cursedMirrorPicker',
