@@ -4,8 +4,8 @@
 // @version      0.4
 // @description  Modular Auto Battle addon: Power Wishlist, Shrine Event Picker, Portrait Trial Picker, and future modules
 // @match        https://demonicscans.org/occurrence_castle.php?slug=vampire_castle
-// @updateURL    https://github.com/Myrkjartan-Hrolfr/demonicscans_veyra_scripts/edit/main/Auto%20Battle%20Extras-0.4.js
-// @downloadURL  https://github.com/Myrkjartan-Hrolfr/demonicscans_veyra_scripts/edit/main/Auto%20Battle%20Extras-0.4.js
+// @updateURL    https://github.com/Myrkjartan-Hrolfr/demonicscans_veyra_scripts/blob/main/Auto%20Battle%20Extras-0.4.js
+// @downloadURL  https://github.com/Myrkjartan-Hrolfr/demonicscans_veyra_scripts/blob/main/Auto%20Battle%20Extras-0.4.js
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
