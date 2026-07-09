@@ -5,8 +5,8 @@
 // @version      0.4
 // @description  Modular Auto Battle addon
 // @match        https://demonicscans.org/occurrence_castle.php*
-// @updateURL    https://raw.githubusercontent.com/Myrkjartan-Hrolfr/demonicscans_veyra_scripts/refs/heads/main/Auto%20Battle%20Extras-0.4.js
-// @downloadURL  https://raw.githubusercontent.com/Myrkjartan-Hrolfr/demonicscans_veyra_scripts/refs/heads/main/Auto%20Battle%20Extras-0.4.js
+// @updateURL    https://github.com/Myrkjartan-Hrolfr/demonicscans_veyra_scripts/raw/refs/heads/main/Auto%20Battle%20Extras-0.4.user.js
+// @downloadURL  https://github.com/Myrkjartan-Hrolfr/demonicscans_veyra_scripts/raw/refs/heads/main/Auto%20Battle%20Extras-0.4.user.js
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
