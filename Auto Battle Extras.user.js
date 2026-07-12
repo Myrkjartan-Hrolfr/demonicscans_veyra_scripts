@@ -2980,6 +2980,626 @@
         }
     });
 
+    AutoBattleExtras.registerModule({
+        id: 'smallBloodPotionAutoUse',
+        title: 'Small Blood Potion Auto Use',
+
+        defaults: {
+            enabled: false,
+            onlyDuringBattle: true,
+            resetLastDamageOnKill: true,
+            submitDelay: 50
+        },
+
+        isUsingPotion: false,
+        fetchHookInstalled: false,
+        manualSubmitGuardInstalled: false,
+        fastScanInterval: null,
+        lastSeenMessageText: '',
+        lastSeenRunLogText: '',
+
+        read(api) {
+            const state = api.readState(this.id, this.defaults);
+
+            return {
+                ...this.defaults,
+                ...state,
+                onlyDuringBattle: state.onlyDuringBattle !== false,
+                resetLastDamageOnKill: state.resetLastDamageOnKill !== false
+            };
+        },
+
+        write(api, state) {
+            api.saveState(this.id, {
+                ...this.defaults,
+                ...state
+            });
+        },
+
+        getDamageStorageKey() {
+            return 'tmAutoBattleExtras:' + this.id + ':lastMonsterDamage:v2';
+        },
+
+        readLastMonsterDamage() {
+            try {
+                const data = JSON.parse(localStorage.getItem(this.getDamageStorageKey()) || '{}');
+
+                return {
+                    damage: Number(data.damage) || 0,
+                    source: data.source || '',
+                    text: data.text || '',
+                    updatedAt: Number(data.updatedAt) || 0
+                };
+            } catch {
+                return {
+                    damage: 0,
+                    source: '',
+                    text: '',
+                    updatedAt: 0
+                };
+            }
+        },
+
+        writeLastMonsterDamage(damage, source, text) {
+            const cleanDamage = Number(damage);
+
+            if (!Number.isFinite(cleanDamage) || cleanDamage <= 0) return false;
+
+            localStorage.setItem(this.getDamageStorageKey(), JSON.stringify({
+                damage: Math.round(cleanDamage),
+                source: source || 'unknown',
+                text: String(text || '').slice(0, 300),
+                updatedAt: Date.now()
+            }));
+
+            return true;
+        },
+
+        clearLastMonsterDamage(reason) {
+            localStorage.setItem(this.getDamageStorageKey(), JSON.stringify({
+                damage: 0,
+                source: reason || 'reset',
+                text: '',
+                updatedAt: Date.now()
+            }));
+        },
+
+        parseNumber(value) {
+            const clean = String(value || '').replace(/[^\d]/g, '');
+            return clean ? Number(clean) : NaN;
+        },
+
+        getCurrentHp(api) {
+            const hpText = api.normalizeText(document.querySelector('#playerHpText')?.textContent || '');
+            const match = hpText.match(/(.+?)\s*\/\s*(.+)/);
+
+            if (!match) return NaN;
+
+            return this.parseNumber(match[1]);
+        },
+
+        hasActiveBattle() {
+            const autoPanel = document.querySelector('#autoBattlePanel');
+
+            if (autoPanel?.dataset?.hasBattle === '1') return true;
+
+            return !!(
+                document.querySelector('.monster-card') &&
+                document.querySelector('form.js-attack-form')
+            );
+        },
+
+        getSmallBloodPotionForm(api) {
+            const direct = Array.from(document.querySelectorAll('form[data-item-name]')).find((form) => {
+                return api.normalizeText(form.dataset.itemName).toLowerCase() === 'small blood potion';
+            });
+
+            if (direct) return direct;
+
+            const items = Array.from(document.querySelectorAll('.item'));
+
+            for (const item of items) {
+                const title = api.normalizeText(item.querySelector('.item-title')?.textContent || '');
+
+                if (title.toLowerCase() !== 'small blood potion') continue;
+
+                const form = item.querySelector('form');
+                if (form) return form;
+            }
+
+            return null;
+        },
+
+        getSmallBloodPotionCount(api) {
+            const items = Array.from(document.querySelectorAll('.item'));
+
+            for (const item of items) {
+                const title = api.normalizeText(item.querySelector('.item-title')?.textContent || '');
+
+                if (title.toLowerCase() !== 'small blood potion') continue;
+
+                const meta = api.normalizeText(item.querySelector('.item-meta')?.textContent || '');
+                const match = meta.match(/x\s*(\d+)/i);
+
+                if (match) return Number(match[1]);
+            }
+
+            return this.getSmallBloodPotionForm(api) ? 1 : 0;
+        },
+
+        textContainsKill(text) {
+            const raw = String(text || '');
+
+            return (
+                /\[kill\]/i.test(raw) ||
+                /\bkilled\b/i.test(raw) ||
+                /\bmonster\s+(?:was\s+)?killed\b/i.test(raw) ||
+                /\bdefeated\b/i.test(raw)
+            );
+        },
+
+        extractMonsterDamageFromText(text) {
+            const raw = String(text || '');
+
+            if (!raw.trim()) return 0;
+
+            // Important:
+            // The message can contain your damage and the monster retaliation in the same text:
+            // "You dealt 218 damage. The monster retaliated for 8."
+            // We only extract the monster retaliation damage.
+
+            const patterns = [
+                // ajaxMessage example:
+                // "The monster retaliated for 8."
+                /\bmonster\s+retaliated\s+for\s+([\d,.]+)/i,
+                /\bmonster\b.*?\bretaliated\b.*?\bfor\s+([\d,.]+)/i,
+                /\bmonster\b.*?\bretaliates\b.*?\bfor\s+([\d,.]+)/i,
+
+                // Recent Run Log example:
+                // "[attack] Dealt 218 damage. Retaliation dealt 8."
+                /\bretaliation\s+dealt\s+([\d,.]+)/i,
+                /\bretaliation\b.*?\bdealt\b.*?([\d,.]+)/i,
+
+                // Other possible variants:
+                /\byou\s+(?:take|took|suffer|suffered|receive|received)\s+([\d,.]+)\s+damage\b/i,
+                /\b(?:monster|enemy|foe|it|doppelganger|reflection)\b.*?\b(?:deals?|hits?|strikes?|attacks?|counterattacks?)\b.*?([\d,.]+)\s+damage\b/i,
+                /\b(?:deals?|hits?|strikes?)\s+you\s+for\s+([\d,.]+)/i,
+                /\b(?:counterattack|counter attack|counter-hit|counter hit)\b.*?([\d,.]+)\s+damage\b/i,
+                /\b([\d,.]+)\s+damage\s+to\s+you\b/i
+            ];
+
+            for (const pattern of patterns) {
+                const match = raw.match(pattern);
+                if (!match) continue;
+
+                const damage = this.parseNumber(match[1]);
+                if (Number.isFinite(damage) && damage > 0) return damage;
+            }
+
+            return 0;
+        },
+
+        extractMonsterDamageFromObject(value, path) {
+            if (!value) return 0;
+
+            if (typeof value === 'string') {
+                return this.extractMonsterDamageFromText(value);
+            }
+
+            if (typeof value === 'number') {
+                const pathText = String(path || '').toLowerCase();
+
+                const likelyDamageKey =
+                    pathText.includes('monster_damage') ||
+                    pathText.includes('counter_damage') ||
+                    pathText.includes('counterattack_damage') ||
+                    pathText.includes('retaliation_damage') ||
+                    pathText.includes('damage_taken') ||
+                    pathText.includes('taken_damage') ||
+                    pathText.includes('incoming_damage') ||
+                    pathText.includes('player_damage_taken');
+
+                return likelyDamageKey && value > 0 ? value : 0;
+            }
+
+            if (Array.isArray(value)) {
+                for (let index = 0; index < value.length; index += 1) {
+                    const damage = this.extractMonsterDamageFromObject(value[index], path + '[' + index + ']');
+                    if (damage > 0) return damage;
+                }
+
+                return 0;
+            }
+
+            if (typeof value === 'object') {
+                const preferredKeys = [
+                    'monster_damage',
+                    'counter_damage',
+                    'counterattack_damage',
+                    'retaliation_damage',
+                    'damage_taken',
+                    'taken_damage',
+                    'incoming_damage',
+                    'player_damage_taken',
+                    'message',
+                    'log',
+                    'text',
+                    'description'
+                ];
+
+                for (const key of preferredKeys) {
+                    if (!(key in value)) continue;
+
+                    const damage = this.extractMonsterDamageFromObject(value[key], path ? path + '.' + key : key);
+                    if (damage > 0) return damage;
+                }
+
+                for (const [key, child] of Object.entries(value)) {
+                    const damage = this.extractMonsterDamageFromObject(child, path ? path + '.' + key : key);
+                    if (damage > 0) return damage;
+                }
+            }
+
+            return 0;
+        },
+
+        rememberDamageFromText(api, text, source) {
+            const state = this.read(api);
+
+            if (state.resetLastDamageOnKill && this.textContainsKill(text)) {
+                this.clearLastMonsterDamage('kill detected in ' + (source || 'text'));
+                api.setModuleStatus(this.id, 'Last monster damage reset because a kill was detected.');
+                return true;
+            }
+
+            const damage = this.extractMonsterDamageFromText(text);
+
+            if (damage > 0) {
+                this.writeLastMonsterDamage(damage, source || 'text', text);
+                api.setModuleStatus(this.id, 'Last monster damage recorded: ' + damage + '.');
+                return true;
+            }
+
+            return false;
+        },
+
+        rememberDamageFromResponse(api, data) {
+            const state = this.read(api);
+
+            const text =
+                typeof data?.message === 'string'
+                    ? data.message
+                    : JSON.stringify(data).slice(0, 300);
+
+            if (state.resetLastDamageOnKill && this.textContainsKill(text)) {
+                this.clearLastMonsterDamage('kill detected in attack response');
+                api.setModuleStatus(this.id, 'Last monster damage reset because a kill was detected.');
+                return true;
+            }
+
+            const damage = this.extractMonsterDamageFromObject(data, '');
+
+            if (damage > 0) {
+                this.writeLastMonsterDamage(damage, 'attack response', text);
+                api.setModuleStatus(this.id, 'Last monster damage recorded: ' + damage + '.');
+                return true;
+            }
+
+            return false;
+        },
+
+        scanRunLogForDamageOrKill(api) {
+            const cards = Array.from(document.querySelectorAll('.card'));
+            const recentRunLogCard = cards.find((card) => {
+                const title = api.normalizeText(card.querySelector('h2')?.textContent || '');
+                return title === 'Recent Run Log';
+            });
+
+            if (!recentRunLogCard) return false;
+
+            const firstLog = recentRunLogCard.querySelector('.log');
+            const text = api.normalizeText(firstLog?.textContent || '');
+
+            if (!text || text === this.lastSeenRunLogText) return false;
+
+            this.lastSeenRunLogText = text;
+
+            return this.rememberDamageFromText(api, text, 'recent run log');
+        },
+
+        shouldUsePotion(api) {
+            const state = this.read(api);
+
+            if (!state.enabled) return false;
+            if (this.isUsingPotion) return false;
+
+            if (state.onlyDuringBattle && !this.hasActiveBattle()) return false;
+
+            const form = this.getSmallBloodPotionForm(api);
+            if (!form) return false;
+
+            const currentHp = this.getCurrentHp(api);
+            if (!Number.isFinite(currentHp) || currentHp <= 0) return false;
+
+            const last = this.readLastMonsterDamage();
+            if (!Number.isFinite(last.damage) || last.damage <= 0) return false;
+
+            // Survival rule:
+            // If the next hit repeats the last monster damage, HP <= damage means death risk.
+            return currentHp <= last.damage;
+        },
+
+        usePotion(api, reason) {
+            if (this.isUsingPotion) return false;
+
+            const form = this.getSmallBloodPotionForm(api);
+            if (!form) return false;
+
+            const currentHp = this.getCurrentHp(api);
+            const last = this.readLastMonsterDamage();
+            const count = this.getSmallBloodPotionCount(api);
+
+            this.isUsingPotion = true;
+
+            api.setModuleStatus(
+                this.id,
+                'Using Small Blood Potion automatically. Current HP: ' +
+                currentHp +
+                ' | last monster damage: ' +
+                last.damage +
+                (count ? ' | available: x' + count : '') +
+                (reason ? ' | reason: ' + reason : '')
+            );
+
+            window.setTimeout(() => {
+                api.submitForm(form, {
+                    restartAutoBattle: true,
+                    restartReason: 'Small Blood Potion Auto Use'
+                });
+            }, Number(this.read(api).submitDelay) || 50);
+
+            return true;
+        },
+
+        isAttackRequest(args) {
+            const init = args[1] || {};
+            const method = String(init.method || '').toUpperCase();
+
+            if (method !== 'POST') return false;
+
+            const body = init.body;
+            if (!(body instanceof FormData)) return false;
+
+            const action = body.get('action');
+            const attackType = body.get('attack_type');
+
+            return action === 'attack' && ['slash', 'magic'].includes(String(attackType));
+        },
+
+        installFetchHook(api) {
+            if (this.fetchHookInstalled) return;
+
+            this.fetchHookInstalled = true;
+
+            const module = this;
+            const originalFetch = window.fetch;
+
+            window.fetch = async function smallBloodPotionFetchHook(...args) {
+                try {
+                    if (module.isAttackRequest(args) && module.shouldUsePotion(api)) {
+                        const didUsePotion = module.usePotion(api, 'before attack');
+
+                        if (didUsePotion) {
+                            return new Promise(() => { });
+                        }
+                    }
+                } catch (error) {
+                    console.error('[AutoBattleExtras] Small Blood Potion pre-attack guard failed:', error);
+                }
+
+                const response = await originalFetch.apply(this, args);
+
+                try {
+                    if (module.isAttackRequest(args)) {
+                        const clone = response.clone();
+                        const text = await clone.text();
+
+                        try {
+                            const data = JSON.parse(text);
+                            module.rememberDamageFromResponse(api, data);
+                        } catch {
+                            module.rememberDamageFromText(api, text, 'attack response text');
+                        }
+
+                        api.scheduleScan(50);
+                    }
+                } catch (error) {
+                    console.error('[AutoBattleExtras] Small Blood Potion damage read failed:', error);
+                }
+
+                return response;
+            };
+        },
+
+        installManualSubmitGuard(api) {
+            if (this.manualSubmitGuardInstalled) return;
+
+            this.manualSubmitGuardInstalled = true;
+
+            document.addEventListener(
+                'submit',
+                (event) => {
+                    const form = event.target;
+
+                    if (!(form instanceof HTMLFormElement)) return;
+                    if (!form.matches('form.js-attack-form')) return;
+
+                    if (!this.shouldUsePotion(api)) return;
+
+                    const didUsePotion = this.usePotion(api, 'before manual attack');
+
+                    if (didUsePotion) {
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                    }
+                },
+                true
+            );
+        },
+
+        startFastScan(api) {
+            if (this.fastScanInterval) return;
+
+            this.fastScanInterval = window.setInterval(() => {
+                const state = this.read(api);
+                if (!state.enabled) return;
+
+                const messageBox = document.querySelector('#ajaxMessage');
+                const messageText = api.normalizeText(messageBox?.textContent || '');
+
+                if (messageText && messageText !== this.lastSeenMessageText) {
+                    this.lastSeenMessageText = messageText;
+                    this.rememberDamageFromText(api, messageText, 'ajax message');
+                }
+
+                this.scanRunLogForDamageOrKill(api);
+
+                if (this.shouldUsePotion(api)) {
+                    this.usePotion(api, 'HP at or below last monster damage');
+                }
+            }, 250);
+        },
+
+        render(panel, api) {
+            const state = this.read(api);
+
+            this.installFetchHook(api);
+            this.installManualSubmitGuard(api);
+            this.startFastScan(api);
+
+            const enabledLabel = document.createElement('label');
+            enabledLabel.style.display = 'flex';
+            enabledLabel.style.gap = '8px';
+            enabledLabel.style.alignItems = 'center';
+            enabledLabel.style.marginBottom = '10px';
+
+            const enabledCheckbox = api.createCheckbox(state.enabled, (checked) => {
+                const latest = this.read(api);
+                latest.enabled = checked;
+                this.write(api, latest);
+
+                api.setModuleStatus(this.id, checked ? 'Small Blood Potion Auto Use enabled.' : 'Small Blood Potion Auto Use paused.');
+                api.scheduleScan(50);
+            });
+
+            enabledLabel.appendChild(enabledCheckbox);
+            enabledLabel.appendChild(document.createTextNode('Automatically use Small Blood Potion'));
+
+            const battleOnlyLabel = document.createElement('label');
+            battleOnlyLabel.style.display = 'flex';
+            battleOnlyLabel.style.gap = '8px';
+            battleOnlyLabel.style.alignItems = 'center';
+            battleOnlyLabel.style.marginBottom = '10px';
+
+            const battleOnlyCheckbox = api.createCheckbox(state.onlyDuringBattle, (checked) => {
+                const latest = this.read(api);
+                latest.onlyDuringBattle = checked;
+                this.write(api, latest);
+
+                api.setModuleStatus(this.id, checked ? 'Only during battle enabled.' : 'Only during battle disabled.');
+                api.scheduleScan(50);
+            });
+
+            battleOnlyLabel.appendChild(battleOnlyCheckbox);
+            battleOnlyLabel.appendChild(document.createTextNode('Only use during active battle'));
+
+            const resetOnKillLabel = document.createElement('label');
+            resetOnKillLabel.style.display = 'flex';
+            resetOnKillLabel.style.gap = '8px';
+            resetOnKillLabel.style.alignItems = 'center';
+            resetOnKillLabel.style.marginBottom = '10px';
+
+            const resetOnKillCheckbox = api.createCheckbox(state.resetLastDamageOnKill, (checked) => {
+                const latest = this.read(api);
+                latest.resetLastDamageOnKill = checked;
+                this.write(api, latest);
+
+                api.setModuleStatus(this.id, checked ? 'Reset last damage on kill enabled.' : 'Reset last damage on kill disabled.');
+                api.scheduleScan(50);
+            });
+
+            resetOnKillLabel.appendChild(resetOnKillCheckbox);
+            resetOnKillLabel.appendChild(document.createTextNode('Reset last monster damage when a kill is detected'));
+
+            const hint = document.createElement('div');
+            hint.style.fontSize = '12px';
+            hint.style.opacity = '0.8';
+            hint.style.marginBottom = '8px';
+            hint.textContent =
+                'Uses a Small Blood Potion when current HP is less than or equal to the last recorded monster retaliation damage. Damage is read from combat messages, not from HP differences.';
+
+            const clearButton = document.createElement('button');
+            clearButton.type = 'button';
+            clearButton.textContent = 'Reset last damage';
+            clearButton.style.marginRight = '8px';
+
+            clearButton.addEventListener('click', () => {
+                this.clearLastMonsterDamage('manual reset');
+                api.setModuleStatus(this.id, 'Last monster damage reset manually.');
+            });
+
+            const scanButton = document.createElement('button');
+            scanButton.type = 'button';
+            scanButton.textContent = 'Check now';
+
+            scanButton.addEventListener('click', () => {
+                const didUse = this.scan(api);
+
+                if (!didUse) {
+                    const hp = this.getCurrentHp(api);
+                    const last = this.readLastMonsterDamage();
+                    const count = this.getSmallBloodPotionCount(api);
+
+                    api.setModuleStatus(
+                        this.id,
+                        'No potion used. Current HP: ' +
+                        (Number.isFinite(hp) ? hp : 'unknown') +
+                        ' | last monster damage: ' +
+                        (last.damage || 'unknown') +
+                        ' | available: x' +
+                        count
+                    );
+                }
+            });
+
+            panel.appendChild(enabledLabel);
+            panel.appendChild(battleOnlyLabel);
+            panel.appendChild(resetOnKillLabel);
+            panel.appendChild(hint);
+            panel.appendChild(clearButton);
+            panel.appendChild(scanButton);
+        },
+
+        scan(api) {
+            const state = this.read(api);
+            if (!state.enabled) return false;
+
+            const messageBox = document.querySelector('#ajaxMessage');
+            const messageText = api.normalizeText(messageBox?.textContent || '');
+
+            if (messageText && messageText !== this.lastSeenMessageText) {
+                this.lastSeenMessageText = messageText;
+                this.rememberDamageFromText(api, messageText, 'ajax message');
+            }
+
+            this.scanRunLogForDamageOrKill(api);
+
+            if (!this.shouldUsePotion(api)) return false;
+
+            return this.usePotion(api, 'module scan');
+        }
+    });
+
 
     /*
     Add future modules here, before AutoBattleExtras.start().
