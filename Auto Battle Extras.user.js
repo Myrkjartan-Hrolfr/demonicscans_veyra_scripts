@@ -2,7 +2,7 @@
 // @name         Auto Battle Extras
 // @namespace    local.autobattle.extras
 // @author       Myrkjartan Hrolfr
-// @version      0.5
+// @version      0.6
 // @description  Modular Auto Battle addon
 // @match        https://demonicscans.org/occurrence_castle.php*
 // @updateURL    https://github.com/Myrkjartan-Hrolfr/demonicscans_veyra_scripts/raw/refs/heads/main/Auto%20Battle%20Extras-0.4.user.js
