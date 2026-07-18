@@ -9,28 +9,28 @@
 // ==/UserScript==
 
 (() => {
-  "use strict";
+  'use strict';
 
-  const ID = "tm-monster-auto-battle";
+  const ID = 'tm-monster-auto-battle';
   const STORE_KEY = `${ID}:settings:v6:${location.host}:${location.pathname}`;
 
   const RESUME_KEY = `${ID}:resume:v3:${location.host}:${location.pathname}`;
 
   const SEL = {
-    monsterCard: ".battle-card.monster-card",
-    attack: "button.attack-btn",
-    damage: "#yourDamageValue",
-    monsterHp: "#hpText",
-    stamina: "#stamina_span",
-    playerHp: "#pHpText",
-    playerMana: "#pManaText",
-    exp: ".game-topbar .gtb-exp " + ".gtb-exp-top span:last-child",
-    potion: ".potion-use-btn",
-    potionCard: ".potion-card",
+    monsterCard: '.battle-card.monster-card',
+    attack: 'button.attack-btn',
+    damage: '#yourDamageValue',
+    monsterHp: '#hpText',
+    stamina: '#stamina_span',
+    playerHp: '#pHpText',
+    playerMana: '#pManaText',
+    exp: '.game-topbar .gtb-exp ' + '.gtb-exp-top span:last-child',
+    potion: '.potion-use-btn',
+    potionCard: '.potion-card',
   };
 
   const DEFAULTS = {
-    attackKeys: ["", "", ""],
+    attackKeys: ['', '', ''],
 
     autoStamina: false,
     autoMana: false,
@@ -39,7 +39,7 @@
     stopBeforeLevelUp: false,
     levelMultiplier: 2,
 
-    targetDamage: "0",
+    targetDamage: '0',
     delayMs: 1200,
     collapsed: false,
 
@@ -58,10 +58,10 @@
     panel: null,
 
     running: false,
-    monsterKey: "",
+    monsterKey: '',
 
     attacks: [],
-    attackSignature: "",
+    attackSignature: '',
 
     potions: [],
     settings: loadSettings(),
@@ -81,21 +81,17 @@
       setTimeout(resolve, milliseconds);
     });
 
-  const queryAll = (selector, root = document) => [
-    ...root.querySelectorAll(selector),
-  ];
+  const queryAll = (selector, root = document) => [...root.querySelectorAll(selector)];
 
   function loadSettings() {
     try {
-      const saved = JSON.parse(localStorage.getItem(STORE_KEY) || "{}");
+      const saved = JSON.parse(localStorage.getItem(STORE_KEY) || '{}');
 
       return {
         ...DEFAULTS,
         ...saved,
 
-        attackKeys: Array.isArray(saved.attackKeys)
-          ? saved.attackKeys.slice(0, 3)
-          : ["", "", ""],
+        attackKeys: Array.isArray(saved.attackKeys) ? saved.attackKeys.slice(0, 3) : ['', '', ''],
 
         potionEnabled: {
           ...(saved.potionEnabled || {}),
@@ -114,7 +110,7 @@
         },
       };
     } catch (error) {
-      console.warn("[Monster Auto Battle] Could not load settings.", error);
+      console.warn('[Monster Auto Battle] Could not load settings.', error);
 
       return JSON.parse(JSON.stringify(DEFAULTS));
     }
@@ -124,38 +120,36 @@
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify(state.settings));
     } catch (error) {
-      console.warn("[Monster Auto Battle] Could not save settings.", error);
+      console.warn('[Monster Auto Battle] Could not save settings.', error);
     }
   }
 
   function formatNumber(value) {
     return Number.isFinite(value)
-      ? new Intl.NumberFormat("en-US", {
+      ? new Intl.NumberFormat('en-US', {
           maximumFractionDigits: 0,
         }).format(value)
-      : "—";
+      : '—';
   }
 
   function parseInteger(value) {
-    const match = String(value ?? "").match(/-?\d{1,3}(?:[.,\s]\d{3})+|-?\d+/);
+    const match = String(value ?? '').match(/-?\d{1,3}(?:[.,\s]\d{3})+|-?\d+/);
 
     if (!match) {
       return null;
     }
 
-    const number = Number(match[0].replace(/\D/g, ""));
+    const number = Number(match[0].replace(/\D/g, ''));
 
     if (!Number.isFinite(number)) {
       return null;
     }
 
-    return match[0].trim().startsWith("-") ? -number : number;
+    return match[0].trim().startsWith('-') ? -number : number;
   }
 
   function parseFraction(value) {
-    const match = String(value ?? "").match(
-      /(\d{1,3}(?:[.,\s]\d{3})+|\d+)\s*\/\s*(\d{1,3}(?:[.,\s]\d{3})+|\d+)/,
-    );
+    const match = String(value ?? '').match(/(\d{1,3}(?:[.,\s]\d{3})+|\d+)\s*\/\s*(\d{1,3}(?:[.,\s]\d{3})+|\d+)/);
 
     if (!match) {
       return null;
@@ -176,10 +170,10 @@
   }
 
   function parseTarget(value) {
-    const raw = String(value ?? "")
+    const raw = String(value ?? '')
       .trim()
       .toLowerCase()
-      .replace(/\s+/g, "");
+      .replace(/\s+/g, '');
 
     if (!raw) {
       return 0;
@@ -192,7 +186,7 @@
     }
 
     const factors = {
-      "": 1,
+      '': 1,
       k: 1e3,
       m: 1e6,
       b: 1e9,
@@ -200,21 +194,20 @@
       q: 1e15,
     };
 
-    const suffix = match[2] || "";
+    const suffix = match[2] || '';
 
     let numberText = match[1];
 
     if (!suffix) {
-      numberText = numberText.replace(/\D/g, "");
-    } else if (numberText.includes(".") && numberText.includes(",")) {
-      const decimal =
-        numberText.lastIndexOf(",") > numberText.lastIndexOf(".") ? "," : ".";
+      numberText = numberText.replace(/\D/g, '');
+    } else if (numberText.includes('.') && numberText.includes(',')) {
+      const decimal = numberText.lastIndexOf(',') > numberText.lastIndexOf('.') ? ',' : '.';
 
-      const thousands = decimal === "," ? "." : ",";
+      const thousands = decimal === ',' ? '.' : ',';
 
-      numberText = numberText.split(thousands).join("").replace(decimal, ".");
+      numberText = numberText.split(thousands).join('').replace(decimal, '.');
     } else {
-      numberText = numberText.replace(",", ".");
+      numberText = numberText.replace(',', '.');
     }
 
     const result = Number(numberText) * factors[suffix];
@@ -224,11 +217,11 @@
 
   function escapeHtml(value) {
     return String(value)
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;")
-      .replaceAll("'", "&#039;");
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#039;');
   }
 
   function findMonsterCard() {
@@ -240,17 +233,13 @@
   }
 
   function getMonsterKey(card = state.card) {
-    const title =
-      card?.querySelector(".card-title")?.textContent?.trim() || "monster";
+    const title = card?.querySelector('.card-title')?.textContent?.trim() || 'monster';
 
-    const image =
-      card
-        ?.querySelector("#monsterImage, .monster_image")
-        ?.getAttribute("src") || "";
+    const image = card?.querySelector('#monsterImage, .monster_image')?.getAttribute('src') || '';
 
-    const instance = window.AUTO_DIE_CFG?.nextDieMs ?? "";
+    const instance = window.AUTO_DIE_CFG?.nextDieMs ?? '';
 
-    return [location.pathname, title, image, instance].join("|");
+    return [location.pathname, title, image, instance].join('|');
   }
 
   function getCurrentDamage() {
@@ -262,23 +251,15 @@
   }
 
   function getCurrentMana() {
-    return (
-      parseFraction(document.querySelector(SEL.playerMana)?.textContent)
-        ?.current ?? null
-    );
+    return parseFraction(document.querySelector(SEL.playerMana)?.textContent)?.current ?? null;
   }
 
   function getCurrentHealth() {
-    return (
-      parseFraction(document.querySelector(SEL.playerHp)?.textContent)
-        ?.current ?? null
-    );
+    return parseFraction(document.querySelector(SEL.playerHp)?.textContent)?.current ?? null;
   }
 
   function getExperienceProgress() {
-    const experience = parseFraction(
-      document.querySelector(SEL.exp)?.textContent,
-    );
+    const experience = parseFraction(document.querySelector(SEL.exp)?.textContent);
 
     if (!experience) {
       return null;
@@ -321,11 +302,7 @@
     while (state.running && Date.now() - startedAt < timeoutMs) {
       const current = getExperienceProgress();
 
-      if (
-        current &&
-        (current.current !== before.current ||
-          current.maximum !== before.maximum)
-      ) {
+      if (current && (current.current !== before.current || current.maximum !== before.maximum)) {
         return current;
       }
 
@@ -336,29 +313,23 @@
   }
 
   function isMonsterDead() {
-    const health = parseFraction(
-      state.card?.querySelector(SEL.monsterHp)?.textContent,
-    )?.current;
+    const health = parseFraction(state.card?.querySelector(SEL.monsterHp)?.textContent)?.current;
 
-    return health === 0 || Boolean(state.card?.classList.contains("dead"));
+    return health === 0 || Boolean(state.card?.classList.contains('dead'));
   }
 
   function getAttackCosts(button) {
     const text = [
-      button.dataset.skillName || "",
+      button.dataset.skillName || '',
 
-      button.textContent || "",
+      button.textContent || '',
 
-      button.querySelector(".skill-cost")?.textContent || "",
-    ].join(" ");
+      button.querySelector('.skill-cost')?.textContent || '',
+    ].join(' ');
 
-    const staminaMatch = text.match(
-      /(\d{1,3}(?:[.,\s]\d{3})+|\d+)\s*(?:stam|stamina)\b/i,
-    );
+    const staminaMatch = text.match(/(\d{1,3}(?:[.,\s]\d{3})+|\d+)\s*(?:stam|stamina)\b/i);
 
-    const manaMatch = text.match(
-      /(\d{1,3}(?:[.,\s]\d{3})+|\d+)\s*(?:mp|mana)\b/i,
-    );
+    const manaMatch = text.match(/(\d{1,3}(?:[.,\s]\d{3})+|\d+)\s*(?:mp|mana)\b/i);
 
     let stamina = staminaMatch ? parseInteger(staminaMatch[1]) : null;
 
@@ -372,9 +343,7 @@
      * Power Slash (10)
      */
     if (!Number.isFinite(stamina) || stamina <= 1) {
-      const ending = button.textContent?.match(
-        /\((\d{1,3}(?:[.,\s]\d{3})+|\d+)\)\s*$/,
-      );
+      const ending = button.textContent?.match(/\((\d{1,3}(?:[.,\s]\d{3})+|\d+)\)\s*$/);
 
       const visibleCost = ending ? parseInteger(ending[1]) : null;
 
@@ -393,37 +362,31 @@
   function attackFromButton(button) {
     const name =
       button.dataset.skillName?.trim() ||
-      button.querySelector(".skill-name")?.textContent?.trim() ||
+      button.querySelector('.skill-name')?.textContent?.trim() ||
       button.textContent?.trim() ||
-      "Unnamed Attack";
+      'Unnamed Attack';
 
-    const skillId = button.dataset.skillId ?? "";
+    const skillId = button.dataset.skillId ?? '';
 
     return {
       key: `${skillId}|${name}`,
 
       name,
 
-      group: button.closest(".class-skill-bar")
-        ? "Class Attacks"
-        : "Standard Attacks",
+      group: button.closest('.class-skill-bar') ? 'Class Attacks' : 'Standard Attacks',
 
       costs: getAttackCosts(button),
     };
   }
 
   function discoverAttacks() {
-    const attacks = state.card
-      ? queryAll(SEL.attack, state.card).map(attackFromButton)
-      : [];
+    const attacks = state.card ? queryAll(SEL.attack, state.card).map(attackFromButton) : [];
 
     const signature = attacks
       .map((attack) => {
-        return (
-          `${attack.key}:` + `${attack.costs.stamina}:` + `${attack.costs.mana}`
-        );
+        return `${attack.key}:` + `${attack.costs.stamina}:` + `${attack.costs.mana}`;
       })
-      .join("||");
+      .join('||');
 
     const changed = signature !== state.attackSignature;
 
@@ -431,9 +394,7 @@
 
     state.attacks = attacks;
 
-    const keys = Array.isArray(state.settings.attackKeys)
-      ? state.settings.attackKeys.slice(0, 3)
-      : ["", "", ""];
+    const keys = Array.isArray(state.settings.attackKeys) ? state.settings.attackKeys.slice(0, 3) : ['', '', ''];
 
     for (let index = 0; index < 3; index += 1) {
       if (
@@ -450,7 +411,7 @@
         })?.key ||
         attacks[index]?.key ||
         attacks[0]?.key ||
-        "";
+        '';
     }
 
     state.settings.attackKeys = keys;
@@ -483,19 +444,19 @@
   function getPotionType(name, description) {
     const text = `${name} ${description}`.toLowerCase();
 
-    if (text.includes("stamina")) {
-      return "stamina";
+    if (text.includes('stamina')) {
+      return 'stamina';
     }
 
-    if (text.includes("mana")) {
-      return "mana";
+    if (text.includes('mana')) {
+      return 'mana';
     }
 
     if (/\bhp\b|health|heal/.test(text)) {
-      return "health";
+      return 'health';
     }
 
-    return "other";
+    return 'other';
   }
 
   function potionFromButton(button) {
@@ -503,20 +464,19 @@
 
     const name =
       button.dataset.name?.trim() ||
-      card?.querySelector(".potion-name span")?.textContent?.trim() ||
+      card?.querySelector('.potion-name span')?.textContent?.trim() ||
       button.textContent?.trim() ||
-      "Unknown Potion";
+      'Unknown Potion';
 
-    const description =
-      card?.querySelector(".potion-desc")?.textContent?.trim() || "";
+    const description = card?.querySelector('.potion-desc')?.textContent?.trim() || '';
 
     const itemId = String(button.dataset.item || card?.dataset.itemId || name);
 
     const quantity =
       [
-        card?.querySelector(".potion-qty-left")?.textContent,
+        card?.querySelector('.potion-qty-left')?.textContent,
 
-        button.querySelector(".ds-potion-count")?.textContent,
+        button.querySelector('.ds-potion-count')?.textContent,
 
         button.dataset.max,
       ]
@@ -536,7 +496,7 @@
   }
 
   function supportsMultiplePotionUse(potion) {
-    return potion?.itemId === "30" || potion?.itemId === "162";
+    return potion?.itemId === '30' || potion?.itemId === '162';
   }
 
   function getConfiguredPotionAmount(potion) {
@@ -563,7 +523,7 @@
     for (const button of buttons) {
       const potion = potionFromButton(button);
 
-      if (potion.type === "other") {
+      if (potion.type === 'other') {
         continue;
       }
 
@@ -576,7 +536,7 @@
 
     state.potions = [...unique.values()];
 
-    for (const type of ["stamina", "mana", "health"]) {
+    for (const type of ['stamina', 'mana', 'health']) {
       const available = state.potions
         .filter((potion) => {
           return potion.type === type;
@@ -612,18 +572,12 @@
   }
 
   function getPotionAmountInput(button) {
-    return (
-      button
-        .closest(".potion-actions")
-        ?.querySelector('input[type="number"]') || null
-    );
+    return button.closest('.potion-actions')?.querySelector('input[type="number"]') || null;
   }
 
   function findLivePotionButton(potion, amount = 1) {
     const matches = queryAll(SEL.potion).filter((button) => {
-      return (
-        potionFromButton(button).itemId === potion.itemId && !button.disabled
-      );
+      return potionFromButton(button).itemId === potion.itemId && !button.disabled;
     });
 
     if (amount > 1) {
@@ -655,8 +609,8 @@
     const rectangle = element.getBoundingClientRect();
 
     return (
-      style.display !== "none" &&
-      style.visibility !== "hidden" &&
+      style.display !== 'none' &&
+      style.visibility !== 'hidden' &&
       Number(style.opacity || 1) > 0 &&
       rectangle.width > 0 &&
       rectangle.height > 0
@@ -665,16 +619,16 @@
 
   function findPotionConfirmationButton() {
     const directSelectors = [
-      ".swal2-container .swal2-confirm",
-      ".swal-modal .swal-button--confirm",
-      ".modal.show .btn-confirm",
+      '.swal2-container .swal2-confirm',
+      '.swal-modal .swal-button--confirm',
+      '.modal.show .btn-confirm',
       '.modal.show [data-confirm="true"]',
-      ".modal.show button.btn-primary",
+      '.modal.show button.btn-primary',
       '[role="dialog"][aria-modal="true"] .confirm',
       '[role="dialog"][aria-modal="true"] [data-confirm]',
       '[role="dialog"][aria-modal="true"] button[type="submit"]',
-      ".dialog.open .confirm",
-      ".popup.open .confirm",
+      '.dialog.open .confirm',
+      '.popup.open .confirm',
     ];
 
     for (const selector of directSelectors) {
@@ -688,17 +642,16 @@
     }
 
     const dialogSelectors = [
-      ".swal2-container",
-      ".swal-overlay",
-      ".modal.show",
+      '.swal2-container',
+      '.swal-overlay',
+      '.modal.show',
       '[role="dialog"][aria-modal="true"]',
-      ".dialog.open",
-      ".popup.open",
-      ".modal.active",
+      '.dialog.open',
+      '.popup.open',
+      '.modal.active',
     ];
 
-    const acceptedText =
-      /^(confirm|yes|ok|okay|use|continue|accept|confirm use|use potion|confirm potion)$/i;
+    const acceptedText = /^(confirm|yes|ok|okay|use|continue|accept|confirm use|use potion|confirm potion)$/i;
 
     for (const selector of dialogSelectors) {
       for (const dialog of queryAll(selector)) {
@@ -706,22 +659,10 @@
           continue;
         }
 
-        const button = queryAll(
-          'button, input[type="button"], input[type="submit"]',
-          dialog,
-        ).find((element) => {
-          const text = String(
-            element.textContent ||
-              element.value ||
-              element.getAttribute("aria-label") ||
-              "",
-          ).trim();
+        const button = queryAll('button, input[type="button"], input[type="submit"]', dialog).find((element) => {
+          const text = String(element.textContent || element.value || element.getAttribute('aria-label') || '').trim();
 
-          return (
-            !element.disabled &&
-            isElementVisible(element) &&
-            acceptedText.test(text)
-          );
+          return !element.disabled && isElementVisible(element) && acceptedText.test(text);
         });
 
         if (button) {
@@ -740,7 +681,7 @@
       const button = findPotionConfirmationButton();
 
       if (button) {
-        log("Potion confirmation accepted automatically.");
+        log('Potion confirmation accepted automatically.');
 
         button.click();
 
@@ -760,17 +701,14 @@
 
     try {
       window.confirm = (message) => {
-        log(`Potion confirmation accepted: ${String(message || "Confirm")}`);
+        log(`Potion confirmation accepted: ${String(message || 'Confirm')}`);
 
         return true;
       };
 
       replaced = true;
     } catch (error) {
-      console.warn(
-        "[Monster Auto Battle] Could not override confirm().",
-        error,
-      );
+      console.warn('[Monster Auto Battle] Could not override confirm().', error);
     }
 
     void watchPotionConfirmation();
@@ -786,10 +724,7 @@
         try {
           window.confirm = originalConfirm;
         } catch (error) {
-          console.warn(
-            "[Monster Auto Battle] Could not restore confirm().",
-            error,
-          );
+          console.warn('[Monster Auto Battle] Could not restore confirm().', error);
         }
       }, 1200);
     }
@@ -816,7 +751,7 @@
         }),
       );
     } catch (error) {
-      console.warn("[Monster Auto Battle] Could not save resume state.", error);
+      console.warn('[Monster Auto Battle] Could not save resume state.', error);
     }
   }
 
@@ -864,33 +799,25 @@
         });
       })
       .find((item) => {
-        return (
-          item &&
-          item.quantity > 0 &&
-          state.settings.potionEnabled[item.key] !== false
-        );
+        return item && item.quantity > 0 && state.settings.potionEnabled[item.key] !== false;
       });
 
     if (!potion) {
-      setStatus(`No enabled ${type} potion is available.`, "error");
+      setStatus(`No enabled ${type} potion is available.`, 'error');
 
       log(`No ${type} potion is available.`);
 
       return false;
     }
 
-    const amount = supportsMultiplePotionUse(potion)
-      ? getActualPotionAmount(potion)
-      : 1;
+    const amount = supportsMultiplePotionUse(potion) ? getActualPotionAmount(potion) : 1;
 
     const button = findLivePotionButton(potion, amount);
 
     if (!button) {
       setStatus(
-        amount > 1
-          ? `${potion.name} has no editable amount field.`
-          : `${potion.name} could not be found.`,
-        "error",
+        amount > 1 ? `${potion.name} has no editable amount field.` : `${potion.name} could not be found.`,
+        'error',
       );
 
       return false;
@@ -899,16 +826,12 @@
     const beforeQuantity = potion.quantity;
 
     const beforeResource =
-      type === "stamina"
-        ? getCurrentStamina()
-        : type === "mana"
-          ? getCurrentMana()
-          : getCurrentHealth();
+      type === 'stamina' ? getCurrentStamina() : type === 'mana' ? getCurrentMana() : getCurrentHealth();
 
     const input = getPotionAmountInput(button);
 
     if (amount > 1 && (!input || input.readOnly || input.disabled)) {
-      setStatus(`Could not set the amount for ${potion.name}.`, "error");
+      setStatus(`Could not set the amount for ${potion.name}.`, 'error');
 
       return false;
     }
@@ -917,13 +840,13 @@
       input.value = String(amount);
 
       input.dispatchEvent(
-        new Event("input", {
+        new Event('input', {
           bubbles: true,
         }),
       );
 
       input.dispatchEvent(
-        new Event("change", {
+        new Event('change', {
           bubbles: true,
         }),
       );
@@ -953,18 +876,12 @@
       });
 
       const afterResource =
-        type === "stamina"
-          ? getCurrentStamina()
-          : type === "mana"
-            ? getCurrentMana()
-            : getCurrentHealth();
+        type === 'stamina' ? getCurrentStamina() : type === 'mana' ? getCurrentMana() : getCurrentHealth();
 
       const quantityChanged = refreshed && refreshed.quantity < beforeQuantity;
 
       const resourceChanged =
-        Number.isFinite(beforeResource) &&
-        Number.isFinite(afterResource) &&
-        afterResource > beforeResource;
+        Number.isFinite(beforeResource) && Number.isFinite(afterResource) && afterResource > beforeResource;
 
       if (quantityChanged || resourceChanged) {
         log(`${potion.name} was used successfully. Auto-battle will continue.`);
@@ -980,22 +897,20 @@
 
     renderPotionLists();
 
-    log(
-      `${potion.name} was clicked, but no resource or quantity change was detected.`,
-    );
+    log(`${potion.name} was clicked, but no resource or quantity change was detected.`);
 
     return false;
   }
 
   function getFeedbackText() {
     const selectors = [
-      ".toast",
-      ".toast-message",
-      ".notification",
-      ".alert",
-      ".message",
-      ".swal2-popup",
-      ".swal2-html-container",
+      '.toast',
+      '.toast-message',
+      '.notification',
+      '.alert',
+      '.message',
+      '.swal2-popup',
+      '.swal2-html-container',
       '[role="alert"]',
     ];
 
@@ -1011,7 +926,7 @@
         return element.textContent?.trim();
       })
       .filter(Boolean)
-      .join(" | ")
+      .join(' | ')
       .toLowerCase();
   }
 
@@ -1020,12 +935,8 @@
       return null;
     }
 
-    if (
-      /you are dead|you died|you have died|knocked out|cannot attack.*dead|dead.*cannot attack/.test(
-        text,
-      )
-    ) {
-      return "dead";
+    if (/you are dead|you died|you have died|knocked out|cannot attack.*dead|dead.*cannot attack/.test(text)) {
+      return 'dead';
     }
 
     if (
@@ -1033,19 +944,15 @@
         text,
       )
     ) {
-      return "stamina";
+      return 'stamina';
     }
 
-    if (
-      /not enough\s+mana|insufficient\s+mana|out of\s+mana|mana\s+(?:is\s+)?(?:empty|too low|depleted)/.test(
-        text,
-      )
-    ) {
-      return "mana";
+    if (/not enough\s+mana|insufficient\s+mana|out of\s+mana|mana\s+(?:is\s+)?(?:empty|too low|depleted)/.test(text)) {
+      return 'mana';
     }
 
     if (/cooldown|too fast|please wait|wait before|rate limit/.test(text)) {
-      return "cooldown";
+      return 'cooldown';
     }
 
     return null;
@@ -1059,13 +966,9 @@
 
       const damage = getCurrentDamage();
 
-      if (
-        Number.isFinite(beforeDamage) &&
-        Number.isFinite(damage) &&
-        damage > beforeDamage
-      ) {
+      if (Number.isFinite(beforeDamage) && Number.isFinite(damage) && damage > beforeDamage) {
         return {
-          type: "damage",
+          type: 'damage',
 
           damage: damage - beforeDamage,
         };
@@ -1073,7 +976,7 @@
 
       if (isMonsterDead()) {
         return {
-          type: "monster-dead",
+          type: 'monster-dead',
         };
       }
 
@@ -1091,10 +994,7 @@
     const finalFeedback = getFeedbackText();
 
     return {
-      type:
-        finalFeedback !== beforeFeedback
-          ? classifyFeedback(finalFeedback) || "timeout"
-          : "timeout",
+      type: finalFeedback !== beforeFeedback ? classifyFeedback(finalFeedback) || 'timeout' : 'timeout',
     };
   }
 
@@ -1104,18 +1004,15 @@
     }
 
     if (!state.settings.autoHealth) {
-      stop("Your health is 0 and automatic health potions are disabled.");
+      stop('Your health is 0 and automatic health potions are disabled.');
 
       return false;
     }
 
-    const used = await usePotion("health");
+    const used = await usePotion('health');
 
     if (!used) {
-      stop(
-        "You are defeated and no enabled health potion is available.",
-        "error",
-      );
+      stop('You are defeated and no enabled health potion is available.', 'error');
 
       return false;
     }
@@ -1130,16 +1027,12 @@
       renderAttackOptions();
     }
 
-    const attacks = [
-      getSelectedAttack(0),
-      getSelectedAttack(1),
-      getSelectedAttack(2),
-    ];
+    const attacks = [getSelectedAttack(0), getSelectedAttack(1), getSelectedAttack(2)];
 
     const primary = attacks[0];
 
     if (!primary) {
-      stop("Attack 1 is not available on the current monster card.", "error");
+      stop('Attack 1 is not available on the current monster card.', 'error');
 
       return null;
     }
@@ -1173,13 +1066,10 @@
             continue;
           }
 
-          const used = await usePotion("mana");
+          const used = await usePotion('mana');
 
           if (!used) {
-            stop(
-              `Attack ${index + 1} requires mana, but no mana potion is available.`,
-              "error",
-            );
+            stop(`Attack ${index + 1} requires mana, but no mana potion is available.`, 'error');
 
             return null;
           }
@@ -1198,25 +1088,21 @@
       }
 
       if (manaBlocked) {
-        stop(
-          "A fallback attack requires more mana. Enable mana potions or select another attack.",
-        );
+        stop('A fallback attack requires more mana. Enable mana potions or select another attack.');
 
         return null;
       }
 
       if (!state.settings.autoStamina) {
-        stop(
-          "Attack 2 and Attack 3 also require more stamina. Automatic stamina potions are disabled.",
-        );
+        stop('Attack 2 and Attack 3 also require more stamina. Automatic stamina potions are disabled.');
 
         return null;
       }
 
-      const used = await usePotion("stamina");
+      const used = await usePotion('stamina');
 
       if (!used) {
-        stop("No enabled stamina potion is available.", "error");
+        stop('No enabled stamina potion is available.', 'error');
 
         return null;
       }
@@ -1241,13 +1127,10 @@
         return null;
       }
 
-      const used = await usePotion("mana");
+      const used = await usePotion('mana');
 
       if (!used) {
-        stop(
-          "Attack 1 requires mana, but no enabled mana potion is available.",
-          "error",
-        );
+        stop('Attack 1 requires mana, but no enabled mana potion is available.', 'error');
 
         return null;
       }
@@ -1286,13 +1169,10 @@
             continue;
           }
 
-          const used = await usePotion("mana");
+          const used = await usePotion('mana');
 
           if (!used) {
-            stop(
-              `Attack ${index + 1} requires mana, but no mana potion is available.`,
-              "error",
-            );
+            stop(`Attack ${index + 1} requires mana, but no mana potion is available.`, 'error');
 
             return null;
           }
@@ -1304,9 +1184,7 @@
           };
         }
 
-        log(
-          `Attack 1 is too expensive. Using Attack ${index + 1}: ${attack.name}.`,
-        );
+        log(`Attack 1 is too expensive. Using Attack ${index + 1}: ${attack.name}.`);
 
         return {
           attack,
@@ -1316,7 +1194,7 @@
     }
 
     if (manaBlocked) {
-      stop("A fallback attack has enough stamina but requires more mana.");
+      stop('A fallback attack has enough stamina but requires more mana.');
 
       return null;
     }
@@ -1326,20 +1204,15 @@
      * three selected attacks were rejected.
      */
     if (!state.settings.autoStamina) {
-      stop(
-        `Current stamina (${formatNumber(stamina)}) is not enough for any selected attack.`,
-      );
+      stop(`Current stamina (${formatNumber(stamina)}) is not enough for any selected attack.`);
 
       return null;
     }
 
-    const used = await usePotion("stamina");
+    const used = await usePotion('stamina');
 
     if (!used) {
-      stop(
-        "Stamina is too low and no enabled stamina potion is available.",
-        "error",
-      );
+      stop('Stamina is too low and no enabled stamina potion is available.', 'error');
 
       return null;
     }
@@ -1352,83 +1225,80 @@
   }
 
   async function handleFailedAttack(outcome, attackIndex) {
-    if (outcome.type === "monster-dead") {
-      stop("Monster defeated.", "success");
+    if (outcome.type === 'monster-dead') {
+      stop('Monster defeated.', 'success');
 
       return;
     }
 
-    if (outcome.type === "dead") {
+    if (outcome.type === 'dead') {
       if (!state.settings.autoHealth) {
-        stop("You are defeated and automatic health potions are disabled.");
+        stop('You are defeated and automatic health potions are disabled.');
 
         return;
       }
 
-      const used = await usePotion("health");
+      const used = await usePotion('health');
 
       if (!used) {
-        stop("No enabled health potion is available.", "error");
+        stop('No enabled health potion is available.', 'error');
       }
 
       return;
     }
 
-    if (outcome.type === "mana") {
+    if (outcome.type === 'mana') {
       if (!state.settings.autoMana) {
-        stop("Not enough mana and automatic mana potions are disabled.");
+        stop('Not enough mana and automatic mana potions are disabled.');
 
         return;
       }
 
-      const used = await usePotion("mana");
+      const used = await usePotion('mana');
 
       if (used) {
         state.forcedAttackIndex = attackIndex;
 
         await sleep(650);
       } else {
-        stop("No enabled mana potion is available.", "error");
+        stop('No enabled mana potion is available.', 'error');
       }
 
       return;
     }
 
-    if (outcome.type === "stamina") {
-      const nextAttack =
-        attackIndex < 2 ? getSelectedAttack(attackIndex + 1) : null;
+    if (outcome.type === 'stamina') {
+      const nextAttack = attackIndex < 2 ? getSelectedAttack(attackIndex + 1) : null;
 
       if (getCurrentStamina() !== 0 && nextAttack) {
         state.forcedAttackIndex = attackIndex + 1;
 
-        log(
-          `Attack ${attackIndex + 1} failed because of stamina. Trying Attack ${attackIndex + 2}.`,
-        );
+        log(`Attack ${attackIndex + 1} failed because of stamina. Trying Attack ${attackIndex + 2}.`);
 
         return;
       }
 
       if (!state.settings.autoStamina) {
-        stop("Not enough stamina and automatic stamina potions are disabled.");
+        stop('Not enough stamina and automatic stamina potions are disabled.');
 
         return;
       }
 
-      const used = await usePotion("stamina");
+      const used = await usePotion('stamina');
 
       if (used) {
         state.forcedAttackIndex = 0;
 
         await sleep(650);
       } else {
-        stop("No enabled stamina potion is available.", "error");
+        stop('No enabled stamina potion is available.', 'error');
       }
 
       return;
     }
 
-    if (outcome.type === "cooldown") {
-      log("The server reported a cooldown. Waiting longer.");
+    if (outcome.type === 'cooldown') {
+      log('The server reported a cooldown. Waiting longer.');
 
       await sleep(Math.max(1600, state.settings.delayMs));
 
@@ -1438,9 +1308,9 @@
     state.noDamageCount += 1;
 
     if (state.noDamageCount >= 2) {
-      stop("No damage was detected twice. Safety stop activated.", "error");
+      stop('No damage was detected twice. Safety stop activated.', 'error');
     } else {
-      log("No damage was detected. One retry will be attempted.");
+      log('No damage was detected. One retry will be attempted.');
 
       await sleep(Math.max(1200, state.settings.delayMs));
     }
@@ -1452,35 +1322,26 @@
     }
 
     state.settings.attackKeys = [1, 2, 3].map((number, index) => {
-      return (
-        state.panel.querySelector(`#mabAttack${number}`)?.value ||
-        state.settings.attackKeys[index] ||
-        ""
-      );
+      return state.panel.querySelector(`#mabAttack${number}`)?.value || state.settings.attackKeys[index] || '';
     });
 
-    state.settings.targetDamage =
-      state.panel.querySelector("#mabTarget")?.value.trim() || "0";
+    state.settings.targetDamage = state.panel.querySelector('#mabTarget')?.value.trim() || '0';
 
     state.settings.delayMs = Math.max(
       600,
 
-      Number(state.panel.querySelector("#mabDelay")?.value) || 1200,
+      Number(state.panel.querySelector('#mabDelay')?.value) || 1200,
     );
 
-    state.settings.autoStamina =
-      state.panel.querySelector("#mabAutoStamina").checked;
+    state.settings.autoStamina = state.panel.querySelector('#mabAutoStamina').checked;
 
-    state.settings.autoMana = state.panel.querySelector("#mabAutoMana").checked;
+    state.settings.autoMana = state.panel.querySelector('#mabAutoMana').checked;
 
-    state.settings.autoHealth =
-      state.panel.querySelector("#mabAutoHealth").checked;
+    state.settings.autoHealth = state.panel.querySelector('#mabAutoHealth').checked;
 
-    state.settings.stopBeforeLevelUp =
-      state.panel.querySelector("#mabLevelGuard").checked;
+    state.settings.stopBeforeLevelUp = state.panel.querySelector('#mabLevelGuard').checked;
 
-    state.settings.levelMultiplier =
-      Number(state.panel.querySelector("#mabMultiplier").value) || 2;
+    state.settings.levelMultiplier = Number(state.panel.querySelector('#mabMultiplier').value) || 2;
 
     saveSettings();
   }
@@ -1489,16 +1350,13 @@
     const target = parseTarget(state.settings.targetDamage);
 
     if (!Number.isFinite(target) || target < 0) {
-      setStatus(
-        "Invalid target damage. Examples: 5m, 5b, or 5,000,000.",
-        "error",
-      );
+      setStatus('Invalid target damage. Examples: 5m, 5b, or 5,000,000.', 'error');
 
       return false;
     }
 
     if (!(state.settings.levelMultiplier > 0)) {
-      setStatus("The level-up multiplier must be greater than 0.", "error");
+      setStatus('The level-up multiplier must be greater than 0.', 'error');
 
       return false;
     }
@@ -1507,7 +1365,7 @@
       const attack = getSelectedAttack(index);
 
       if (!attack || !findLiveAttackButton(attack.key)) {
-        setStatus(`Please select a valid Attack ${index + 1}.`, "error");
+        setStatus(`Please select a valid Attack ${index + 1}.`, 'error');
 
         return false;
       }
@@ -1541,10 +1399,7 @@
     if (resumeData?.monsterKey && resumeData.monsterKey !== currentMonsterKey) {
       clearResumeState();
 
-      setStatus(
-        "Auto-battle could not resume because the monster changed.",
-        "error",
-      );
+      setStatus('Auto-battle could not resume because the monster changed.', 'error');
 
       return;
     }
@@ -1556,10 +1411,7 @@
 
       state.lastDamage = Number(resumeData.lastDamage) || 0;
 
-      state.lastExperienceGain =
-        resumeData.lastExperienceGain == null
-          ? null
-          : Number(resumeData.lastExperienceGain);
+      state.lastExperienceGain = resumeData.lastExperienceGain == null ? null : Number(resumeData.lastExperienceGain);
     } else {
       clearResumeState();
 
@@ -1577,40 +1429,34 @@
     updateButtons();
     updateMetrics();
 
-    setStatus(
-      resumeData
-        ? "Auto-battle resumed after potion use."
-        : "Auto-battle is running.",
-      "running",
-    );
+    setStatus(resumeData ? 'Auto-battle resumed after potion use.' : 'Auto-battle is running.', 'running');
 
-    log(
-      `Started with ${formatNumber(
-        getCurrentDamage() || 0,
-      )} damage already dealt.`,
-    );
+    log(`Started with ${formatNumber(getCurrentDamage() || 0)} damage already dealt.`);
 
     try {
       while (state.running) {
         if (!state.card?.isConnected || getMonsterKey() !== state.monsterKey) {
-          stop("The monster card changed. Auto-battle was stopped.");
+          stop('The monster card changed. Auto-battle was stopped.');
 
           break;
         }
 
         if (isMonsterDead()) {
-          stop("Monster defeated.", "success");
+          stop('Monster defeated.', 'success');
 
           break;
         }
 
         const target = parseTarget(state.settings.targetDamage);
 
-        if (target > 0 && state.sessionDamage >= target) {
-          stop(
-            `Target damage of ${formatNumber(target)} was reached.`,
-            "success",
-          );
+        /*
+         * Target damage refers to the total damage
+         * already dealt to the current monster.
+         */
+        const totalMonsterDamage = getCurrentDamage();
+
+        if (target > 0 && Number.isFinite(totalMonsterDamage) && totalMonsterDamage >= target) {
+          stop(`Total monster damage target of ${formatNumber(target)} was reached.`, 'success');
 
           break;
         }
@@ -1629,23 +1475,19 @@
           const remaining = getRemainingExperience();
 
           if (!Number.isFinite(remaining)) {
-            stop(
-              "Remaining EXP could not be read. Level-up protection stopped the script.",
-              "error",
-            );
+            stop('Remaining EXP could not be read. Level-up protection stopped the script.', 'error');
 
             break;
           }
 
-          const threshold =
-            state.lastExperienceGain * state.settings.levelMultiplier;
+          const threshold = state.lastExperienceGain * state.settings.levelMultiplier;
 
           if (remaining < threshold) {
             stop(
               `Level-up protection: ${formatNumber(remaining)} EXP remains. ` +
                 `The last attack granted ${formatNumber(state.lastExperienceGain)} EXP, ` +
                 `so the stop threshold is ${formatNumber(threshold)} EXP.`,
-              "success",
+              'success',
             );
 
             break;
@@ -1673,19 +1515,16 @@
         const button = findLiveAttackButton(prepared.attack.key);
 
         if (!button) {
-          stop(`Attack ${prepared.index + 1} is no longer available.`, "error");
+          stop(`Attack ${prepared.index + 1} is no longer available.`, 'error');
 
           break;
         }
 
-        if (
-          button.disabled ||
-          button.getAttribute("aria-disabled") === "true"
-        ) {
+        if (button.disabled || button.getAttribute('aria-disabled') === 'true') {
           state.noDamageCount += 1;
 
           if (state.noDamageCount >= 3) {
-            stop("The selected attack button remained disabled.", "error");
+            stop('The selected attack button remained disabled.', 'error');
 
             break;
           }
@@ -1705,16 +1544,13 @@
 
         button.click();
 
-        const outcome = await waitForAttackOutcome(
-          beforeDamage,
-          beforeFeedback,
-        );
+        const outcome = await waitForAttackOutcome(beforeDamage, beforeFeedback);
 
         if (!state.running) {
           break;
         }
 
-        if (outcome.type === "damage") {
+        if (outcome.type === 'damage') {
           clearResumeState();
 
           state.noDamageCount = 0;
@@ -1725,13 +1561,9 @@
 
           state.sessionDamage += state.lastDamage;
 
-          const afterExperience =
-            await waitForExperienceUpdate(beforeExperience);
+          const afterExperience = await waitForExperienceUpdate(beforeExperience);
 
-          state.lastExperienceGain = calculateExperienceGain(
-            beforeExperience,
-            afterExperience,
-          );
+          state.lastExperienceGain = calculateExperienceGain(beforeExperience, afterExperience);
 
           if (Number.isFinite(state.lastExperienceGain)) {
             log(
@@ -1740,9 +1572,8 @@
             );
           } else if (state.settings.stopBeforeLevelUp) {
             stop(
-              "The EXP gain from the last attack could not be determined. " +
-                "Level-up protection stopped the script.",
-              "error",
+              'The EXP gain from the last attack could not be determined. ' + 'Level-up protection stopped the script.',
+              'error',
             );
 
             break;
@@ -1758,9 +1589,9 @@
         }
       }
     } catch (error) {
-      console.error("[Monster Auto Battle]", error);
+      console.error('[Monster Auto Battle]', error);
 
-      stop(`Error: ${error?.message || error}`, "error");
+      stop(`Error: ${error?.message || error}`, 'error');
     } finally {
       state.running = false;
 
@@ -1769,7 +1600,7 @@
     }
   }
 
-  function stop(message = "Stopped manually.", tone = "idle") {
+  function stop(message = 'Stopped manually.', tone = 'idle') {
     state.running = false;
 
     clearResumeState();
@@ -1786,7 +1617,7 @@
       return;
     }
 
-    const style = document.createElement("style");
+    const style = document.createElement('style');
 
     style.id = `${ID}-style`;
 
@@ -2141,14 +1972,14 @@
   }
 
   function createPanel() {
-    const panel = document.createElement("section");
+    const panel = document.createElement('section');
 
     panel.id = ID;
 
     panel.innerHTML = `
       <details
         class="mab-main"
-        ${state.settings.collapsed ? "" : "open"}
+        ${state.settings.collapsed ? '' : 'open'}
       >
         <summary class="mab-header">
           <span>🤖 Auto Battle</span>
@@ -2192,9 +2023,9 @@
 
             <label class="mab-field">
               <span>
-                Target damage
+                Total monster damage target
                 <small>
-                  0 means unlimited
+                  Includes damage dealt before Start. 0 means unlimited.
                 </small>
               </span>
 
@@ -2226,7 +2057,7 @@
               <input
                 id="mabAutoStamina"
                 type="checkbox"
-                ${state.settings.autoStamina ? "checked" : ""}
+                ${state.settings.autoStamina ? 'checked' : ''}
               >
 
               Use stamina potions automatically
@@ -2236,7 +2067,7 @@
               <input
                 id="mabAutoMana"
                 type="checkbox"
-                ${state.settings.autoMana ? "checked" : ""}
+                ${state.settings.autoMana ? 'checked' : ''}
               >
 
               Use mana potions automatically
@@ -2246,7 +2077,7 @@
               <input
                 id="mabAutoHealth"
                 type="checkbox"
-                ${state.settings.autoHealth ? "checked" : ""}
+                ${state.settings.autoHealth ? 'checked' : ''}
               >
 
               Use a full health potion when defeated
@@ -2258,7 +2089,7 @@
               <input
                 id="mabLevelGuard"
                 type="checkbox"
-                ${state.settings.stopBeforeLevelUp ? "checked" : ""}
+                ${state.settings.stopBeforeLevelUp ? 'checked' : ''}
               >
 
               Stop before level-up
@@ -2353,7 +2184,7 @@
           <div class="mab-metrics">
             <div>
               <span>
-                Session damage
+                Total monster damage
               </span>
 
               <strong id="mabSession">
@@ -2427,7 +2258,7 @@
 
       select.replaceChildren();
 
-      for (const groupName of ["Standard Attacks", "Class Attacks"]) {
+      for (const groupName of ['Standard Attacks', 'Class Attacks']) {
         const attacks = state.attacks.filter((attack) => {
           return attack.group === groupName;
         });
@@ -2436,12 +2267,12 @@
           continue;
         }
 
-        const group = document.createElement("optgroup");
+        const group = document.createElement('optgroup');
 
         group.label = groupName;
 
         for (const attack of attacks) {
-          const option = document.createElement("option");
+          const option = document.createElement('option');
 
           const costs = [];
 
@@ -2455,9 +2286,7 @@
 
           option.value = attack.key;
 
-          option.textContent = costs.length
-            ? `${attack.name} · ${costs.join(" / ")}`
-            : attack.name;
+          option.textContent = costs.length ? `${attack.name} · ${costs.join(' / ')}` : attack.name;
 
           option.selected = attack.key === state.settings.attackKeys[index];
 
@@ -2476,11 +2305,11 @@
 
     discoverPotions();
 
-    renderPotionList("stamina", "#mabStaminaList");
+    renderPotionList('stamina', '#mabStaminaList');
 
-    renderPotionList("mana", "#mabManaList");
+    renderPotionList('mana', '#mabManaList');
 
-    renderPotionList("health", "#mabHealthList");
+    renderPotionList('health', '#mabHealthList');
   }
 
   function renderPotionList(type, selector) {
@@ -2501,11 +2330,11 @@
       .filter(Boolean);
 
     if (!potions.length) {
-      const empty = document.createElement("div");
+      const empty = document.createElement('div');
 
-      empty.className = "mab-empty";
+      empty.className = 'mab-empty';
 
-      empty.textContent = "No matching potion was found.";
+      empty.textContent = 'No matching potion was found.';
 
       container.appendChild(empty);
 
@@ -2513,31 +2342,31 @@
     }
 
     potions.forEach((potion, index) => {
-      const row = document.createElement("div");
+      const row = document.createElement('div');
 
-      row.className = "mab-potion-row";
+      row.className = 'mab-potion-row';
 
-      const enabled = document.createElement("input");
+      const enabled = document.createElement('input');
 
-      enabled.type = "checkbox";
+      enabled.type = 'checkbox';
 
       enabled.checked = state.settings.potionEnabled[potion.key] !== false;
 
-      enabled.title = "Allow this potion";
+      enabled.title = 'Allow this potion';
 
-      enabled.addEventListener("change", () => {
+      enabled.addEventListener('change', () => {
         state.settings.potionEnabled[potion.key] = enabled.checked;
 
         saveSettings();
       });
 
-      const main = document.createElement("div");
+      const main = document.createElement('div');
 
-      main.className = "mab-potion-main";
+      main.className = 'mab-potion-main';
 
-      const name = document.createElement("div");
+      const name = document.createElement('div');
 
-      name.className = "mab-potion-name";
+      name.className = 'mab-potion-name';
 
       name.textContent = potion.name;
 
@@ -2546,27 +2375,27 @@
       main.appendChild(name);
 
       if (supportsMultiplePotionUse(potion)) {
-        const amountRow = document.createElement("label");
+        const amountRow = document.createElement('label');
 
-        amountRow.className = "mab-potion-amount";
+        amountRow.className = 'mab-potion-amount';
 
-        const amountLabel = document.createElement("span");
+        const amountLabel = document.createElement('span');
 
-        amountLabel.textContent = "Use at once:";
+        amountLabel.textContent = 'Use at once:';
 
-        const amountInput = document.createElement("input");
+        const amountInput = document.createElement('input');
 
-        amountInput.type = "number";
+        amountInput.type = 'number';
 
-        amountInput.min = "1";
+        amountInput.min = '1';
 
-        amountInput.step = "1";
+        amountInput.step = '1';
 
         amountInput.value = String(getConfiguredPotionAmount(potion));
 
-        amountInput.title = "Number of potions to use at once";
+        amountInput.title = 'Number of potions to use at once';
 
-        amountInput.addEventListener("change", () => {
+        amountInput.addEventListener('change', () => {
           const amount = Math.max(
             1,
 
@@ -2580,7 +2409,7 @@
           saveSettings();
         });
 
-        amountInput.addEventListener("click", (event) => {
+        amountInput.addEventListener('click', (event) => {
           event.stopPropagation();
         });
 
@@ -2589,42 +2418,42 @@
         main.appendChild(amountRow);
       }
 
-      const quantity = document.createElement("div");
+      const quantity = document.createElement('div');
 
-      quantity.className = "mab-quantity";
+      quantity.className = 'mab-quantity';
 
       quantity.textContent = `×${formatNumber(potion.quantity)}`;
 
-      const moves = document.createElement("div");
+      const moves = document.createElement('div');
 
-      moves.className = "mab-moves";
+      moves.className = 'mab-moves';
 
-      const up = document.createElement("button");
+      const up = document.createElement('button');
 
-      const down = document.createElement("button");
+      const down = document.createElement('button');
 
       for (const button of [up, down]) {
-        button.type = "button";
+        button.type = 'button';
 
-        button.className = "mab-move";
+        button.className = 'mab-move';
       }
 
-      up.textContent = "↑";
-      up.title = "Increase priority";
+      up.textContent = '↑';
+      up.title = 'Increase priority';
 
       up.disabled = index === 0;
 
-      down.textContent = "↓";
+      down.textContent = '↓';
 
-      down.title = "Decrease priority";
+      down.title = 'Decrease priority';
 
       down.disabled = index === potions.length - 1;
 
-      up.addEventListener("click", () => {
+      up.addEventListener('click', () => {
         movePotion(type, index, -1);
       });
 
-      down.addEventListener("click", () => {
+      down.addEventListener('click', () => {
         movePotion(type, index, 1);
       });
 
@@ -2651,8 +2480,8 @@
     renderPotionLists();
   }
 
-  function setStatus(message, tone = "idle") {
-    const element = state.panel?.querySelector("#mabStatus");
+  function setStatus(message, tone = 'idle') {
+    const element = state.panel?.querySelector('#mabStatus');
 
     if (!element) {
       return;
@@ -2664,15 +2493,15 @@
   }
 
   function log(message) {
-    const container = state.panel?.querySelector("#mabLog");
+    const container = state.panel?.querySelector('#mabLog');
 
     if (!container) {
       return;
     }
 
-    const line = document.createElement("div");
+    const line = document.createElement('div');
 
-    line.textContent = `[${new Date().toLocaleTimeString("en-GB")}] ${message}`;
+    line.textContent = `[${new Date().toLocaleTimeString('en-GB')}] ${message}`;
 
     container.prepend(line);
 
@@ -2686,9 +2515,9 @@
       return;
     }
 
-    state.panel.querySelector("#mabStart").disabled = state.running;
+    state.panel.querySelector('#mabStart').disabled = state.running;
 
-    state.panel.querySelector("#mabStop").disabled = !state.running;
+    state.panel.querySelector('#mabStop').disabled = !state.running;
   }
 
   function updateMetrics() {
@@ -2696,53 +2525,45 @@
       return;
     }
 
-    state.panel.querySelector("#mabSession").textContent = formatNumber(
-      state.sessionDamage,
-    );
+    const totalMonsterDamage = getCurrentDamage();
 
-    state.panel.querySelector("#mabLast").textContent = Number.isFinite(
-      state.lastExperienceGain,
-    )
+    state.panel.querySelector('#mabSession').textContent = Number.isFinite(totalMonsterDamage)
+      ? formatNumber(totalMonsterDamage)
+      : '—';
+
+    state.panel.querySelector('#mabLast').textContent = Number.isFinite(state.lastExperienceGain)
       ? formatNumber(state.lastExperienceGain)
-      : "—";
+      : '—';
 
     const remaining = getRemainingExperience();
 
-    state.panel.querySelector("#mabExp").textContent = Number.isFinite(
-      remaining,
-    )
-      ? formatNumber(remaining)
-      : "—";
+    state.panel.querySelector('#mabExp').textContent = Number.isFinite(remaining) ? formatNumber(remaining) : '—';
 
-    state.panel.querySelector("#mabResources").textContent = [
-      getCurrentStamina(),
-      getCurrentMana(),
-      getCurrentHealth(),
-    ]
+    state.panel.querySelector('#mabResources').textContent = [getCurrentStamina(), getCurrentMana(), getCurrentHealth()]
       .map((value) => {
-        return Number.isFinite(value) ? formatNumber(value) : "—";
+        return Number.isFinite(value) ? formatNumber(value) : '—';
       })
-      .join(" / ");
+      .join(' / ');
   }
 
   function bindEvents() {
-    const details = state.panel.querySelector(".mab-main");
+    const details = state.panel.querySelector('.mab-main');
 
-    details.addEventListener("toggle", () => {
+    details.addEventListener('toggle', () => {
       state.settings.collapsed = !details.open;
 
       saveSettings();
     });
 
-    state.panel.querySelector("#mabStart").addEventListener("click", () => {
+    state.panel.querySelector('#mabStart').addEventListener('click', () => {
       void runAutoBattle();
     });
 
-    state.panel.querySelector("#mabStop").addEventListener("click", () => {
+    state.panel.querySelector('#mabStop').addEventListener('click', () => {
       stop();
     });
 
-    state.panel.querySelector("#mabRefresh").addEventListener("click", () => {
+    state.panel.querySelector('#mabRefresh').addEventListener('click', () => {
       discoverAttacks();
       discoverPotions();
 
@@ -2750,29 +2571,29 @@
       renderPotionLists();
       updateMetrics();
 
-      setStatus("Attacks and potions were refreshed.", "success");
+      setStatus('Attacks and potions were refreshed.', 'success');
     });
 
     const selectors = [
-      "#mabAttack1",
-      "#mabAttack2",
-      "#mabAttack3",
-      "#mabTarget",
-      "#mabDelay",
-      "#mabAutoStamina",
-      "#mabAutoMana",
-      "#mabAutoHealth",
-      "#mabLevelGuard",
-      "#mabMultiplier",
+      '#mabAttack1',
+      '#mabAttack2',
+      '#mabAttack3',
+      '#mabTarget',
+      '#mabDelay',
+      '#mabAutoStamina',
+      '#mabAutoMana',
+      '#mabAutoHealth',
+      '#mabLevelGuard',
+      '#mabMultiplier',
     ];
 
     for (const selector of selectors) {
       const element = state.panel.querySelector(selector);
 
-      element.addEventListener("change", readForm);
+      element.addEventListener('change', readForm);
 
       if (element.matches('input[type="text"], input[type="number"]')) {
-        element.addEventListener("input", readForm);
+        element.addEventListener('input', readForm);
       }
     }
   }
@@ -2791,12 +2612,12 @@
     if (resumeData.monsterKey !== getMonsterKey()) {
       clearResumeState();
 
-      setStatus("Auto-battle was not resumed because the monster changed.");
+      setStatus('Auto-battle was not resumed because the monster changed.');
 
       return;
     }
 
-    setStatus("Potion use completed. Resuming auto-battle...", "running");
+    setStatus('Potion use completed. Resuming auto-battle...', 'running');
 
     await sleep(500);
 
@@ -2818,17 +2639,16 @@
 
     const incomingKey = getMonsterKey(card);
 
-    const sameRunningMonster =
-      state.running && state.monsterKey && incomingKey === state.monsterKey;
+    const sameRunningMonster = state.running && state.monsterKey && incomingKey === state.monsterKey;
 
     if (state.running && !sameRunningMonster) {
-      stop("The monster changed. Auto-battle was stopped.");
+      stop('The monster changed. Auto-battle was stopped.');
     }
 
     document.getElementById(ID)?.remove();
 
     state.card = card;
-    state.attackSignature = "";
+    state.attackSignature = '';
 
     discoverAttacks();
     discoverPotions();
@@ -2846,10 +2666,10 @@
 
     setStatus(
       sameRunningMonster
-        ? "Battle card refreshed after potion use. Auto-battle is continuing."
-        : "Ready. This configuration applies only to the currently visible monster.",
+        ? 'Battle card refreshed after potion use. Auto-battle is continuing.'
+        : 'Ready. This configuration applies only to the currently visible monster.',
 
-      sameRunningMonster ? "running" : "idle",
+      sameRunningMonster ? 'running' : 'idle',
     );
 
     if (!state.running) {
@@ -2869,10 +2689,7 @@
     }
 
     const attackChanged = mutations.some((mutation) => {
-      const target =
-        mutation.target instanceof Element
-          ? mutation.target
-          : mutation.target.parentElement;
+      const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
 
       if (target?.closest?.(`#${ID}`)) {
         return false;
@@ -2883,10 +2700,7 @@
       }
 
       return [...mutation.addedNodes, ...mutation.removedNodes].some((node) => {
-        return (
-          node instanceof Element &&
-          (node.matches?.(SEL.attack) || node.querySelector?.(SEL.attack))
-        );
+        return node instanceof Element && (node.matches?.(SEL.attack) || node.querySelector?.(SEL.attack));
       });
     });
 
@@ -2901,17 +2715,14 @@
     }
 
     const potionChanged = mutations.some((mutation) => {
-      const target =
-        mutation.target instanceof Element
-          ? mutation.target
-          : mutation.target.parentElement;
+      const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
 
       return target?.closest?.(
-        "#battleDrawer, " +
-          "#ds-combat-potion-quick-use, " +
-          ".potion-card, " +
-          ".potion-qty-left, " +
-          ".ds-potion-count",
+        '#battleDrawer, ' +
+          '#ds-combat-potion-quick-use, ' +
+          '.potion-card, ' +
+          '.potion-qty-left, ' +
+          '.ds-potion-count',
       );
     });
 
@@ -2925,17 +2736,9 @@
     }
 
     const resourceChanged = mutations.some((mutation) => {
-      const target =
-        mutation.target instanceof Element
-          ? mutation.target
-          : mutation.target.parentElement;
+      const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
 
-      return target?.closest?.(
-        `${SEL.stamina}, ` +
-          `${SEL.playerHp}, ` +
-          `${SEL.playerMana}, ` +
-          ".gtb-exp",
-      );
+      return target?.closest?.(`${SEL.stamina}, ` + `${SEL.playerHp}, ` + `${SEL.playerMana}, ` + '.gtb-exp');
     });
 
     if (resourceChanged && state.panel) {
