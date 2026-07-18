@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Monster Auto Battle - 3 Attack Fallback
 // @namespace    http://tampermonkey.net/
-// @version      1.4.0
+// @version      1.4.1
 // @description  Auto-battle for the current monster with three attacks, potion priorities, target damage, and level-up protection.
 // @match        https://demonicscans.org/battle.php*
 // @grant        none
