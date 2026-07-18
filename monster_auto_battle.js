@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Monster Auto Battle - 3 Attack Fallback
 // @namespace    http://tampermonkey.net/
-// @version      1.3.1
+// @version      1.3.2
 // @description  Auto-battle for the current monster with three attacks, potion priorities, target damage, and level-up protection.
 // @match        https://demonicscans.org/battle.php*
 // @grant        none
@@ -951,6 +951,243 @@
         );
     }
 
+    function isElementVisible(element) {
+        if (!element || !element.isConnected) {
+            return false;
+        }
+
+        const style = getComputedStyle(element);
+        const rectangle =
+            element.getBoundingClientRect();
+
+        return (
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            Number(style.opacity || 1) > 0 &&
+            rectangle.width > 0 &&
+            rectangle.height > 0
+        );
+    }
+
+    /*
+     * Finds confirmation buttons inside common modal systems.
+     *
+     * Supported examples:
+     * - SweetAlert / SweetAlert2
+     * - Bootstrap modals
+     * - Native-looking custom dialogs
+     * - Generic role="dialog" popups
+     */
+    function findPotionConfirmationButton() {
+        const directSelectors = [
+            '.swal2-container .swal2-confirm',
+            '.swal-modal .swal-button--confirm',
+            '.modal.show .btn-confirm',
+            '.modal.show [data-confirm="true"]',
+            '.modal.show button.btn-primary',
+            '[role="dialog"][aria-modal="true"] .confirm',
+            '[role="dialog"][aria-modal="true"] [data-confirm]',
+            '[role="dialog"][aria-modal="true"] button[type="submit"]',
+            '.dialog.open .confirm',
+            '.popup.open .confirm',
+        ];
+
+        for (const selector of directSelectors) {
+            const button =
+                queryAll(selector).find(
+                    element =>
+                        isElementVisible(element) &&
+                        !element.disabled,
+                );
+
+            if (button) {
+                return button;
+            }
+        }
+
+        /*
+         * Fallback for dialogs without useful classes.
+         * Only buttons inside visible dialog containers are considered.
+         */
+        const dialogSelectors = [
+            '.swal2-container',
+            '.swal-overlay',
+            '.modal.show',
+            '[role="dialog"][aria-modal="true"]',
+            '.dialog.open',
+            '.popup.open',
+            '.modal.active',
+        ];
+
+        const acceptedButtonTexts = [
+            /^confirm$/i,
+            /^yes$/i,
+            /^ok$/i,
+            /^okay$/i,
+            /^use$/i,
+            /^continue$/i,
+            /^accept$/i,
+            /^confirm use$/i,
+            /^use potion$/i,
+            /^confirm potion$/i,
+        ];
+
+        for (const dialogSelector of dialogSelectors) {
+            for (
+                const dialog
+                of queryAll(dialogSelector)
+            ) {
+                if (!isElementVisible(dialog)) {
+                    continue;
+                }
+
+                const buttons =
+                    queryAll(
+                        'button, input[type="button"], input[type="submit"]',
+                        dialog,
+                    );
+
+                for (const button of buttons) {
+                    if (
+                        button.disabled ||
+                        !isElementVisible(button)
+                    ) {
+                        continue;
+                    }
+
+                    const text = String(
+                        button.textContent ||
+                        button.value ||
+                        button.getAttribute('aria-label') ||
+                        '',
+                    ).trim();
+
+                    if (
+                        acceptedButtonTexts.some(
+                            pattern => pattern.test(text),
+                        )
+                    ) {
+                        return button;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /*
+     * Watches briefly for a custom confirmation modal
+     * and confirms it automatically.
+     */
+    async function watchForPotionConfirmation(
+        timeoutMs = 6000,
+    ) {
+        const startedAt = Date.now();
+
+        while (
+            state.running &&
+            Date.now() - startedAt < timeoutMs
+        ) {
+            const confirmButton =
+                findPotionConfirmationButton();
+
+            if (confirmButton) {
+                log(
+                    'Potion confirmation detected and accepted automatically.',
+                );
+
+                confirmButton.click();
+
+                return true;
+            }
+
+            await sleep(75);
+        }
+
+        return false;
+    }
+
+    /*
+     * Temporarily accepts native JavaScript confirm() dialogs.
+     *
+     * The override exists only around the potion click and is
+     * restored immediately afterwards.
+     */
+    function installTemporaryNativeConfirm() {
+        const originalConfirm =
+            window.confirm;
+
+        let installed = false;
+
+        try {
+            window.confirm = message => {
+                log(
+                    `Potion confirmation accepted: ${String(message || 'Confirm')
+                    }`,
+                );
+
+                return true;
+            };
+
+            installed = true;
+        } catch (error) {
+            console.warn(
+                '[Monster Auto Battle] ' +
+                'Could not temporarily override window.confirm.',
+                error,
+            );
+        }
+
+        return () => {
+            if (!installed) {
+                return;
+            }
+
+            try {
+                window.confirm =
+                    originalConfirm;
+            } catch (error) {
+                console.warn(
+                    '[Monster Auto Battle] ' +
+                    'Could not restore window.confirm.',
+                    error,
+                );
+            }
+        };
+    }
+
+    /*
+     * Clicks a potion and handles both native and custom confirmations.
+     */
+    function clickPotionWithAutoConfirmation(
+        button,
+    ) {
+        const restoreNativeConfirm =
+            installTemporaryNativeConfirm();
+
+        /*
+         * Start watching before clicking because the modal
+         * may be inserted into the DOM immediately.
+         */
+        void watchForPotionConfirmation(
+            6000,
+        );
+
+        try {
+            button.click();
+        } finally {
+            /*
+             * Native confirm() runs synchronously during button.click().
+             * A short delay also covers click handlers that use setTimeout().
+             */
+            setTimeout(
+                restoreNativeConfirm,
+                1000,
+            );
+        }
+    }
+
     async function usePotion(type) {
         discoverPotions();
 
@@ -1056,7 +1293,9 @@
             )}.`,
         );
 
-        button.click();
+        clickPotionWithAutoConfirmation(
+            button,
+        );
 
         const startedAt =
             Date.now();
@@ -1068,7 +1307,7 @@
         while (
             state.running &&
             Date.now() - startedAt <
-            3500
+            7000
         ) {
             await sleep(120);
 
