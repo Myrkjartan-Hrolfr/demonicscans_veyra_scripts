@@ -2646,7 +2646,7 @@
             >
 
             <span>
-              × the last damage
+              × the last EXP gain
             </span>
           </div>
 
@@ -3052,7 +3052,14 @@
 
         saveSettings();
       });
+        saveSettings();
+      });
 
+      const main = document.createElement("div");
+
+      main.className = "mab-potion-main";
+
+      const name = document.createElement("div");
       const name = document.createElement("div");
 
       name.className = "mab-potion-name";
