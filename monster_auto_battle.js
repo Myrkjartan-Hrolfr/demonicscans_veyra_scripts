@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Monster Auto Battle - 3 Attack Fallback
 // @namespace    http://tampermonkey.net/
-// @version      1.3.0
+// @version      1.3.1
 // @description  Auto-battle for the current monster with three attacks, potion priorities, target damage, and level-up protection.
 // @match        https://demonicscans.org/battle.php*
 // @grant        none
@@ -71,8 +71,8 @@
 
         sessionDamage: 0,
         lastDamage: 0,
+        lastExperienceGain: null,
         noDamageCount: 0,
-
         /*
          * Used when the server reports insufficient stamina.
          * The script then proceeds to the next selected attack.
@@ -370,23 +370,131 @@
         );
     }
 
-    function getRemainingExperience() {
-        const experience =
-            parseFraction(
-                document
-                    .querySelector(SEL.exp)
-                    ?.textContent,
-            );
+    function getExperienceProgress() {
+        const experience = parseFraction(
+            document
+                .querySelector(SEL.exp)
+                ?.textContent,
+        );
 
         if (!experience) {
             return null;
         }
 
-        return Math.max(
-            0,
-            experience.maximum -
-            experience.current,
+        return {
+            current: experience.current,
+            maximum: experience.maximum,
+
+            remaining: Math.max(
+                0,
+                experience.maximum -
+                experience.current,
+            ),
+        };
+    }
+
+    function getRemainingExperience() {
+        return (
+            getExperienceProgress()
+                ?.remaining ??
+            null
         );
+    }
+
+    /*
+     * Calculates the EXP gained between two header states.
+     *
+     * Normal example:
+     * Before: 25,706,330
+     * After:  25,706,900
+     * Gain:          570
+     *
+     * It also handles a single level rollover:
+     * Before: 52,598,800 / 52,598,856
+     * After:         200 / new maximum
+     * Gain:          256
+     */
+    function calculateExperienceGain(
+        before,
+        after,
+    ) {
+        if (!before || !after) {
+            return null;
+        }
+
+        /*
+         * Normal EXP increase without a level-up.
+         */
+        if (
+            after.maximum === before.maximum &&
+            after.current >= before.current
+        ) {
+            return (
+                after.current -
+                before.current
+            );
+        }
+
+        /*
+         * The EXP counter rolled over because
+         * a level-up occurred.
+         */
+        if (
+            after.maximum !== before.maximum ||
+            after.current < before.current
+        ) {
+            return Math.max(
+                0,
+                (
+                    before.maximum -
+                    before.current
+                ) +
+                after.current,
+            );
+        }
+
+        return null;
+    }
+
+    /*
+     * The battle response and the topbar EXP update
+     * may not happen at exactly the same moment.
+     * Therefore, wait briefly for the EXP value to change.
+     */
+    async function waitForExperienceUpdate(
+        before,
+        timeoutMs = 3000,
+    ) {
+        if (!before) {
+            return null;
+        }
+
+        const startedAt = Date.now();
+
+        while (
+            state.running &&
+            Date.now() - startedAt <
+            timeoutMs
+        ) {
+            const current =
+                getExperienceProgress();
+
+            if (
+                current &&
+                (
+                    current.current !==
+                    before.current ||
+                    current.maximum !==
+                    before.maximum
+                )
+            ) {
+                return current;
+            }
+
+            await sleep(100);
+        }
+
+        return getExperienceProgress();
     }
 
     function isMonsterDead() {
@@ -1883,6 +1991,7 @@
 
         state.sessionDamage = 0;
         state.lastDamage = 0;
+        state.lastExperienceGain = null;
         state.noDamageCount = 0;
         state.forcedAttackIndex = 0;
 
@@ -1962,7 +2071,10 @@
                 if (
                     state.settings
                         .stopBeforeLevelUp &&
-                    state.lastDamage > 0
+                    Number.isFinite(
+                        state.lastExperienceGain,
+                    ) &&
+                    state.lastExperienceGain > 0
                 ) {
                     const remaining =
                         getRemainingExperience();
@@ -1980,8 +2092,14 @@
                         break;
                     }
 
+                    /*
+                     * Stop threshold:
+                     *
+                     * EXP gained by the last attack
+                     * multiplied by the configured factor.
+                     */
                     const stopThreshold =
-                        state.lastDamage *
+                        state.lastExperienceGain *
                         state.settings
                             .levelMultiplier;
 
@@ -1993,11 +2111,14 @@
                             `Level-up protection: ` +
                             `${formatNumber(
                                 remaining,
-                            )} EXP remains, ` +
-                            `below the ` +
+                            )} EXP remains. ` +
+                            `The last attack granted ` +
+                            `${formatNumber(
+                                state.lastExperienceGain,
+                            )} EXP, resulting in a stop threshold of ` +
                             `${formatNumber(
                                 stopThreshold,
-                            )} stop threshold.`,
+                            )} EXP.`,
                             'success',
                         );
 
@@ -2082,6 +2203,13 @@
                 const beforeDamage =
                     getCurrentDamage();
 
+                /*
+                 * Save the current EXP immediately before
+                 * clicking the attack button.
+                 */
+                const beforeExperience =
+                    getExperienceProgress();
+
                 const beforeFeedback =
                     getFeedbackText();
 
@@ -2118,12 +2246,60 @@
                     state.sessionDamage +=
                         state.lastDamage;
 
-                    log(
-                        `Hit dealt ` +
-                        `${formatNumber(
-                            state.lastDamage,
-                        )} damage.`,
-                    );
+                    /*
+                     * Wait for the EXP value in the topbar
+                     * to update after the successful attack.
+                     */
+                    const afterExperience =
+                        await waitForExperienceUpdate(
+                            beforeExperience,
+                        );
+
+                    state.lastExperienceGain =
+                        calculateExperienceGain(
+                            beforeExperience,
+                            afterExperience,
+                        );
+
+                    if (
+                        Number.isFinite(
+                            state.lastExperienceGain,
+                        )
+                    ) {
+                        log(
+                            `Hit dealt ` +
+                            `${formatNumber(
+                                state.lastDamage,
+                            )} damage and granted ` +
+                            `${formatNumber(
+                                state.lastExperienceGain,
+                            )} EXP.`,
+                        );
+                    } else {
+                        log(
+                            `Hit dealt ` +
+                            `${formatNumber(
+                                state.lastDamage,
+                            )} damage, but the EXP gain ` +
+                            `could not be determined.`,
+                        );
+
+                        /*
+                         * The level-up guard cannot safely continue
+                         * without knowing the last EXP gain.
+                         */
+                        if (
+                            state.settings
+                                .stopBeforeLevelUp
+                        ) {
+                            stop(
+                                'The EXP gain from the last attack could not be determined. Level-up protection stopped the script for safety.',
+                                'error',
+                            );
+
+                            break;
+                        }
+                    }
 
                     updateMetrics();
                 } else {
@@ -2781,7 +2957,7 @@
 
             <div>
               <span>
-                Last hit
+                 Last EXP gain
               </span>
 
               <strong
@@ -3293,9 +3469,13 @@
                 '#mabLast',
             )
             .textContent =
-            formatNumber(
-                state.lastDamage,
-            );
+            Number.isFinite(
+                state.lastExperienceGain,
+            )
+                ? formatNumber(
+                    state.lastExperienceGain,
+                )
+                : '—';
 
         const remainingExperience =
             getRemainingExperience();
