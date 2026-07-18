@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Monster Auto Battle - 3 Attack Fallback
 // @namespace    http://tampermonkey.net/
-// @version      1.3.2
+// @version      1.3.3
 // @description  Auto-battle for the current monster with three attacks, potion priorities, target damage, and level-up protection.
 // @match        https://demonicscans.org/battle.php*
 // @grant        none
@@ -14,7 +14,8 @@
     const ID = 'tm-monster-auto-battle';
     const STORE_KEY =
         `${ID}:settings:v4:${location.host}:${location.pathname}`;
-
+    const RESUME_KEY =
+        `${ID}:potion-resume:v1:${location.host}:${location.pathname}`;
     const SEL = {
         monsterCard: '.battle-card.monster-card',
         attack: 'button.attack-btn',
@@ -61,6 +62,7 @@
         panel: null,
 
         running: false,
+        expectingPotionRefresh: false,
         monsterKey: '',
 
         attacks: [],
@@ -135,6 +137,156 @@
                 '[Monster Auto Battle] ' +
                 'Could not save settings.',
                 error,
+            );
+        }
+    }
+
+    function savePotionResumeState() {
+        if (!state.running) {
+            return;
+        }
+
+        const resumeData = {
+            savedAt: Date.now(),
+
+            monsterKey:
+                state.monsterKey ||
+                getMonsterKey(),
+
+            sessionDamage:
+                state.sessionDamage,
+
+            lastDamage:
+                state.lastDamage,
+
+            lastExperienceGain:
+                state.lastExperienceGain,
+
+            noDamageCount:
+                state.noDamageCount,
+        };
+
+        try {
+            sessionStorage.setItem(
+                RESUME_KEY,
+                JSON.stringify(resumeData),
+            );
+        } catch (error) {
+            console.warn(
+                '[Monster Auto Battle] ' +
+                'Could not store the potion resume state.',
+                error,
+            );
+        }
+    }
+
+    function loadPotionResumeState() {
+        try {
+            const raw =
+                sessionStorage.getItem(
+                    RESUME_KEY,
+                );
+
+            if (!raw) {
+                return null;
+            }
+
+            const resumeData =
+                JSON.parse(raw);
+
+            /*
+             * Do not resume an old battle session.
+             * The token exists only to survive the
+             * short reload caused by potion use.
+             */
+            if (
+                !resumeData?.savedAt ||
+                Date.now() -
+                resumeData.savedAt >
+                30000
+            ) {
+                clearPotionResumeState();
+
+                return null;
+            }
+
+            return resumeData;
+        } catch (error) {
+            console.warn(
+                '[Monster Auto Battle] ' +
+                'Could not read the potion resume state.',
+                error,
+            );
+
+            clearPotionResumeState();
+
+            return null;
+        }
+    }
+
+    function clearPotionResumeState() {
+        try {
+            sessionStorage.removeItem(
+                RESUME_KEY,
+            );
+        } catch (error) {
+            console.warn(
+                '[Monster Auto Battle] ' +
+                'Could not clear the potion resume state.',
+                error,
+            );
+        }
+    }
+
+    async function resumeAfterPotionReload() {
+        if (
+            state.running ||
+            !state.card
+        ) {
+            return;
+        }
+
+        const resumeData =
+            loadPotionResumeState();
+
+        if (!resumeData) {
+            return;
+        }
+
+        const currentMonsterKey =
+            getMonsterKey();
+
+        if (
+            currentMonsterKey !==
+            resumeData.monsterKey
+        ) {
+            clearPotionResumeState();
+
+            setStatus(
+                'Auto-battle was not resumed because the monster changed.',
+            );
+
+            return;
+        }
+
+        setStatus(
+            'Potion use completed. Resuming auto-battle...',
+            'running',
+        );
+
+        log(
+            'A potion page refresh was detected. Auto-battle will resume automatically.',
+        );
+
+        /*
+         * Give the refreshed battle page a moment
+         * to finish binding its own click handlers.
+         */
+        await sleep(500);
+
+        if (!state.running) {
+            void runAutoBattle(
+                resumeData,
             );
         }
     }
@@ -323,10 +475,21 @@
                 ?.getAttribute('src') ||
             '';
 
+        /*
+         * nextDieMs normally identifies the current
+         * monster instance more precisely than its
+         * title and image alone.
+         */
+        const monsterInstance =
+            window.AUTO_DIE_CFG
+                ?.nextDieMs ??
+            '';
+
         return [
             location.pathname,
             title,
             image,
+            monsterInstance,
         ].join('|');
     }
 
@@ -1293,9 +1456,28 @@
             )}.`,
         );
 
-        clickPotionWithAutoConfirmation(
-            button,
-        );
+        /*
+         * Store the active battle before clicking the
+         * potion. This allows the script to continue
+         * after a partial DOM refresh or full page reload.
+         */
+        state.expectingPotionRefresh =
+            true;
+
+        savePotionResumeState();
+
+        try {
+            clickPotionWithAutoConfirmation(
+                button,
+            );
+        } catch (error) {
+            state.expectingPotionRefresh =
+                false;
+
+            clearPotionResumeState();
+
+            throw error;
+        }
 
         const startedAt =
             Date.now();
@@ -1346,6 +1528,21 @@
                 quantityChanged ||
                 resourceChanged
             ) {
+                state.expectingPotionRefresh =
+                    false;
+
+                /*
+                 * Do not clear the resume token yet.
+                 * Some potion actions update the DOM first
+                 * and reload the page a fraction later.
+                 *
+                 * The token is cleared after the next
+                 * successful attack or when battle stops.
+                 */
+                log(
+                    `${potion.name} was used successfully. Auto-battle will continue automatically.`,
+                );
+
                 renderPotionLists();
                 updateMetrics();
 
@@ -1353,11 +1550,16 @@
             }
         }
 
+        state.expectingPotionRefresh =
+            false;
+
+        clearPotionResumeState();
+
         renderPotionLists();
 
         log(
             `${potion.name} was clicked, ` +
-            `but no change was detected.`,
+            `but no resource or quantity change was detected.`,
         );
 
         return false;
@@ -2209,7 +2411,14 @@
         return true;
     }
 
-    async function runAutoBattle() {
+    async function runAutoBattle(resumeData = null,) {
+        /*
+ * A click event may be passed when the function
+ * is used directly as an event listener.
+ */
+        if (resumeData instanceof Event) {
+            resumeData = null;
+        }
         if (state.running) {
             return;
         }
@@ -2225,14 +2434,81 @@
             return;
         }
 
-        state.monsterKey =
+        const currentMonsterKey =
             getMonsterKey();
 
-        state.sessionDamage = 0;
-        state.lastDamage = 0;
-        state.lastExperienceGain = null;
-        state.noDamageCount = 0;
-        state.forcedAttackIndex = 0;
+        if (
+            resumeData?.monsterKey &&
+            resumeData.monsterKey !==
+            currentMonsterKey
+        ) {
+            clearPotionResumeState();
+
+            setStatus(
+                'Auto-battle could not resume because the monster changed.',
+                'error',
+            );
+
+            return;
+        }
+
+        state.monsterKey =
+            currentMonsterKey;
+
+        if (resumeData) {
+            state.sessionDamage =
+                Number.isFinite(
+                    Number(
+                        resumeData.sessionDamage,
+                    ),
+                )
+                    ? Number(
+                        resumeData.sessionDamage,
+                    )
+                    : 0;
+
+            state.lastDamage =
+                Number.isFinite(
+                    Number(
+                        resumeData.lastDamage,
+                    ),
+                )
+                    ? Number(
+                        resumeData.lastDamage,
+                    )
+                    : 0;
+
+            state.lastExperienceGain =
+                resumeData
+                    .lastExperienceGain == null
+                    ? null
+                    : Number.isFinite(
+                        Number(
+                            resumeData
+                                .lastExperienceGain,
+                        ),
+                    )
+                        ? Number(
+                            resumeData
+                                .lastExperienceGain,
+                        )
+                        : null;
+
+            state.noDamageCount = 0;
+            state.forcedAttackIndex = 0;
+        } else {
+            /*
+             * A manually started battle must not inherit
+             * an old potion-resume token.
+             */
+            clearPotionResumeState();
+
+            state.sessionDamage = 0;
+            state.lastDamage = 0;
+            state.lastExperienceGain = null;
+            state.noDamageCount = 0;
+            state.forcedAttackIndex = 0;
+        }
 
         state.running = true;
 
@@ -2240,7 +2516,9 @@
         updateMetrics();
 
         setStatus(
-            'Auto-battle is running.',
+            resumeData
+                ? 'Auto-battle resumed after potion use.'
+                : 'Auto-battle is running.',
             'running',
         );
 
@@ -2473,6 +2751,15 @@
                     outcome.type ===
                     'damage'
                 ) {
+                    /*
+                     * The battle successfully continued after
+                     * the potion. The reload token is no longer needed.
+                     */
+                    clearPotionResumeState();
+
+                    state.expectingPotionRefresh =
+                        false;
+
                     state.noDamageCount = 0;
                     state.forcedAttackIndex = 0;
 
@@ -2581,6 +2868,15 @@
         tone = 'idle',
     ) {
         state.running = false;
+
+        state.expectingPotionRefresh =
+            false;
+
+        /*
+         * Manual stops, errors, target completion and
+         * monster deaths must cancel automatic resuming.
+         */
+        clearPotionResumeState();
 
         setStatus(
             message,
@@ -3781,7 +4077,9 @@
             )
             .addEventListener(
                 'click',
-                runAutoBattle,
+                () => {
+                    void runAutoBattle();
+                },
             );
 
         state.panel
@@ -3866,16 +4164,31 @@
         }
 
         if (
-            state.panel
-                ?.isConnected &&
+            state.panel?.isConnected &&
             state.card === card
         ) {
             return;
         }
 
-        if (state.running) {
+        const incomingMonsterKey =
+            getMonsterKey(card);
+
+        const sameRunningMonster =
+            state.running &&
+            state.monsterKey &&
+            incomingMonsterKey ===
+            state.monsterKey;
+
+        /*
+         * A potion may rebuild the monster card.
+         * Continue when it is still the same monster.
+         */
+        if (
+            state.running &&
+            !sameRunningMonster
+        ) {
             stop(
-                'The monster card was rebuilt.',
+                'The monster changed. Auto-battle was stopped.',
             );
         }
 
@@ -3894,8 +4207,8 @@
             createPanel();
 
         /*
-         * Append the controller to the
-         * bottom of the monster card.
+         * Append the controller to the bottom
+         * of the current monster card.
          */
         card.appendChild(
             state.panel,
@@ -3907,9 +4220,38 @@
         updateButtons();
         updateMetrics();
 
-        setStatus(
-            'Ready. This configuration applies only to the currently visible monster.',
-        );
+        if (sameRunningMonster) {
+            setStatus(
+                'Battle card refreshed after potion use. Auto-battle is continuing.',
+                'running',
+            );
+
+            log(
+                'The battle card was refreshed, but the same monster is still active. Continuing automatically.',
+            );
+        } else {
+            setStatus(
+                'Ready. This configuration applies only to the currently visible monster.',
+            );
+        }
+
+        /*
+         * After a full page reload, state.running is false,
+         * but the sessionStorage resume token still exists.
+         */
+        if (!state.running) {
+            clearTimeout(
+                state.timers.resume,
+            );
+
+            state.timers.resume =
+                setTimeout(
+                    () => {
+                        void resumeAfterPotionReload();
+                    },
+                    400,
+                );
+        }
     }
 
     const observer =
