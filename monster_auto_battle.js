@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Monster Auto Battle - 3 Attack Fallback
 // @namespace    http://tampermonkey.net/
-// @version      1.3.4
+// @version      1.4.0
 // @description  Auto-battle for the current monster with three attacks, potion priorities, target damage, and level-up protection.
 // @match        https://demonicscans.org/battle.php*
 // @grant        none
@@ -12,25 +12,24 @@
   "use strict";
 
   const ID = "tm-monster-auto-battle";
-  const STORE_KEY = `${ID}:settings:v4:${location.host}:${location.pathname}`;
-  const RESUME_KEY = `${ID}:potion-resume:v1:${location.host}:${location.pathname}`;
+  const STORE_KEY = `${ID}:settings:v6:${location.host}:${location.pathname}`;
+
+  const RESUME_KEY = `${ID}:resume:v3:${location.host}:${location.pathname}`;
+
   const SEL = {
     monsterCard: ".battle-card.monster-card",
     attack: "button.attack-btn",
     damage: "#yourDamageValue",
     monsterHp: "#hpText",
-
-    // Exact selectors from the current game layout.
     stamina: "#stamina_span",
     playerHp: "#pHpText",
     playerMana: "#pManaText",
     exp: ".game-topbar .gtb-exp " + ".gtb-exp-top span:last-child",
-
     potion: ".potion-use-btn",
     potionCard: ".potion-card",
   };
 
-  const defaults = {
+  const DEFAULTS = {
     attackKeys: ["", "", ""],
 
     autoStamina: false,
@@ -46,6 +45,7 @@
 
     potionEnabled: {},
     potionUseAmount: {},
+
     potionOrder: {
       stamina: [],
       mana: [],
@@ -58,7 +58,6 @@
     panel: null,
 
     running: false,
-    expectingPotionRefresh: false,
     monsterKey: "",
 
     attacks: [],
@@ -70,22 +69,28 @@
     sessionDamage: 0,
     lastDamage: 0,
     lastExperienceGain: null,
+
     noDamageCount: 0,
-    /*
-     * Used when the server reports insufficient stamina.
-     * The script then proceeds to the next selected attack.
-     */
     forcedAttackIndex: 0,
 
     timers: {},
   };
+
+  const sleep = (milliseconds) =>
+    new Promise((resolve) => {
+      setTimeout(resolve, milliseconds);
+    });
+
+  const queryAll = (selector, root = document) => [
+    ...root.querySelectorAll(selector),
+  ];
 
   function loadSettings() {
     try {
       const saved = JSON.parse(localStorage.getItem(STORE_KEY) || "{}");
 
       return {
-        ...defaults,
+        ...DEFAULTS,
         ...saved,
 
         attackKeys: Array.isArray(saved.attackKeys)
@@ -109,12 +114,9 @@
         },
       };
     } catch (error) {
-      console.warn(
-        "[Monster Auto Battle] " + "Could not load settings.",
-        error,
-      );
+      console.warn("[Monster Auto Battle] Could not load settings.", error);
 
-      return JSON.parse(JSON.stringify(defaults));
+      return JSON.parse(JSON.stringify(DEFAULTS));
     }
   }
 
@@ -122,133 +124,9 @@
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify(state.settings));
     } catch (error) {
-      console.warn(
-        "[Monster Auto Battle] " + "Could not save settings.",
-        error,
-      );
+      console.warn("[Monster Auto Battle] Could not save settings.", error);
     }
   }
-
-  function savePotionResumeState() {
-    if (!state.running) {
-      return;
-    }
-
-    const resumeData = {
-      savedAt: Date.now(),
-
-      monsterKey: state.monsterKey || getMonsterKey(),
-
-      sessionDamage: state.sessionDamage,
-
-      lastDamage: state.lastDamage,
-
-      lastExperienceGain: state.lastExperienceGain,
-
-      noDamageCount: state.noDamageCount,
-    };
-
-    try {
-      sessionStorage.setItem(RESUME_KEY, JSON.stringify(resumeData));
-    } catch (error) {
-      console.warn(
-        "[Monster Auto Battle] " + "Could not store the potion resume state.",
-        error,
-      );
-    }
-  }
-
-  function loadPotionResumeState() {
-    try {
-      const raw = sessionStorage.getItem(RESUME_KEY);
-
-      if (!raw) {
-        return null;
-      }
-
-      const resumeData = JSON.parse(raw);
-
-      /*
-       * Do not resume an old battle session.
-       * The token exists only to survive the
-       * short reload caused by potion use.
-       */
-      if (!resumeData?.savedAt || Date.now() - resumeData.savedAt > 30000) {
-        clearPotionResumeState();
-
-        return null;
-      }
-
-      return resumeData;
-    } catch (error) {
-      console.warn(
-        "[Monster Auto Battle] " + "Could not read the potion resume state.",
-        error,
-      );
-
-      clearPotionResumeState();
-
-      return null;
-    }
-  }
-
-  function clearPotionResumeState() {
-    try {
-      sessionStorage.removeItem(RESUME_KEY);
-    } catch (error) {
-      console.warn(
-        "[Monster Auto Battle] " + "Could not clear the potion resume state.",
-        error,
-      );
-    }
-  }
-
-  async function resumeAfterPotionReload() {
-    if (state.running || !state.card) {
-      return;
-    }
-
-    const resumeData = loadPotionResumeState();
-
-    if (!resumeData) {
-      return;
-    }
-
-    const currentMonsterKey = getMonsterKey();
-
-    if (currentMonsterKey !== resumeData.monsterKey) {
-      clearPotionResumeState();
-
-      setStatus("Auto-battle was not resumed because the monster changed.");
-
-      return;
-    }
-
-    setStatus("Potion use completed. Resuming auto-battle...", "running");
-
-    log(
-      "A potion page refresh was detected. Auto-battle will resume automatically.",
-    );
-
-    /*
-     * Give the refreshed battle page a moment
-     * to finish binding its own click handlers.
-     */
-    await sleep(500);
-
-    if (!state.running) {
-      void runAutoBattle(resumeData);
-    }
-  }
-
-  const sleep = (milliseconds) =>
-    new Promise((resolve) => {
-      setTimeout(resolve, milliseconds);
-    });
-
-  const queryAll = (selector, root = document) => [
-    ...root.querySelectorAll(selector),
-  ];
 
   function formatNumber(value) {
     return Number.isFinite(value)
@@ -274,8 +152,8 @@
     return match[0].trim().startsWith("-") ? -number : number;
   }
 
-  function parseFraction(text) {
-    const match = String(text ?? "").match(
+  function parseFraction(value) {
+    const match = String(value ?? "").match(
       /(\d{1,3}(?:[.,\s]\d{3})+|\d+)\s*\/\s*(\d{1,3}(?:[.,\s]\d{3})+|\d+)/,
     );
 
@@ -313,8 +191,6 @@
       return NaN;
     }
 
-    const suffix = match[2] || "";
-
     const factors = {
       "": 1,
       k: 1e3,
@@ -324,24 +200,21 @@
       q: 1e15,
     };
 
+    const suffix = match[2] || "";
+
     let numberText = match[1];
 
-    if (suffix) {
-      if (numberText.includes(".") && numberText.includes(",")) {
-        const decimalSeparator =
-          numberText.lastIndexOf(",") > numberText.lastIndexOf(".") ? "," : ".";
-
-        const thousandsSeparator = decimalSeparator === "," ? "." : ",";
-
-        numberText = numberText
-          .split(thousandsSeparator)
-          .join("")
-          .replace(decimalSeparator, ".");
-      } else {
-        numberText = numberText.replace(",", ".");
-      }
-    } else {
+    if (!suffix) {
       numberText = numberText.replace(/\D/g, "");
+    } else if (numberText.includes(".") && numberText.includes(",")) {
+      const decimal =
+        numberText.lastIndexOf(",") > numberText.lastIndexOf(".") ? "," : ".";
+
+      const thousands = decimal === "," ? "." : ",";
+
+      numberText = numberText.split(thousands).join("").replace(decimal, ".");
+    } else {
+      numberText = numberText.replace(",", ".");
     }
 
     const result = Number(numberText) * factors[suffix];
@@ -360,9 +233,9 @@
 
   function findMonsterCard() {
     return (
-      queryAll(SEL.monsterCard).find((card) =>
-        card.querySelector(SEL.attack),
-      ) || null
+      queryAll(SEL.monsterCard).find((card) => {
+        return card.querySelector(SEL.attack);
+      }) || null
     );
   }
 
@@ -375,14 +248,9 @@
         ?.querySelector("#monsterImage, .monster_image")
         ?.getAttribute("src") || "";
 
-    /*
-     * nextDieMs normally identifies the current
-     * monster instance more precisely than its
-     * title and image alone.
-     */
-    const monsterInstance = window.AUTO_DIE_CFG?.nextDieMs ?? "";
+    const instance = window.AUTO_DIE_CFG?.nextDieMs ?? "";
 
-    return [location.pathname, title, image, monsterInstance].join("|");
+    return [location.pathname, title, image, instance].join("|");
   }
 
   function getCurrentDamage() {
@@ -393,16 +261,16 @@
     return parseInteger(document.querySelector(SEL.stamina)?.textContent);
   }
 
-  function getCurrentHealth() {
+  function getCurrentMana() {
     return (
-      parseFraction(document.querySelector(SEL.playerHp)?.textContent)
+      parseFraction(document.querySelector(SEL.playerMana)?.textContent)
         ?.current ?? null
     );
   }
 
-  function getCurrentMana() {
+  function getCurrentHealth() {
     return (
-      parseFraction(document.querySelector(SEL.playerMana)?.textContent)
+      parseFraction(document.querySelector(SEL.playerHp)?.textContent)
         ?.current ?? null
     );
   }
@@ -417,8 +285,7 @@
     }
 
     return {
-      current: experience.current,
-      maximum: experience.maximum,
+      ...experience,
 
       remaining: Math.max(0, experience.maximum - experience.current),
     };
@@ -428,35 +295,15 @@
     return getExperienceProgress()?.remaining ?? null;
   }
 
-  /*
-   * Calculates the EXP gained between two header states.
-   *
-   * Normal example:
-   * Before: 25,706,330
-   * After:  25,706,900
-   * Gain:          570
-   *
-   * It also handles a single level rollover:
-   * Before: 52,598,800 / 52,598,856
-   * After:         200 / new maximum
-   * Gain:          256
-   */
   function calculateExperienceGain(before, after) {
     if (!before || !after) {
       return null;
     }
 
-    /*
-     * Normal EXP increase without a level-up.
-     */
     if (after.maximum === before.maximum && after.current >= before.current) {
       return after.current - before.current;
     }
 
-    /*
-     * The EXP counter rolled over because
-     * a level-up occurred.
-     */
     if (after.maximum !== before.maximum || after.current < before.current) {
       return Math.max(0, before.maximum - before.current + after.current);
     }
@@ -464,11 +311,6 @@
     return null;
   }
 
-  /*
-   * The battle response and the topbar EXP update
-   * may not happen at exactly the same moment.
-   * Therefore, wait briefly for the EXP value to change.
-   */
   async function waitForExperienceUpdate(before, timeoutMs = 3000) {
     if (!before) {
       return null;
@@ -494,17 +336,19 @@
   }
 
   function isMonsterDead() {
-    const currentHp = parseFraction(
+    const health = parseFraction(
       state.card?.querySelector(SEL.monsterHp)?.textContent,
     )?.current;
 
-    return currentHp === 0 || Boolean(state.card?.classList.contains("dead"));
+    return health === 0 || Boolean(state.card?.classList.contains("dead"));
   }
 
   function getAttackCosts(button) {
     const text = [
       button.dataset.skillName || "",
+
       button.textContent || "",
+
       button.querySelector(".skill-cost")?.textContent || "",
     ].join(" ");
 
@@ -521,8 +365,8 @@
     const mana = manaMatch ? parseInteger(manaMatch[1]) : 0;
 
     /*
-     * Standard attacks often contain the real
-     * stamina cost only in the visible button text.
+     * Standard attack buttons often contain
+     * the real stamina cost only in their text.
      *
      * Example:
      * Power Slash (10)
@@ -541,6 +385,7 @@
 
     return {
       stamina: stamina || 0,
+
       mana: mana || 0,
     };
   }
@@ -556,6 +401,7 @@
 
     return {
       key: `${skillId}|${name}`,
+
       name,
 
       group: button.closest(".class-skill-bar")
@@ -566,10 +412,6 @@
     };
   }
 
-  /*
-   * The available attacks are always read
-   * directly from the current monster card.
-   */
   function discoverAttacks() {
     const attacks = state.card
       ? queryAll(SEL.attack, state.card).map(attackFromButton)
@@ -577,7 +419,9 @@
 
     const signature = attacks
       .map((attack) => {
-        return [attack.key, attack.costs.stamina, attack.costs.mana].join(":");
+        return (
+          `${attack.key}:` + `${attack.costs.stamina}:` + `${attack.costs.mana}`
+        );
       })
       .join("||");
 
@@ -591,18 +435,19 @@
       ? state.settings.attackKeys.slice(0, 3)
       : ["", "", ""];
 
-    /*
-     * When a saved attack is not available
-     * on the new monster, choose an attack
-     * that actually exists.
-     */
     for (let index = 0; index < 3; index += 1) {
-      if (attacks.some((attack) => attack.key === keys[index])) {
+      if (
+        attacks.some((attack) => {
+          return attack.key === keys[index];
+        })
+      ) {
         continue;
       }
 
       keys[index] =
-        attacks.find((attack) => !keys.includes(attack.key))?.key ||
+        attacks.find((attack) => {
+          return !keys.includes(attack.key);
+        })?.key ||
         attacks[index]?.key ||
         attacks[0]?.key ||
         "";
@@ -617,9 +462,9 @@
 
   function getSelectedAttack(index) {
     return (
-      state.attacks.find(
-        (attack) => attack.key === state.settings.attackKeys[index],
-      ) || null
+      state.attacks.find((attack) => {
+        return attack.key === state.settings.attackKeys[index];
+      }) || null
     );
   }
 
@@ -629,14 +474,14 @@
     }
 
     return (
-      queryAll(SEL.attack, state.card).find(
-        (button) => attackFromButton(button).key === key,
-      ) || null
+      queryAll(SEL.attack, state.card).find((button) => {
+        return attackFromButton(button).key === key;
+      }) || null
     );
   }
 
   function getPotionType(name, description) {
-    const text = [name, description].join(" ").toLowerCase();
+    const text = `${name} ${description}`.toLowerCase();
 
     if (text.includes("stamina")) {
       return "stamina";
@@ -667,23 +512,19 @@
 
     const itemId = String(button.dataset.item || card?.dataset.itemId || name);
 
-    /*
-     * Drawer potions use .potion-qty-left.
-     * Quick-use potions use .ds-potion-count.
-     */
-    const quantitySources = [
-      card?.querySelector(".potion-qty-left")?.textContent,
-
-      button.querySelector(".ds-potion-count")?.textContent,
-
-      button.dataset.max,
-    ];
-
     const quantity =
-      quantitySources.map(parseInteger).find(Number.isFinite) ?? 0;
+      [
+        card?.querySelector(".potion-qty-left")?.textContent,
+
+        button.querySelector(".ds-potion-count")?.textContent,
+
+        button.dataset.max,
+      ]
+        .map(parseInteger)
+        .find(Number.isFinite) ?? 0;
 
     return {
-      key: `${itemId}|${name}`,
+      key: itemId,
       itemId,
       name,
       description,
@@ -694,40 +535,19 @@
     };
   }
 
-  /*
-   * Only these two potion types support
-   * configurable multi-use:
-   *
-   * Item 30  = Small Stamina Potion
-   * Item 162 = Mana Potion S
-   */
   function supportsMultiplePotionUse(potion) {
     return potion?.itemId === "30" || potion?.itemId === "162";
   }
 
   function getConfiguredPotionAmount(potion) {
-    const configured = Number(
-      state.settings.potionUseAmount?.[potion.key] ?? 1,
-    );
+    const value = Number(state.settings.potionUseAmount?.[potion.key] ?? 1);
 
-    if (!Number.isFinite(configured)) {
-      return 1;
-    }
-
-    return Math.max(1, Math.floor(configured));
+    return Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1;
   }
 
   function getActualPotionAmount(potion) {
     const configured = getConfiguredPotionAmount(potion);
 
-    /*
-     * Never request more potions than
-     * are currently available.
-     *
-     * The saved configuration is not changed,
-     * so the preferred amount remains available
-     * when the inventory is replenished.
-     */
     if (Number.isFinite(potion.quantity) && potion.quantity > 0) {
       return Math.min(configured, potion.quantity);
     }
@@ -738,15 +558,15 @@
   function discoverPotions() {
     const unique = new Map();
 
-    const discovered = queryAll(SEL.potion)
-      .map(potionFromButton)
-      .filter((potion) => potion.type !== "other");
+    const buttons = queryAll(SEL.potion);
 
-    /*
-     * A potion can appear in both the drawer
-     * and the quick-use bar. Keep one entry.
-     */
-    for (const potion of discovered) {
+    for (const button of buttons) {
+      const potion = potionFromButton(button);
+
+      if (potion.type === "other") {
+        continue;
+      }
+
       const existing = unique.get(potion.key);
 
       if (!existing || potion.quantity > existing.quantity) {
@@ -758,15 +578,23 @@
 
     for (const type of ["stamina", "mana", "health"]) {
       const available = state.potions
-        .filter((potion) => potion.type === type)
-        .map((potion) => potion.key);
+        .filter((potion) => {
+          return potion.type === type;
+        })
+        .map((potion) => {
+          return potion.key;
+        });
 
-      const previousOrder = state.settings.potionOrder[type] || [];
+      const oldOrder = state.settings.potionOrder[type] || [];
 
       state.settings.potionOrder[type] = [
-        ...previousOrder.filter((key) => available.includes(key)),
+        ...oldOrder.filter((key) => {
+          return available.includes(key);
+        }),
 
-        ...available.filter((key) => !previousOrder.includes(key)),
+        ...available.filter((key) => {
+          return !oldOrder.includes(key);
+        }),
       ];
 
       for (const key of available) {
@@ -783,56 +611,34 @@
     saveSettings();
   }
 
-  function findLivePotionButton(potion, requestedAmount = 1) {
+  function getPotionAmountInput(button) {
+    return (
+      button
+        .closest(".potion-actions")
+        ?.querySelector('input[type="number"]') || null
+    );
+  }
+
+  function findLivePotionButton(potion, amount = 1) {
     const matches = queryAll(SEL.potion).filter((button) => {
-      return potionFromButton(button).key === potion.key;
+      return (
+        potionFromButton(button).itemId === potion.itemId && !button.disabled
+      );
     });
 
-    const getAmountInput = (button) => {
-      return (
-        button
-          .closest(".potion-actions")
-          ?.querySelector('input[type="number"]') || null
-      );
-    };
-
-    const hasEditableAmountInput = (button) => {
-      const input = getAmountInput(button);
-
-      return Boolean(input && !input.readOnly && !input.disabled);
-    };
-
-    /*
-     * Multiple potions require an editable
-     * amount input. The button may be located
-     * in the drawer even when the drawer is closed.
-     */
-    if (requestedAmount > 1) {
+    if (amount > 1) {
       return (
         matches.find((button) => {
-          return (
-            !button.disabled &&
-            button.offsetParent !== null &&
-            hasEditableAmountInput(button)
-          );
-        }) ||
-        matches.find((button) => {
-          return !button.disabled && hasEditableAmountInput(button);
-        }) ||
-        null
+          const input = getPotionAmountInput(button);
+
+          return input && !input.readOnly && !input.disabled;
+        }) || null
       );
     }
 
-    /*
-     * For a single potion, prefer a visible
-     * quick-use button.
-     */
     return (
       matches.find((button) => {
-        return !button.disabled && button.offsetParent !== null;
-      }) ||
-      matches.find((button) => {
-        return !button.disabled;
+        return button.offsetParent !== null;
       }) ||
       matches[0] ||
       null
@@ -840,11 +646,12 @@
   }
 
   function isElementVisible(element) {
-    if (!element || !element.isConnected) {
+    if (!element?.isConnected) {
       return false;
     }
 
     const style = getComputedStyle(element);
+
     const rectangle = element.getBoundingClientRect();
 
     return (
@@ -856,15 +663,6 @@
     );
   }
 
-  /*
-   * Finds confirmation buttons inside common modal systems.
-   *
-   * Supported examples:
-   * - SweetAlert / SweetAlert2
-   * - Bootstrap modals
-   * - Native-looking custom dialogs
-   * - Generic role="dialog" popups
-   */
   function findPotionConfirmationButton() {
     const directSelectors = [
       ".swal2-container .swal2-confirm",
@@ -880,19 +678,15 @@
     ];
 
     for (const selector of directSelectors) {
-      const button = queryAll(selector).find(
-        (element) => isElementVisible(element) && !element.disabled,
-      );
+      const button = queryAll(selector).find((element) => {
+        return isElementVisible(element) && !element.disabled;
+      });
 
       if (button) {
         return button;
       }
     }
 
-    /*
-     * Fallback for dialogs without useful classes.
-     * Only buttons inside visible dialog containers are considered.
-     */
     const dialogSelectors = [
       ".swal2-container",
       ".swal-overlay",
@@ -903,45 +697,35 @@
       ".modal.active",
     ];
 
-    const acceptedButtonTexts = [
-      /^confirm$/i,
-      /^yes$/i,
-      /^ok$/i,
-      /^okay$/i,
-      /^use$/i,
-      /^continue$/i,
-      /^accept$/i,
-      /^confirm use$/i,
-      /^use potion$/i,
-      /^confirm potion$/i,
-    ];
+    const acceptedText =
+      /^(confirm|yes|ok|okay|use|continue|accept|confirm use|use potion|confirm potion)$/i;
 
-    for (const dialogSelector of dialogSelectors) {
-      for (const dialog of queryAll(dialogSelector)) {
+    for (const selector of dialogSelectors) {
+      for (const dialog of queryAll(selector)) {
         if (!isElementVisible(dialog)) {
           continue;
         }
 
-        const buttons = queryAll(
+        const button = queryAll(
           'button, input[type="button"], input[type="submit"]',
           dialog,
-        );
-
-        for (const button of buttons) {
-          if (button.disabled || !isElementVisible(button)) {
-            continue;
-          }
-
+        ).find((element) => {
           const text = String(
-            button.textContent ||
-              button.value ||
-              button.getAttribute("aria-label") ||
+            element.textContent ||
+              element.value ||
+              element.getAttribute("aria-label") ||
               "",
           ).trim();
 
-          if (acceptedButtonTexts.some((pattern) => pattern.test(text))) {
-            return button;
-          }
+          return (
+            !element.disabled &&
+            isElementVisible(element) &&
+            acceptedText.test(text)
+          );
+        });
+
+        if (button) {
+          return button;
         }
       }
     }
@@ -949,20 +733,16 @@
     return null;
   }
 
-  /*
-   * Watches briefly for a custom confirmation modal
-   * and confirms it automatically.
-   */
-  async function watchForPotionConfirmation(timeoutMs = 6000) {
+  async function watchPotionConfirmation(timeoutMs = 6000) {
     const startedAt = Date.now();
 
     while (state.running && Date.now() - startedAt < timeoutMs) {
-      const confirmButton = findPotionConfirmationButton();
+      const button = findPotionConfirmationButton();
 
-      if (confirmButton) {
-        log("Potion confirmation detected and accepted automatically.");
+      if (button) {
+        log("Potion confirmation accepted automatically.");
 
-        confirmButton.click();
+        button.click();
 
         return true;
       }
@@ -973,16 +753,10 @@
     return false;
   }
 
-  /*
-   * Temporarily accepts native JavaScript confirm() dialogs.
-   *
-   * The override exists only around the potion click and is
-   * restored immediately afterwards.
-   */
-  function installTemporaryNativeConfirm() {
+  function clickPotionWithConfirmation(button) {
     const originalConfirm = window.confirm;
 
-    let installed = false;
+    let replaced = false;
 
     try {
       window.confirm = (message) => {
@@ -991,51 +765,92 @@
         return true;
       };
 
-      installed = true;
+      replaced = true;
     } catch (error) {
       console.warn(
-        "[Monster Auto Battle] " +
-          "Could not temporarily override window.confirm.",
+        "[Monster Auto Battle] Could not override confirm().",
         error,
       );
     }
 
-    return () => {
-      if (!installed) {
-        return;
-      }
-
-      try {
-        window.confirm = originalConfirm;
-      } catch (error) {
-        console.warn(
-          "[Monster Auto Battle] " + "Could not restore window.confirm.",
-          error,
-        );
-      }
-    };
-  }
-
-  /*
-   * Clicks a potion and handles both native and custom confirmations.
-   */
-  function clickPotionWithAutoConfirmation(button) {
-    const restoreNativeConfirm = installTemporaryNativeConfirm();
-
-    /*
-     * Start watching before clicking because the modal
-     * may be inserted into the DOM immediately.
-     */
-    void watchForPotionConfirmation(6000);
+    void watchPotionConfirmation();
 
     try {
       button.click();
     } finally {
+      setTimeout(() => {
+        if (!replaced) {
+          return;
+        }
+
+        try {
+          window.confirm = originalConfirm;
+        } catch (error) {
+          console.warn(
+            "[Monster Auto Battle] Could not restore confirm().",
+            error,
+          );
+        }
+      }, 1200);
+    }
+  }
+
+  function saveResumeState() {
+    if (!state.running) {
+      return;
+    }
+
+    try {
+      sessionStorage.setItem(
+        RESUME_KEY,
+        JSON.stringify({
+          savedAt: Date.now(),
+
+          monsterKey: state.monsterKey || getMonsterKey(),
+
+          sessionDamage: state.sessionDamage,
+
+          lastDamage: state.lastDamage,
+
+          lastExperienceGain: state.lastExperienceGain,
+        }),
+      );
+    } catch (error) {
+      console.warn("[Monster Auto Battle] Could not save resume state.", error);
+    }
+  }
+
+  function loadResumeState() {
+    try {
+      const raw = sessionStorage.getItem(RESUME_KEY);
+
+      if (!raw) {
+        return null;
+      }
+
+      const data = JSON.parse(raw);
+
+      if (!data?.savedAt || Date.now() - data.savedAt > 60000) {
+        clearResumeState();
+
+        return null;
+      }
+
+      return data;
+    } catch (error) {
+      clearResumeState();
+
+      return null;
+    }
+  }
+
+  function clearResumeState() {
+    try {
+      sessionStorage.removeItem(RESUME_KEY);
+    } catch (_) {
       /*
-       * Native confirm() runs synchronously during button.click().
-       * A short delay also covers click handlers that use setTimeout().
+       * Ignore storage errors.
        */
-      setTimeout(restoreNativeConfirm, 1000);
     }
   }
 
@@ -1044,7 +859,9 @@
 
     const potion = (state.settings.potionOrder[type] || [])
       .map((key) => {
-        return state.potions.find((item) => item.key === key);
+        return state.potions.find((item) => {
+          return item.key === key;
+        });
       })
       .find((item) => {
         return (
@@ -1062,24 +879,18 @@
       return false;
     }
 
-    const requestedAmount = supportsMultiplePotionUse(potion)
+    const amount = supportsMultiplePotionUse(potion)
       ? getActualPotionAmount(potion)
       : 1;
 
-    const button = findLivePotionButton(potion, requestedAmount);
+    const button = findLivePotionButton(potion, amount);
 
     if (!button) {
       setStatus(
-        requestedAmount > 1
-          ? `${potion.name} has no usable amount field on the page.`
-          : `${potion.name} could not be found on the page.`,
+        amount > 1
+          ? `${potion.name} has no editable amount field.`
+          : `${potion.name} could not be found.`,
         "error",
-      );
-
-      log(
-        requestedAmount > 1
-          ? `Could not find an editable amount field for ${potion.name}.`
-          : `${potion.name} could not be found on the page.`,
       );
 
       return false;
@@ -1094,19 +905,16 @@
           ? getCurrentMana()
           : getCurrentHealth();
 
-    /*
-     * Use only one potion per click.
-     */
-    const input = button
-      .closest(".potion-actions")
-      ?.querySelector('input[type="number"]');
+    const input = getPotionAmountInput(button);
 
-    /*
-     * Write the configured quantity into
-     * the game's own potion amount field.
-     */
+    if (amount > 1 && (!input || input.readOnly || input.disabled)) {
+      setStatus(`Could not set the amount for ${potion.name}.`, "error");
+
+      return false;
+    }
+
     if (input && !input.readOnly && !input.disabled) {
-      input.value = String(requestedAmount);
+      input.value = String(amount);
 
       input.dispatchEvent(
         new Event("input", {
@@ -1120,64 +928,29 @@
         }),
       );
 
-      /*
-       * Some pages use additional event handlers
-       * that read the value only after a short delay.
-       */
       await sleep(80);
-    } else if (requestedAmount > 1) {
-      setStatus(`Could not set the amount for ${potion.name}.`, "error");
-
-      log(
-        `${potion.name} requires an editable amount field to use ${requestedAmount} at once.`,
-      );
-
-      return false;
     }
 
     log(
-      requestedAmount > 1
-        ? `Using ${formatNumber(requestedAmount)} × ${potion.name}. ` +
-            `Stock before use: ` +
-            `${formatNumber(beforeQuantity)}.`
-        : `Using ${potion.name}. ` +
-            `Stock before use: ` +
-            `${formatNumber(beforeQuantity)}.`,
+      amount > 1
+        ? `Using ${formatNumber(amount)} × ${potion.name}. Stock before use: ${formatNumber(beforeQuantity)}.`
+        : `Using ${potion.name}. Stock before use: ${formatNumber(beforeQuantity)}.`,
     );
 
-    /*
-     * Store the active battle before clicking the
-     * potion. This allows the script to continue
-     * after a partial DOM refresh or full page reload.
-     */
-    state.expectingPotionRefresh = true;
+    saveResumeState();
 
-    savePotionResumeState();
-
-    try {
-      clickPotionWithAutoConfirmation(button);
-    } catch (error) {
-      state.expectingPotionRefresh = false;
-
-      clearPotionResumeState();
-
-      throw error;
-    }
+    clickPotionWithConfirmation(button);
 
     const startedAt = Date.now();
 
-    /*
-     * Wait until the resource increases
-     * or the potion quantity decreases.
-     */
-    while (state.running && Date.now() - startedAt < 7000) {
+    while (state.running && Date.now() - startedAt < 8000) {
       await sleep(120);
 
       discoverPotions();
 
-      const refreshedPotion = state.potions.find(
-        (item) => item.key === potion.key,
-      );
+      const refreshed = state.potions.find((item) => {
+        return item.key === potion.key;
+      });
 
       const afterResource =
         type === "stamina"
@@ -1186,8 +959,7 @@
             ? getCurrentMana()
             : getCurrentHealth();
 
-      const quantityChanged =
-        refreshedPotion && refreshedPotion.quantity < beforeQuantity;
+      const quantityChanged = refreshed && refreshed.quantity < beforeQuantity;
 
       const resourceChanged =
         Number.isFinite(beforeResource) &&
@@ -1195,19 +967,7 @@
         afterResource > beforeResource;
 
       if (quantityChanged || resourceChanged) {
-        state.expectingPotionRefresh = false;
-
-        /*
-         * Do not clear the resume token yet.
-         * Some potion actions update the DOM first
-         * and reload the page a fraction later.
-         *
-         * The token is cleared after the next
-         * successful attack or when battle stops.
-         */
-        log(
-          `${potion.name} was used successfully. Auto-battle will continue automatically.`,
-        );
+        log(`${potion.name} was used successfully. Auto-battle will continue.`);
 
         renderPotionLists();
         updateMetrics();
@@ -1216,15 +976,12 @@
       }
     }
 
-    state.expectingPotionRefresh = false;
-
-    clearPotionResumeState();
+    clearResumeState();
 
     renderPotionLists();
 
     log(
-      `${potion.name} was clicked, ` +
-        `but no resource or quantity change was detected.`,
+      `${potion.name} was clicked, but no resource or quantity change was detected.`,
     );
 
     return false;
@@ -1300,12 +1057,6 @@
     while (state.running && Date.now() - startedAt < 6500) {
       await sleep(110);
 
-      if (isMonsterDead()) {
-        return {
-          type: "monster-dead",
-        };
-      }
-
       const damage = getCurrentDamage();
 
       if (
@@ -1317,6 +1068,12 @@
           type: "damage",
 
           damage: damage - beforeDamage,
+        };
+      }
+
+      if (isMonsterDead()) {
+        return {
+          type: "monster-dead",
         };
       }
 
@@ -1342,13 +1099,7 @@
   }
 
   async function ensurePlayerIsAlive() {
-    const health = getCurrentHealth();
-
-    /*
-     * Only an explicitly detected value
-     * of zero is treated as defeat.
-     */
-    if (health !== 0) {
+    if (getCurrentHealth() !== 0) {
       return true;
     }
 
@@ -1374,22 +1125,8 @@
     return true;
   }
 
-  /*
-   * Attack priority:
-   *
-   * 1. Use Attack 1 whenever possible.
-   * 2. If Attack 1 lacks mana, use a mana potion.
-   * 3. If Attack 1 lacks stamina and stamina is not zero,
-   *    try Attack 2.
-   * 4. If Attack 2 also costs too much stamina,
-   *    try Attack 3.
-   * 5. If Attack 3 also costs too much stamina,
-   *    use a stamina potion.
-   */
   async function prepareNextAttack() {
-    const attacksChanged = discoverAttacks();
-
-    if (attacksChanged) {
+    if (discoverAttacks()) {
       renderAttackOptions();
     }
 
@@ -1412,11 +1149,11 @@
     const mana = getCurrentMana();
 
     /*
-     * This branch is used after the server
-     * reported insufficient stamina.
+     * Continue a stamina fallback chain that
+     * was started after a server error.
      */
     if (state.forcedAttackIndex > 0) {
-      let fallbackBlockedByMana = false;
+      let manaBlocked = false;
 
       for (let index = state.forcedAttackIndex; index < 3; index += 1) {
         const attack = attacks[index];
@@ -1430,7 +1167,7 @@
         }
 
         if (Number.isFinite(mana) && mana < attack.costs.mana) {
-          fallbackBlockedByMana = true;
+          manaBlocked = true;
 
           if (!state.settings.autoMana) {
             continue;
@@ -1440,7 +1177,7 @@
 
           if (!used) {
             stop(
-              `Attack ${index + 1} requires mana, but no enabled mana potion is available.`,
+              `Attack ${index + 1} requires mana, but no mana potion is available.`,
               "error",
             );
 
@@ -1460,9 +1197,9 @@
         };
       }
 
-      if (fallbackBlockedByMana) {
+      if (manaBlocked) {
         stop(
-          "A fallback attack has enough stamina but requires more mana. Enable automatic mana potions or select another fallback attack.",
+          "A fallback attack requires more mana. Enable mana potions or select another attack.",
         );
 
         return null;
@@ -1492,16 +1229,13 @@
     }
 
     /*
-     * Attack 1 always has priority.
-     * Mana is restored before switching
-     * away from Attack 1.
+     * Attack 1 has absolute priority.
+     * Restore mana before switching away from it.
      */
     if (Number.isFinite(mana) && mana < primary.costs.mana) {
       if (!state.settings.autoMana) {
         stop(
-          `Attack 1 requires ` +
-            `${formatNumber(primary.costs.mana)} mana, but only ` +
-            `${formatNumber(mana)} is available.`,
+          `Attack 1 requires ${formatNumber(primary.costs.mana)} mana, but only ${formatNumber(mana)} is available.`,
         );
 
         return null;
@@ -1523,38 +1257,30 @@
       };
     }
 
-    /*
-     * When stamina cannot be read,
-     * attempt Attack 1 and rely on
-     * the server response if necessary.
-     */
     if (!Number.isFinite(stamina) || stamina >= primary.costs.stamina) {
       return {
         attack: primary,
+
         index: 0,
       };
     }
 
-    let fallbackBlockedByMana = false;
+    let manaBlocked = false;
 
     /*
-     * Attack 2 and Attack 3 are checked
-     * only while stamina is above zero.
+     * If Attack 1 lacks stamina and current
+     * stamina is not zero, test Attack 2 and 3.
      */
     if (stamina > 0) {
-      for (let index = 1; index <= 2; index += 1) {
+      for (let index = 1; index < 3; index += 1) {
         const attack = attacks[index];
 
-        if (!attack) {
-          continue;
-        }
-
-        if (stamina < attack.costs.stamina) {
+        if (!attack || stamina < attack.costs.stamina) {
           continue;
         }
 
         if (Number.isFinite(mana) && mana < attack.costs.mana) {
-          fallbackBlockedByMana = true;
+          manaBlocked = true;
 
           if (!state.settings.autoMana) {
             continue;
@@ -1564,7 +1290,7 @@
 
           if (!used) {
             stop(
-              `Attack ${index + 1} has enough stamina but requires mana, and no enabled mana potion is available.`,
+              `Attack ${index + 1} requires mana, but no mana potion is available.`,
               "error",
             );
 
@@ -1579,9 +1305,7 @@
         }
 
         log(
-          `Attack 1 is too expensive. ` +
-            `Using Attack ${index + 1}: ` +
-            `${attack.name}.`,
+          `Attack 1 is too expensive. Using Attack ${index + 1}: ${attack.name}.`,
         );
 
         return {
@@ -1591,25 +1315,19 @@
       }
     }
 
-    if (fallbackBlockedByMana) {
-      stop(
-        "A fallback attack has enough stamina but requires more mana. Enable automatic mana potions or select another fallback attack.",
-      );
+    if (manaBlocked) {
+      stop("A fallback attack has enough stamina but requires more mana.");
 
       return null;
     }
 
     /*
-     * Only after all three attacks fail
-     * because of stamina is a stamina
-     * potion used.
+     * Only use a stamina potion after all
+     * three selected attacks were rejected.
      */
     if (!state.settings.autoStamina) {
       stop(
-        `Current stamina ` +
-          `(${formatNumber(
-            stamina,
-          )}) is not enough for any selected attack, and automatic stamina potions are disabled.`,
+        `Current stamina (${formatNumber(stamina)}) is not enough for any selected attack.`,
       );
 
       return null;
@@ -1651,8 +1369,6 @@
 
       if (!used) {
         stop("No enabled health potion is available.", "error");
-      } else {
-        await sleep(650);
       }
 
       return;
@@ -1667,33 +1383,26 @@
 
       const used = await usePotion("mana");
 
-      if (!used) {
-        stop("No enabled mana potion is available.", "error");
-      } else {
+      if (used) {
         state.forcedAttackIndex = attackIndex;
 
         await sleep(650);
+      } else {
+        stop("No enabled mana potion is available.", "error");
       }
 
       return;
     }
 
     if (outcome.type === "stamina") {
-      const stamina = getCurrentStamina();
-
       const nextAttack =
         attackIndex < 2 ? getSelectedAttack(attackIndex + 1) : null;
 
-      /*
-       * If stamina is not explicitly zero,
-       * try the next fallback attack first.
-       */
-      if (stamina !== 0 && nextAttack) {
+      if (getCurrentStamina() !== 0 && nextAttack) {
         state.forcedAttackIndex = attackIndex + 1;
 
         log(
-          `Attack ${attackIndex + 1} failed because of stamina. ` +
-            `Trying Attack ${attackIndex + 2}.`,
+          `Attack ${attackIndex + 1} failed because of stamina. Trying Attack ${attackIndex + 2}.`,
         );
 
         return;
@@ -1707,12 +1416,12 @@
 
       const used = await usePotion("stamina");
 
-      if (!used) {
-        stop("No enabled stamina potion is available.", "error");
-      } else {
+      if (used) {
         state.forcedAttackIndex = 0;
 
         await sleep(650);
+      } else {
+        stop("No enabled stamina potion is available.", "error");
       }
 
       return;
@@ -1808,13 +1517,10 @@
   }
 
   async function runAutoBattle(resumeData = null) {
-    /*
-     * A click event may be passed when the function
-     * is used directly as an event listener.
-     */
     if (resumeData instanceof Event) {
       resumeData = null;
     }
+
     if (state.running) {
       return;
     }
@@ -1833,7 +1539,7 @@
     const currentMonsterKey = getMonsterKey();
 
     if (resumeData?.monsterKey && resumeData.monsterKey !== currentMonsterKey) {
-      clearPotionResumeState();
+      clearResumeState();
 
       setStatus(
         "Auto-battle could not resume because the monster changed.",
@@ -1846,37 +1552,26 @@
     state.monsterKey = currentMonsterKey;
 
     if (resumeData) {
-      state.sessionDamage = Number.isFinite(Number(resumeData.sessionDamage))
-        ? Number(resumeData.sessionDamage)
-        : 0;
+      state.sessionDamage = Number(resumeData.sessionDamage) || 0;
 
-      state.lastDamage = Number.isFinite(Number(resumeData.lastDamage))
-        ? Number(resumeData.lastDamage)
-        : 0;
+      state.lastDamage = Number(resumeData.lastDamage) || 0;
 
       state.lastExperienceGain =
         resumeData.lastExperienceGain == null
           ? null
-          : Number.isFinite(Number(resumeData.lastExperienceGain))
-            ? Number(resumeData.lastExperienceGain)
-            : null;
-
-      state.noDamageCount = 0;
-      state.forcedAttackIndex = 0;
+          : Number(resumeData.lastExperienceGain);
     } else {
-      /*
-       * A manually started battle must not inherit
-       * an old potion-resume token.
-       */
-      clearPotionResumeState();
+      clearResumeState();
 
       state.sessionDamage = 0;
+
       state.lastDamage = 0;
+
       state.lastExperienceGain = null;
-      state.noDamageCount = 0;
-      state.forcedAttackIndex = 0;
     }
 
+    state.noDamageCount = 0;
+    state.forcedAttackIndex = 0;
     state.running = true;
 
     updateButtons();
@@ -1890,16 +1585,13 @@
     );
 
     log(
-      `Started with ` +
-        `${formatNumber(getCurrentDamage() || 0)} damage already dealt.`,
+      `Started with ${formatNumber(
+        getCurrentDamage() || 0,
+      )} damage already dealt.`,
     );
 
     try {
       while (state.running) {
-        /*
-         * The automation applies only
-         * to the monster it was started on.
-         */
         if (!state.card?.isConnected || getMonsterKey() !== state.monsterKey) {
           stop("The monster card changed. Auto-battle was stopped.");
 
@@ -1916,7 +1608,7 @@
 
         if (target > 0 && state.sessionDamage >= target) {
           stop(
-            `Target damage of ` + `${formatNumber(target)} was reached.`,
+            `Target damage of ${formatNumber(target)} was reached.`,
             "success",
           );
 
@@ -1924,10 +1616,10 @@
         }
 
         /*
-         * Level-up protection uses:
+         * Level-up protection:
          *
          * remaining EXP <
-         * last damage × multiplier
+         * last EXP gain × multiplier
          */
         if (
           state.settings.stopBeforeLevelUp &&
@@ -1938,31 +1630,21 @@
 
           if (!Number.isFinite(remaining)) {
             stop(
-              "Remaining EXP could not be read. Level-up protection stopped the script for safety.",
+              "Remaining EXP could not be read. Level-up protection stopped the script.",
               "error",
             );
 
             break;
           }
 
-          /*
-           * Stop threshold:
-           *
-           * EXP gained by the last attack
-           * multiplied by the configured factor.
-           */
-          const stopThreshold =
+          const threshold =
             state.lastExperienceGain * state.settings.levelMultiplier;
 
-          if (remaining < stopThreshold) {
+          if (remaining < threshold) {
             stop(
-              `Level-up protection: ` +
-                `${formatNumber(remaining)} EXP remains. ` +
-                `The last attack granted ` +
-                `${formatNumber(
-                  state.lastExperienceGain,
-                )} EXP, resulting in a stop threshold of ` +
-                `${formatNumber(stopThreshold)} EXP.`,
+              `Level-up protection: ${formatNumber(remaining)} EXP remains. ` +
+                `The last attack granted ${formatNumber(state.lastExperienceGain)} EXP, ` +
+                `so the stop threshold is ${formatNumber(threshold)} EXP.`,
               "success",
             );
 
@@ -1970,7 +1652,9 @@
           }
         }
 
-        if (!(await ensurePlayerIsAlive())) {
+        const alive = await ensurePlayerIsAlive();
+
+        if (!alive) {
           break;
         }
 
@@ -1980,11 +1664,6 @@
           break;
         }
 
-        /*
-         * After using a potion,
-         * read all resources and
-         * attack choices again.
-         */
         if (prepared.retry) {
           await sleep(500);
 
@@ -2011,8 +1690,6 @@
             break;
           }
 
-          log(`Attack ${prepared.index + 1} is disabled. Waiting briefly.`);
-
           await sleep(Math.max(1200, state.settings.delayMs));
 
           continue;
@@ -2020,15 +1697,11 @@
 
         const beforeDamage = getCurrentDamage();
 
-        /*
-         * Save the current EXP immediately before
-         * clicking the attack button.
-         */
         const beforeExperience = getExperienceProgress();
 
         const beforeFeedback = getFeedbackText();
 
-        log(`Attack ${prepared.index + 1}: ` + `${prepared.attack.name}.`);
+        log(`Attack ${prepared.index + 1}: ${prepared.attack.name}.`);
 
         button.click();
 
@@ -2042,25 +1715,16 @@
         }
 
         if (outcome.type === "damage") {
-          /*
-           * The battle successfully continued after
-           * the potion. The reload token is no longer needed.
-           */
-          clearPotionResumeState();
-
-          state.expectingPotionRefresh = false;
+          clearResumeState();
 
           state.noDamageCount = 0;
+
           state.forcedAttackIndex = 0;
 
           state.lastDamage = Math.max(0, outcome.damage || 0);
 
           state.sessionDamage += state.lastDamage;
 
-          /*
-           * Wait for the EXP value in the topbar
-           * to update after the successful attack.
-           */
           const afterExperience =
             await waitForExperienceUpdate(beforeExperience);
 
@@ -2071,29 +1735,17 @@
 
           if (Number.isFinite(state.lastExperienceGain)) {
             log(
-              `Hit dealt ` +
-                `${formatNumber(state.lastDamage)} damage and granted ` +
+              `Hit dealt ${formatNumber(state.lastDamage)} damage and granted ` +
                 `${formatNumber(state.lastExperienceGain)} EXP.`,
             );
-          } else {
-            log(
-              `Hit dealt ` +
-                `${formatNumber(state.lastDamage)} damage, but the EXP gain ` +
-                `could not be determined.`,
+          } else if (state.settings.stopBeforeLevelUp) {
+            stop(
+              "The EXP gain from the last attack could not be determined. " +
+                "Level-up protection stopped the script.",
+              "error",
             );
 
-            /*
-             * The level-up guard cannot safely continue
-             * without knowing the last EXP gain.
-             */
-            if (state.settings.stopBeforeLevelUp) {
-              stop(
-                "The EXP gain from the last attack could not be determined. Level-up protection stopped the script for safety.",
-                "error",
-              );
-
-              break;
-            }
+            break;
           }
 
           updateMetrics();
@@ -2108,7 +1760,7 @@
     } catch (error) {
       console.error("[Monster Auto Battle]", error);
 
-      stop(`Error: ` + `${error?.message || error}`, "error");
+      stop(`Error: ${error?.message || error}`, "error");
     } finally {
       state.running = false;
 
@@ -2120,17 +1772,12 @@
   function stop(message = "Stopped manually.", tone = "idle") {
     state.running = false;
 
-    state.expectingPotionRefresh = false;
-
-    /*
-     * Manual stops, errors, target completion and
-     * monster deaths must cancel automatic resuming.
-     */
-    clearPotionResumeState();
+    clearResumeState();
 
     setStatus(message, tone);
 
     log(message);
+
     updateButtons();
   }
 
@@ -2144,27 +1791,6 @@
     style.id = `${ID}-style`;
 
     style.textContent = `
-
-        #tm-monster-auto-battle .mab-potion-main {
-            min-width: 0;
-        }
-
-        #tm-monster-auto-battle .mab-potion-amount {
-          display: flex;
-          align-items: center;
-          gap: 6px;
-          margin-top: 5px;
-          color: #98a4d2;
-          font-size: 10px;
-          font-weight: 600;
-        }
-
-#tm-monster-auto-battle .mab-potion-amount input[type="number"] {
-  width: 68px;
-  min-height: 26px;
-  padding: 3px 6px;
-  font-size: 11px;
-}
       #${ID} {
         margin-top: 14px;
         color: #dfe6ff;
@@ -2246,9 +1872,7 @@
       #${ID} select:focus,
       #${ID} input:focus {
         border-color: #7488ff;
-        box-shadow:
-          0 0 0 2px
-          rgba(116,136,255,.16);
+        box-shadow: 0 0 0 2px rgba(116,136,255,.16);
       }
 
       #${ID} .mab-options,
@@ -2323,6 +1947,10 @@
         background: #191c30;
       }
 
+      #${ID} .mab-potion-main {
+        min-width: 0;
+      }
+
       #${ID} .mab-potion-name {
         overflow: hidden;
         font-size: 11px;
@@ -2330,11 +1958,27 @@
         white-space: nowrap;
       }
 
+      #${ID} .mab-potion-amount {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-top: 5px;
+        color: #98a4d2;
+        font-size: 10px;
+        font-weight: 600;
+      }
+
+      #${ID} .mab-potion-amount input[type="number"] {
+        width: 68px;
+        min-height: 26px;
+        padding: 3px 6px;
+        font-size: 11px;
+      }
+
       #${ID} .mab-quantity {
         color: #98a4d2;
         font-size: 10px;
-        font-variant-numeric:
-          tabular-nums;
+        font-variant-numeric: tabular-nums;
       }
 
       #${ID} .mab-moves {
@@ -2425,10 +2069,7 @@
       #${ID} .mab-metrics {
         display: grid;
         grid-template-columns:
-          repeat(
-            4,
-            minmax(0,1fr)
-          );
+          repeat(4,minmax(0,1fr));
         gap: 7px;
         margin-top: 10px;
       }
@@ -2451,8 +2092,7 @@
         display: block;
         margin-top: 3px;
         font-size: 12px;
-        font-variant-numeric:
-          tabular-nums;
+        font-variant-numeric: tabular-nums;
       }
 
       #${ID} .mab-log {
@@ -2512,7 +2152,6 @@
       >
         <summary class="mab-header">
           <span>🤖 Auto Battle</span>
-
           <span class="mab-note">
             Current monster only
           </span>
@@ -2523,14 +2162,10 @@
             <label class="mab-field">
               <span>
                 Attack 1
-                <small>
-                  Primary attack
-                </small>
+                <small>Primary attack</small>
               </span>
 
-              <select
-                id="mabAttack1"
-              ></select>
+              <select id="mabAttack1"></select>
             </label>
 
             <label class="mab-field">
@@ -2541,9 +2176,7 @@
                 </small>
               </span>
 
-              <select
-                id="mabAttack2"
-              ></select>
+              <select id="mabAttack2"></select>
             </label>
 
             <label class="mab-field">
@@ -2554,9 +2187,7 @@
                 </small>
               </span>
 
-              <select
-                id="mabAttack3"
-              ></select>
+              <select id="mabAttack3"></select>
             </label>
 
             <label class="mab-field">
@@ -2725,22 +2356,18 @@
                 Session damage
               </span>
 
-              <strong
-                id="mabSession"
-              >
+              <strong id="mabSession">
                 0
               </strong>
             </div>
 
             <div>
               <span>
-                 Last EXP gain
+                Last EXP gain
               </span>
 
-              <strong
-                id="mabLast"
-              >
-                0
+              <strong id="mabLast">
+                —
               </strong>
             </div>
 
@@ -2749,9 +2376,7 @@
                 Remaining EXP
               </span>
 
-              <strong
-                id="mabExp"
-              >
+              <strong id="mabExp">
                 —
               </strong>
             </div>
@@ -2761,18 +2386,14 @@
                 Stamina / Mana / HP
               </span>
 
-              <strong
-                id="mabResources"
-              >
+              <strong id="mabResources">
                 — / — / —
               </strong>
             </div>
           </div>
 
           <details>
-            <summary>
-              Log
-            </summary>
+            <summary>Log</summary>
 
             <div
               id="mabLog"
@@ -2807,9 +2428,9 @@
       select.replaceChildren();
 
       for (const groupName of ["Standard Attacks", "Class Attacks"]) {
-        const attacks = state.attacks.filter(
-          (attack) => attack.group === groupName,
-        );
+        const attacks = state.attacks.filter((attack) => {
+          return attack.group === groupName;
+        });
 
         if (!attacks.length) {
           continue;
@@ -2835,7 +2456,7 @@
           option.value = attack.key;
 
           option.textContent = costs.length
-            ? `${attack.name} · ` + costs.join(" / ")
+            ? `${attack.name} · ${costs.join(" / ")}`
             : attack.name;
 
           option.selected = attack.key === state.settings.attackKeys[index];
@@ -2848,8 +2469,22 @@
     }
   }
 
+  function renderPotionLists() {
+    if (!state.panel) {
+      return;
+    }
+
+    discoverPotions();
+
+    renderPotionList("stamina", "#mabStaminaList");
+
+    renderPotionList("mana", "#mabManaList");
+
+    renderPotionList("health", "#mabHealthList");
+  }
+
   function renderPotionList(type, selector) {
-    const container = state.panel.querySelector(selector);
+    const container = state.panel?.querySelector(selector);
 
     if (!container) {
       return;
@@ -2859,7 +2494,9 @@
 
     const potions = (state.settings.potionOrder[type] || [])
       .map((key) => {
-        return state.potions.find((potion) => potion.key === key);
+        return state.potions.find((potion) => {
+          return potion.key === key;
+        });
       })
       .filter(Boolean);
 
@@ -2908,11 +2545,6 @@
 
       main.appendChild(name);
 
-      /*
-       * Show an amount field only for:
-       * - Small Stamina Potion
-       * - Mana Potion S
-       */
       if (supportsMultiplePotionUse(potion)) {
         const amountRow = document.createElement("label");
 
@@ -2927,15 +2559,17 @@
         amountInput.type = "number";
 
         amountInput.min = "1";
+
         amountInput.step = "1";
 
         amountInput.value = String(getConfiguredPotionAmount(potion));
 
         amountInput.title = "Number of potions to use at once";
 
-        const saveAmount = () => {
+        amountInput.addEventListener("change", () => {
           const amount = Math.max(
             1,
+
             Math.floor(Number(amountInput.value) || 1),
           );
 
@@ -2944,14 +2578,8 @@
           state.settings.potionUseAmount[potion.key] = amount;
 
           saveSettings();
-        };
+        });
 
-        amountInput.addEventListener("change", saveAmount);
-
-        /*
-         * Stop clicks inside the amount field
-         * from triggering other row controls.
-         */
         amountInput.addEventListener("click", (event) => {
           event.stopPropagation();
         });
@@ -2960,113 +2588,6 @@
 
         main.appendChild(amountRow);
       }
-
-      const quantity = document.createElement("div");
-
-      quantity.className = "mab-quantity";
-
-      quantity.textContent = `×${formatNumber(potion.quantity)}`;
-
-      const moves = document.createElement("div");
-
-      moves.className = "mab-moves";
-
-      const up = document.createElement("button");
-
-      const down = document.createElement("button");
-
-      for (const moveButton of [up, down]) {
-        moveButton.type = "button";
-
-        moveButton.className = "mab-move";
-      }
-
-      up.textContent = "↑";
-      up.title = "Increase priority";
-
-      up.disabled = index === 0;
-
-      down.textContent = "↓";
-      down.title = "Decrease priority";
-
-      down.disabled = index === potions.length - 1;
-
-      up.addEventListener("click", () => {
-        movePotion(type, index, -1);
-      });
-
-      down.addEventListener("click", () => {
-        movePotion(type, index, 1);
-      });
-
-      moves.append(up, down);
-
-      row.append(enabled, main, quantity, moves);
-
-      container.appendChild(row);
-    });
-  }
-
-  function renderPotionList(type, selector) {
-    const container = state.panel.querySelector(selector);
-
-    if (!container) {
-      return;
-    }
-
-    container.replaceChildren();
-
-    const potions = (state.settings.potionOrder[type] || [])
-      .map((key) => {
-        return state.potions.find((potion) => potion.key === key);
-      })
-      .filter(Boolean);
-
-    if (!potions.length) {
-      const empty = document.createElement("div");
-
-      empty.className = "mab-empty";
-
-      empty.textContent = "No matching potion was found.";
-
-      container.appendChild(empty);
-
-      return;
-    }
-
-    potions.forEach((potion, index) => {
-      const row = document.createElement("div");
-
-      row.className = "mab-potion-row";
-
-      const enabled = document.createElement("input");
-
-      enabled.type = "checkbox";
-
-      enabled.checked = state.settings.potionEnabled[potion.key] !== false;
-
-      enabled.title = "Allow this potion";
-
-      enabled.addEventListener("change", () => {
-        state.settings.potionEnabled[potion.key] = enabled.checked;
-
-        saveSettings();
-      });
-        saveSettings();
-      });
-
-      const main = document.createElement("div");
-
-      main.className = "mab-potion-main";
-
-      const name = document.createElement("div");
-      const name = document.createElement("div");
-
-      name.className = "mab-potion-name";
-
-      name.textContent = potion.name;
-
-      name.title = potion.description;
 
       const quantity = document.createElement("div");
 
@@ -3094,6 +2615,7 @@
       up.disabled = index === 0;
 
       down.textContent = "↓";
+
       down.title = "Decrease priority";
 
       down.disabled = index === potions.length - 1;
@@ -3108,7 +2630,7 @@
 
       moves.append(up, down);
 
-      row.append(enabled, name, quantity, moves);
+      row.append(enabled, main, quantity, moves);
 
       container.appendChild(row);
     });
@@ -3138,7 +2660,7 @@
 
     element.textContent = message;
 
-    element.className = `mab-status ` + `mab-status-${tone}`;
+    element.className = `mab-status mab-status-${tone}`;
   }
 
   function log(message) {
@@ -3184,24 +2706,18 @@
       ? formatNumber(state.lastExperienceGain)
       : "—";
 
-    const remainingExperience = getRemainingExperience();
+    const remaining = getRemainingExperience();
 
     state.panel.querySelector("#mabExp").textContent = Number.isFinite(
-      remainingExperience,
+      remaining,
     )
-      ? formatNumber(remainingExperience)
+      ? formatNumber(remaining)
       : "—";
 
-    const stamina = getCurrentStamina();
-
-    const mana = getCurrentMana();
-
-    const health = getCurrentHealth();
-
     state.panel.querySelector("#mabResources").textContent = [
-      stamina,
-      mana,
-      health,
+      getCurrentStamina(),
+      getCurrentMana(),
+      getCurrentHealth(),
     ]
       .map((value) => {
         return Number.isFinite(value) ? formatNumber(value) : "—";
@@ -3237,7 +2753,7 @@
       setStatus("Attacks and potions were refreshed.", "success");
     });
 
-    const formSelectors = [
+    const selectors = [
       "#mabAttack1",
       "#mabAttack2",
       "#mabAttack3",
@@ -3250,14 +2766,42 @@
       "#mabMultiplier",
     ];
 
-    for (const selector of formSelectors) {
+    for (const selector of selectors) {
       const element = state.panel.querySelector(selector);
 
       element.addEventListener("change", readForm);
 
-      if (element.matches('input[type="text"], ' + 'input[type="number"]')) {
+      if (element.matches('input[type="text"], input[type="number"]')) {
         element.addEventListener("input", readForm);
       }
+    }
+  }
+
+  async function resumeAfterReload() {
+    if (state.running || !state.card) {
+      return;
+    }
+
+    const resumeData = loadResumeState();
+
+    if (!resumeData) {
+      return;
+    }
+
+    if (resumeData.monsterKey !== getMonsterKey()) {
+      clearResumeState();
+
+      setStatus("Auto-battle was not resumed because the monster changed.");
+
+      return;
+    }
+
+    setStatus("Potion use completed. Resuming auto-battle...", "running");
+
+    await sleep(500);
+
+    if (!state.running) {
+      void runAutoBattle(resumeData);
     }
   }
 
@@ -3272,17 +2816,11 @@
       return;
     }
 
-    const incomingMonsterKey = getMonsterKey(card);
+    const incomingKey = getMonsterKey(card);
 
     const sameRunningMonster =
-      state.running &&
-      state.monsterKey &&
-      incomingMonsterKey === state.monsterKey;
+      state.running && state.monsterKey && incomingKey === state.monsterKey;
 
-    /*
-     * A potion may rebuild the monster card.
-     * Continue when it is still the same monster.
-     */
     if (state.running && !sameRunningMonster) {
       stop("The monster changed. Auto-battle was stopped.");
     }
@@ -3298,10 +2836,6 @@
 
     state.panel = createPanel();
 
-    /*
-     * Append the controller to the bottom
-     * of the current monster card.
-     */
     card.appendChild(state.panel);
 
     bindEvents();
@@ -3310,50 +2844,31 @@
     updateButtons();
     updateMetrics();
 
-    if (sameRunningMonster) {
-      setStatus(
-        "Battle card refreshed after potion use. Auto-battle is continuing.",
-        "running",
-      );
+    setStatus(
+      sameRunningMonster
+        ? "Battle card refreshed after potion use. Auto-battle is continuing."
+        : "Ready. This configuration applies only to the currently visible monster.",
 
-      log(
-        "The battle card was refreshed, but the same monster is still active. Continuing automatically.",
-      );
-    } else {
-      setStatus(
-        "Ready. This configuration applies only to the currently visible monster.",
-      );
-    }
+      sameRunningMonster ? "running" : "idle",
+    );
 
-    /*
-     * After a full page reload, state.running is false,
-     * but the sessionStorage resume token still exists.
-     */
     if (!state.running) {
       clearTimeout(state.timers.resume);
 
       state.timers.resume = setTimeout(() => {
-        void resumeAfterPotionReload();
+        void resumeAfterReload();
       }, 400);
     }
   }
 
   const observer = new MutationObserver((mutations) => {
-    /*
-     * Re-mount if the battle card
-     * has been replaced.
-     */
     if (!document.getElementById(ID)) {
       clearTimeout(state.timers.mount);
 
       state.timers.mount = setTimeout(mount, 150);
     }
 
-    /*
-     * Refresh attacks when the
-     * current monster card changes.
-     */
-    const attacksChanged = mutations.some((mutation) => {
+    const attackChanged = mutations.some((mutation) => {
       const target =
         mutation.target instanceof Element
           ? mutation.target
@@ -3375,43 +2890,32 @@
       });
     });
 
-    if (attacksChanged && state.panel) {
+    if (attackChanged && state.panel) {
       clearTimeout(state.timers.attacks);
 
       state.timers.attacks = setTimeout(() => {
         if (discoverAttacks()) {
           renderAttackOptions();
-
-          setStatus(
-            "The current monster card attacks were refreshed.",
-            "success",
-          );
         }
       }, 180);
     }
 
-    /*
-     * Refresh potion quantities from
-     * both the drawer and quick-use bar.
-     */
-    const potionsChanged = mutations.some((mutation) => {
+    const potionChanged = mutations.some((mutation) => {
       const target =
         mutation.target instanceof Element
           ? mutation.target
           : mutation.target.parentElement;
 
       return target?.closest?.(
-        [
-          "#battleDrawer",
-          "#ds-combat-potion-quick-use",
-          ".potion-card",
-          ".potion-qty-left",
+        "#battleDrawer, " +
+          "#ds-combat-potion-quick-use, " +
+          ".potion-card, " +
+          ".potion-qty-left, " +
           ".ds-potion-count",
-        ].join(", "),
       );
     });
 
-    if (potionsChanged && state.panel) {
+    if (potionChanged && state.panel) {
       clearTimeout(state.timers.potions);
 
       state.timers.potions = setTimeout(() => {
@@ -3420,22 +2924,21 @@
       }, 250);
     }
 
-    /*
-     * Update displayed stamina,
-     * mana, health and EXP.
-     */
-    const resourcesChanged = mutations.some((mutation) => {
+    const resourceChanged = mutations.some((mutation) => {
       const target =
         mutation.target instanceof Element
           ? mutation.target
           : mutation.target.parentElement;
 
       return target?.closest?.(
-        [SEL.stamina, SEL.playerHp, SEL.playerMana, ".gtb-exp"].join(", "),
+        `${SEL.stamina}, ` +
+          `${SEL.playerHp}, ` +
+          `${SEL.playerMana}, ` +
+          ".gtb-exp",
       );
     });
 
-    if (resourcesChanged && state.panel) {
+    if (resourceChanged && state.panel) {
       clearTimeout(state.timers.metrics);
 
       state.timers.metrics = setTimeout(updateMetrics, 100);
