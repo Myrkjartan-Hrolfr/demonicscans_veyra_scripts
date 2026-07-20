@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Monster Auto Battle - 3 Attack Fallback
 // @namespace    http://tampermonkey.net/
-// @version      1.4.1
+// @version      1.4.2
 // @description  Auto-battle for the current monster with three attacks, potion priorities, target damage, and level-up protection.
 // @match        https://demonicscans.org/battle.php*
 // @grant        none
@@ -15,7 +15,7 @@
   const STORE_KEY = `${ID}:settings:v6:${location.host}:${location.pathname}`;
 
   const RESUME_KEY = `${ID}:resume:v3:${location.host}:${location.pathname}`;
-
+  const MAX_RATE_RETRIES = 8;
   const SEL = {
     monsterCard: '.battle-card.monster-card',
     attack: 'button.attack-btn',
@@ -31,7 +31,6 @@
 
   const DEFAULTS = {
     attackKeys: ['', '', ''],
-
     autoStamina: false,
     autoMana: false,
     autoHealth: false,
@@ -40,7 +39,7 @@
     levelMultiplier: 2,
 
     targetDamage: '0',
-    delayMs: 1200,
+    delayMs: 100,
     collapsed: false,
 
     potionEnabled: {},
@@ -146,6 +145,59 @@
     }
 
     return match[0].trim().startsWith('-') ? -number : number;
+  }
+
+  function parseGameNumber(value) {
+    if (typeof value === 'number') {
+      return Number.isFinite(value) ? Math.round(value) : null;
+    }
+
+    const match = String(value ?? '').match(/(-?[\d.,]+)\s*([kKmMbBtTqQ])?/);
+
+    if (!match) {
+      return null;
+    }
+
+    const suffix = String(match[2] || '').toLowerCase();
+
+    /*
+     * Without an abbreviation, use the existing
+     * integer parser because game numbers normally
+     * contain comma or dot thousands separators.
+     */
+    if (!suffix) {
+      return parseInteger(match[1]);
+    }
+
+    const normalized = match[1].replace(/,/g, '');
+
+    const number = Number.parseFloat(normalized);
+
+    if (!Number.isFinite(number)) {
+      return null;
+    }
+
+    const multipliers = {
+      k: 1e3,
+      m: 1e6,
+      b: 1e9,
+      t: 1e12,
+      q: 1e15,
+    };
+
+    return Math.round(number * multipliers[suffix]);
+  }
+
+  function firstGameNumber(...values) {
+    for (const value of values) {
+      const number = parseGameNumber(value);
+
+      if (Number.isFinite(number)) {
+        return number;
+      }
+    }
+
+    return null;
   }
 
   function parseFraction(value) {
@@ -366,16 +418,19 @@
       button.textContent?.trim() ||
       'Unnamed Attack';
 
-    const skillId = button.dataset.skillId ?? '';
+    const skillId = String(button.dataset.skillId ?? '');
+
+    const costs = getAttackCosts(button);
 
     return {
       key: `${skillId}|${name}`,
 
+      skillId,
       name,
 
       group: button.closest('.class-skill-bar') ? 'Class Attacks' : 'Standard Attacks',
 
-      costs: getAttackCosts(button),
+      costs,
     };
   }
 
@@ -439,6 +494,478 @@
         return attackFromButton(button).key === key;
       }) || null
     );
+  }
+
+  function getFastAttackContext(button) {
+    const urlParams = new URLSearchParams(location.search);
+
+    const getHiddenValue = (name) => {
+      return document.querySelector(`input[name="${name}"]`)?.value || '';
+    };
+
+    const dgmid = urlParams.get('dgmid') || button?.dataset?.dgmid || getHiddenValue('dgmid');
+
+    const instanceId = urlParams.get('instance_id') || button?.dataset?.instanceId || getHiddenValue('instance_id');
+
+    if (!dgmid || !instanceId) {
+      return null;
+    }
+
+    return {
+      dgmid: String(dgmid),
+
+      instanceId: String(instanceId),
+    };
+  }
+
+  function getRetryAfterMilliseconds(response) {
+    const value = response.headers.get('Retry-After');
+
+    if (!value) {
+      return null;
+    }
+
+    const seconds = Number.parseInt(String(value).trim(), 10);
+
+    if (!Number.isFinite(seconds) || seconds <= 0) {
+      return null;
+    }
+
+    return Math.min(seconds * 1000, 120000);
+  }
+
+  function parseFastAttackResponse(response, raw) {
+    let data = null;
+
+    try {
+      data = JSON.parse(raw);
+    } catch (_) {
+      /*
+       * Some server responses are HTML or plain text.
+       */
+    }
+
+    const message = String(data?.message ?? raw ?? '');
+
+    const lowerMessage = message.toLowerCase();
+
+    const strongDamage = String(raw).match(/<strong>\s*([\d,.\s]+)\s*<\/strong>/i)?.[1];
+
+    const messageDamage = message.match(/(?:dealt|hit(?:\s+for)?)\s*([\d,.\s]+)\s*(?:damage|dmg)/i)?.[1];
+
+    const messageExperience = message.match(
+      /(?:gained|granted|received|earned)\s*([\d,.\s]+)\s*(?:exp|experience)\b/i,
+    )?.[1];
+
+    const damage = firstGameNumber(
+      data?.damage,
+      data?.damage_dealt,
+      data?.damageDealt,
+      data?.hit_damage,
+      data?.hitDamage,
+      strongDamage,
+      messageDamage,
+    );
+
+    const totalDamage = firstGameNumber(
+      data?.totaldmgdealt,
+      data?.total_damage_dealt,
+      data?.totalDamageDealt,
+      data?.total_damage,
+      data?.totalDamage,
+    );
+
+    const experienceGain = firstGameNumber(
+      data?.exp_gain,
+      data?.expGained,
+      data?.experience_gain,
+      data?.experienceGained,
+      data?.experience_gained,
+      messageExperience,
+    );
+
+    const userHpAfter = firstGameNumber(
+      data?.retaliation?.user_hp_after,
+
+      data?.user_hp_after,
+      data?.userHpAfter,
+    );
+
+    const staminaAfter = firstGameNumber(data?.stamina_after, data?.staminaAfter, data?.current_stamina);
+
+    const manaAfter = firstGameNumber(data?.mana_after, data?.manaAfter, data?.current_mana);
+
+    const explicitFailure = data?.status === 'error' || data?.success === false;
+
+    const ok = !explicitFailure && (response.ok || data?.status === 'success' || data?.success === true);
+
+    const monsterDead =
+      data?.monster_dead === true ||
+      data?.monsterDead === true ||
+      lowerMessage.includes('is dead') ||
+      lowerMessage.includes('defeated') ||
+      lowerMessage.includes('monster died') ||
+      lowerMessage.includes('already dead') ||
+      lowerMessage.includes('you killed') ||
+      lowerMessage.includes('has been slain') ||
+      lowerMessage.includes('0 hp');
+
+    return {
+      ok,
+      data,
+      message,
+
+      status: response.status,
+
+      retryAfterMs: getRetryAfterMilliseconds(response),
+
+      damage,
+      totalDamage,
+      experienceGain,
+
+      userHpAfter,
+      staminaAfter,
+      manaAfter,
+
+      monsterDead,
+
+      feedbackType: classifyFeedback(lowerMessage),
+    };
+  }
+
+  function setLiveText(selector, text) {
+    const element = document.querySelector(selector);
+
+    if (element && text != null) {
+      element.textContent = String(text);
+    }
+  }
+
+  function applyFastAttackResult(result, beforeDamage) {
+    let totalDamage = result.totalDamage;
+
+    if (!Number.isFinite(totalDamage) && Number.isFinite(beforeDamage) && Number.isFinite(result.damage)) {
+      totalDamage = beforeDamage + result.damage;
+    }
+
+    if (Number.isFinite(totalDamage)) {
+      const damageElement = state.card?.querySelector(SEL.damage);
+
+      if (damageElement) {
+        damageElement.textContent = formatNumber(totalDamage);
+      }
+    }
+
+    if (Number.isFinite(result.staminaAfter)) {
+      setLiveText(SEL.stamina, formatNumber(result.staminaAfter));
+    }
+
+    if (Number.isFinite(result.userHpAfter)) {
+      const healthElement = document.querySelector(SEL.playerHp);
+
+      const health = parseFraction(healthElement?.textContent);
+
+      if (healthElement && health) {
+        healthElement.textContent = `💚 ${formatNumber(result.userHpAfter)} / ${formatNumber(health.maximum)} HP`;
+      }
+    }
+
+    if (Number.isFinite(result.manaAfter)) {
+      const manaElement = document.querySelector(SEL.playerMana);
+
+      const mana = parseFraction(manaElement?.textContent);
+
+      if (manaElement && mana) {
+        manaElement.textContent = `💠 ${formatNumber(result.manaAfter)} / ${formatNumber(mana.maximum)} MP`;
+      }
+    }
+  }
+
+  async function fetchDashboardSnapshot() {
+    try {
+      const response = await fetch('/game_dash.php', {
+        credentials: 'same-origin',
+
+        cache: 'no-store',
+
+        headers: {
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+      });
+
+      if (!response.ok) {
+        return null;
+      }
+
+      const html = await response.text();
+
+      const snapshotDocument = new DOMParser().parseFromString(html, 'text/html');
+
+      /*
+       * Copy the updated resource values into
+       * the currently visible battle page.
+       */
+      for (const selector of [SEL.stamina, SEL.playerHp, SEL.playerMana, SEL.exp]) {
+        const source = snapshotDocument.querySelector(selector);
+
+        const target = document.querySelector(selector);
+
+        if (source && target) {
+          target.textContent = source.textContent;
+        }
+      }
+
+      const experience = parseFraction(snapshotDocument.querySelector(SEL.exp)?.textContent);
+
+      return {
+        experience: experience
+          ? {
+              current: experience.current,
+
+              maximum: experience.maximum,
+
+              remaining: Math.max(0, experience.maximum - experience.current),
+            }
+          : null,
+      };
+    } catch (error) {
+      console.warn('[Monster Auto Battle] Could not refresh dashboard values.', error);
+
+      return null;
+    }
+  }
+
+  function applyKnownExperienceGain(beforeExperience, experienceGain) {
+    if (!beforeExperience || !Number.isFinite(experienceGain) || experienceGain <= 0) {
+      return null;
+    }
+
+    const newCurrent = beforeExperience.current + experienceGain;
+
+    /*
+     * A level rollover needs the new maximum and
+     * therefore cannot safely be synthesized.
+     */
+    if (newCurrent >= beforeExperience.maximum) {
+      return null;
+    }
+
+    const experienceElement = document.querySelector(SEL.exp);
+
+    if (experienceElement) {
+      experienceElement.textContent = `${formatNumber(newCurrent)} / ${formatNumber(beforeExperience.maximum)}`;
+    }
+
+    return {
+      current: newCurrent,
+
+      maximum: beforeExperience.maximum,
+
+      remaining: beforeExperience.maximum - newCurrent,
+    };
+  }
+
+  async function refreshAfterFastAttack(beforeExperience, experienceGain) {
+    let snapshot = await fetchDashboardSnapshot();
+
+    let afterExperience = snapshot?.experience || null;
+
+    /*
+     * The server may update the dashboard a fraction
+     * later. Retry once when level-up protection is active.
+     */
+    if (
+      state.settings.stopBeforeLevelUp &&
+      beforeExperience &&
+      afterExperience &&
+      afterExperience.current === beforeExperience.current &&
+      afterExperience.maximum === beforeExperience.maximum
+    ) {
+      await sleep(150);
+
+      snapshot = await fetchDashboardSnapshot();
+
+      afterExperience = snapshot?.experience || afterExperience;
+    }
+
+    if (
+      !afterExperience ||
+      (beforeExperience &&
+        afterExperience.current === beforeExperience.current &&
+        afterExperience.maximum === beforeExperience.maximum)
+    ) {
+      afterExperience = applyKnownExperienceGain(beforeExperience, experienceGain) || afterExperience;
+    }
+
+    return afterExperience;
+  }
+
+  async function performFastAttack(attack, button, beforeDamage, beforeExperience) {
+    const context = getFastAttackContext(button);
+
+    /*
+     * Normal non-dungeon battle pages may not expose
+     * dgmid and instance_id. The caller will use the
+     * original button-click method in that case.
+     */
+    if (!context || attack.skillId === '') {
+      return {
+        unsupported: true,
+      };
+    }
+
+    const body = new URLSearchParams();
+
+    body.set('instance_id', context.instanceId);
+
+    body.set('dgmid', context.dgmid);
+
+    body.set('skill_id', attack.skillId);
+
+    body.set('stamina_cost', String(attack.costs.stamina));
+
+    for (let attempt = 0; attempt < MAX_RATE_RETRIES; attempt += 1) {
+      if (!state.running) {
+        return {
+          type: 'timeout',
+          mode: 'api',
+        };
+      }
+
+      let response;
+
+      try {
+        response = await fetch('/damage.php', {
+          method: 'POST',
+
+          credentials: 'same-origin',
+
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+
+            'X-Requested-With': 'XMLHttpRequest',
+          },
+
+          body: body.toString(),
+        });
+      } catch (error) {
+        console.error('[Monster Auto Battle] Fast attack request failed.', error);
+
+        /*
+         * Do not click the button after a network error.
+         * The server may have received the request even
+         * though the response was interrupted.
+         */
+        return {
+          type: 'timeout',
+          mode: 'api',
+          message: String(error),
+        };
+      }
+
+      const raw = await response.text();
+
+      const result = parseFastAttackResponse(response, raw);
+
+      const rateLimited =
+        response.status === 429 ||
+        result.feedbackType === 'cooldown' ||
+        /rate limit|too fast|cooling down/.test(result.message.toLowerCase());
+
+      if (rateLimited) {
+        const wait = result.retryAfterMs || Math.min(20000, 800 * Math.pow(2, attempt));
+
+        setStatus(`Rate limited. Retrying in ${Math.ceil(wait / 1000)} seconds...`, 'running');
+
+        await sleep(wait);
+
+        continue;
+      }
+
+      applyFastAttackResult(result, beforeDamage);
+
+      const afterExperience = await refreshAfterFastAttack(beforeExperience, result.experienceGain);
+
+      let damage = result.damage;
+
+      if (!Number.isFinite(damage) && Number.isFinite(result.totalDamage) && Number.isFinite(beforeDamage)) {
+        damage = Math.max(0, result.totalDamage - beforeDamage);
+      }
+
+      if (result.ok && Number.isFinite(damage) && damage > 0) {
+        return {
+          type: 'damage',
+          mode: 'api',
+
+          damage,
+          totalDamage: result.totalDamage,
+
+          experienceGain: result.experienceGain,
+
+          afterExperience,
+
+          monsterDead: result.monsterDead,
+
+          message: result.message,
+        };
+      }
+
+      if (result.monsterDead) {
+        return {
+          type: 'monster-dead',
+
+          mode: 'api',
+
+          afterExperience,
+
+          message: result.message,
+        };
+      }
+
+      if (result.feedbackType) {
+        return {
+          type: result.feedbackType,
+
+          mode: 'api',
+
+          message: result.message,
+
+          retryAfterMs: result.retryAfterMs,
+        };
+      }
+
+      return {
+        type: 'timeout',
+
+        mode: 'api',
+
+        message: result.message,
+      };
+    }
+
+    return {
+      type: 'cooldown',
+
+      mode: 'api',
+
+      retryAfterMs: 20000,
+    };
+  }
+
+  async function performAttack(attack, button, beforeDamage, beforeExperience, beforeFeedback) {
+    const fastResult = await performFastAttack(attack, button, beforeDamage, beforeExperience);
+
+    if (!fastResult.unsupported) {
+      return fastResult;
+    }
+
+    /*
+     * Fallback for battle modes that do not support
+     * the direct /damage.php request parameters.
+     */
+    button.click();
+
+    return waitForAttackOutcome(beforeDamage, beforeFeedback);
   }
 
   function getPotionType(name, description) {
@@ -1298,9 +1825,15 @@
     }
 
     if (outcome.type === 'cooldown') {
-      log('The server reported a cooldown. Waiting longer.');
+      const wait = Math.max(
+        outcome.retryAfterMs || 1600,
 
-      await sleep(Math.max(1600, state.settings.delayMs));
+        state.settings.delayMs,
+      );
+
+      log(`The server reported a cooldown. Waiting ${Math.ceil(wait / 1000)} seconds.`);
+
+      await sleep(wait);
 
       return;
     }
@@ -1328,9 +1861,9 @@
     state.settings.targetDamage = state.panel.querySelector('#mabTarget')?.value.trim() || '0';
 
     state.settings.delayMs = Math.max(
-      600,
+      0,
 
-      Number(state.panel.querySelector('#mabDelay')?.value) || 1200,
+      Number(state.panel.querySelector('#mabDelay')?.value) || 0,
     );
 
     state.settings.autoStamina = state.panel.querySelector('#mabAutoStamina').checked;
@@ -1542,9 +2075,7 @@
 
         log(`Attack ${prepared.index + 1}: ${prepared.attack.name}.`);
 
-        button.click();
-
-        const outcome = await waitForAttackOutcome(beforeDamage, beforeFeedback);
+        const outcome = await performAttack(prepared.attack, button, beforeDamage, beforeExperience, beforeFeedback);
 
         if (!state.running) {
           break;
@@ -1561,9 +2092,17 @@
 
           state.sessionDamage += state.lastDamage;
 
-          const afterExperience = await waitForExperienceUpdate(beforeExperience);
+          const afterExperience =
+            outcome.mode === 'api' ? outcome.afterExperience : await waitForExperienceUpdate(beforeExperience);
 
-          state.lastExperienceGain = calculateExperienceGain(beforeExperience, afterExperience);
+          const calculatedExperienceGain = calculateExperienceGain(beforeExperience, afterExperience);
+
+          state.lastExperienceGain =
+            Number.isFinite(outcome.experienceGain) && outcome.experienceGain > 0
+              ? outcome.experienceGain
+              : Number.isFinite(calculatedExperienceGain) && calculatedExperienceGain > 0
+                ? calculatedExperienceGain
+                : null;
 
           if (Number.isFinite(state.lastExperienceGain)) {
             log(
@@ -1580,12 +2119,17 @@
           }
 
           updateMetrics();
+          if (outcome.monsterDead) {
+            stop('Monster defeated.', 'success');
+
+            break;
+          }
         } else {
           await handleFailedAttack(outcome, prepared.index);
         }
 
         if (state.running) {
-          await sleep(Math.max(600, state.settings.delayMs));
+          await sleep(Math.max(0, state.settings.delayMs));
         }
       }
     } catch (error) {
@@ -2045,8 +2589,8 @@
               <input
                 id="mabDelay"
                 type="number"
-                min="600"
-                step="100"
+                min="0"
+                step="50"
                 value="${state.settings.delayMs}"
               >
             </label>
