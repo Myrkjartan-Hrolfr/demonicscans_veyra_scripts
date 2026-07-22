@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Auto Farm Profile Manager
 // @namespace    local.auto-farm-profile-manager
-// @version      1.0.0
+// @version      1.0.1
 // @description  Speichert pro Monster eigene Auto-Farm-Einstellungen und wendet sie mit einem Klick an.
-// @match        https://demonicscans.org/battle.php*
+// @match        https://demonicscans.org/active_wave.php*
 // @grant        none
 // @run-at       document-idle
 // @noframes
