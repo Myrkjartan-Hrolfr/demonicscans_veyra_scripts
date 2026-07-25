@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dungeon Location Farmer - Controlled
 // @namespace    http://tampermonkey.net/
-// @version      2.0.0
+// @version      2.0.1
 // @description  Farm all alive monsters with attack fallbacks and configurable potion priorities.
 // @author       [J4F] RacletteCestLavie / enhanced
 // @match        https://demonicscans.org/guild_dungeon_location.php*
@@ -11,9 +11,9 @@
 // ==/UserScript==
 
 (() => {
-  'use strict';
+  "use strict";
 
-  const ID = 'dlf-controlled';
+  const ID = "dlf-controlled";
   const STORE_KEY = `${ID}:settings:v2:${location.host}:${location.pathname}`;
   const RESUME_KEY = `${ID}:resume:v1:${location.host}:${location.pathname}`;
 
@@ -24,36 +24,36 @@
   const POTION_RESULT_TIMEOUT_MS = 8000;
 
   const SEL = {
-    stamina: '#stamina_span',
-    potion: '.potion-use-btn',
-    potionCard: '.potion-card',
-    playerHp: '#pHpText',
+    stamina: "#stamina_span",
+    potion: ".potion-use-btn",
+    potionCard: ".potion-card",
+    playerHp: "#pHpText",
   };
 
   const SKILLS = {
-    slash: { id: '0', name: 'Slash', cost: 1 },
-    'power slash': { id: '-1', name: 'Power Slash', cost: 10 },
-    'heroic slash': { id: '-2', name: 'Heroic Slash', cost: 50 },
-    'ultimate slash': { id: '-3', name: 'Ultimate Slash', cost: 100 },
-    'legendary slash': { id: '-4', name: 'Legendary Slash', cost: 200 },
+    slash: { id: "0", name: "Slash", cost: 1 },
+    "power slash": { id: "-1", name: "Power Slash", cost: 10 },
+    "heroic slash": { id: "-2", name: "Heroic Slash", cost: 50 },
+    "ultimate slash": { id: "-3", name: "Ultimate Slash", cost: 100 },
+    "legendary slash": { id: "-4", name: "Legendary Slash", cost: 200 },
   };
 
   const DEFAULTS = {
-    attackKeys: ['legendary slash', 'ultimate slash', 'slash'],
+    attackKeys: ["legendary slash", "ultimate slash", "slash"],
     attackDelayMs: 100,
 
-    damageMode: 'kill',
-    specificDamage: '1000000',
+    damageMode: "kill",
+    specificDamage: "1000000",
 
     autoStamina: false,
     staminaReserve: 10,
-    staminaFailureAction: 'wait',
+    staminaFailureAction: "wait",
     staminaWaitSeconds: 30,
     maxStaminaWaits: 10,
 
     autoHealth: false,
     healthThreshold: 30,
-    healthFailureAction: 'stop',
+    healthFailureAction: "stop",
 
     potionEnabled: {},
     potionUseAmount: {},
@@ -79,11 +79,13 @@
 
   function loadSettings() {
     try {
-      const saved = JSON.parse(localStorage.getItem(STORE_KEY) || '{}');
+      const saved = JSON.parse(localStorage.getItem(STORE_KEY) || "{}");
       const settings = {
         ...clone(DEFAULTS),
         ...saved,
-        attackKeys: Array.isArray(saved.attackKeys) ? saved.attackKeys.slice(0, 3) : clone(DEFAULTS.attackKeys),
+        attackKeys: Array.isArray(saved.attackKeys)
+          ? saved.attackKeys.slice(0, 3)
+          : clone(DEFAULTS.attackKeys),
         potionEnabled: { ...(saved.potionEnabled || {}) },
         potionUseAmount: { ...(saved.potionUseAmount || {}) },
         potionOrder: {
@@ -98,7 +100,7 @@
 
       return settings;
     } catch (error) {
-      console.warn('[DLF] Could not load settings.', error);
+      console.warn("[DLF] Could not load settings.", error);
       return clone(DEFAULTS);
     }
   }
@@ -107,7 +109,7 @@
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify(state.settings));
     } catch (error) {
-      console.warn('[DLF] Could not save settings.', error);
+      console.warn("[DLF] Could not save settings.", error);
     }
   }
 
@@ -130,21 +132,25 @@
   }
 
   function formatNumber(value) {
-    return Number.isFinite(value) ? new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(value) : '?';
+    return Number.isFinite(value)
+      ? new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value)
+      : "?";
   }
 
   function parseInteger(value) {
-    const match = String(value ?? '').match(/-?\d{1,3}(?:[.,\s]\d{3})+|-?\d+/);
+    const match = String(value ?? "").match(/-?\d{1,3}(?:[.,\s]\d{3})+|-?\d+/);
     if (!match) return null;
 
-    const number = Number(match[0].replace(/\D/g, ''));
+    const number = Number(match[0].replace(/\D/g, ""));
     if (!Number.isFinite(number)) return null;
 
-    return match[0].trim().startsWith('-') ? -number : number;
+    return match[0].trim().startsWith("-") ? -number : number;
   }
 
   function parseFraction(value) {
-    const match = String(value ?? '').match(/(\d{1,3}(?:[.,\s]\d{3})+|\d+)\s*\/\s*(\d{1,3}(?:[.,\s]\d{3})+|\d+)/);
+    const match = String(value ?? "").match(
+      /(\d{1,3}(?:[.,\s]\d{3})+|\d+)\s*\/\s*(\d{1,3}(?:[.,\s]\d{3})+|\d+)/,
+    );
 
     if (!match) return null;
 
@@ -156,24 +162,24 @@
   }
 
   function parseGameNumber(value) {
-    if (typeof value === 'number') {
+    if (typeof value === "number") {
       return Number.isFinite(value) ? Math.round(value) : null;
     }
 
-    const match = String(value ?? '').match(/(-?[\d.,]+)\s*([kKmMbBtTqQ])?/);
+    const match = String(value ?? "").match(/(-?[\d.,]+)\s*([kKmMbBtTqQ])?/);
     if (!match) return null;
 
-    const suffix = String(match[2] || '').toLowerCase();
+    const suffix = String(match[2] || "").toLowerCase();
     if (!suffix) return parseInteger(match[1]);
 
     let numberText = match[1];
 
-    if (numberText.includes('.') && numberText.includes(',')) {
-      const decimal = numberText.lastIndexOf(',') > numberText.lastIndexOf('.') ? ',' : '.';
-      const thousands = decimal === ',' ? '.' : ',';
-      numberText = numberText.split(thousands).join('').replace(decimal, '.');
+    if (numberText.includes(".") && numberText.includes(",")) {
+      const decimal = numberText.lastIndexOf(",") > numberText.lastIndexOf(".") ? "," : ".";
+      const thousands = decimal === "," ? "." : ",";
+      numberText = numberText.split(thousands).join("").replace(decimal, ".");
     } else {
-      numberText = numberText.replace(',', '.');
+      numberText = numberText.replace(",", ".");
     }
 
     const multipliers = { k: 1e3, m: 1e6, b: 1e9, t: 1e12, q: 1e15 };
@@ -191,27 +197,24 @@
   }
 
   function parseTarget(value) {
-    const raw = String(value ?? '')
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g, '');
+    const raw = String(value ?? "").trim().toLowerCase().replace(/\s+/g, "");
     if (!raw) return 0;
 
     const match = raw.match(/^([\d.,]+)([kmbtq])?$/);
     if (!match) return NaN;
 
-    const factors = { '': 1, k: 1e3, m: 1e6, b: 1e9, t: 1e12, q: 1e15 };
-    const suffix = match[2] || '';
+    const factors = { "": 1, k: 1e3, m: 1e6, b: 1e9, t: 1e12, q: 1e15 };
+    const suffix = match[2] || "";
     let numberText = match[1];
 
     if (!suffix) {
-      numberText = numberText.replace(/\D/g, '');
-    } else if (numberText.includes('.') && numberText.includes(',')) {
-      const decimal = numberText.lastIndexOf(',') > numberText.lastIndexOf('.') ? ',' : '.';
-      const thousands = decimal === ',' ? '.' : ',';
-      numberText = numberText.split(thousands).join('').replace(decimal, '.');
+      numberText = numberText.replace(/\D/g, "");
+    } else if (numberText.includes(".") && numberText.includes(",")) {
+      const decimal = numberText.lastIndexOf(",") > numberText.lastIndexOf(".") ? "," : ".";
+      const thousands = decimal === "," ? "." : ",";
+      numberText = numberText.split(thousands).join("").replace(decimal, ".");
     } else {
-      numberText = numberText.replace(',', '.');
+      numberText = numberText.replace(",", ".");
     }
 
     const result = Number(numberText) * factors[suffix];
@@ -220,11 +223,11 @@
 
   function escapeHtml(value) {
     return String(value)
-      .replaceAll('&', '&amp;')
-      .replaceAll('<', '&lt;')
-      .replaceAll('>', '&gt;')
-      .replaceAll('"', '&quot;')
-      .replaceAll("'", '&#039;');
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
   }
 
   function getUserId() {
@@ -237,7 +240,7 @@
     const direct = parseFraction(document.querySelector(SEL.playerHp)?.textContent);
     if (direct) return direct;
 
-    return parseFraction(document.querySelector('.playerhp .muted')?.textContent);
+    return parseFraction(document.querySelector(".playerhp .muted")?.textContent);
   }
 
   function getStaminaFromPage() {
@@ -246,20 +249,20 @@
 
   async function fetchDashboardSnapshot() {
     try {
-      const response = await fetch('/game_dash.php', {
-        credentials: 'same-origin',
-        cache: 'no-store',
-        headers: { 'X-Requested-With': 'XMLHttpRequest' },
+      const response = await fetch("/game_dash.php", {
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: { "X-Requested-With": "XMLHttpRequest" },
       });
 
       if (!response.ok) return null;
 
       const html = await response.text();
-      const snapshotDocument = new DOMParser().parseFromString(html, 'text/html');
+      const snapshotDocument = new DOMParser().parseFromString(html, "text/html");
       const stamina = parseInteger(snapshotDocument.querySelector(SEL.stamina)?.textContent);
       const health =
         parseFraction(snapshotDocument.querySelector(SEL.playerHp)?.textContent) ||
-        parseFraction(snapshotDocument.querySelector('.playerhp .muted')?.textContent);
+        parseFraction(snapshotDocument.querySelector(".playerhp .muted")?.textContent);
 
       const sourceStamina = snapshotDocument.querySelector(SEL.stamina);
       const targetStamina = document.querySelector(SEL.stamina);
@@ -271,7 +274,7 @@
 
       return { stamina, health };
     } catch (error) {
-      console.warn('[DLF] Could not refresh dashboard values.', error);
+      console.warn("[DLF] Could not refresh dashboard values.", error);
       return null;
     }
   }
@@ -284,25 +287,26 @@
   function getAliveMonsters() {
     const monsters = [];
 
-    for (const card of document.querySelectorAll('.mon:not(.dead)')) {
+    for (const card of document.querySelectorAll(".mon:not(.dead)")) {
       const link = card.querySelector("a[href*='battle.php']");
       if (!link) continue;
 
-      const href = link.getAttribute('href') || '';
-      const params = new URLSearchParams(href.split('?')[1] || '');
-      const dgmid = params.get('dgmid');
+      const href = link.getAttribute("href") || "";
+      const params = new URLSearchParams(href.split("?")[1] || "");
+      const dgmid = params.get("dgmid");
       if (!dgmid) continue;
 
       const nameElement =
-        card.querySelector('[style*="font-weight:700"]') || card.querySelector('[style*="font-weight: 700"]');
+        card.querySelector('[style*="font-weight:700"]') ||
+        card.querySelector('[style*="font-weight: 700"]');
 
-      let name = 'Unknown';
+      let name = "Unknown";
       if (nameElement) {
         name = nameElement.textContent.trim();
-        nameElement.querySelectorAll('*').forEach((element) => {
-          name = name.replace(element.textContent, '').trim();
+        nameElement.querySelectorAll("*").forEach((element) => {
+          name = name.replace(element.textContent, "").trim();
         });
-        name = name.replace(/\s+/g, ' ').trim() || 'Unknown';
+        name = name.replace(/\s+/g, " ").trim() || "Unknown";
       }
 
       monsters.push({ dgmid, name });
@@ -316,19 +320,19 @@
 
     try {
       const response = await fetch(`/battle.php?dgmid=${dgmid}&instance_id=${instanceId}`, {
-        credentials: 'same-origin',
-        cache: 'no-store',
+        credentials: "same-origin",
+        cache: "no-store",
       });
 
       const html = await response.text();
-      const battleDocument = new DOMParser().parseFromString(html, 'text/html');
+      const battleDocument = new DOMParser().parseFromString(html, "text/html");
 
       let capDamage = null;
-      for (const block of battleDocument.querySelectorAll('.stat-block')) {
-        const label = block.querySelector('.label');
-        if (!label || label.textContent.trim() !== 'EXP Cap') continue;
+      for (const block of battleDocument.querySelectorAll(".stat-block")) {
+        const label = block.querySelector(".label");
+        if (!label || label.textContent.trim() !== "EXP Cap") continue;
 
-        const note = block.querySelector(':scope > div:not(.label)');
+        const note = block.querySelector(":scope > div:not(.label)");
         const match = note?.textContent?.match(/deal\s*~?([\d.,]+\s*[kKmMbBtTqQ]?)\s*dmg/i);
         if (match) {
           capDamage = parseGameNumber(match[1]);
@@ -338,13 +342,13 @@
 
       let currentDamage = 0;
       if (userId) {
-        for (const row of battleDocument.querySelectorAll('.lb-list .lb-row')) {
-          const link = row.querySelector('.lb-name a');
-          const href = link?.getAttribute('href') || '';
-          const pid = new URLSearchParams(href.split('?')[1] || '').get('pid');
+        for (const row of battleDocument.querySelectorAll(".lb-list .lb-row")) {
+          const link = row.querySelector(".lb-name a");
+          const href = link?.getAttribute("href") || "";
+          const pid = new URLSearchParams(href.split("?")[1] || "").get("pid");
 
           if (String(pid) === String(userId)) {
-            currentDamage = parseGameNumber(row.querySelector('.lb-dmg')?.textContent) || 0;
+            currentDamage = parseGameNumber(row.querySelector(".lb-dmg")?.textContent) || 0;
             break;
           }
         }
@@ -352,27 +356,27 @@
 
       return { capDamage, currentDamage };
     } catch (error) {
-      console.warn('[DLF] Could not read battle data.', error);
+      console.warn("[DLF] Could not read battle data.", error);
       return { capDamage: null, currentDamage: 0 };
     }
   }
 
   async function doJoin(dgmid, instanceId) {
     const userId = getUserId();
-    if (!userId) return { ok: false, msg: 'Could not find user ID' };
+    if (!userId) return { ok: false, msg: "Could not find user ID" };
 
     const body = new URLSearchParams();
-    body.set('instance_id', instanceId);
-    body.set('dgmid', dgmid);
-    body.set('user_id', userId);
+    body.set("instance_id", instanceId);
+    body.set("dgmid", dgmid);
+    body.set("user_id", userId);
 
     try {
-      const response = await fetch('/dungeon_join_battle.php', {
-        method: 'POST',
-        credentials: 'same-origin',
+      const response = await fetch("/dungeon_join_battle.php", {
+        method: "POST",
+        credentials: "same-origin",
         headers: {
-          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-          'X-Requested-With': 'XMLHttpRequest',
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "X-Requested-With": "XMLHttpRequest",
         },
         body: body.toString(),
       });
@@ -385,8 +389,8 @@
         // Plain text responses are supported.
       }
 
-      const explicitFailure = data?.status === 'error' || data?.success === false;
-      const ok = !explicitFailure && (response.ok || data?.status === 'success' || data?.success === true);
+      const explicitFailure = data?.status === "error" || data?.success === false;
+      const ok = !explicitFailure && (response.ok || data?.status === "success" || data?.success === true);
 
       return { ok, msg: data?.message || raw.slice(0, 250) };
     } catch (error) {
@@ -395,7 +399,7 @@
   }
 
   function getRetryAfterMilliseconds(response) {
-    const value = response.headers.get('Retry-After');
+    const value = response.headers.get("Retry-After");
     if (!value) return null;
 
     const seconds = Number.parseInt(String(value).trim(), 10);
@@ -404,19 +408,19 @@
 
   async function doAttack(dgmid, skill, instanceId) {
     const body = new URLSearchParams();
-    body.set('instance_id', instanceId);
-    body.set('dgmid', dgmid);
-    body.set('skill_id', skill.id);
-    body.set('stamina_cost', String(skill.cost));
+    body.set("instance_id", instanceId);
+    body.set("dgmid", dgmid);
+    body.set("skill_id", skill.id);
+    body.set("stamina_cost", String(skill.cost));
 
     let response;
     try {
-      response = await fetch('/damage.php', {
-        method: 'POST',
-        credentials: 'same-origin',
+      response = await fetch("/damage.php", {
+        method: "POST",
+        credentials: "same-origin",
         headers: {
-          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-          'X-Requested-With': 'XMLHttpRequest',
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "X-Requested-With": "XMLHttpRequest",
         },
         body: body.toString(),
       });
@@ -443,22 +447,21 @@
       // Plain text and HTML responses are supported.
     }
 
-    const message = String(data?.message ?? raw ?? '');
+    const message = String(data?.message ?? raw ?? "");
     const lowerMessage = message.toLowerCase();
 
     const strongDamage = String(raw).match(/<strong>\s*([\d,.\s]+)\s*<\/strong>/i)?.[1];
     const messageDamage = message.match(/(?:dealt|hit(?:\s+for)?)\s*([\d,.\s]+)\s*(?:damage|dmg)/i)?.[1];
 
-    const damage =
-      firstGameNumber(
-        data?.damage,
-        data?.damage_dealt,
-        data?.damageDealt,
-        data?.hit_damage,
-        data?.hitDamage,
-        strongDamage,
-        messageDamage,
-      ) || 0;
+    const damage = firstGameNumber(
+      data?.damage,
+      data?.damage_dealt,
+      data?.damageDealt,
+      data?.hit_damage,
+      data?.hitDamage,
+      strongDamage,
+      messageDamage,
+    ) || 0;
 
     const totalDamage = firstGameNumber(
       data?.totaldmgdealt,
@@ -468,37 +471,39 @@
       data?.totalDamage,
     );
 
-    const userHpAfter = firstGameNumber(data?.retaliation?.user_hp_after, data?.user_hp_after, data?.userHpAfter);
+    const userHpAfter = firstGameNumber(
+      data?.retaliation?.user_hp_after,
+      data?.user_hp_after,
+      data?.userHpAfter,
+    );
 
-    const staminaAfter = firstGameNumber(data?.stamina_after, data?.staminaAfter, data?.current_stamina);
+    const staminaAfter = firstGameNumber(
+      data?.stamina_after,
+      data?.staminaAfter,
+      data?.current_stamina,
+    );
 
-    const explicitFailure = data?.status === 'error' || data?.success === false;
-    const ok = !explicitFailure && (response.ok || data?.status === 'success' || data?.success === true);
+    const explicitFailure = data?.status === "error" || data?.success === false;
+    const ok = !explicitFailure && (response.ok || data?.status === "success" || data?.success === true);
 
     const monsterDead =
       data?.monster_dead === true ||
       data?.monsterDead === true ||
-      lowerMessage.includes('is dead') ||
-      lowerMessage.includes('defeated') ||
-      lowerMessage.includes('monster died') ||
-      lowerMessage.includes('already dead') ||
-      lowerMessage.includes('you killed') ||
-      lowerMessage.includes('has been slain') ||
-      lowerMessage.includes('0 hp');
+      lowerMessage.includes("is dead") ||
+      lowerMessage.includes("defeated") ||
+      lowerMessage.includes("monster died") ||
+      lowerMessage.includes("already dead") ||
+      lowerMessage.includes("you killed") ||
+      lowerMessage.includes("has been slain") ||
+      lowerMessage.includes("0 hp");
 
     let feedbackType = null;
-    if (
-      /not enough\s+stamina|insufficient\s+stamina|out of\s+stamina|stamina\s+(?:is\s+)?(?:empty|too low|depleted)/.test(
-        lowerMessage,
-      )
-    ) {
-      feedbackType = 'stamina';
-    } else if (
-      /you are dead|you died|you have died|knocked out|cannot attack.*dead|dead.*cannot attack/.test(lowerMessage)
-    ) {
-      feedbackType = 'dead';
+    if (/not enough\s+stamina|insufficient\s+stamina|out of\s+stamina|stamina\s+(?:is\s+)?(?:empty|too low|depleted)/.test(lowerMessage)) {
+      feedbackType = "stamina";
+    } else if (/you are dead|you died|you have died|knocked out|cannot attack.*dead|dead.*cannot attack/.test(lowerMessage)) {
+      feedbackType = "dead";
     } else if (/cooldown|too fast|please wait|wait before|rate limit|cooling down/.test(lowerMessage)) {
-      feedbackType = 'cooldown';
+      feedbackType = "cooldown";
     }
 
     return {
@@ -517,51 +522,51 @@
 
   async function lootAll(instanceId, locationId) {
     const body = new URLSearchParams();
-    body.set('action', 'loot_all');
-    body.set('instance_id', String(instanceId));
-    body.set('location_id', String(locationId));
+    body.set("action", "loot_all");
+    body.set("instance_id", String(instanceId));
+    body.set("location_id", String(locationId));
 
     try {
-      const response = await fetch('/dungeon_loot.php', {
-        method: 'POST',
-        credentials: 'same-origin',
+      const response = await fetch("/dungeon_loot.php", {
+        method: "POST",
+        credentials: "same-origin",
         headers: {
-          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-          'X-Requested-With': 'XMLHttpRequest',
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "X-Requested-With": "XMLHttpRequest",
         },
         body: body.toString(),
       });
       return await response.json();
     } catch (error) {
-      return { status: 'error', message: String(error) };
+      return { status: "error", message: String(error) };
     }
   }
 
   function getPotionType(name, description) {
     const text = `${name} ${description}`.toLowerCase();
-    if (text.includes('stamina')) return 'stamina';
-    if (/\bhp\b|health|heal/.test(text)) return 'health';
-    return 'other';
+    if (text.includes("stamina")) return "stamina";
+    if (/\bhp\b|health|heal/.test(text)) return "health";
+    return "other";
   }
 
   function getPotionAmountInput(button) {
-    return button.closest('.potion-actions')?.querySelector('input[type="number"]') || null;
+    return button.closest(".potion-actions")?.querySelector('input[type="number"]') || null;
   }
 
   function potionFromButton(button) {
     const card = button.closest(SEL.potionCard);
     const name =
       button.dataset.name?.trim() ||
-      card?.querySelector('.potion-name span')?.textContent?.trim() ||
+      card?.querySelector(".potion-name span")?.textContent?.trim() ||
       button.textContent?.trim() ||
-      'Unknown Potion';
+      "Unknown Potion";
 
-    const description = card?.querySelector('.potion-desc')?.textContent?.trim() || '';
+    const description = card?.querySelector(".potion-desc")?.textContent?.trim() || "";
     const itemId = String(button.dataset.item || card?.dataset.itemId || name);
 
     const quantity = [
-      card?.querySelector('.potion-qty-left')?.textContent,
-      button.querySelector('.ds-potion-count')?.textContent,
+      card?.querySelector(".potion-qty-left")?.textContent,
+      button.querySelector(".ds-potion-count")?.textContent,
       button.dataset.max,
     ]
       .map(parseInteger)
@@ -574,7 +579,7 @@
       description,
       type: getPotionType(name, description),
       quantity: Number.isFinite(quantity) ? quantity : null,
-      supportsAmount: Boolean(getPotionAmountInput(button)) || itemId === '30' || itemId === '162',
+      supportsAmount: Boolean(getPotionAmountInput(button)) || itemId === "30" || itemId === "162",
     };
   }
 
@@ -583,7 +588,7 @@
 
     for (const button of queryAll(SEL.potion)) {
       const potion = potionFromButton(button);
-      if (potion.type === 'other') continue;
+      if (potion.type === "other") continue;
 
       const existing = unique.get(potion.key);
       const existingQuantity = existing?.quantity ?? -1;
@@ -594,7 +599,7 @@
 
     state.potions = [...unique.values()];
 
-    for (const type of ['stamina', 'health']) {
+    for (const type of ["stamina", "health"]) {
       const available = state.potions.filter((potion) => potion.type === type).map((potion) => potion.key);
       const oldOrder = state.settings.potionOrder[type] || [];
 
@@ -632,12 +637,10 @@
     });
 
     if (amount > 1) {
-      return (
-        matches.find((button) => {
-          const input = getPotionAmountInput(button);
-          return input && !input.readOnly && !input.disabled;
-        }) || null
-      );
+      return matches.find((button) => {
+        const input = getPotionAmountInput(button);
+        return input && !input.readOnly && !input.disabled;
+      }) || null;
     }
 
     return matches.find((button) => button.offsetParent !== null) || matches[0] || null;
@@ -650,8 +653,8 @@
     const rectangle = element.getBoundingClientRect();
 
     return (
-      style.display !== 'none' &&
-      style.visibility !== 'hidden' &&
+      style.display !== "none" &&
+      style.visibility !== "hidden" &&
       Number(style.opacity || 1) > 0 &&
       rectangle.width > 0 &&
       rectangle.height > 0
@@ -660,16 +663,16 @@
 
   function findPotionConfirmationButton() {
     const directSelectors = [
-      '.swal2-container .swal2-confirm',
-      '.swal-modal .swal-button--confirm',
-      '.modal.show .btn-confirm',
+      ".swal2-container .swal2-confirm",
+      ".swal-modal .swal-button--confirm",
+      ".modal.show .btn-confirm",
       '.modal.show [data-confirm="true"]',
-      '.modal.show button.btn-primary',
+      ".modal.show button.btn-primary",
       '[role="dialog"][aria-modal="true"] .confirm',
       '[role="dialog"][aria-modal="true"] [data-confirm]',
       '[role="dialog"][aria-modal="true"] button[type="submit"]',
-      '.dialog.open .confirm',
-      '.popup.open .confirm',
+      ".dialog.open .confirm",
+      ".popup.open .confirm",
     ];
 
     for (const selector of directSelectors) {
@@ -678,24 +681,25 @@
     }
 
     const dialogSelectors = [
-      '.swal2-container',
-      '.swal-overlay',
-      '.modal.show',
+      ".swal2-container",
+      ".swal-overlay",
+      ".modal.show",
       '[role="dialog"][aria-modal="true"]',
-      '.dialog.open',
-      '.popup.open',
-      '.modal.active',
+      ".dialog.open",
+      ".popup.open",
+      ".modal.active",
     ];
 
-    const acceptedText =
-      /^(confirm|yes|ok|okay|use|continue|accept|confirm use|use potion|confirm potion|bestätigen|ja|benutzen)$/i;
+    const acceptedText = /^(confirm|yes|ok|okay|use|continue|accept|confirm use|use potion|confirm potion|bestätigen|ja|benutzen)$/i;
 
     for (const selector of dialogSelectors) {
       for (const dialog of queryAll(selector)) {
         if (!isElementVisible(dialog)) continue;
 
         const button = queryAll('button, input[type="button"], input[type="submit"]', dialog).find((element) => {
-          const text = String(element.textContent || element.value || element.getAttribute('aria-label') || '').trim();
+          const text = String(
+            element.textContent || element.value || element.getAttribute("aria-label") || "",
+          ).trim();
 
           return !element.disabled && isElementVisible(element) && acceptedText.test(text);
         });
@@ -713,7 +717,7 @@
     while (Date.now() - startedAt < POTION_CONFIRM_TIMEOUT_MS) {
       const button = findPotionConfirmationButton();
       if (button) {
-        addLog('Potion confirmation accepted automatically.');
+        addLog("Potion confirmation accepted automatically.");
         button.click();
         return true;
       }
@@ -729,12 +733,12 @@
 
     try {
       window.confirm = (message) => {
-        addLog(`Potion confirmation accepted: ${String(message || 'Confirm')}`);
+        addLog(`Potion confirmation accepted: ${String(message || "Confirm")}`);
         return true;
       };
       replaced = true;
     } catch (error) {
-      console.warn('[DLF] Could not override confirm().', error);
+      console.warn("[DLF] Could not override confirm().", error);
     }
 
     void watchPotionConfirmation(addLog);
@@ -747,7 +751,7 @@
         try {
           window.confirm = originalConfirm;
         } catch (error) {
-          console.warn('[DLF] Could not restore confirm().', error);
+          console.warn("[DLF] Could not restore confirm().", error);
         }
       }, 1200);
     }
@@ -766,7 +770,7 @@
         }),
       );
     } catch (error) {
-      console.warn('[DLF] Could not save resume state.', error);
+      console.warn("[DLF] Could not save resume state.", error);
     }
   }
 
@@ -799,21 +803,19 @@
   function getPreferredPotion(type) {
     discoverPotions();
 
-    return (
-      (state.settings.potionOrder[type] || [])
-        .map((key) => state.potions.find((potion) => potion.key === key))
-        .find((potion) => {
-          const available = potion && (potion.quantity === null || potion.quantity > 0);
-          return available && state.settings.potionEnabled[potion.key] !== false;
-        }) || null
-    );
+    return (state.settings.potionOrder[type] || [])
+      .map((key) => state.potions.find((potion) => potion.key === key))
+      .find((potion) => {
+        const available = potion && (potion.quantity === null || potion.quantity > 0);
+        return available && state.settings.potionEnabled[potion.key] !== false;
+      }) || null;
   }
 
   async function usePotion(type, setStatus, addLog) {
     const potion = getPreferredPotion(type);
 
     if (!potion) {
-      setStatus(`No enabled ${type} potion is available.`, 'error');
+      setStatus(`No enabled ${type} potion is available.`, "error");
       addLog(`No enabled ${type} potion is available.`);
       return false;
     }
@@ -822,9 +824,10 @@
     const button = findLivePotionButton(potion, amount);
 
     if (!button) {
-      const message =
-        amount > 1 ? `${potion.name} has no editable amount field.` : `${potion.name} could not be found.`;
-      setStatus(message, 'error');
+      const message = amount > 1
+        ? `${potion.name} has no editable amount field.`
+        : `${potion.name} could not be found.`;
+      setStatus(message, "error");
       addLog(message);
       return false;
     }
@@ -832,32 +835,31 @@
     const input = getPotionAmountInput(button);
     if (amount > 1 && (!input || input.readOnly || input.disabled)) {
       const message = `Could not set the amount for ${potion.name}.`;
-      setStatus(message, 'error');
+      setStatus(message, "error");
       addLog(message);
       return false;
     }
 
     const beforeQuantity = potion.quantity;
     const beforeSnapshot = await fetchDashboardSnapshot();
-    const beforeResource =
-      type === 'stamina'
-        ? (beforeSnapshot?.stamina ?? getStaminaFromPage())
-        : (beforeSnapshot?.health?.current ?? getPlayerHpFromPage()?.current);
+    const beforeResource = type === "stamina"
+      ? beforeSnapshot?.stamina ?? getStaminaFromPage()
+      : beforeSnapshot?.health?.current ?? getPlayerHpFromPage()?.current;
 
     if (input && !input.readOnly && !input.disabled) {
       input.value = String(amount);
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
       await sleep(80);
     }
 
-    const stockText = Number.isFinite(beforeQuantity) ? formatNumber(beforeQuantity) : 'unknown';
+    const stockText = Number.isFinite(beforeQuantity) ? formatNumber(beforeQuantity) : "unknown";
     addLog(
       amount > 1
         ? `Using ${formatNumber(amount)} x ${potion.name}. Stock before use: ${stockText}.`
         : `Using ${potion.name}. Stock before use: ${stockText}.`,
     );
-    setStatus(`Using ${potion.name}...`, 'running');
+    setStatus(`Using ${potion.name}...`, "running");
 
     saveResumeState();
     clickPotionWithConfirmation(button, addLog);
@@ -868,13 +870,19 @@
       discoverPotions(false);
 
       const refreshed = state.potions.find((item) => item.key === potion.key);
-      const afterResource = type === 'stamina' ? getStaminaFromPage() : getPlayerHpFromPage()?.current;
+      const afterResource = type === "stamina"
+        ? getStaminaFromPage()
+        : getPlayerHpFromPage()?.current;
 
       const quantityChanged =
-        Number.isFinite(beforeQuantity) && Number.isFinite(refreshed?.quantity) && refreshed.quantity < beforeQuantity;
+        Number.isFinite(beforeQuantity) &&
+        Number.isFinite(refreshed?.quantity) &&
+        refreshed.quantity < beforeQuantity;
 
       const resourceChanged =
-        Number.isFinite(beforeResource) && Number.isFinite(afterResource) && afterResource > beforeResource;
+        Number.isFinite(beforeResource) &&
+        Number.isFinite(afterResource) &&
+        afterResource > beforeResource;
 
       if (quantityChanged || resourceChanged) {
         clearResumeState();
@@ -887,16 +895,22 @@
     }
 
     const afterSnapshot = await fetchDashboardSnapshot();
-    const afterResource = type === 'stamina' ? afterSnapshot?.stamina : afterSnapshot?.health?.current;
+    const afterResource = type === "stamina"
+      ? afterSnapshot?.stamina
+      : afterSnapshot?.health?.current;
 
     discoverPotions(false);
     const refreshed = state.potions.find((item) => item.key === potion.key);
 
     const quantityChanged =
-      Number.isFinite(beforeQuantity) && Number.isFinite(refreshed?.quantity) && refreshed.quantity < beforeQuantity;
+      Number.isFinite(beforeQuantity) &&
+      Number.isFinite(refreshed?.quantity) &&
+      refreshed.quantity < beforeQuantity;
 
     const resourceChanged =
-      Number.isFinite(beforeResource) && Number.isFinite(afterResource) && afterResource > beforeResource;
+      Number.isFinite(beforeResource) &&
+      Number.isFinite(afterResource) &&
+      afterResource > beforeResource;
 
     if (quantityChanged || resourceChanged) {
       clearResumeState();
@@ -923,7 +937,7 @@
       skills.push({ key, ...skill });
     }
 
-    if (!skills.length) skills.push({ key: 'slash', ...SKILLS.slash });
+    if (!skills.length) skills.push({ key: "slash", ...SKILLS.slash });
     return skills;
   }
 
@@ -951,45 +965,51 @@
     if (settings.autoStamina) {
       setStatus(
         `Stamina ${formatNumber(stamina)} is below the required ${formatNumber(required)}. Using a potion...`,
-        'running',
+        "running",
       );
 
-      const used = await usePotion('stamina', setStatus, addLog);
+      const used = await usePotion("stamina", setStatus, addLog);
       if (used) {
         counters.staminaWaits = 0;
         return { retry: true };
       }
     }
 
-    if (settings.staminaFailureAction === 'stop') {
-      return { stop: true, reason: 'no_stamina', stamina, required };
+    if (settings.staminaFailureAction === "stop") {
+      return { stop: true, reason: "no_stamina", stamina, required };
     }
 
     counters.staminaWaits += 1;
     if (counters.staminaWaits > settings.maxStaminaWaits) {
-      return { stop: true, reason: 'no_stamina', stamina, required };
+      return { stop: true, reason: "no_stamina", stamina, required };
     }
 
     const waitMs = Math.max(1, settings.staminaWaitSeconds) * 1000;
     setStatus(
       `Low stamina (${formatNumber(stamina)}). Waiting ${Math.round(waitMs / 1000)} seconds ` +
         `(${counters.staminaWaits}/${settings.maxStaminaWaits})...`,
-      'running',
+      "running",
     );
     await sleepInterruptible(waitMs, runState);
 
-    if (runState.stopped) return { stop: true, reason: 'stopped' };
+    if (runState.stopped) return { stop: true, reason: "stopped" };
     return { retry: true };
   }
 
-  async function ensureHealthAvailable(playerHp, settings, runState, setStatus, addLog) {
+  async function ensureHealthAvailable(
+    playerHp,
+    settings,
+    runState,
+    setStatus,
+    addLog,
+  ) {
     if (!playerHp || !Number.isFinite(playerHp.maximum) || playerHp.maximum <= 0) {
       return { ok: true, health: playerHp };
     }
 
     if (playerHp.current <= 0 && !settings.autoHealth) {
       runState.stopped = true;
-      return { ok: false, reason: 'player_dead' };
+      return { ok: false, reason: "player_dead" };
     }
 
     if (!settings.autoHealth) {
@@ -1003,10 +1023,10 @@
 
     setStatus(
       `HP is low (${formatNumber(playerHp.current)} / ${formatNumber(playerHp.maximum)}). Using a potion...`,
-      'running',
+      "running",
     );
 
-    const used = await usePotion('health', setStatus, addLog);
+    const used = await usePotion("health", setStatus, addLog);
     if (used) {
       await sleep(400);
       const snapshot = await fetchDashboardSnapshot();
@@ -1014,9 +1034,9 @@
     }
 
     if (playerHp.current <= 0) {
-      const healButton = document.getElementById('healBtn');
+      const healButton = document.getElementById("healBtn");
       if (healButton && !healButton.disabled) {
-        addLog('No health potion was available. Clicking the page revive button.');
+        addLog("No health potion was available. Clicking the page revive button.");
         healButton.click();
         await sleep(3000);
         const snapshot = await fetchDashboardSnapshot();
@@ -1024,25 +1044,34 @@
       }
     }
 
-    if (settings.healthFailureAction === 'continue' && playerHp.current > 0) {
-      addLog('No enabled health potion was available. Continuing because this is configured.');
+    if (settings.healthFailureAction === "continue" && playerHp.current > 0) {
+      addLog("No enabled health potion was available. Continuing because this is configured.");
       return { ok: true, health: playerHp };
     }
 
     runState.stopped = true;
-    return { ok: false, reason: playerHp.current <= 0 ? 'player_dead' : 'no_health_potion' };
+    return { ok: false, reason: playerHp.current <= 0 ? "player_dead" : "no_health_potion" };
   }
 
-  async function attackUntilTarget(dgmid, name, instanceId, settings, runState, setStatus, line, addLog) {
+  async function attackUntilTarget(
+    dgmid,
+    name,
+    instanceId,
+    settings,
+    runState,
+    setStatus,
+    line,
+    addLog,
+  ) {
     let target = null;
     let baseline = 0;
 
-    if (settings.damageMode === 'cap' || settings.damageMode === 'specific') {
-      setStatus(`Checking battle data for ${name}...`, 'running');
+    if (settings.damageMode === "cap" || settings.damageMode === "specific") {
+      setStatus(`Checking battle data for ${name}...`, "running");
       const battleData = await getMonsterBattleData(dgmid, instanceId);
       baseline = battleData.currentDamage || 0;
 
-      if (settings.damageMode === 'cap') {
+      if (settings.damageMode === "cap") {
         target = battleData.capDamage;
         if (!Number.isFinite(target)) {
           addLog(`No EXP cap was found for ${name}. Kill mode will be used for this monster.`);
@@ -1054,21 +1083,21 @@
 
       if (Number.isFinite(target) && baseline >= target) {
         const message = `${name} is already at target (${formatNumber(baseline)} / ${formatNumber(target)}).`;
-        setStatus(message, 'success');
-        line.update(`✓ ${message}`, '#5fd07a');
-        return { reason: 'already_done', totalDamage: baseline };
+        setStatus(message, "success");
+        line.update(`✓ ${message}`, "#5fd07a");
+        return { reason: "already_done", totalDamage: baseline };
       }
     }
 
     let playerHp = getPlayerHpFromPage();
 
-    setStatus(`Joining ${name}...`, 'running');
+    setStatus(`Joining ${name}...`, "running");
     const joinResult = await doJoin(dgmid, instanceId);
     if (!joinResult.ok) {
       const message = `Join failed for ${name}: ${joinResult.msg}`;
-      setStatus(message, 'error');
-      line.update(`✗ ${message}`, '#e06c6c');
-      return { reason: 'join_failed' };
+      setStatus(message, "error");
+      line.update(`✗ ${message}`, "#e06c6c");
+      return { reason: "join_failed" };
     }
 
     let attackCount = 0;
@@ -1078,29 +1107,41 @@
     const counters = { staminaWaits: 0 };
 
     while (!runState.stopped) {
-      const healthResult = await ensureHealthAvailable(playerHp, settings, runState, setStatus, addLog);
+      const healthResult = await ensureHealthAvailable(
+        playerHp,
+        settings,
+        runState,
+        setStatus,
+        addLog,
+      );
 
       if (!healthResult.ok) {
         line.update(
-          `✗ ${name} - ${healthResult.reason === 'player_dead' ? 'player died' : 'no health potion'} ` +
+          `✗ ${name} - ${healthResult.reason === "player_dead" ? "player died" : "no health potion"} ` +
             `(${formatNumber(totalDamage)} dmg)`,
-          '#e06c6c',
+          "#e06c6c",
         );
         return { reason: healthResult.reason, totalDamage };
       }
       playerHp = healthResult.health;
 
-      const prepared = await ensureAttackAvailable(settings, runState, setStatus, addLog, counters);
+      const prepared = await ensureAttackAvailable(
+        settings,
+        runState,
+        setStatus,
+        addLog,
+        counters,
+      );
 
       if (prepared.stop) {
-        if (prepared.reason === 'stopped') break;
+        if (prepared.reason === "stopped") break;
 
         const message =
           `${name} - out of stamina (${formatNumber(prepared.stamina)} available, ` +
           `${formatNumber(prepared.required)} required)`;
-        line.update(`✗ ${message}`, '#e0b35c');
+        line.update(`✗ ${message}`, "#e0b35c");
         runState.stopped = true;
-        return { reason: 'no_stamina', totalDamage };
+        return { reason: "no_stamina", totalDamage };
       }
 
       if (prepared.retry) continue;
@@ -1113,26 +1154,29 @@
         result = await doAttack(dgmid, skill, instanceId);
         const rateLimited =
           result.status === 429 ||
-          result.feedbackType === 'cooldown' ||
+          result.feedbackType === "cooldown" ||
           /rate limit|too fast|cooling down/.test(String(result.msg).toLowerCase());
 
         if (!rateLimited && result.status === 200) break;
         if (!rateLimited && result.status !== 200 && result.status !== 0) break;
 
         const wait = result.retryAfterMs || Math.min(20000, 800 * Math.pow(2, attempt));
-        setStatus(`Rate limited. Retrying ${name} in ${Math.ceil(wait / 1000)} seconds...`, 'running');
+        setStatus(
+          `Rate limited. Retrying ${name} in ${Math.ceil(wait / 1000)} seconds...`,
+          "running",
+        );
         await sleepInterruptible(wait, runState);
       }
 
       if (runState.stopped || !result) break;
 
-      if (result.feedbackType === 'stamina') {
+      if (result.feedbackType === "stamina") {
         addLog(`${skill.name} was rejected because of stamina. Rechecking attack fallbacks.`);
         await sleep(300);
         continue;
       }
 
-      if (result.feedbackType === 'dead') {
+      if (result.feedbackType === "dead") {
         playerHp = { current: 0, maximum: playerHp?.maximum || 0 };
         continue;
       }
@@ -1141,12 +1185,15 @@
         failRetries += 1;
         if (failRetries >= MAX_FAIL_RETRIES) {
           const message = `${name} - gave up after ${MAX_FAIL_RETRIES} failed attacks.`;
-          setStatus(message, 'error');
-          line.update(`✗ ${message}`, '#e06c6c');
-          return { reason: 'failed', totalDamage };
+          setStatus(message, "error");
+          line.update(`✗ ${message}`, "#e06c6c");
+          return { reason: "failed", totalDamage };
         }
 
-        setStatus(`${skill.name} failed (${failRetries}/${MAX_FAIL_RETRIES}): ${result.msg}`, 'error');
+        setStatus(
+          `${skill.name} failed (${failRetries}/${MAX_FAIL_RETRIES}): ${result.msg}`,
+          "error",
+        );
         await sleep(1000);
         continue;
       }
@@ -1156,7 +1203,10 @@
       sessionDamage += Math.max(0, Number(result.damage) || 0);
 
       const reportedTotal = Number(result.totalDamage);
-      totalDamage = Math.max(baseline + sessionDamage, Number.isFinite(reportedTotal) ? reportedTotal : 0);
+      totalDamage = Math.max(
+        baseline + sessionDamage,
+        Number.isFinite(reportedTotal) ? reportedTotal : 0,
+      );
 
       if (Number.isFinite(result.userHpAfter)) {
         playerHp = {
@@ -1174,22 +1224,25 @@
         ? `${formatNumber(totalDamage)} / ${formatNumber(target)}`
         : `${formatNumber(totalDamage)} dmg`;
 
-      setStatus(`${name}: ${skill.name} #${attackCount}, +${formatNumber(result.damage)} [${targetText}]`, 'running');
+      setStatus(
+        `${name}: ${skill.name} #${attackCount}, +${formatNumber(result.damage)} [${targetText}]`,
+        "running",
+      );
       line.update(`⚔ ${name} - ${targetText} (${skill.name}, hit #${attackCount})`);
       updateMetrics(skill.name);
 
       if (result.monsterDead) {
         const message = `${name} defeated (${formatNumber(totalDamage)} dmg).`;
-        setStatus(message, 'success');
-        line.update(`💀 ${message}`, '#5fd07a');
-        return { reason: 'dead', attackCount, totalDamage };
+        setStatus(message, "success");
+        line.update(`💀 ${message}`, "#5fd07a");
+        return { reason: "dead", attackCount, totalDamage };
       }
 
       if (Number.isFinite(target) && totalDamage >= target) {
         const message = `${name} reached target (${formatNumber(totalDamage)} / ${formatNumber(target)}).`;
-        setStatus(message, 'success');
-        line.update(`🎯 ${message}`, '#5fd07a');
-        return { reason: 'target_reached', attackCount, totalDamage };
+        setStatus(message, "success");
+        line.update(`🎯 ${message}`, "#5fd07a");
+        return { reason: "target_reached", attackCount, totalDamage };
       }
 
       if (settings.attackDelayMs > 0) {
@@ -1197,18 +1250,18 @@
       }
     }
 
-    return { reason: 'stopped', totalDamage };
+    return { reason: "stopped", totalDamage };
   }
 
   async function runFarm(instanceId, locationId, settings, runState, setStatus, newLogLine, addLog) {
     const monsters = getAliveMonsters();
 
     if (!monsters.length) {
-      setStatus('No alive monsters were found on this location.', 'error');
+      setStatus("No alive monsters were found on this location.", "error");
       return;
     }
 
-    setStatus(`Found ${monsters.length} alive monster(s). Starting...`, 'running');
+    setStatus(`Found ${monsters.length} alive monster(s). Starting...`, "running");
     addLog(`Started with ${monsters.length} alive monster(s).`);
     await sleep(300);
 
@@ -1232,37 +1285,37 @@
         addLog,
       );
 
-      if (result.reason === 'dead') killed += 1;
-      if (['dead', 'target_reached', 'already_done'].includes(result.reason)) processed += 1;
-      if (['no_stamina', 'player_dead', 'no_health_potion'].includes(result.reason)) break;
+      if (result.reason === "dead") killed += 1;
+      if (["dead", "target_reached", "already_done"].includes(result.reason)) processed += 1;
+      if (["no_stamina", "player_dead", "no_health_potion"].includes(result.reason)) break;
     }
 
     if (runState.stopped) {
-      setStatus(`Stopped. Processed ${processed}, killed ${killed}.`, 'idle');
+      setStatus(`Stopped. Processed ${processed}, killed ${killed}.`, "idle");
       addLog(`Stopped. Processed ${processed}, killed ${killed}.`);
       return;
     }
 
     if (killed > 0) {
-      setStatus('Looting dead monsters...', 'running');
+      setStatus("Looting dead monsters...", "running");
       const loot = await lootAll(instanceId, locationId);
 
-      if (loot?.status === 'success') {
+      if (loot?.status === "success") {
         const summary = loot.summary || {};
         const message =
           `Done. Killed ${killed}, processed ${processed}. ` +
           `EXP: ${formatNumber(summary.exp || 0)}, Gold: ${formatNumber(summary.gold || 0)}, ` +
           `Items: ${Array.isArray(loot.items) ? loot.items.length : 0}.`;
-        setStatus(message, 'success');
+        setStatus(message, "success");
         addLog(message);
       } else {
         const message = `Done, but looting failed. Killed ${killed}, processed ${processed}.`;
-        setStatus(message, 'error');
+        setStatus(message, "error");
         addLog(message);
       }
     } else {
       const message = `Done. Processed ${processed} monster(s), none killed.`;
-      setStatus(message, 'success');
+      setStatus(message, "success");
       addLog(message);
     }
   }
@@ -1270,7 +1323,7 @@
   function injectStyles() {
     if (document.getElementById(`${ID}-style`)) return;
 
-    const style = document.createElement('style');
+    const style = document.createElement("style");
     style.id = `${ID}-style`;
     style.textContent = `
       #${ID}-overlay {
@@ -1350,21 +1403,21 @@
   function createSkillOptions(selectedKey) {
     return Object.entries(SKILLS)
       .map(([key, skill]) => {
-        const selected = key === selectedKey ? ' selected' : '';
+        const selected = key === selectedKey ? " selected" : "";
         return `<option value="${escapeHtml(key)}"${selected}>${escapeHtml(skill.name)} (${skill.cost} STA)</option>`;
       })
-      .join('');
+      .join("");
   }
 
   function createUI() {
     const urlParams = new URLSearchParams(location.search);
-    const instanceId = urlParams.get('instance_id');
-    const locationId = urlParams.get('location_id');
+    const instanceId = urlParams.get("instance_id");
+    const locationId = urlParams.get("location_id");
     if (!instanceId || !locationId) return;
 
     let monstersHeader = null;
-    for (const header of document.querySelectorAll('.panel .h')) {
-      if (header.textContent.includes('Monsters')) {
+    for (const header of document.querySelectorAll(".panel .h")) {
+      if (header.textContent.includes("Monsters")) {
         monstersHeader = header;
         break;
       }
@@ -1374,19 +1427,19 @@
     injectStyles();
     discoverPotions();
 
-    const triggerRow = document.createElement('div');
-    triggerRow.style.cssText = 'margin:8px 0 12px;';
+    const triggerRow = document.createElement("div");
+    triggerRow.style.cssText = "margin:8px 0 12px;";
 
-    const triggerButton = document.createElement('button');
-    triggerButton.type = 'button';
-    triggerButton.textContent = '⚔ Farm Location';
+    const triggerButton = document.createElement("button");
+    triggerButton.type = "button";
+    triggerButton.textContent = "⚔ Farm Location";
     triggerButton.style.cssText =
-      'padding:7px 14px;border-radius:10px;border:1px solid #2f324d;background:#24263a;color:#edeff6;font-size:13px;font-weight:700;cursor:pointer';
+      "padding:7px 14px;border-radius:10px;border:1px solid #2f324d;background:#24263a;color:#edeff6;font-size:13px;font-weight:700;cursor:pointer";
 
     triggerRow.appendChild(triggerButton);
-    monstersHeader.insertAdjacentElement('afterend', triggerRow);
+    monstersHeader.insertAdjacentElement("afterend", triggerRow);
 
-    const overlay = document.createElement('div');
+    const overlay = document.createElement("div");
     overlay.id = `${ID}-overlay`;
     overlay.innerHTML = `
       <section id="${ID}">
@@ -1423,11 +1476,11 @@
         <div class="dlf-section">
           <div class="dlf-section-title">Damage goal</div>
           <div class="dlf-options">
-            <label><input type="radio" name="dlfMode" value="kill" ${state.settings.damageMode === 'kill' ? 'checked' : ''}> Kill monster</label>
-            <label><input type="radio" name="dlfMode" value="cap" ${state.settings.damageMode === 'cap' ? 'checked' : ''}> EXP cap</label>
-            <label><input type="radio" name="dlfMode" value="specific" ${state.settings.damageMode === 'specific' ? 'checked' : ''}> Specific damage</label>
+            <label><input type="radio" name="dlfMode" value="kill" ${state.settings.damageMode === "kill" ? "checked" : ""}> Kill monster</label>
+            <label><input type="radio" name="dlfMode" value="cap" ${state.settings.damageMode === "cap" ? "checked" : ""}> EXP cap</label>
+            <label><input type="radio" name="dlfMode" value="specific" ${state.settings.damageMode === "specific" ? "checked" : ""}> Specific damage</label>
           </div>
-          <label id="dlfSpecificRow" class="dlf-field" style="margin-top:9px;${state.settings.damageMode === 'specific' ? '' : 'display:none'}">
+          <label id="dlfSpecificRow" class="dlf-field" style="margin-top:9px;${state.settings.damageMode === "specific" ? "" : "display:none"}">
             <span>Damage amount <small>Examples: 5m, 5b, 5,000,000</small></span>
             <input id="dlfSpecific" type="text" value="${escapeHtml(state.settings.specificDamage)}" placeholder="5m">
           </label>
@@ -1437,7 +1490,7 @@
           <div class="dlf-section-title">Resource behavior</div>
           <div class="dlf-grid">
             <label class="dlf-field">
-              <span><input id="dlfAutoStamina" type="checkbox" ${state.settings.autoStamina ? 'checked' : ''}> Use stamina potions automatically</span>
+              <span><input id="dlfAutoStamina" type="checkbox" ${state.settings.autoStamina ? "checked" : ""}> Use stamina potions automatically</span>
               <small>A potion is used only when none of the three attacks can preserve the stamina reserve.</small>
             </label>
             <label class="dlf-field">
@@ -1447,8 +1500,8 @@
             <label class="dlf-field">
               <span>When no stamina potion works</span>
               <select id="dlfStaminaAction">
-                <option value="wait" ${state.settings.staminaFailureAction === 'wait' ? 'selected' : ''}>Wait for regeneration</option>
-                <option value="stop" ${state.settings.staminaFailureAction === 'stop' ? 'selected' : ''}>Stop immediately</option>
+                <option value="wait" ${state.settings.staminaFailureAction === "wait" ? "selected" : ""}>Wait for regeneration</option>
+                <option value="stop" ${state.settings.staminaFailureAction === "stop" ? "selected" : ""}>Stop immediately</option>
               </select>
             </label>
             <label class="dlf-field">
@@ -1459,7 +1512,7 @@
               </div>
             </label>
             <label class="dlf-field">
-              <span><input id="dlfAutoHealth" type="checkbox" ${state.settings.autoHealth ? 'checked' : ''}> Use health potions automatically</span>
+              <span><input id="dlfAutoHealth" type="checkbox" ${state.settings.autoHealth ? "checked" : ""}> Use health potions automatically</span>
               <small>The first enabled health potion in the priority list is used.</small>
             </label>
             <label class="dlf-field">
@@ -1469,8 +1522,8 @@
             <label class="dlf-field">
               <span>When no health potion works</span>
               <select id="dlfHealthAction">
-                <option value="stop" ${state.settings.healthFailureAction === 'stop' ? 'selected' : ''}>Stop</option>
-                <option value="continue" ${state.settings.healthFailureAction === 'continue' ? 'selected' : ''}>Continue while alive</option>
+                <option value="stop" ${state.settings.healthFailureAction === "stop" ? "selected" : ""}>Stop</option>
+                <option value="continue" ${state.settings.healthFailureAction === "continue" ? "selected" : ""}>Continue while alive</option>
               </select>
             </label>
           </div>
@@ -1507,7 +1560,7 @@
           <div><span>Current attack</span><strong id="dlfMetricAttack">-</strong></div>
         </div>
 
-        <details style="margin-top:9px">
+        <details id="dlfLogDetails" style="margin-top:9px">
           <summary>Log</summary>
           <div id="dlfLog" class="dlf-log"></div>
         </details>
@@ -1520,18 +1573,29 @@
 
     state.ui = {
       triggerButton,
-      close: overlay.querySelector('#dlfClose'),
-      start: overlay.querySelector('#dlfStart'),
-      stop: overlay.querySelector('#dlfStop'),
-      status: overlay.querySelector('#dlfStatus'),
-      log: overlay.querySelector('#dlfLog'),
-      specificRow: overlay.querySelector('#dlfSpecificRow'),
-      staminaList: overlay.querySelector('#dlfStaminaList'),
-      healthList: overlay.querySelector('#dlfHealthList'),
-      metricStamina: overlay.querySelector('#dlfMetricStamina'),
-      metricHp: overlay.querySelector('#dlfMetricHp'),
-      metricAttack: overlay.querySelector('#dlfMetricAttack'),
+      close: overlay.querySelector("#dlfClose"),
+      start: overlay.querySelector("#dlfStart"),
+      stop: overlay.querySelector("#dlfStop"),
+      status: overlay.querySelector("#dlfStatus"),
+      logDetails: overlay.querySelector("#dlfLogDetails"),
+      log: overlay.querySelector("#dlfLog"),
+      specificRow: overlay.querySelector("#dlfSpecificRow"),
+      staminaList: overlay.querySelector("#dlfStaminaList"),
+      healthList: overlay.querySelector("#dlfHealthList"),
+      metricStamina: overlay.querySelector("#dlfMetricStamina"),
+      metricHp: overlay.querySelector("#dlfMetricHp"),
+      metricAttack: overlay.querySelector("#dlfMetricAttack"),
     };
+
+    state.ui.logDetails?.addEventListener("toggle", () => {
+      if (!state.runState.stopped && !state.ui.logDetails.open) {
+        requestAnimationFrame(() => {
+          if (!state.runState.stopped && state.ui.logDetails) {
+            state.ui.logDetails.open = true;
+          }
+        });
+      }
+    });
 
     bindUIEvents(instanceId, locationId);
     renderPotionLists();
@@ -1546,80 +1610,108 @@
     if (!state.overlay) return state.settings;
 
     state.settings.attackKeys = [1, 2, 3].map((number) => {
-      return state.overlay.querySelector(`#dlfAttack${number}`)?.value || 'slash';
+      return state.overlay.querySelector(`#dlfAttack${number}`)?.value || "slash";
     });
 
     state.settings.attackDelayMs = Math.max(
       0,
-      Math.floor(Number(state.overlay.querySelector('#dlfDelay')?.value) || 0),
+      Math.floor(Number(state.overlay.querySelector("#dlfDelay")?.value) || 0),
     );
 
-    state.settings.damageMode = state.overlay.querySelector('input[name="dlfMode"]:checked')?.value || 'kill';
-    state.settings.specificDamage = state.overlay.querySelector('#dlfSpecific')?.value.trim() || '0';
+    state.settings.damageMode =
+      state.overlay.querySelector('input[name="dlfMode"]:checked')?.value || "kill";
+    state.settings.specificDamage = state.overlay.querySelector("#dlfSpecific")?.value.trim() || "0";
 
-    state.settings.autoStamina = state.overlay.querySelector('#dlfAutoStamina')?.checked || false;
+    state.settings.autoStamina = state.overlay.querySelector("#dlfAutoStamina")?.checked || false;
     state.settings.staminaReserve = Math.max(
       0,
-      Math.floor(Number(state.overlay.querySelector('#dlfReserve')?.value) || 0),
+      Math.floor(Number(state.overlay.querySelector("#dlfReserve")?.value) || 0),
     );
-    state.settings.staminaFailureAction = state.overlay.querySelector('#dlfStaminaAction')?.value || 'wait';
+    state.settings.staminaFailureAction = state.overlay.querySelector("#dlfStaminaAction")?.value || "wait";
     state.settings.staminaWaitSeconds = Math.max(
       1,
-      Math.floor(Number(state.overlay.querySelector('#dlfWaitSeconds')?.value) || 30),
+      Math.floor(Number(state.overlay.querySelector("#dlfWaitSeconds")?.value) || 30),
     );
     state.settings.maxStaminaWaits = Math.max(
       1,
-      Math.floor(Number(state.overlay.querySelector('#dlfMaxWaits')?.value) || 10),
+      Math.floor(Number(state.overlay.querySelector("#dlfMaxWaits")?.value) || 10),
     );
 
-    state.settings.autoHealth = state.overlay.querySelector('#dlfAutoHealth')?.checked || false;
+    state.settings.autoHealth = state.overlay.querySelector("#dlfAutoHealth")?.checked || false;
     state.settings.healthThreshold = Math.min(
       99,
-      Math.max(1, Math.floor(Number(state.overlay.querySelector('#dlfHealthThreshold')?.value) || 30)),
+      Math.max(1, Math.floor(Number(state.overlay.querySelector("#dlfHealthThreshold")?.value) || 30)),
     );
-    state.settings.healthFailureAction = state.overlay.querySelector('#dlfHealthAction')?.value || 'stop';
+    state.settings.healthFailureAction = state.overlay.querySelector("#dlfHealthAction")?.value || "stop";
 
     saveSettings();
     return state.settings;
   }
 
   function validateSettings() {
-    if (state.settings.damageMode === 'specific') {
+    if (state.settings.damageMode === "specific") {
       const target = parseTarget(state.settings.specificDamage);
       if (!Number.isFinite(target) || target <= 0) {
-        setStatus('Invalid specific damage. Examples: 5m, 5b, or 5,000,000.', 'error');
+        setStatus("Invalid specific damage. Examples: 5m, 5b, or 5,000,000.", "error");
         return false;
       }
     }
 
     if (!getSelectedSkills(state.settings).length) {
-      setStatus('Select at least one valid attack.', 'error');
+      setStatus("Select at least one valid attack.", "error");
       return false;
     }
 
     return true;
   }
 
-  function setStatus(message, tone = 'idle') {
+  function setStatus(message, tone = "idle") {
     if (!state.ui.status) return;
     state.ui.status.textContent = message;
     state.ui.status.className = `dlf-status dlf-status-${tone}`;
   }
 
+  function keepRunningLogVisible(scrollIntoView = false) {
+    if (state.runState.stopped || !state.ui.logDetails) return;
+
+    state.ui.logDetails.open = true;
+
+    if (state.ui.log) {
+      state.ui.log.scrollTop = 0;
+    }
+
+    if (scrollIntoView) {
+      requestAnimationFrame(() => {
+        if (!state.runState.stopped) {
+          state.ui.logDetails?.scrollIntoView({
+            behavior: "smooth",
+            block: "nearest",
+          });
+        }
+      });
+    }
+  }
+
   function addLog(message) {
     if (!state.ui.log) return;
 
-    const line = document.createElement('div');
-    line.textContent = `[${new Date().toLocaleTimeString('en-GB')}] ${message}`;
+    keepRunningLogVisible();
+
+    const line = document.createElement("div");
+    line.textContent = `[${new Date().toLocaleTimeString("en-GB")}] ${message}`;
     state.ui.log.prepend(line);
 
     while (state.ui.log.children.length > MAX_LOG_LINES) {
       state.ui.log.lastElementChild?.remove();
     }
+
+    state.ui.log.scrollTop = 0;
   }
 
   function newLogLine(text, color) {
-    const line = document.createElement('div');
+    keepRunningLogVisible();
+
+    const line = document.createElement("div");
     line.textContent = text;
     if (color) line.style.color = color;
     state.ui.log.prepend(line);
@@ -1628,10 +1720,14 @@
       state.ui.log.lastElementChild?.remove();
     }
 
+    state.ui.log.scrollTop = 0;
+
     return {
       update(nextText, nextColor) {
+        keepRunningLogVisible();
         line.textContent = nextText;
         if (nextColor) line.style.color = nextColor;
+        state.ui.log.scrollTop = 0;
       },
     };
   }
@@ -1649,18 +1745,20 @@
 
     if (state.ui.metricStamina) state.ui.metricStamina.textContent = formatNumber(stamina);
     if (state.ui.metricHp) {
-      state.ui.metricHp.textContent = hp ? `${formatNumber(hp.current)} / ${formatNumber(hp.maximum)}` : '?';
+      state.ui.metricHp.textContent = hp
+        ? `${formatNumber(hp.current)} / ${formatNumber(hp.maximum)}`
+        : "?";
     }
     if (state.ui.metricAttack && activeAttack !== null) {
-      state.ui.metricAttack.textContent = activeAttack || '-';
+      state.ui.metricAttack.textContent = activeAttack || "-";
     }
   }
 
   function renderPotionLists() {
     if (!state.overlay) return;
     discoverPotions();
-    renderPotionList('stamina', state.ui.staminaList);
-    renderPotionList('health', state.ui.healthList);
+    renderPotionList("stamina", state.ui.staminaList);
+    renderPotionList("health", state.ui.healthList);
   }
 
   function renderPotionList(type, container) {
@@ -1672,46 +1770,46 @@
       .filter(Boolean);
 
     if (!potions.length) {
-      const empty = document.createElement('div');
-      empty.className = 'dlf-empty';
-      empty.textContent = 'No matching potion was found on this page.';
+      const empty = document.createElement("div");
+      empty.className = "dlf-empty";
+      empty.textContent = "No matching potion was found on this page.";
       container.appendChild(empty);
       return;
     }
 
     potions.forEach((potion, index) => {
-      const row = document.createElement('div');
-      row.className = 'dlf-potion-row';
+      const row = document.createElement("div");
+      row.className = "dlf-potion-row";
 
-      const enabled = document.createElement('input');
-      enabled.type = 'checkbox';
+      const enabled = document.createElement("input");
+      enabled.type = "checkbox";
       enabled.checked = state.settings.potionEnabled[potion.key] !== false;
-      enabled.title = 'Allow this potion';
-      enabled.addEventListener('change', () => {
+      enabled.title = "Allow this potion";
+      enabled.addEventListener("change", () => {
         state.settings.potionEnabled[potion.key] = enabled.checked;
         saveSettings();
       });
 
-      const main = document.createElement('div');
-      const name = document.createElement('div');
-      name.className = 'dlf-potion-name';
+      const main = document.createElement("div");
+      const name = document.createElement("div");
+      name.className = "dlf-potion-name";
       name.textContent = potion.name;
       name.title = potion.description;
       main.appendChild(name);
 
       if (potion.supportsAmount) {
-        const amountRow = document.createElement('label');
-        amountRow.className = 'dlf-potion-amount';
+        const amountRow = document.createElement("label");
+        amountRow.className = "dlf-potion-amount";
 
-        const amountLabel = document.createElement('span');
-        amountLabel.textContent = 'Use at once:';
+        const amountLabel = document.createElement("span");
+        amountLabel.textContent = "Use at once:";
 
-        const amountInput = document.createElement('input');
-        amountInput.type = 'number';
-        amountInput.min = '1';
-        amountInput.step = '1';
+        const amountInput = document.createElement("input");
+        amountInput.type = "number";
+        amountInput.min = "1";
+        amountInput.step = "1";
         amountInput.value = String(getConfiguredPotionAmount(potion));
-        amountInput.addEventListener('change', () => {
+        amountInput.addEventListener("change", () => {
           const amount = Math.max(1, Math.floor(Number(amountInput.value) || 1));
           amountInput.value = String(amount);
           state.settings.potionUseAmount[potion.key] = amount;
@@ -1722,28 +1820,28 @@
         main.appendChild(amountRow);
       }
 
-      const quantity = document.createElement('div');
-      quantity.className = 'dlf-qty';
-      quantity.textContent = Number.isFinite(potion.quantity) ? `x${formatNumber(potion.quantity)}` : 'x?';
+      const quantity = document.createElement("div");
+      quantity.className = "dlf-qty";
+      quantity.textContent = Number.isFinite(potion.quantity) ? `x${formatNumber(potion.quantity)}` : "x?";
 
-      const moves = document.createElement('div');
-      moves.className = 'dlf-moves';
+      const moves = document.createElement("div");
+      moves.className = "dlf-moves";
 
-      const up = document.createElement('button');
-      up.type = 'button';
-      up.className = 'dlf-move';
-      up.textContent = '↑';
-      up.title = 'Increase priority';
+      const up = document.createElement("button");
+      up.type = "button";
+      up.className = "dlf-move";
+      up.textContent = "↑";
+      up.title = "Increase priority";
       up.disabled = index === 0;
-      up.addEventListener('click', () => movePotion(type, index, -1));
+      up.addEventListener("click", () => movePotion(type, index, -1));
 
-      const down = document.createElement('button');
-      down.type = 'button';
-      down.className = 'dlf-move';
-      down.textContent = '↓';
-      down.title = 'Decrease priority';
+      const down = document.createElement("button");
+      down.type = "button";
+      down.className = "dlf-move";
+      down.textContent = "↓";
+      down.title = "Decrease priority";
       down.disabled = index === potions.length - 1;
-      down.addEventListener('click', () => movePotion(type, index, 1));
+      down.addEventListener("click", () => movePotion(type, index, 1));
 
       moves.append(up, down);
       row.append(enabled, main, quantity, moves);
@@ -1778,28 +1876,37 @@
     state.runState = { stopped: false };
     state.activeRun = { instanceId, locationId };
     updateButtons();
+    keepRunningLogVisible(true);
 
-    if (resume) addLog('Resumed after potion use or page reload.');
+    if (resume) addLog("Resumed after potion use or page reload.");
 
     try {
-      await runFarm(instanceId, locationId, settings, state.runState, setStatus, newLogLine, addLog);
+      await runFarm(
+        instanceId,
+        locationId,
+        settings,
+        state.runState,
+        setStatus,
+        newLogLine,
+        addLog,
+      );
     } catch (error) {
-      console.error('[DLF]', error);
-      setStatus(`Error: ${error?.message || error}`, 'error');
+      console.error("[DLF]", error);
+      setStatus(`Error: ${error?.message || error}`, "error");
       addLog(`Error: ${error?.message || error}`);
     } finally {
       state.runState.stopped = true;
       clearResumeState();
       updateButtons();
-      updateMetrics('');
+      updateMetrics("");
     }
   }
 
   function stopFarm() {
     state.runState.stopped = true;
     clearResumeState();
-    setStatus('Stopping...', 'idle');
-    addLog('Manual stop requested.');
+    setStatus("Stopping...", "idle");
+    addLog("Manual stop requested.");
     updateButtons();
   }
 
@@ -1814,53 +1921,53 @@
       return;
     }
 
-    state.overlay.style.display = 'flex';
-    setStatus('Potion use completed. Resuming the location farmer...', 'running');
+    state.overlay.style.display = "flex";
+    setStatus("Potion use completed. Resuming the location farmer...", "running");
     await sleep(350);
     await startFarm(instanceId, locationId, true);
   }
 
   function bindUIEvents(instanceId, locationId) {
-    state.ui.triggerButton.addEventListener('click', () => {
-      state.overlay.style.display = 'flex';
+    state.ui.triggerButton.addEventListener("click", () => {
+      state.overlay.style.display = "flex";
       discoverPotions();
       renderPotionLists();
       updateMetrics();
     });
 
-    state.ui.close.addEventListener('click', () => {
+    state.ui.close.addEventListener("click", () => {
       if (!state.runState.stopped) return;
-      state.overlay.style.display = 'none';
+      state.overlay.style.display = "none";
     });
 
-    state.overlay.addEventListener('click', (event) => {
+    state.overlay.addEventListener("click", (event) => {
       if (event.target === state.overlay && state.runState.stopped) {
-        state.overlay.style.display = 'none';
+        state.overlay.style.display = "none";
       }
     });
 
-    state.ui.start.addEventListener('click', () => {
+    state.ui.start.addEventListener("click", () => {
       void startFarm(instanceId, locationId, false);
     });
 
-    state.ui.stop.addEventListener('click', stopFarm);
+    state.ui.stop.addEventListener("click", stopFarm);
 
-    state.overlay.querySelector('#dlfRefreshPotions').addEventListener('click', () => {
+    state.overlay.querySelector("#dlfRefreshPotions").addEventListener("click", () => {
       discoverPotions();
       renderPotionLists();
       updateMetrics();
-      setStatus('Potion list refreshed.', 'success');
+      setStatus("Potion list refreshed.", "success");
     });
 
-    for (const element of state.overlay.querySelectorAll('select, input')) {
-      element.addEventListener('change', () => {
+    for (const element of state.overlay.querySelectorAll("select, input")) {
+      element.addEventListener("change", () => {
         readForm();
         const mode = state.settings.damageMode;
-        state.ui.specificRow.style.display = mode === 'specific' ? 'flex' : 'none';
+        state.ui.specificRow.style.display = mode === "specific" ? "flex" : "none";
       });
 
       if (element.matches('input[type="text"], input[type="number"]')) {
-        element.addEventListener('input', readForm);
+        element.addEventListener("input", readForm);
       }
     }
   }
@@ -1869,7 +1976,7 @@
     const potionChanged = mutations.some((mutation) => {
       const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
       return target?.closest?.(
-        '#battleDrawer, #ds-combat-potion-quick-use, .potion-card, .potion-qty-left, .ds-potion-count',
+        "#battleDrawer, #ds-combat-potion-quick-use, .potion-card, .potion-qty-left, .ds-potion-count",
       );
     });
 
