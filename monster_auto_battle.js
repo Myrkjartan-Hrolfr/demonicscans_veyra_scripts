@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Monster Auto Battle - 3 Attack Fallback
 // @namespace    http://tampermonkey.net/
-// @version      1.4.2
+// @version      1.4.3
 // @description  Auto-battle for the current monster with three attacks, potion priorities, target damage, and level-up protection.
 // @match        https://demonicscans.org/battle.php*
 // @grant        none
@@ -265,6 +265,83 @@
     const result = Number(numberText) * factors[suffix];
 
     return Number.isFinite(result) ? result : NaN;
+  }
+
+  function formatTargetDisplay(value) {
+    const raw = String(value ?? '')
+      .trim()
+      .replace(/\s+/g, '');
+
+    if (!raw) {
+      return '';
+    }
+
+    /*
+     * Keep abbreviated values such as:
+     * 5m, 2.5b, 750k
+     */
+    if (/[kmbtq]$/i.test(raw)) {
+      return raw;
+    }
+
+    const digits = raw.replace(/\D/g, '');
+
+    if (!digits) {
+      return '';
+    }
+
+    /*
+     * Avoid converting very large values through Number,
+     * because Number may lose integer precision.
+     */
+    return digits.replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+  }
+
+  function formatTargetInput(input) {
+    const originalValue = input.value;
+
+    /*
+     * Do not interfere with abbreviated inputs.
+     */
+    if (/[kmbtq]$/i.test(originalValue.trim())) {
+      return;
+    }
+
+    const oldCursor = input.selectionStart ?? originalValue.length;
+
+    /*
+     * Remember how many digits were located
+     * before the cursor.
+     */
+    const digitsBeforeCursor = originalValue.slice(0, oldCursor).replace(/\D/g, '').length;
+
+    const formatted = formatTargetDisplay(originalValue);
+
+    input.value = formatted;
+
+    /*
+     * Restore the cursor after the same number
+     * of digits, accounting for inserted dots.
+     */
+    let newCursor = 0;
+    let digitsSeen = 0;
+
+    while (newCursor < formatted.length && digitsSeen < digitsBeforeCursor) {
+      if (/\d/.test(formatted[newCursor])) {
+        digitsSeen += 1;
+      }
+
+      newCursor += 1;
+    }
+
+    try {
+      input.setSelectionRange(newCursor, newCursor);
+    } catch (_) {
+      /*
+       * Ignore browsers that do not support
+       * cursor positioning for this input.
+       */
+    }
   }
 
   function escapeHtml(value) {
@@ -2576,7 +2653,7 @@
               <input
                 id="mabTarget"
                 type="text"
-                value="${escapeHtml(state.settings.targetDamage)}"
+                value="${escapeHtml(formatTargetDisplay(state.settings.targetDamage))}"
                 placeholder="5b or 5,000,000,000"
               >
             </label>
@@ -3122,7 +3199,6 @@
       '#mabAttack1',
       '#mabAttack2',
       '#mabAttack3',
-      '#mabTarget',
       '#mabDelay',
       '#mabAutoStamina',
       '#mabAutoMana',
@@ -3140,6 +3216,25 @@
         element.addEventListener('input', readForm);
       }
     }
+    const targetInput = state.panel.querySelector('#mabTarget');
+
+    targetInput.addEventListener('input', () => {
+      formatTargetInput(targetInput);
+
+      readForm();
+    });
+
+    targetInput.addEventListener('blur', () => {
+      targetInput.value = formatTargetDisplay(targetInput.value);
+
+      readForm();
+    });
+
+    targetInput.addEventListener('change', () => {
+      targetInput.value = formatTargetDisplay(targetInput.value);
+
+      readForm();
+    });
   }
 
   async function resumeAfterReload() {
