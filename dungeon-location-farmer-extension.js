@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dungeon Location Farmer - Controlled
 // @namespace    http://tampermonkey.net/
-// @version      2.0.3
+// @version      2.0.4
 // @description  Farm all alive monsters with attack fallbacks and configurable potion priorities.
 // @author       [J4F] RacletteCestLavie / enhanced
 // @match        https://demonicscans.org/guild_dungeon_location.php*
@@ -72,7 +72,13 @@
     activeRun: null,
     potionRefreshTimer: null,
     resumePending: false,
+    pageIsUnloading: false,
+    resumeCleanupTimer: null,
   };
+
+  window.addEventListener('beforeunload', () => {
+    state.pageIsUnloading = true;
+  });
 
   function clone(value) {
     return JSON.parse(JSON.stringify(value));
@@ -757,6 +763,10 @@
   function saveResumeState() {
     if (!state.activeRun || state.runState.stopped) return;
 
+    clearTimeout(state.resumeCleanupTimer);
+    state.resumeCleanupTimer = null;
+    state.resumePending = true;
+
     try {
       sessionStorage.setItem(
         RESUME_KEY,
@@ -764,12 +774,9 @@
           savedAt: Date.now(),
           instanceId: state.activeRun.instanceId,
           locationId: state.activeRun.locationId,
+          reason: 'potion',
         }),
       );
-
-      // Verhindert, dass der finally-Block den Marker
-      // während eines Potion-Reloads sofort wieder löscht.
-      state.resumePending = true;
     } catch (error) {
       state.resumePending = false;
       console.warn('[DLF] Could not save resume state.', error);
@@ -795,6 +802,9 @@
   }
 
   function clearResumeState() {
+    clearTimeout(state.resumeCleanupTimer);
+
+    state.resumeCleanupTimer = null;
     state.resumePending = false;
 
     try {
@@ -802,6 +812,25 @@
     } catch (_) {
       // Ignore storage errors.
     }
+  }
+
+  function scheduleResumeCleanupAfterStableAttack() {
+    if (!state.resumePending) return;
+
+    clearTimeout(state.resumeCleanupTimer);
+
+    /*
+     * Der Marker bleibt noch fünf Sekunden bestehen.
+     * Falls die Potion einen verzögerten Reload auslöst,
+     * wird dieser Timer durch den Seitenwechsel abgebrochen
+     * und der Marker bleibt für die Wiederaufnahme erhalten.
+     */
+    state.resumeCleanupTimer = setTimeout(() => {
+      if (!state.pageIsUnloading && !state.runState.stopped && state.resumePending) {
+        addLog('Potion recovery confirmed after a successful attack.');
+        clearResumeState();
+      }
+    }, 5000);
   }
 
   function getPreferredPotion(type) {
@@ -885,7 +914,7 @@
         Number.isFinite(beforeResource) && Number.isFinite(afterResource) && afterResource > beforeResource;
 
       if (quantityChanged || resourceChanged) {
-        clearResumeState();
+        // clearResumeState();
         saveSettings();
         renderPotionLists();
         updateMetrics();
@@ -907,7 +936,7 @@
       Number.isFinite(beforeResource) && Number.isFinite(afterResource) && afterResource > beforeResource;
 
     if (quantityChanged || resourceChanged) {
-      clearResumeState();
+      // clearResumeState();
       renderPotionLists();
       updateMetrics();
       addLog(`${potion.name} was used successfully.`);
@@ -1160,6 +1189,14 @@
       }
 
       failRetries = 0;
+
+      /*
+       * Ein Angriff nach der Potion hat funktioniert.
+       * Der Resume-Marker wird mit Verzögerung gelöscht,
+       * falls die Seite nicht doch noch neu lädt.
+       */
+      scheduleResumeCleanupAfterStableAttack();
+
       attackCount += 1;
       sessionDamage += Math.max(0, Number(result.damage) || 0);
 
@@ -1852,7 +1889,7 @@
 
       // Bei einem durch eine Potion ausgelösten Seitenwechsel
       // muss der Resume-Marker erhalten bleiben.
-      if (!state.resumePending) {
+      if (!state.resumePending && !state.pageIsUnloading) {
         clearResumeState();
       }
 
@@ -1874,6 +1911,9 @@
 
     const resume = loadResumeState();
     if (!resume) return;
+
+    state.resumePending = true;
+    state.pageIsUnloading = false;
 
     if (String(resume.instanceId) !== String(instanceId) || String(resume.locationId) !== String(locationId)) {
       clearResumeState();
