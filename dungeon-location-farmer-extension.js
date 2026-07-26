@@ -71,6 +71,7 @@
     runState: { stopped: true },
     activeRun: null,
     potionRefreshTimer: null,
+    resumePending: false,
   };
 
   function clone(value) {
@@ -765,7 +766,12 @@
           locationId: state.activeRun.locationId,
         }),
       );
+
+      // Verhindert, dass der finally-Block den Marker
+      // während eines Potion-Reloads sofort wieder löscht.
+      state.resumePending = true;
     } catch (error) {
+      state.resumePending = false;
       console.warn('[DLF] Could not save resume state.', error);
     }
   }
@@ -789,6 +795,8 @@
   }
 
   function clearResumeState() {
+    state.resumePending = false;
+
     try {
       sessionStorage.removeItem(RESUME_KEY);
     } catch (_) {
@@ -1816,7 +1824,9 @@
     readForm();
     if (!validateSettings()) return;
 
-    if (!resume) clearResumeState();
+    // Der vorhandene Resume-Marker wurde jetzt verarbeitet.
+    // Spätere Potion-Nutzungen erstellen bei Bedarf einen neuen.
+    clearResumeState();
 
     const specificDamage = parseTarget(state.settings.specificDamage);
     const settings = {
@@ -1839,7 +1849,13 @@
       addLog(`Error: ${error?.message || error}`);
     } finally {
       state.runState.stopped = true;
-      clearResumeState();
+
+      // Bei einem durch eine Potion ausgelösten Seitenwechsel
+      // muss der Resume-Marker erhalten bleiben.
+      if (!state.resumePending) {
+        clearResumeState();
+      }
+
       updateButtons();
       updateMetrics('');
     }
