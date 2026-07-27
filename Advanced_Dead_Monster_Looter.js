@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Advanced Dead Monster Looter V1.0
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  Auto-Merges, Loot Selected, and Extract & Loot Combo (Max 5/Day)
 // @author       Gemini
 // @match        https://demonicscans.org/active_wave.php*
@@ -242,111 +242,28 @@
      * versehentlich das Level eines Monsters erkannt wird.
      */
     const readPlayerLevel = (root = document) => {
-      const selectors = [
-        '#userLevel',
-        '#playerLevel',
-        '#characterLevel',
-        '#user-level',
-        '#player-level',
-        '#character-level',
-        '.user-level',
-        '.player-level',
-        '.character-level',
-        '.profile-level',
-        '[data-user-level]',
-        '[data-player-level]',
-        '[data-character-level]',
-      ];
+      const levelElement = root.querySelector('.game-topbar .gtb-level, .gtb-level');
 
-      for (const selector of selectors) {
-        const elements = Array.from(root.querySelectorAll(selector));
+      if (!levelElement) {
+        console.warn('[Loot to Level Up] .gtb-level wurde nicht gefunden.');
+        return null;
+      }
 
-        for (const element of elements) {
-          const possibleValues = [
-            element.getAttribute('data-user-level'),
-            element.getAttribute('data-player-level'),
-            element.getAttribute('data-character-level'),
-            element.value,
-            element.textContent,
-          ];
+      const levelText = levelElement.textContent.trim();
+      const match = levelText.match(/\bLV\s*([\d.,]+)/i);
 
-          for (const value of possibleValues) {
-            if (!value) continue;
-
-            const directLevel = parseLevelNumber(value);
-            if (directLevel !== null && /^\s*\d+\s*$/.test(String(value))) {
-              return directLevel;
-            }
-
-            const match = String(value).match(/\b(?:player|character|user)?\s*(?:level|lvl|lv)\s*[:#]?\s*(\d+)\b/i);
-
-            if (match) {
-              return parseLevelNumber(match[1]);
-            }
-          }
-        }
+      if (!match) {
+        console.warn('[Loot to Level Up] Level konnte nicht gelesen werden:', levelText);
+        return null;
       }
 
       /*
-       * Zuerst typische Spieler-, Profil- und Navigationsbereiche prüfen.
+       * Entfernt Punkte und Kommas, falls das Level irgendwann
+       * beispielsweise als "LV 3,154" angezeigt wird.
        */
-      const preferredContainers = Array.from(
-        root.querySelectorAll(`
-                header,
-                nav,
-                .navbar,
-                .topbar,
-                .user-info,
-                .player-info,
-                .character-info,
-                .profile-info,
-                .account-info,
-                #user-info,
-                #player-info,
-                #character-info,
-                #profile-info
-            `),
-      );
+      const level = Number.parseInt(match[1].replace(/[^\d]/g, ''), 10);
 
-      for (const element of preferredContainers) {
-        if (element.closest('.monster-card')) continue;
-
-        const text = element.textContent || '';
-        const match = text.match(/\b(?:player|character|user)?\s*(?:level|lvl|lv)\s*[:#]?\s*(\d+)\b/i);
-
-        if (match) {
-          return parseLevelNumber(match[1]);
-        }
-      }
-
-      /*
-       * Letzter Fallback: kurze direkte Textzeilen außerhalb der
-       * Monsterkarten und außerhalb des Tampermonkey-Panels.
-       */
-      const allElements = Array.from(root.querySelectorAll('body *'));
-
-      for (const element of allElements) {
-        if (element.closest('.monster-card, #tmLootModal, #dmControlPanel, script, style')) {
-          continue;
-        }
-
-        const directText = Array.from(element.childNodes)
-          .filter((node) => node.nodeType === Node.TEXT_NODE)
-          .map((node) => node.textContent)
-          .join(' ')
-          .replace(/\s+/g, ' ')
-          .trim();
-
-        if (!directText || directText.length > 80) continue;
-
-        const match = directText.match(/\b(?:player|character|user)?\s*(?:level|lvl|lv)\s*[:#]\s*(\d+)\b/i);
-
-        if (match) {
-          return parseLevelNumber(match[1]);
-        }
-      }
-
-      return null;
+      return Number.isFinite(level) ? level : null;
     };
 
     /*
@@ -356,22 +273,40 @@
      */
     const fetchCurrentPlayerLevel = async () => {
       try {
-        const response = await fetch(window.location.href, {
+        const freshUrl = new URL(window.location.href);
+
+        /*
+         * Verhindert, dass Browser oder Server eine alte Seite
+         * aus dem Cache zurückgeben.
+         */
+        freshUrl.searchParams.set('_tm_level_check', Date.now().toString());
+
+        const response = await fetch(freshUrl.toString(), {
           method: 'GET',
           credentials: 'same-origin',
           cache: 'no-store',
+          headers: {
+            'Cache-Control': 'no-cache',
+          },
         });
 
         if (!response.ok) {
+          console.warn('[Loot to Level Up] Level-Seite konnte nicht geladen werden:', response.status);
           return null;
         }
 
         const html = await response.text();
+
         const freshDocument = new DOMParser().parseFromString(html, 'text/html');
 
-        return readPlayerLevel(freshDocument);
+        const freshLevel = readPlayerLevel(freshDocument);
+
+        console.log('[Loot to Level Up] Frisch geladenes Level:', freshLevel);
+
+        return freshLevel;
       } catch (error) {
-        console.warn('Could not refresh player level:', error);
+        console.error('[Loot to Level Up] Level-Prüfung fehlgeschlagen:', error);
+
         return null;
       }
     };
@@ -554,9 +489,22 @@
       const itemGroups = {};
       const attemptedIds = new Set();
 
-      let startingLevel = readPlayerLevel();
+      const startingLevel = readPlayerLevel(document) ?? (await fetchCurrentPlayerLevel());
+
       let lastKnownLevel = startingLevel;
       let levelReached = false;
+
+      console.log('[Loot to Level Up] Festes Startlevel:', startingLevel);
+
+      if (startingLevel === null) {
+        statusBox.innerHTML = `
+        <span style="color:#ff4444;">
+            Player-Level konnte in .gtb-level nicht gefunden werden.
+        </span>
+    `;
+
+        return;
+      }
       let finishReason = 'No more eligible cards are available.';
 
       try {
@@ -686,44 +634,58 @@
 
             let levelResult = detectLevelUp(data, rawText, startingLevel);
 
-            if (levelResult.level !== null) {
-              lastKnownLevel = levelResult.level;
-            }
+            /*
+             * Dem Server kurz Zeit geben, das neue Level zu speichern.
+             */
+            await wait(300);
 
             /*
-             * Wenn die API kein eindeutiges Level-up meldet,
-             * prüfen wir zusätzlich eine frische Version der Seite.
+             * Das Spielerlevel wird gezielt aus:
+             *
+             * <div class="gtb-level">LV 3154</div>
+             *
+             * auf einer frisch geladenen Seite gelesen.
              */
-            if (!levelResult.reached) {
-              const refreshedLevel = await fetchCurrentPlayerLevel();
+            let currentLevel = await fetchCurrentPlayerLevel();
 
-              if (refreshedLevel !== null) {
-                lastKnownLevel = refreshedLevel;
+            /*
+             * Zweite Prüfung, falls der Server das neue Level
+             * mit etwas Verzögerung speichert.
+             */
+            if (currentLevel === null || currentLevel <= startingLevel) {
+              await wait(700);
 
-                /*
-                 * Falls beim Start noch kein Level erkannt
-                 * werden konnte, wird der erste gefundene Wert
-                 * als Vergleichsbasis gespeichert.
-                 */
-                if (startingLevel === null) {
-                  startingLevel = refreshedLevel;
-                } else if (refreshedLevel > startingLevel) {
-                  levelResult = {
-                    reached: true,
-                    level: refreshedLevel,
-                  };
-                }
+              const secondLevelCheck = await fetchCurrentPlayerLevel();
+
+              if (secondLevelCheck !== null) {
+                currentLevel = secondLevelCheck;
               }
             }
 
-            if (levelResult.reached) {
+            console.log('[Loot to Level Up] Levelvergleich:', {
+              startingLevel,
+              currentLevel,
+              monsterId,
+            });
+
+            if (currentLevel !== null) {
+              lastKnownLevel = currentLevel;
+            }
+
+            if (currentLevel !== null && currentLevel > startingLevel) {
               levelReached = true;
+              finishReason = `Level ${currentLevel} erreicht.`;
 
-              if (levelResult.level !== null) {
-                lastKnownLevel = levelResult.level;
-              }
+              statusBox.innerHTML = `
+        <span style="color:#00e676; font-weight:bold;">
+            ⬆️ Level ${currentLevel} erreicht. Looting wurde gestoppt.
+        </span>
+    `;
 
-              finishReason = lastKnownLevel !== null ? `Level ${lastKnownLevel} reached.` : 'Level-up detected.';
+              console.log('[Loot to Level Up] LEVEL-UP ERKANNT. STOP.', {
+                startingLevel,
+                currentLevel,
+              });
 
               break;
             }
