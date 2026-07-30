@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Advanced Dead Monster Looter V1.0
+// @name         Advanced Dead Monster Looter V1.4
 // @namespace    http://tampermonkey.net/
-// @version      1.2
-// @description  Auto-Merges, Loot Selected, and Extract & Loot Combo (Max 5/Day)
+// @version      1.4
+// @description  Auto-Merges, Loot Selected, Extract & Loot, with exact QUANTITY display
 // @author       Gemini
 // @match        https://demonicscans.org/active_wave.php*
 // @grant        none
@@ -176,6 +176,155 @@
       document.querySelectorAll('.dm-checkbox').forEach((cb) => (cb.checked = false));
     });
 
+    // --- Exact loot response helpers ---
+    // The normal battle-page loot button reads item.QUANTITY first and then
+    // item.quantity. Stacked monsters therefore return one object whose
+    // QUANTITY contains the real number of acquired units.
+    const parsePositiveQuantity = (value, fallback = 1) => {
+      if (value === null || value === undefined || value === '') return fallback;
+
+      if (typeof value === 'number') {
+        return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+      }
+
+      let normalized = String(value).trim();
+      if (!normalized) return fallback;
+
+      // Accept plain values such as "75", "75.00" and formatted integers
+      // such as "1,250" without turning 75.00 into 7500.
+      if (/^\d{1,3}(?:[,.]\d{3})+$/.test(normalized)) {
+        normalized = normalized.replace(/[,.]/g, '');
+      }
+
+      const parsed = Number(normalized);
+      return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+    };
+
+    const parseLootQuantity = (item) => {
+      if (!item || typeof item !== 'object') return 1;
+
+      // Exact order used by the game's own Claim Loot handler.
+      const exactQuantity = item.QUANTITY ?? item.quantity;
+      if (exactQuantity !== null && exactQuantity !== undefined && exactQuantity !== '') {
+        return parsePositiveQuantity(exactQuantity, 1);
+      }
+
+      // Compatibility fallbacks for other loot response variants.
+      const quantityCandidates = [
+        item.QTY,
+        item.qty,
+        item.AMOUNT,
+        item.amount,
+        item.COUNT,
+        item.count,
+        item.STACK,
+        item.stack,
+        item.stack_size,
+        item.stackSize,
+        item.item_count,
+        item.itemCount,
+        item.pivot?.QUANTITY,
+        item.pivot?.quantity,
+        item.pivot?.qty,
+        item.meta?.QUANTITY,
+        item.meta?.quantity,
+        item.meta?.qty,
+      ];
+
+      for (const value of quantityCandidates) {
+        const quantity = parsePositiveQuantity(value, 0);
+        if (quantity > 0) return quantity;
+      }
+
+      return 1;
+    };
+
+    const getLootItemName = (item) =>
+      item?.NAME || item?.name || item?.ITEM_NAME || item?.item_name || item?.title || 'Unknown Item';
+
+    const getLootItemImage = (item) =>
+      item?.IMAGE_URL ||
+      item?.image_url ||
+      item?.image ||
+      item?.IMG ||
+      item?.img ||
+      'https://via.placeholder.com/64?text=Item';
+
+    const normalizeLootPayload = (payload, source = 'normal') => {
+      if (!payload) return [];
+
+      if (Array.isArray(payload)) {
+        return payload
+          .filter((item) => item && typeof item === 'object')
+          .map((item) => ({ ...item, __lootSource: source }));
+      }
+
+      if (typeof payload !== 'object') return [];
+
+      const looksLikeSingleItem = Boolean(
+        payload.NAME ||
+        payload.name ||
+        payload.ITEM_NAME ||
+        payload.item_name ||
+        payload.IMAGE_URL ||
+        payload.image_url ||
+        payload.image,
+      );
+
+      if (looksLikeSingleItem) {
+        return [{ ...payload, __lootSource: source }];
+      }
+
+      return Object.entries(payload).flatMap(([name, value]) => {
+        if (value && typeof value === 'object') {
+          return [{ name, ...value, __lootSource: source }];
+        }
+
+        const quantity = parsePositiveQuantity(value, 0);
+        return quantity > 0 ? [{ name, QUANTITY: quantity, __lootSource: source }] : [];
+      });
+    };
+
+    /*
+     * Mirrors the real Claim Loot response:
+     *   data.items            -> normal monster drops
+     *   data.ranking_rewards  -> damage-ranking rewards
+     * It also keeps compatibility with older nested response shapes.
+     */
+    const extractLootItems = (data) => {
+      if (!data || typeof data !== 'object') return [];
+
+      const normalPayload =
+        data.items ?? data.rewards?.items ?? data.loot?.items ?? data.item ?? data.rewards?.item ?? data.loot?.item;
+
+      const normalItems = normalizeLootPayload(normalPayload, 'normal');
+      const rankingItems = normalizeLootPayload(data.ranking_rewards, 'ranking');
+
+      return [...normalItems, ...rankingItems];
+    };
+
+    // Adds one API loot entry to the visual summary and returns its real unit count.
+    const addLootItem = (itemGroups, item) => {
+      const quantity = parseLootQuantity(item);
+      const name = getLootItemName(item);
+      const image = getLootItemImage(item);
+      const source = item?.__lootSource === 'ranking' ? 'ranking' : 'normal';
+      const itemId = item?.ID || item?.id || item?.item_id || item?.ITEM_ID || name;
+      const groupKey = `${source}:${String(itemId)}`;
+
+      if (!itemGroups[groupKey]) {
+        itemGroups[groupKey] = {
+          name,
+          img: image,
+          qty: 0,
+          source,
+        };
+      }
+
+      itemGroups[groupKey].qty += quantity;
+      return quantity;
+    };
+
     const renderSummary = (
       boxesProcessed,
       successCount,
@@ -195,7 +344,7 @@
                 <span style="${pillStyle}">Fail: ${failCount}</span>
                 <span style="${pillStyle}">EXP: ${totalExp.toLocaleString()}</span>
                 <span style="${pillStyle}">Gold: ${totalGold.toLocaleString()}</span>
-                <span style="${pillStyle}">Acquired: ${rawItemCount}</span>
+                <span style="${pillStyle}">Item units: ${rawItemCount.toLocaleString()}</span>
             `;
       const itemsContainer = document.getElementById('tmLootItems');
       const aggregatedItems = Object.values(itemGroups).sort((a, b) => b.qty - a.qty);
@@ -204,9 +353,10 @@
           .map(
             (it) => `
                     <div style="background:#1e1e2f; border:1px solid #2b2d44; border-radius:10px; width:92px; padding:8px; text-align:center; display:flex; flex-direction:column; justify-content:space-between; position:relative;">
-                        ${it.qty > 1 ? `<span style="position:absolute; top:4px; right:4px; background:#111827; color:#fff; font-size:11px; font-weight:600; padding:2px 6px; border-radius:999px; border:1px solid #2b2d44; line-height:1; pointer-events:none;">x${it.qty}</span>` : ''}
+                        ${it.qty > 1 ? `<span style="position:absolute; top:4px; right:4px; background:#111827; color:#fff; font-size:11px; font-weight:600; padding:2px 6px; border-radius:999px; border:1px solid #2b2d44; line-height:1; pointer-events:none;">x${it.qty.toLocaleString()}</span>` : ''}
                         <img src="${it.img}" style="width:64px; height:64px; object-fit:cover; border-radius:8px; display:block; margin:0 auto 6px;">
                         <small style="display:block; line-height:1.2; font-size:11px;">${it.name}</small>
+                        ${it.source === 'ranking' ? '<small style="display:block; margin-top:4px; color:#ffd369; font-size:9px; font-weight:bold;">RANK REWARD</small>' : ''}
                     </div>
                 `,
           )
@@ -568,7 +718,11 @@
             let data = {};
 
             try {
-              data = JSON.parse(rawText);
+              data = JSON.parse(
+                String(rawText)
+                  .replace(/^\uFEFF/, '')
+                  .trim(),
+              );
             } catch (parseError) {
               console.warn('Loot response was not valid JSON:', rawText);
             }
@@ -594,31 +748,10 @@
               totalGold += Number(data.gold || 0);
             }
 
-            let itemsArray = [];
-
-            if (Array.isArray(data.items)) {
-              itemsArray = data.items;
-            } else if (data.item) {
-              itemsArray = [data.item];
-            }
+            const itemsArray = extractLootItems(data);
 
             itemsArray.forEach((item) => {
-              rawItemCount++;
-
-              const itemName = item.NAME || item.name || 'Unknown Item';
-
-              const itemImage =
-                item.IMAGE_URL || item.image_url || item.image || 'https://via.placeholder.com/64?text=Item';
-
-              if (!itemGroups[itemName]) {
-                itemGroups[itemName] = {
-                  name: itemName,
-                  img: itemImage,
-                  qty: 0,
-                };
-              }
-
-              itemGroups[itemName].qty++;
+              rawItemCount += addLootItem(itemGroups, item);
             });
 
             /*
@@ -808,7 +941,11 @@
           const textExt = await resExt.text();
           let dataExt = {};
           try {
-            dataExt = JSON.parse(textExt);
+            dataExt = JSON.parse(
+              String(textExt)
+                .replace(/^\uFEFF/, '')
+                .trim(),
+            );
           } catch (e) {}
 
           if (dataExt.ok || dataExt.status === 'success') {
@@ -821,9 +958,11 @@
                 ? dataExt.shadow.image
                 : 'https://via.placeholder.com/64?text=Shadow';
 
-            if (!itemGroups[sName]) itemGroups[sName] = { name: sName, img: sImg, qty: 0 };
-            itemGroups[sName].qty += 1;
-            rawItemCount++;
+            const shadowQuantity = parseLootQuantity(dataExt.shadow || {});
+            const shadowKey = String(dataExt.shadow?.id || dataExt.shadow?.ID || `shadow:${sName}`);
+            if (!itemGroups[shadowKey]) itemGroups[shadowKey] = { name: sName, img: sImg, qty: 0 };
+            itemGroups[shadowKey].qty += shadowQuantity;
+            rawItemCount += shadowQuantity;
           }
         } catch (e) {
           console.error('Extraction failed for', mId, e);
@@ -842,7 +981,11 @@
           const textLoot = await resLoot.text();
           let dataLoot = {};
           try {
-            dataLoot = JSON.parse(textLoot);
+            dataLoot = JSON.parse(
+              String(textLoot)
+                .replace(/^\uFEFF/, '')
+                .trim(),
+            );
           } catch (e) {}
 
           const isSuccess =
@@ -860,16 +1003,10 @@
               totalGold += dataLoot.gold || 0;
             }
 
-            let itemsArray = [];
-            if (dataLoot.items && Array.isArray(dataLoot.items)) itemsArray = dataLoot.items;
-            else if (dataLoot.item) itemsArray = [dataLoot.item];
+            const itemsArray = extractLootItems(dataLoot);
 
-            itemsArray.forEach((it) => {
-              rawItemCount++;
-              const key = it.NAME || it.name || 'Unknown Item';
-              const img = it.IMAGE_URL || it.image_url || it.image || 'https://via.placeholder.com/64?text=Item';
-              if (!itemGroups[key]) itemGroups[key] = { name: key, img: img, qty: 0 };
-              itemGroups[key].qty += 1;
+            itemsArray.forEach((item) => {
+              rawItemCount += addLootItem(itemGroups, item);
             });
           }
         } catch (e) {
@@ -947,7 +1084,11 @@
           const text = await res.text();
           let data = {};
           try {
-            data = JSON.parse(text);
+            data = JSON.parse(
+              String(text)
+                .replace(/^\uFEFF/, '')
+                .trim(),
+            );
           } catch (e) {}
 
           const isSuccess =
@@ -965,16 +1106,10 @@
               totalGold += data.gold || 0;
             }
 
-            let itemsArray = [];
-            if (data.items && Array.isArray(data.items)) itemsArray = data.items;
-            else if (data.item) itemsArray = [data.item];
+            const itemsArray = extractLootItems(data);
 
-            itemsArray.forEach((it) => {
-              rawItemCount++;
-              const key = it.NAME || it.name || 'Unknown Item';
-              const img = it.IMAGE_URL || it.image_url || it.image || 'https://via.placeholder.com/64?text=Item';
-              if (!itemGroups[key]) itemGroups[key] = { name: key, img: img, qty: 0 };
-              itemGroups[key].qty += 1;
+            itemsArray.forEach((item) => {
+              rawItemCount += addLootItem(itemGroups, item);
             });
 
             boxesToProcess[i].closest('.monster-card').style.opacity = '0.2';
