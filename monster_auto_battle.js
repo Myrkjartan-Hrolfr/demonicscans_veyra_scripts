@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Monster Auto Battle - 3 Attack Fallback
+// @name         Monster Auto Battle
 // @namespace    http://tampermonkey.net/
-// @version      1.4.3
+// @version      1.4.4
 // @description  Auto-battle for the current monster with three attacks, potion priorities, target damage, and level-up protection.
 // @match        https://demonicscans.org/battle.php*
 // @grant        none
@@ -3295,7 +3295,13 @@
 
     state.panel = createPanel();
 
-    card.appendChild(state.panel);
+    const battleActionsCard = card.querySelector('.battle-actions-card');
+
+    if (battleActionsCard) {
+      battleActionsCard.insertAdjacentElement('afterend', state.panel);
+    } else {
+      card.appendChild(state.panel);
+    }
 
     bindEvents();
     renderAttackOptions();
