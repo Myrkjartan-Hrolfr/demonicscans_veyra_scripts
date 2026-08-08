@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dungeon Location Farmer - Controlled
 // @namespace    http://tampermonkey.net/
-// @version      2.1.0
+// @version      2.1.1
 // @description  Farm all alive monsters with dynamic class attacks, stamina/mana fallbacks, and configurable potion priorities.
 // @author       [J4F] RacletteCestLavie / enhanced
 // @match        https://demonicscans.org/guild_dungeon_location.php*
@@ -15,7 +15,7 @@
 
   const ID = 'dlf-controlled';
   const STORE_KEY = `${ID}:settings:v2:${location.host}:${location.pathname}`;
-  const RESUME_KEY = `${ID}:resume:v1:${location.host}:${location.pathname}`;
+  const RESUME_KEY = `${ID}:resume:v2:${location.host}:${location.pathname}`;
 
   const MAX_RATE_RETRIES = 8;
   const MAX_FAIL_RETRIES = 3;
@@ -339,6 +339,7 @@
     return monsters;
   }
 
+
   function normalizeAttackName(value) {
     return String(value || '')
       .trim()
@@ -426,12 +427,7 @@
       if (attacks.some((attack) => attack.key === keys[index])) continue;
 
       const oldKey = keys[index];
-      const oldName =
-        SKILLS[oldKey]?.name ||
-        String(oldKey || '')
-          .split('|')
-          .slice(1)
-          .join('|');
+      const oldName = SKILLS[oldKey]?.name || String(oldKey || '').split('|').slice(1).join('|');
       const byName = attacks.find((attack) => {
         return oldName && normalizeAttackName(attack.name).toLowerCase() === normalizeAttackName(oldName).toLowerCase();
       });
@@ -464,9 +460,7 @@
     const html = await response.text();
     const battleDocument = new DOMParser().parseFromString(html, 'text/html');
     const battleCard = battleDocument.querySelector('.battle-card.monster-card') || battleDocument;
-    const discovered = queryAll(SEL.attack, battleCard)
-      .map(attackFromButton)
-      .filter((attack) => attack.id !== '');
+    const discovered = queryAll(SEL.attack, battleCard).map(attackFromButton).filter((attack) => attack.id !== '');
 
     if (!discovered.length) return false;
 
@@ -976,6 +970,16 @@
           instanceId: state.activeRun.instanceId,
           locationId: state.activeRun.locationId,
           reason: 'potion',
+          currentMonsterDgmid: state.activeRun.currentMonsterDgmid || null,
+          currentMonsterName: state.activeRun.currentMonsterName || null,
+          currentMonsterIndex: Number.isInteger(state.activeRun.currentMonsterIndex)
+            ? state.activeRun.currentMonsterIndex
+            : null,
+          remainingMonsterDgmids: Array.isArray(state.activeRun.remainingMonsterDgmids)
+            ? state.activeRun.remainingMonsterDgmids.slice()
+            : [],
+          killed: Math.max(0, Number(state.activeRun.killed) || 0),
+          processed: Math.max(0, Number(state.activeRun.processed) || 0),
         }),
       );
     } catch (error) {
@@ -1161,6 +1165,7 @@
     addLog(`${potion.name} was clicked, but no resource or quantity change was detected.`);
     return false;
   }
+
 
   function getSelectedSkills(settings) {
     const unique = new Set();
@@ -1590,7 +1595,16 @@
     return { reason: 'stopped', totalDamage };
   }
 
-  async function runFarm(instanceId, locationId, settings, runState, setStatus, newLogLine, addLog) {
+  async function runFarm(
+    instanceId,
+    locationId,
+    settings,
+    runState,
+    setStatus,
+    newLogLine,
+    addLog,
+    resumeData = null,
+  ) {
     const monsters = getAliveMonsters();
 
     if (!monsters.length) {
@@ -1598,17 +1612,76 @@
       return;
     }
 
-    setStatus(`Found ${monsters.length} alive monster(s). Starting...`, 'running');
-    addLog(`Started with ${monsters.length} alive monster(s).`);
+    let killed = Math.max(0, Number(resumeData?.killed) || 0);
+    let processed = Math.max(0, Number(resumeData?.processed) || 0);
+    let startIndex = 0;
+    let resumeMonster = null;
+
+    /*
+     * Potion reloads rebuild the alive-monster list. Monsters that were
+     * already killed disappear from that list, while target/cap monsters can
+     * still be present. Use the saved remaining dgmid sequence instead of an
+     * array index so the farmer never has to walk the completed monsters again.
+     */
+    if (resumeData) {
+      const candidates = [];
+
+      if (resumeData.currentMonsterDgmid != null) {
+        candidates.push(String(resumeData.currentMonsterDgmid));
+      }
+
+      if (Array.isArray(resumeData.remainingMonsterDgmids)) {
+        for (const dgmid of resumeData.remainingMonsterDgmids) {
+          const key = String(dgmid);
+          if (!candidates.includes(key)) candidates.push(key);
+        }
+      }
+
+      for (const candidate of candidates) {
+        const foundIndex = monsters.findIndex((monster) => String(monster.dgmid) === candidate);
+        if (foundIndex >= 0) {
+          startIndex = foundIndex;
+          resumeMonster = monsters[foundIndex];
+          break;
+        }
+      }
+
+      if (resumeMonster) {
+        addLog(`Potion resume: continuing directly with ${resumeMonster.name}.`);
+      } else if (candidates.length) {
+        startIndex = monsters.length;
+        addLog('Potion resume: none of the saved remaining monsters are alive anymore. Skipping the monster loop.');
+      }
+    }
+
+    const remainingCount = Math.max(0, monsters.length - startIndex);
+    setStatus(
+      resumeMonster
+        ? `Resuming at ${resumeMonster.name}. ${remainingCount} monster(s) remaining...`
+        : `Found ${monsters.length} alive monster(s). Starting...`,
+      'running',
+    );
+    addLog(
+      resumeMonster
+        ? `Resumed with ${remainingCount} monster(s) from the saved position.`
+        : `Started with ${monsters.length} alive monster(s).`,
+    );
     await sleep(300);
 
-    let killed = 0;
-    let processed = 0;
-
-    for (let index = 0; index < monsters.length; index += 1) {
+    for (let index = startIndex; index < monsters.length; index += 1) {
       if (runState.stopped) break;
 
       const monster = monsters[index];
+
+      if (state.activeRun) {
+        state.activeRun.currentMonsterDgmid = String(monster.dgmid);
+        state.activeRun.currentMonsterName = monster.name;
+        state.activeRun.currentMonsterIndex = index;
+        state.activeRun.remainingMonsterDgmids = monsters.slice(index).map((item) => String(item.dgmid));
+        state.activeRun.killed = killed;
+        state.activeRun.processed = processed;
+      }
+
       const line = newLogLine(`[${index + 1}/${monsters.length}] ${monster.name} - starting...`);
 
       const result = await attackUntilTarget(
@@ -1624,6 +1697,13 @@
 
       if (result.reason === 'dead') killed += 1;
       if (['dead', 'target_reached', 'already_done'].includes(result.reason)) processed += 1;
+
+      if (state.activeRun) {
+        state.activeRun.killed = killed;
+        state.activeRun.processed = processed;
+        state.activeRun.remainingMonsterDgmids = monsters.slice(index + 1).map((item) => String(item.dgmid));
+      }
+
       if (['no_stamina', 'no_mana', 'no_attack', 'player_dead', 'no_health_potion'].includes(result.reason)) break;
     }
 
@@ -2253,15 +2333,12 @@
     renderPotionLists();
   }
 
-  async function startFarm(instanceId, locationId, resume = false) {
+  async function startFarm(instanceId, locationId, resumeData = null) {
     if (!state.runState.stopped) return;
 
     const attacksLoaded = await refreshAvailableAttacks(instanceId, true);
     if (!attacksLoaded && state.settings.attackKeys.some((key) => !SKILLS[key])) {
-      setStatus(
-        'Saved class attacks could not be loaded from the battle page. Refresh attacks and try again.',
-        'error',
-      );
+      setStatus('Saved class attacks could not be loaded from the battle page. Refresh attacks and try again.', 'error');
       return;
     }
 
@@ -2279,14 +2356,34 @@
     };
 
     state.runState = { stopped: false };
-    state.activeRun = { instanceId, locationId };
+    state.activeRun = {
+      instanceId,
+      locationId,
+      currentMonsterDgmid: resumeData?.currentMonsterDgmid || null,
+      currentMonsterName: resumeData?.currentMonsterName || null,
+      currentMonsterIndex: Number.isInteger(resumeData?.currentMonsterIndex) ? resumeData.currentMonsterIndex : null,
+      remainingMonsterDgmids: Array.isArray(resumeData?.remainingMonsterDgmids)
+        ? resumeData.remainingMonsterDgmids.slice()
+        : [],
+      killed: Math.max(0, Number(resumeData?.killed) || 0),
+      processed: Math.max(0, Number(resumeData?.processed) || 0),
+    };
     updateButtons();
     keepRunningLogVisible(true);
 
-    if (resume) addLog('Resumed after potion use or page reload.');
+    if (resumeData) addLog('Resumed after potion use or page reload.');
 
     try {
-      await runFarm(instanceId, locationId, settings, state.runState, setStatus, newLogLine, addLog);
+      await runFarm(
+        instanceId,
+        locationId,
+        settings,
+        state.runState,
+        setStatus,
+        newLogLine,
+        addLog,
+        resumeData,
+      );
     } catch (error) {
       console.error('[DLF]', error);
       setStatus(`Error: ${error?.message || error}`, 'error');
@@ -2330,7 +2427,7 @@
     state.overlay.style.display = 'flex';
     setStatus('Potion use completed. Resuming the location farmer...', 'running');
     await sleep(350);
-    await startFarm(instanceId, locationId, true);
+    await startFarm(instanceId, locationId, resume);
   }
 
   function bindUIEvents(instanceId, locationId) {
@@ -2355,7 +2452,7 @@
     });
 
     state.ui.start.addEventListener('click', () => {
-      void startFarm(instanceId, locationId, false);
+      void startFarm(instanceId, locationId, null);
     });
 
     state.ui.stop.addEventListener('click', stopFarm);
