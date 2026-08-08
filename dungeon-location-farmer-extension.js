@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Dungeon Location Farmer - Controlled
 // @namespace    http://tampermonkey.net/
-// @version      2.0.4
-// @description  Farm all alive monsters with attack fallbacks and configurable potion priorities.
+// @version      2.1.0
+// @description  Farm all alive monsters with dynamic class attacks, stamina/mana fallbacks, and configurable potion priorities.
 // @author       [J4F] RacletteCestLavie / enhanced
 // @match        https://demonicscans.org/guild_dungeon_location.php*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=demonicscans.org
@@ -28,6 +28,8 @@
     potion: '.potion-use-btn',
     potionCard: '.potion-card',
     playerHp: '#pHpText',
+    playerMana: '#pManaText',
+    attack: 'button.attack-btn',
   };
 
   const SKILLS = {
@@ -46,6 +48,7 @@
     specificDamage: '1000000',
 
     autoStamina: false,
+    autoMana: false,
     staminaReserve: 10,
     staminaFailureAction: 'wait',
     staminaWaitSeconds: 30,
@@ -59,12 +62,20 @@
     potionUseAmount: {},
     potionOrder: {
       stamina: [],
+      mana: [],
       health: [],
     },
   };
 
   const state = {
     settings: loadSettings(),
+    attacks: Object.entries(SKILLS).map(([key, skill]) => ({
+      key,
+      ...skill,
+      manaCost: 0,
+      group: 'Standard Attacks',
+    })),
+    attackSignature: '',
     potions: [],
     overlay: null,
     ui: {},
@@ -95,6 +106,7 @@
         potionUseAmount: { ...(saved.potionUseAmount || {}) },
         potionOrder: {
           stamina: saved.potionOrder?.stamina || [],
+          mana: saved.potionOrder?.mana || [],
           health: saved.potionOrder?.health || [],
         },
       };
@@ -251,6 +263,10 @@
     return parseInteger(document.querySelector(SEL.stamina)?.textContent);
   }
 
+  function getPlayerManaFromPage() {
+    return parseFraction(document.querySelector(SEL.playerMana)?.textContent);
+  }
+
   async function fetchDashboardSnapshot() {
     try {
       const response = await fetch('/game_dash.php', {
@@ -264,6 +280,7 @@
       const html = await response.text();
       const snapshotDocument = new DOMParser().parseFromString(html, 'text/html');
       const stamina = parseInteger(snapshotDocument.querySelector(SEL.stamina)?.textContent);
+      const mana = parseFraction(snapshotDocument.querySelector(SEL.playerMana)?.textContent);
       const health =
         parseFraction(snapshotDocument.querySelector(SEL.playerHp)?.textContent) ||
         parseFraction(snapshotDocument.querySelector('.playerhp .muted')?.textContent);
@@ -276,7 +293,11 @@
       const targetHp = document.querySelector(SEL.playerHp);
       if (sourceHp && targetHp) targetHp.textContent = sourceHp.textContent;
 
-      return { stamina, health };
+      const sourceMana = snapshotDocument.querySelector(SEL.playerMana);
+      const targetMana = document.querySelector(SEL.playerMana);
+      if (sourceMana && targetMana) targetMana.textContent = sourceMana.textContent;
+
+      return { stamina, mana, health };
     } catch (error) {
       console.warn('[DLF] Could not refresh dashboard values.', error);
       return null;
@@ -316,6 +337,175 @@
     }
 
     return monsters;
+  }
+
+  function normalizeAttackName(value) {
+    return String(value || '')
+      .trim()
+      .replace(/\s+/g, ' ')
+      .replace(/\s*\(\s*[\d.,\s]+\s*\)\s*$/, '')
+      .trim();
+  }
+
+  function getAttackCosts(button) {
+    const text = [
+      button.dataset.skillName || '',
+      button.textContent || '',
+      button.querySelector('.skill-cost')?.textContent || '',
+    ].join(' ');
+
+    const staminaMatch = text.match(/(\d{1,3}(?:[.,\s]\d{3})+|\d+)\s*(?:stam|stamina)\b/i);
+    const manaMatch = text.match(/(\d{1,3}(?:[.,\s]\d{3})+|\d+)\s*(?:mp|mana)\b/i);
+
+    let stamina = staminaMatch ? parseInteger(staminaMatch[1]) : null;
+    const dataStamina = parseInteger(button.dataset.stamCost);
+    const dataMana = parseInteger(button.dataset.manaCost);
+    const mana = manaMatch ? parseInteger(manaMatch[1]) : (dataMana ?? 0);
+
+    if (!Number.isFinite(stamina) || stamina <= 1) {
+      const ending = button.textContent?.match(/\((\d{1,3}(?:[.,\s]\d{3})+|\d+)\)\s*$/);
+      const visibleCost = ending ? parseInteger(ending[1]) : null;
+      stamina = Number.isFinite(visibleCost) ? visibleCost : (dataStamina ?? stamina ?? 0);
+    }
+
+    return {
+      stamina: stamina || 0,
+      mana: mana || 0,
+    };
+  }
+
+  function getAttackKey(skillId, name) {
+    const normalizedName = normalizeAttackName(name).toLowerCase();
+    const standard = Object.entries(SKILLS).find(([key, skill]) => {
+      return (
+        String(skill.id) === String(skillId) &&
+        (key === normalizedName || normalizeAttackName(skill.name).toLowerCase() === normalizedName)
+      );
+    });
+
+    return standard?.[0] || `${String(skillId)}|${normalizeAttackName(name)}`;
+  }
+
+  function attackFromButton(button) {
+    const rawName =
+      button.dataset.skillName?.trim() ||
+      button.querySelector('.skill-name')?.textContent?.trim() ||
+      button.textContent?.trim() ||
+      'Unnamed Attack';
+
+    const name = normalizeAttackName(rawName) || 'Unnamed Attack';
+    const id = String(button.dataset.skillId ?? '');
+    const costs = getAttackCosts(button);
+
+    return {
+      key: getAttackKey(id, name),
+      id,
+      name,
+      group: button.closest('.class-skill-bar') ? 'Class Attacks' : 'Standard Attacks',
+      cost: costs.stamina,
+      manaCost: costs.mana,
+    };
+  }
+
+  function getStandardAttackList() {
+    return Object.entries(SKILLS).map(([key, skill]) => ({
+      key,
+      ...skill,
+      manaCost: 0,
+      group: 'Standard Attacks',
+    }));
+  }
+
+  function reconcileAttackKeys() {
+    const attacks = state.attacks.length ? state.attacks : getStandardAttackList();
+    const keys = Array.isArray(state.settings.attackKeys) ? state.settings.attackKeys.slice(0, 3) : [];
+
+    while (keys.length < 3) keys.push(DEFAULTS.attackKeys[keys.length]);
+
+    for (let index = 0; index < 3; index += 1) {
+      if (attacks.some((attack) => attack.key === keys[index])) continue;
+
+      const oldKey = keys[index];
+      const oldName =
+        SKILLS[oldKey]?.name ||
+        String(oldKey || '')
+          .split('|')
+          .slice(1)
+          .join('|');
+      const byName = attacks.find((attack) => {
+        return oldName && normalizeAttackName(attack.name).toLowerCase() === normalizeAttackName(oldName).toLowerCase();
+      });
+
+      keys[index] =
+        byName?.key ||
+        attacks.find((attack) => !keys.includes(attack.key))?.key ||
+        attacks[index]?.key ||
+        attacks[0]?.key ||
+        'slash';
+    }
+
+    state.settings.attackKeys = keys;
+    saveSettings();
+  }
+
+  async function discoverAttacksForMonster(dgmid, instanceId) {
+    const response = await fetch(
+      `/battle.php?dgmid=${encodeURIComponent(dgmid)}&instance_id=${encodeURIComponent(instanceId)}`,
+      {
+        credentials: 'same-origin',
+        cache: 'no-store',
+      },
+    );
+
+    if (!response.ok) {
+      throw new Error(`Battle page returned HTTP ${response.status}`);
+    }
+
+    const html = await response.text();
+    const battleDocument = new DOMParser().parseFromString(html, 'text/html');
+    const battleCard = battleDocument.querySelector('.battle-card.monster-card') || battleDocument;
+    const discovered = queryAll(SEL.attack, battleCard)
+      .map(attackFromButton)
+      .filter((attack) => attack.id !== '');
+
+    if (!discovered.length) return false;
+
+    const unique = new Map(discovered.map((attack) => [attack.key, attack]));
+    for (const attack of getStandardAttackList()) {
+      if (![...unique.values()].some((existing) => String(existing.id) === String(attack.id))) {
+        unique.set(attack.key, attack);
+      }
+    }
+
+    const attacks = [...unique.values()];
+    state.attackSignature = attacks
+      .map((attack) => `${attack.key}:${attack.cost}:${attack.manaCost}:${attack.group}`)
+      .join('||');
+    state.attacks = attacks;
+    reconcileAttackKeys();
+    renderAttackOptions();
+    return true;
+  }
+
+  async function refreshAvailableAttacks(instanceId, quiet = false) {
+    const monster = getAliveMonsters()[0];
+    if (!monster) return false;
+
+    try {
+      const loaded = await discoverAttacksForMonster(monster.dgmid, instanceId);
+      if (!quiet && loaded) {
+        const classCount = state.attacks.filter((attack) => attack.group === 'Class Attacks').length;
+        setStatus(
+          `Loaded ${state.attacks.length} attack(s)${classCount ? `, including ${classCount} class attack(s)` : ''}.`,
+          'success',
+        );
+      }
+      return loaded;
+    } catch (error) {
+      console.warn('[DLF] Could not refresh attacks from battle page.', error);
+      if (!quiet) setStatus(`Could not refresh attacks: ${error?.message || error}`, 'error');
+      return false;
+    }
   }
 
   async function getMonsterBattleData(dgmid, instanceId) {
@@ -437,6 +627,7 @@
         monsterDead: false,
         userHpAfter: null,
         staminaAfter: null,
+        manaAfter: null,
         feedbackType: null,
         retryAfterMs: null,
       };
@@ -479,6 +670,8 @@
 
     const staminaAfter = firstGameNumber(data?.stamina_after, data?.staminaAfter, data?.current_stamina);
 
+    const manaAfter = firstGameNumber(data?.mana_after, data?.manaAfter, data?.current_mana);
+
     const explicitFailure = data?.status === 'error' || data?.success === false;
     const ok = !explicitFailure && (response.ok || data?.status === 'success' || data?.success === true);
 
@@ -501,6 +694,12 @@
     ) {
       feedbackType = 'stamina';
     } else if (
+      /not enough\s+mana|insufficient\s+mana|out of\s+mana|mana\s+(?:is\s+)?(?:empty|too low|depleted)/.test(
+        lowerMessage,
+      )
+    ) {
+      feedbackType = 'mana';
+    } else if (
       /you are dead|you died|you have died|knocked out|cannot attack.*dead|dead.*cannot attack/.test(lowerMessage)
     ) {
       feedbackType = 'dead';
@@ -517,6 +716,7 @@
       monsterDead,
       userHpAfter,
       staminaAfter,
+      manaAfter,
       feedbackType,
       retryAfterMs: getRetryAfterMilliseconds(response),
     };
@@ -547,6 +747,7 @@
   function getPotionType(name, description) {
     const text = `${name} ${description}`.toLowerCase();
     if (text.includes('stamina')) return 'stamina';
+    if (text.includes('mana')) return 'mana';
     if (/\bhp\b|health|heal/.test(text)) return 'health';
     return 'other';
   }
@@ -601,7 +802,7 @@
 
     state.potions = [...unique.values()];
 
-    for (const type of ['stamina', 'health']) {
+    for (const type of ['stamina', 'mana', 'health']) {
       const available = state.potions.filter((potion) => potion.type === type).map((potion) => potion.key);
       const oldOrder = state.settings.potionOrder[type] || [];
 
@@ -879,7 +1080,9 @@
     const beforeResource =
       type === 'stamina'
         ? (beforeSnapshot?.stamina ?? getStaminaFromPage())
-        : (beforeSnapshot?.health?.current ?? getPlayerHpFromPage()?.current);
+        : type === 'mana'
+          ? (beforeSnapshot?.mana?.current ?? getPlayerManaFromPage()?.current)
+          : (beforeSnapshot?.health?.current ?? getPlayerHpFromPage()?.current);
 
     if (input && !input.readOnly && !input.disabled) {
       input.value = String(amount);
@@ -905,7 +1108,12 @@
       discoverPotions(false);
 
       const refreshed = state.potions.find((item) => item.key === potion.key);
-      const afterResource = type === 'stamina' ? getStaminaFromPage() : getPlayerHpFromPage()?.current;
+      const afterResource =
+        type === 'stamina'
+          ? getStaminaFromPage()
+          : type === 'mana'
+            ? getPlayerManaFromPage()?.current
+            : getPlayerHpFromPage()?.current;
 
       const quantityChanged =
         Number.isFinite(beforeQuantity) && Number.isFinite(refreshed?.quantity) && refreshed.quantity < beforeQuantity;
@@ -924,7 +1132,12 @@
     }
 
     const afterSnapshot = await fetchDashboardSnapshot();
-    const afterResource = type === 'stamina' ? afterSnapshot?.stamina : afterSnapshot?.health?.current;
+    const afterResource =
+      type === 'stamina'
+        ? afterSnapshot?.stamina
+        : type === 'mana'
+          ? afterSnapshot?.mana?.current
+          : afterSnapshot?.health?.current;
 
     discoverPotions(false);
     const refreshed = state.potions.find((item) => item.key === potion.key);
@@ -952,38 +1165,123 @@
   function getSelectedSkills(settings) {
     const unique = new Set();
     const skills = [];
+    const attacks = state.attacks.length ? state.attacks : getStandardAttackList();
 
     for (const key of settings.attackKeys || []) {
-      const skill = SKILLS[key];
-      if (!skill || unique.has(key)) continue;
-      unique.add(key);
-      skills.push({ key, ...skill });
+      const skill =
+        attacks.find((attack) => attack.key === key) ||
+        (SKILLS[key] ? { key, ...SKILLS[key], manaCost: 0, group: 'Standard Attacks' } : null);
+
+      if (!skill || unique.has(skill.key)) continue;
+      unique.add(skill.key);
+      skills.push(skill);
     }
 
-    if (!skills.length) skills.push({ key: 'slash', ...SKILLS.slash });
+    if (!skills.length) {
+      skills.push({ key: 'slash', ...SKILLS.slash, manaCost: 0, group: 'Standard Attacks' });
+    }
+
     return skills;
   }
 
-  function chooseAttack(stamina, settings) {
-    const skills = getSelectedSkills(settings);
-    if (!Number.isFinite(stamina)) return skills[0];
-
+  function hasEnoughStamina(skill, stamina, settings) {
+    if (!Number.isFinite(stamina)) return true;
     const reserve = Math.max(0, Number(settings.staminaReserve) || 0);
-    return skills.find((skill) => stamina >= skill.cost + reserve) || null;
+    return stamina >= (Number(skill.cost) || 0) + reserve;
+  }
+
+  function hasEnoughMana(skill, mana) {
+    if (!Number.isFinite(mana)) return true;
+    return mana >= (Number(skill.manaCost) || 0);
   }
 
   async function ensureAttackAvailable(settings, runState, setStatus, addLog, counters) {
-    const stamina = await getStamina();
-    const attack = chooseAttack(stamina, settings);
+    const snapshot = await fetchDashboardSnapshot();
+    const stamina = snapshot?.stamina ?? getStaminaFromPage();
+    const mana = snapshot?.mana?.current ?? getPlayerManaFromPage()?.current;
+    const skills = getSelectedSkills(settings);
+    const primary = skills[0];
 
-    if (attack) {
-      counters.staminaWaits = 0;
-      return { attack, stamina };
+    if (!primary) return { stop: true, reason: 'no_attack' };
+
+    /*
+     * Attack 1 keeps absolute priority, matching Monster Auto Battle.
+     * If it has enough stamina but lacks mana, restore mana instead of
+     * silently switching to a different attack.
+     */
+    if (hasEnoughStamina(primary, stamina, settings)) {
+      if (hasEnoughMana(primary, mana)) {
+        counters.staminaWaits = 0;
+        return { attack: primary, stamina, mana };
+      }
+
+      if (settings.autoMana) {
+        setStatus(
+          `${primary.name} needs ${formatNumber(primary.manaCost)} mana, but only ${formatNumber(mana)} is available. Using a potion...`,
+          'running',
+        );
+
+        const used = await usePotion('mana', setStatus, addLog);
+        if (used) return { retry: true };
+      }
+
+      return {
+        stop: true,
+        reason: 'no_mana',
+        mana,
+        requiredMana: primary.manaCost,
+        attackName: primary.name,
+      };
     }
 
-    const skills = getSelectedSkills(settings);
-    const cheapest = Math.min(...skills.map((skill) => skill.cost));
-    const required = cheapest + Math.max(0, Number(settings.staminaReserve) || 0);
+    let manaBlocked = null;
+
+    /*
+     * Attack 2 and 3 remain stamina fallbacks. A fallback whose stamina
+     * requirement fits may request a mana potion when its MP is too low.
+     */
+    for (let index = 1; index < skills.length; index += 1) {
+      const skill = skills[index];
+      if (!hasEnoughStamina(skill, stamina, settings)) continue;
+
+      if (!hasEnoughMana(skill, mana)) {
+        manaBlocked = skill;
+        if (!settings.autoMana) continue;
+
+        setStatus(
+          `${skill.name} is the stamina fallback but needs ${formatNumber(skill.manaCost)} mana. Using a potion...`,
+          'running',
+        );
+
+        const used = await usePotion('mana', setStatus, addLog);
+        if (used) return { retry: true };
+
+        return {
+          stop: true,
+          reason: 'no_mana',
+          mana,
+          requiredMana: skill.manaCost,
+          attackName: skill.name,
+        };
+      }
+
+      counters.staminaWaits = 0;
+      addLog(`Using stamina fallback ${index + 1}: ${skill.name}.`);
+      return { attack: skill, stamina, mana };
+    }
+
+    if (manaBlocked) {
+      return {
+        stop: true,
+        reason: 'no_mana',
+        mana,
+        requiredMana: manaBlocked.manaCost,
+        attackName: manaBlocked.name,
+      };
+    }
+
+    const reserve = Math.max(0, Number(settings.staminaReserve) || 0);
+    const required = Math.min(...skills.map((skill) => (Number(skill.cost) || 0) + reserve));
 
     if (settings.autoStamina) {
       setStatus(
@@ -1132,6 +1430,24 @@
       if (prepared.stop) {
         if (prepared.reason === 'stopped') break;
 
+        if (prepared.reason === 'no_mana') {
+          const message =
+            `${name} - ${prepared.attackName || 'selected attack'} needs ${formatNumber(prepared.requiredMana)} mana ` +
+            `(${formatNumber(prepared.mana)} available)`;
+          line.update(`✗ ${message}`, '#b48ce6');
+          setStatus(message, 'error');
+          runState.stopped = true;
+          return { reason: 'no_mana', totalDamage };
+        }
+
+        if (prepared.reason === 'no_attack') {
+          const message = `${name} - no selected attack is available.`;
+          line.update(`✗ ${message}`, '#e06c6c');
+          setStatus(message, 'error');
+          runState.stopped = true;
+          return { reason: 'no_attack', totalDamage };
+        }
+
         const message =
           `${name} - out of stamina (${formatNumber(prepared.stamina)} available, ` +
           `${formatNumber(prepared.required)} required)`;
@@ -1167,6 +1483,26 @@
         addLog(`${skill.name} was rejected because of stamina. Rechecking attack fallbacks.`);
         await sleep(300);
         continue;
+      }
+
+      if (result.feedbackType === 'mana') {
+        if (settings.autoMana) {
+          addLog(`${skill.name} was rejected because of mana. Trying an enabled mana potion.`);
+          const used = await usePotion('mana', setStatus, addLog);
+
+          if (used) {
+            await sleep(300);
+            continue;
+          }
+        }
+
+        const message = settings.autoMana
+          ? `${name} - not enough mana and no enabled mana potion worked.`
+          : `${name} - not enough mana and automatic mana potions are disabled.`;
+        setStatus(message, 'error');
+        line.update(`✗ ${message}`, '#b48ce6');
+        runState.stopped = true;
+        return { reason: 'no_mana', totalDamage };
       }
 
       if (result.feedbackType === 'dead') {
@@ -1213,6 +1549,15 @@
       if (Number.isFinite(result.staminaAfter)) {
         const staminaElement = document.querySelector(SEL.stamina);
         if (staminaElement) staminaElement.textContent = formatNumber(result.staminaAfter);
+      }
+
+      if (Number.isFinite(result.manaAfter)) {
+        const manaElement = document.querySelector(SEL.playerMana);
+        const mana = parseFraction(manaElement?.textContent);
+
+        if (manaElement && mana) {
+          manaElement.textContent = `💠 ${formatNumber(result.manaAfter)} / ${formatNumber(mana.maximum)} MP`;
+        }
       }
 
       const targetText = Number.isFinite(target)
@@ -1279,7 +1624,7 @@
 
       if (result.reason === 'dead') killed += 1;
       if (['dead', 'target_reached', 'already_done'].includes(result.reason)) processed += 1;
-      if (['no_stamina', 'player_dead', 'no_health_potion'].includes(result.reason)) break;
+      if (['no_stamina', 'no_mana', 'no_attack', 'player_dead', 'no_health_potion'].includes(result.reason)) break;
     }
 
     if (runState.stopped) {
@@ -1358,6 +1703,7 @@
       #${ID} input[type="checkbox"], #${ID} input[type="radio"] { accent-color:#7185ff; }
       #${ID} .dlf-options { display:flex; flex-wrap:wrap; gap:9px 16px; align-items:center; }
       #${ID} .dlf-potion-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+      #${ID} .dlf-potion-wide { grid-column:1/-1; }
       #${ID} fieldset { min-width:0; margin:0; padding:9px; border:1px solid #2f3554; border-radius:10px; background:#101322; }
       #${ID} legend { color:#bfc8f5; font-size:11px; font-weight:800; text-transform:uppercase; }
       #${ID} .dlf-list { display:flex; flex-direction:column; gap:6px; margin-top:6px; }
@@ -1379,7 +1725,7 @@
       #${ID} .dlf-status-running { border-color:#3d765d; background:#17271f; color:#b8f0cf; }
       #${ID} .dlf-status-success { border-color:#476d85; background:#16242d; color:#c8ebff; }
       #${ID} .dlf-status-error { border-color:#7e3b45; background:#2a171b; color:#ffc5cb; }
-      #${ID} .dlf-metrics { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:7px; margin-top:9px; }
+      #${ID} .dlf-metrics { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:7px; margin-top:9px; }
       #${ID} .dlf-metrics > div { padding:7px; border:1px solid #2d3350; border-radius:8px; background:#111423; }
       #${ID} .dlf-metrics span { display:block; color:#8792bd; font-size:9px; text-transform:uppercase; }
       #${ID} .dlf-metrics strong { display:block; margin-top:3px; font-size:12px; }
@@ -1393,12 +1739,45 @@
   }
 
   function createSkillOptions(selectedKey) {
-    return Object.entries(SKILLS)
-      .map(([key, skill]) => {
-        const selected = key === selectedKey ? ' selected' : '';
-        return `<option value="${escapeHtml(key)}"${selected}>${escapeHtml(skill.name)} (${skill.cost} STA)</option>`;
-      })
-      .join('');
+    const attacks = state.attacks.length ? state.attacks : getStandardAttackList();
+    const foundSelected = attacks.some((attack) => attack.key === selectedKey);
+    let html = '';
+
+    for (const groupName of ['Standard Attacks', 'Class Attacks']) {
+      const groupAttacks = attacks.filter((attack) => attack.group === groupName);
+      if (!groupAttacks.length) continue;
+
+      html += `<optgroup label="${escapeHtml(groupName)}">`;
+
+      for (const attack of groupAttacks) {
+        const selected = attack.key === selectedKey ? ' selected' : '';
+        const costs = [];
+        if (attack.cost) costs.push(`${formatNumber(attack.cost)} STA`);
+        if (attack.manaCost) costs.push(`${formatNumber(attack.manaCost)} MP`);
+        const label = costs.length ? `${attack.name} · ${costs.join(' / ')}` : attack.name;
+        html += `<option value="${escapeHtml(attack.key)}"${selected}>${escapeHtml(label)}</option>`;
+      }
+
+      html += '</optgroup>';
+    }
+
+    if (selectedKey && !foundSelected) {
+      html +=
+        `<optgroup label="Saved selection"><option value="${escapeHtml(selectedKey)}" selected>` +
+        `${escapeHtml(selectedKey)} (loading...)</option></optgroup>`;
+    }
+
+    return html;
+  }
+
+  function renderAttackOptions() {
+    if (!state.overlay) return;
+
+    for (let index = 0; index < 3; index += 1) {
+      const select = state.overlay.querySelector(`#dlfAttack${index + 1}`);
+      if (!select) continue;
+      select.innerHTML = createSkillOptions(state.settings.attackKeys[index]);
+    }
   }
 
   function createUI() {
@@ -1438,7 +1817,7 @@
         <div class="dlf-head">
           <div>
             <h2>⚔ Dungeon Location Farmer</h2>
-            <div class="dlf-hint">Attack fallbacks and real potion priorities</div>
+            <div class="dlf-hint">Standard + class attacks with stamina, mana and health potion priorities</div>
           </div>
           <button id="dlfClose" class="dlf-close" type="button">Close</button>
         </div>
@@ -1486,6 +1865,10 @@
               <small>A potion is used only when none of the three attacks can preserve the stamina reserve.</small>
             </label>
             <label class="dlf-field">
+              <span><input id="dlfAutoMana" type="checkbox" ${state.settings.autoMana ? 'checked' : ''}> Use mana potions automatically</span>
+              <small>Mana is restored when the selected class attack needs more MP.</small>
+            </label>
+            <label class="dlf-field">
               <span>Stamina reserve after attack</span>
               <input id="dlfReserve" type="number" min="0" value="${state.settings.staminaReserve}">
             </label>
@@ -1529,11 +1912,15 @@
               <div id="dlfStaminaList" class="dlf-list"></div>
             </fieldset>
             <fieldset>
+              <legend>Mana potions</legend>
+              <div id="dlfManaList" class="dlf-list"></div>
+            </fieldset>
+            <fieldset class="dlf-potion-wide">
               <legend>Health potions</legend>
               <div id="dlfHealthList" class="dlf-list"></div>
             </fieldset>
           </div>
-          <button id="dlfRefreshPotions" class="dlf-secondary" type="button" style="margin-top:9px">Refresh potion list</button>
+          <button id="dlfRefreshPotions" class="dlf-secondary" type="button" style="margin-top:9px">Refresh attacks &amp; potions</button>
           <div class="dlf-hint" style="margin-top:7px">
             The farmer uses the first enabled potion with stock. Use the arrows to change priority.
           </div>
@@ -1548,6 +1935,7 @@
 
         <div class="dlf-metrics">
           <div><span>Stamina</span><strong id="dlfMetricStamina">?</strong></div>
+          <div><span>Mana</span><strong id="dlfMetricMana">?</strong></div>
           <div><span>HP</span><strong id="dlfMetricHp">?</strong></div>
           <div><span>Current attack</span><strong id="dlfMetricAttack">-</strong></div>
         </div>
@@ -1573,8 +1961,10 @@
       log: overlay.querySelector('#dlfLog'),
       specificRow: overlay.querySelector('#dlfSpecificRow'),
       staminaList: overlay.querySelector('#dlfStaminaList'),
+      manaList: overlay.querySelector('#dlfManaList'),
       healthList: overlay.querySelector('#dlfHealthList'),
       metricStamina: overlay.querySelector('#dlfMetricStamina'),
+      metricMana: overlay.querySelector('#dlfMetricMana'),
       metricHp: overlay.querySelector('#dlfMetricHp'),
       metricAttack: overlay.querySelector('#dlfMetricAttack'),
     };
@@ -1590,8 +1980,10 @@
     });
 
     bindUIEvents(instanceId, locationId);
+    renderAttackOptions();
     renderPotionLists();
     updateMetrics();
+    void refreshAvailableAttacks(instanceId, true);
 
     setTimeout(() => {
       void resumeAfterReload(instanceId, locationId);
@@ -1601,8 +1993,8 @@
   function readForm() {
     if (!state.overlay) return state.settings;
 
-    state.settings.attackKeys = [1, 2, 3].map((number) => {
-      return state.overlay.querySelector(`#dlfAttack${number}`)?.value || 'slash';
+    state.settings.attackKeys = [1, 2, 3].map((number, index) => {
+      return state.overlay.querySelector(`#dlfAttack${number}`)?.value || state.settings.attackKeys[index] || 'slash';
     });
 
     state.settings.attackDelayMs = Math.max(
@@ -1614,6 +2006,7 @@
     state.settings.specificDamage = state.overlay.querySelector('#dlfSpecific')?.value.trim() || '0';
 
     state.settings.autoStamina = state.overlay.querySelector('#dlfAutoStamina')?.checked || false;
+    state.settings.autoMana = state.overlay.querySelector('#dlfAutoMana')?.checked || false;
     state.settings.staminaReserve = Math.max(
       0,
       Math.floor(Number(state.overlay.querySelector('#dlfReserve')?.value) || 0),
@@ -1739,9 +2132,13 @@
 
   function updateMetrics(activeAttack = null) {
     const stamina = getStaminaFromPage();
+    const mana = getPlayerManaFromPage();
     const hp = getPlayerHpFromPage();
 
     if (state.ui.metricStamina) state.ui.metricStamina.textContent = formatNumber(stamina);
+    if (state.ui.metricMana) {
+      state.ui.metricMana.textContent = mana ? `${formatNumber(mana.current)} / ${formatNumber(mana.maximum)}` : '?';
+    }
     if (state.ui.metricHp) {
       state.ui.metricHp.textContent = hp ? `${formatNumber(hp.current)} / ${formatNumber(hp.maximum)}` : '?';
     }
@@ -1754,6 +2151,7 @@
     if (!state.overlay) return;
     discoverPotions();
     renderPotionList('stamina', state.ui.staminaList);
+    renderPotionList('mana', state.ui.manaList);
     renderPotionList('health', state.ui.healthList);
   }
 
@@ -1858,6 +2256,15 @@
   async function startFarm(instanceId, locationId, resume = false) {
     if (!state.runState.stopped) return;
 
+    const attacksLoaded = await refreshAvailableAttacks(instanceId, true);
+    if (!attacksLoaded && state.settings.attackKeys.some((key) => !SKILLS[key])) {
+      setStatus(
+        'Saved class attacks could not be loaded from the battle page. Refresh attacks and try again.',
+        'error',
+      );
+      return;
+    }
+
     readForm();
     if (!validateSettings()) return;
 
@@ -1930,8 +2337,10 @@
     state.ui.triggerButton.addEventListener('click', () => {
       state.overlay.style.display = 'flex';
       discoverPotions();
+      renderAttackOptions();
       renderPotionLists();
       updateMetrics();
+      void refreshAvailableAttacks(instanceId, true);
     });
 
     state.ui.close.addEventListener('click', () => {
@@ -1951,11 +2360,17 @@
 
     state.ui.stop.addEventListener('click', stopFarm);
 
-    state.overlay.querySelector('#dlfRefreshPotions').addEventListener('click', () => {
+    state.overlay.querySelector('#dlfRefreshPotions').addEventListener('click', async () => {
+      setStatus('Refreshing attacks and potions...', 'running');
+      const attacksLoaded = await refreshAvailableAttacks(instanceId, true);
       discoverPotions();
+      renderAttackOptions();
       renderPotionLists();
       updateMetrics();
-      setStatus('Potion list refreshed.', 'success');
+      setStatus(
+        attacksLoaded ? 'Attacks and potions refreshed.' : 'Potions refreshed; no battle attacks were found.',
+        attacksLoaded ? 'success' : 'error',
+      );
     });
 
     for (const element of state.overlay.querySelectorAll('select, input')) {
@@ -1989,7 +2404,7 @@
 
     const resourceChanged = mutations.some((mutation) => {
       const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
-      return target?.closest?.(`${SEL.stamina}, ${SEL.playerHp}, .playerhp`);
+      return target?.closest?.(`${SEL.stamina}, ${SEL.playerHp}, ${SEL.playerMana}, .playerhp`);
     });
 
     if (resourceChanged && state.overlay) updateMetrics();
