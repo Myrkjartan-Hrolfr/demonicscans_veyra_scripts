@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dungeon Location Farmer - Controlled
 // @namespace    http://tampermonkey.net/
-// @version      2.1.1
+// @version      2.1.3
 // @description  Farm all alive monsters with dynamic class attacks, stamina/mana fallbacks, and configurable potion priorities.
 // @author       [J4F] RacletteCestLavie / enhanced
 // @match        https://demonicscans.org/guild_dungeon_location.php*
@@ -16,6 +16,7 @@
   const ID = 'dlf-controlled';
   const STORE_KEY = `${ID}:settings:v2:${location.host}:${location.pathname}`;
   const RESUME_KEY = `${ID}:resume:v2:${location.host}:${location.pathname}`;
+  const LOG_KEY = `${ID}:run-log:v2:${location.host}:${location.pathname}`;
 
   const MAX_RATE_RETRIES = 8;
   const MAX_FAIL_RETRIES = 3;
@@ -2023,6 +2024,9 @@
         <details id="dlfLogDetails" style="margin-top:9px">
           <summary>Log</summary>
           <div id="dlfLog" class="dlf-log"></div>
+          <div style="display:flex;justify-content:flex-end;margin-top:7px">
+            <button id="dlfClearLog" class="dlf-secondary" type="button">Clear log</button>
+          </div>
         </details>
       </section>
     `;
@@ -2039,6 +2043,7 @@
       status: overlay.querySelector('#dlfStatus'),
       logDetails: overlay.querySelector('#dlfLogDetails'),
       log: overlay.querySelector('#dlfLog'),
+      clearLog: overlay.querySelector('#dlfClearLog'),
       specificRow: overlay.querySelector('#dlfSpecificRow'),
       staminaList: overlay.querySelector('#dlfStaminaList'),
       manaList: overlay.querySelector('#dlfManaList'),
@@ -2048,6 +2053,13 @@
       metricHp: overlay.querySelector('#dlfMetricHp'),
       metricAttack: overlay.querySelector('#dlfMetricAttack'),
     };
+
+    restoreRunLog();
+
+    state.ui.clearLog?.addEventListener('click', () => {
+      clearRunLog();
+      setStatus('Log cleared.', 'idle');
+    });
 
     state.ui.logDetails?.addEventListener('toggle', () => {
       if (!state.runState.stopped && !state.ui.logDetails.open) {
@@ -2163,6 +2175,60 @@
     }
   }
 
+  function saveRunLog() {
+    if (!state.ui.log) return;
+
+    try {
+      const entries = [...state.ui.log.children]
+        .slice(0, MAX_LOG_LINES)
+        .map((line) => ({
+          text: line.textContent || '',
+          color: line.style.color || '',
+        }));
+
+      sessionStorage.setItem(LOG_KEY, JSON.stringify(entries));
+    } catch (error) {
+      console.warn('[DLF] Could not save run log.', error);
+    }
+  }
+
+  function restoreRunLog() {
+    if (!state.ui.log) return;
+
+    try {
+      const raw = sessionStorage.getItem(LOG_KEY);
+      if (!raw) return;
+
+      const entries = JSON.parse(raw);
+      if (!Array.isArray(entries)) return;
+
+      state.ui.log.replaceChildren();
+
+      for (const entry of entries.slice(0, MAX_LOG_LINES)) {
+        if (!entry || typeof entry.text !== 'string') continue;
+
+        const line = document.createElement('div');
+        line.textContent = entry.text;
+        if (entry.color) line.style.color = entry.color;
+        state.ui.log.appendChild(line);
+      }
+
+      state.ui.log.scrollTop = 0;
+    } catch (error) {
+      console.warn('[DLF] Could not restore run log.', error);
+    }
+  }
+
+  function clearRunLog() {
+    try {
+      sessionStorage.removeItem(LOG_KEY);
+    } catch (error) {
+      console.warn('[DLF] Could not clear run log.', error);
+    }
+
+    state.ui.log?.replaceChildren();
+  }
+
   function addLog(message) {
     if (!state.ui.log) return;
 
@@ -2177,6 +2243,7 @@
     }
 
     state.ui.log.scrollTop = 0;
+    saveRunLog();
   }
 
   function newLogLine(text, color) {
@@ -2192,6 +2259,7 @@
     }
 
     state.ui.log.scrollTop = 0;
+    saveRunLog();
 
     return {
       update(nextText, nextColor) {
@@ -2199,6 +2267,7 @@
         line.textContent = nextText;
         if (nextColor) line.style.color = nextColor;
         state.ui.log.scrollTop = 0;
+        saveRunLog();
       },
     };
   }
@@ -2336,6 +2405,9 @@
   async function startFarm(instanceId, locationId, resumeData = null) {
     if (!state.runState.stopped) return;
 
+    // A manual start begins a fresh run. Potion resumes keep the existing log.
+    if (!resumeData) clearRunLog();
+
     const attacksLoaded = await refreshAvailableAttacks(instanceId, true);
     if (!attacksLoaded && state.settings.attackKeys.some((key) => !SKILLS[key])) {
       setStatus('Saved class attacks could not be loaded from the battle page. Refresh attacks and try again.', 'error');
@@ -2443,11 +2515,13 @@
     state.ui.close.addEventListener('click', () => {
       if (!state.runState.stopped) return;
       state.overlay.style.display = 'none';
+      clearRunLog();
     });
 
     state.overlay.addEventListener('click', (event) => {
       if (event.target === state.overlay && state.runState.stopped) {
         state.overlay.style.display = 'none';
+        clearRunLog();
       }
     });
 
