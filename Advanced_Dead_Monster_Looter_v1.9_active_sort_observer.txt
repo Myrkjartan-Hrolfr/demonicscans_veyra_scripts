@@ -46,7 +46,9 @@
       }
 
       const damageChip = Array.from(card.querySelectorAll('.mini-chip')).find(
-        (chip) => /your damage dealt/i.test(chip.title || '') || /🩸\s*You\s*:/i.test(chip.textContent || ''),
+        (chip) =>
+          /your damage dealt/i.test(chip.title || '') ||
+          /🩸\s*You\s*:/i.test(chip.textContent || ''),
       );
 
       if (damageChip) {
@@ -64,7 +66,9 @@
     let originalActiveOrders = null;
 
     const collectActiveCardsByParent = () => {
-      const cards = Array.from(document.querySelectorAll('.monster-card')).filter((card) => card.dataset.dead !== '1');
+      const cards = Array.from(document.querySelectorAll('.monster-card')).filter(
+        (card) => card.dataset.dead !== '1',
+      );
 
       const groups = new Map();
       cards.forEach((card) => {
@@ -1292,11 +1296,7 @@
           try {
             const rawText = await response.text();
             if (rawText.trim()) {
-              const data = JSON.parse(
-                String(rawText)
-                  .replace(/^\uFEFF/, '')
-                  .trim(),
-              );
+              const data = JSON.parse(String(rawText).replace(/^\uFEFF/, '').trim());
               success = isLootSuccessResponse(data);
             }
           } catch (e) {
