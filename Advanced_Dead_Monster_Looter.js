@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Advanced Dead Monster Looter V1.5
+// @name         Advanced Dead Monster Looter V1.7
 // @namespace    http://tampermonkey.net/
-// @version      1.5
-// @description  Auto-Merges, damage sorting, Loot Selected, Extract & Loot, with exact QUANTITY display
+// @version      1.7
+// @description  Auto-Merges, damage sorting, fast 0-damage loot, Loot Selected, Extract & Loot
 // @author       Gemini
 // @match        https://demonicscans.org/active_wave.php*
 // @grant        none
@@ -60,6 +60,7 @@
                 <button id="dmSelectAll" style="background: #333; color: #fff; border: 1px solid #2b2d44; padding: 8px 12px; border-radius: 6px; cursor: pointer;" disabled>Select All Visible</button>
                 <button id="dmSelectNone" style="background: #333; color: #fff; border: 1px solid #2b2d44; padding: 8px 12px; border-radius: 6px; cursor: pointer;" disabled>Select None</button>
                 <button id="dmSortDamage" style="background: #3b1f2b; color: #ffd7e2; border: 1px solid #8f3f5b; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: bold;" disabled title="Sort dead monster cards by your damage, ascending">🩸 Damage ↑</button>
+                <button id="dmLootZeroDamage" style="background: #20354a; color: #d8efff; border: 1px solid #3d78a8; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: bold;" disabled title="Loot all eligible dead monsters where your damage is exactly 0">🩸 0 DMG Loot</button>
 
                 <div style="margin-left: auto; display: flex; gap: 8px; align-items: center; background: #111; padding: 4px 8px; border-radius: 8px; border: 1px solid #333;">
                     <span style="color: #cfd4ff; font-size: 12px;">Max to Loot:</span>
@@ -82,6 +83,7 @@
     const btnAll = document.getElementById('dmSelectAll');
     const btnNone = document.getElementById('dmSelectNone');
     const btnSortDamage = document.getElementById('dmSortDamage');
+    const btnLootZeroDamage = document.getElementById('dmLootZeroDamage');
     const btnLoot = document.getElementById('dmLootSelected');
     const btnExtract = document.getElementById('dmExtractSelected');
     const btnLevel = document.getElementById('dmLootToLevel');
@@ -192,6 +194,7 @@
     btnAll.disabled = false;
     btnNone.disabled = false;
     btnSortDamage.disabled = false;
+    btnLootZeroDamage.disabled = false;
     btnLoot.disabled = false;
     btnExtract.disabled = false;
     btnLevel.disabled = false;
@@ -662,6 +665,7 @@
       levelLootStopRequested = false;
 
       btnLoot.disabled = true;
+      btnLootZeroDamage.disabled = true;
       btnExtract.disabled = true;
       btnAll.disabled = true;
       btnNone.disabled = true;
@@ -930,6 +934,7 @@
         btnLevel.disabled = false;
 
         btnLoot.disabled = false;
+        btnLootZeroDamage.disabled = false;
         btnExtract.disabled = false;
         btnAll.disabled = false;
         btnNone.disabled = false;
@@ -957,6 +962,7 @@
 
       btnExtract.disabled = true;
       btnLoot.disabled = true;
+      btnLootZeroDamage.disabled = true;
       btnLevel.disabled = true;
 
       let successCount = 0,
@@ -1086,10 +1092,129 @@
 
       btnExtract.disabled = false;
       btnLoot.disabled = false;
+      btnLootZeroDamage.disabled = false;
       btnLevel.disabled = false;
     });
 
-    // --- 7. Standard Loot Loop ---
+    // --- 7. Fast Loot All Zero-Damage Monsters ---
+    // 0-damage monsters grant no EXP, gold or item rewards, so this path
+    // only sends the loot request and checks whether the server accepted it.
+    btnLootZeroDamage.addEventListener('click', async () => {
+      const zeroDamageCards = deadCards.filter((card) => {
+        const damage = getCardUserDamage(card);
+        const checkbox = card.querySelector('.dm-checkbox');
+        const opacity = Number.parseFloat(card.style.opacity || '1');
+
+        return (
+          card.hasAttribute('data-userdmg') &&
+          damage === 0 &&
+          card.dataset.eligible === '1' &&
+          checkbox &&
+          !checkbox.disabled &&
+          card.style.pointerEvents !== 'none' &&
+          opacity > 0.2
+        );
+      });
+
+      if (zeroDamageCards.length === 0) {
+        statusBox.innerHTML = '<span style="color:#ffbb33;">No eligible 0-damage monsters found.</span>';
+        return;
+      }
+
+      const previousButtonText = btnLootZeroDamage.innerText;
+      btnLootZeroDamage.innerText = `Looting 0 DMG... (0/${zeroDamageCards.length})`;
+
+      btnLootZeroDamage.disabled = true;
+      btnLoot.disabled = true;
+      btnExtract.disabled = true;
+      btnLevel.disabled = true;
+      btnAll.disabled = true;
+      btnNone.disabled = true;
+      btnSortDamage.disabled = true;
+      filterSel.disabled = true;
+      limitInput.disabled = true;
+
+      let successCount = 0;
+      let failCount = 0;
+
+      for (let i = 0; i < zeroDamageCards.length; i++) {
+        const card = zeroDamageCards[i];
+        const checkbox = card.querySelector('.dm-checkbox');
+        const monsterId = card.dataset.monsterId || checkbox?.dataset.id;
+
+        btnLootZeroDamage.innerText = `Looting 0 DMG... (${i + 1}/${zeroDamageCards.length})`;
+        statusBox.innerHTML = `Looting 0-damage monster <span style="color:#7dcfff;">${i + 1} of ${zeroDamageCards.length}</span>...`;
+
+        if (!monsterId) {
+          failCount++;
+          continue;
+        }
+
+        try {
+          const formData = new FormData();
+          formData.append('monster_id', monsterId);
+          if (typeof USER_ID !== 'undefined') formData.append('user_id', USER_ID);
+
+          const response = await fetch('loot.php', {
+            method: 'POST',
+            body: formData,
+            credentials: 'same-origin',
+          });
+
+          // We deliberately do not process EXP, gold, items or ranking rewards here.
+          // The JSON is only used to distinguish a successful loot request from a rejected one.
+          let success = response.ok;
+
+          try {
+            const rawText = await response.text();
+            if (rawText.trim()) {
+              const data = JSON.parse(
+                String(rawText)
+                  .replace(/^\uFEFF/, '')
+                  .trim(),
+              );
+              success = isLootSuccessResponse(data);
+            }
+          } catch (e) {
+            // If the endpoint returned HTTP success but no usable JSON, keep response.ok.
+          }
+
+          if (success) {
+            successCount++;
+            card.style.opacity = '0.2';
+            card.style.pointerEvents = 'none';
+            if (checkbox) checkbox.checked = false;
+          } else {
+            failCount++;
+            console.warn('0-damage loot failed for monster:', monsterId);
+          }
+        } catch (error) {
+          failCount++;
+          console.error('0-damage loot request failed:', monsterId, error);
+        }
+
+        await wait(250);
+      }
+
+      statusBox.innerHTML =
+        failCount === 0
+          ? `<span style="color:#00c851;">0-damage looting finished: ${successCount} monsters looted.</span>`
+          : `<span style="color:#ffbb33;">0-damage looting finished: ${successCount} success, ${failCount} failed.</span>`;
+
+      // No loot summary modal for 0-damage monsters.
+      btnLootZeroDamage.innerText = previousButtonText;
+      btnLootZeroDamage.disabled = false;
+      btnLoot.disabled = false;
+      btnExtract.disabled = false;
+      btnLevel.disabled = false;
+      btnAll.disabled = false;
+      btnNone.disabled = false;
+      btnSortDamage.disabled = false;
+      filterSel.disabled = false;
+      limitInput.disabled = false;
+    });
+
+    // --- 8. Standard Loot Loop ---
     btnLoot.addEventListener('click', async () => {
       const selectedBoxes = document.querySelectorAll('.dm-checkbox:checked');
       if (selectedBoxes.length === 0) {
@@ -1108,6 +1233,7 @@
 
       btnLoot.innerText = 'Looting...';
       btnLoot.disabled = true;
+      btnLootZeroDamage.disabled = true;
       btnExtract.disabled = true;
       btnLevel.disabled = true;
       let totalExp = 0,
@@ -1176,6 +1302,7 @@
       btnLoot.innerText = '💰 Loot Selected';
 
       btnLoot.disabled = false;
+      btnLootZeroDamage.disabled = false;
       btnExtract.disabled = false;
       btnLevel.disabled = false;
     });
