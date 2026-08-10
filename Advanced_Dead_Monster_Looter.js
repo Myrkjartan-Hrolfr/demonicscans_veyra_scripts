@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Advanced Dead Monster Looter V1.4
+// @name         Advanced Dead Monster Looter V1.5
 // @namespace    http://tampermonkey.net/
-// @version      1.4
-// @description  Auto-Merges, Loot Selected, Extract & Loot, with exact QUANTITY display
+// @version      1.5
+// @description  Auto-Merges, damage sorting, Loot Selected, Extract & Loot, with exact QUANTITY display
 // @author       Gemini
 // @match        https://demonicscans.org/active_wave.php*
 // @grant        none
@@ -59,6 +59,7 @@
                 </select>
                 <button id="dmSelectAll" style="background: #333; color: #fff; border: 1px solid #2b2d44; padding: 8px 12px; border-radius: 6px; cursor: pointer;" disabled>Select All Visible</button>
                 <button id="dmSelectNone" style="background: #333; color: #fff; border: 1px solid #2b2d44; padding: 8px 12px; border-radius: 6px; cursor: pointer;" disabled>Select None</button>
+                <button id="dmSortDamage" style="background: #3b1f2b; color: #ffd7e2; border: 1px solid #8f3f5b; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: bold;" disabled title="Sort dead monster cards by your damage, ascending">🩸 Damage ↑</button>
 
                 <div style="margin-left: auto; display: flex; gap: 8px; align-items: center; background: #111; padding: 4px 8px; border-radius: 8px; border: 1px solid #333;">
                     <span style="color: #cfd4ff; font-size: 12px;">Max to Loot:</span>
@@ -80,6 +81,7 @@
     const filterSel = document.getElementById('dmFilter');
     const btnAll = document.getElementById('dmSelectAll');
     const btnNone = document.getElementById('dmSelectNone');
+    const btnSortDamage = document.getElementById('dmSortDamage');
     const btnLoot = document.getElementById('dmLootSelected');
     const btnExtract = document.getElementById('dmExtractSelected');
     const btnLevel = document.getElementById('dmLootToLevel');
@@ -120,6 +122,47 @@
       });
     }
 
+    // --- Damage sort toggle ---
+    // Capture the final merged order so the second click can restore it exactly.
+    const originalDeadCardOrder = [...deadCards];
+    const originalDeadCardIndex = new Map(originalDeadCardOrder.map((card, index) => [card, index]));
+    let damageSortActive = false;
+
+    const getCardUserDamage = (card) => {
+      const damage = Number.parseInt(card.dataset.userdmg || '0', 10);
+      return Number.isFinite(damage) ? damage : 0;
+    };
+
+    const applyDeadCardOrder = (cards) => {
+      cards.forEach((card) => container.appendChild(card));
+    };
+
+    btnSortDamage.addEventListener('click', () => {
+      damageSortActive = !damageSortActive;
+
+      if (damageSortActive) {
+        const sortedCards = [...deadCards].sort((a, b) => {
+          const damageDifference = getCardUserDamage(a) - getCardUserDamage(b);
+
+          // Stable tie-breaker: preserve the original order for equal damage.
+          if (damageDifference !== 0) return damageDifference;
+          return originalDeadCardIndex.get(a) - originalDeadCardIndex.get(b);
+        });
+
+        applyDeadCardOrder(sortedCards);
+        btnSortDamage.innerText = '↩ Original Order';
+        btnSortDamage.title = 'Restore the original dead monster card order';
+        btnSortDamage.style.background = '#6b263e';
+        statusBox.innerHTML = '<span style="color:#ff9fbd;">🩸 Sorted by your damage: lowest → highest.</span>';
+      } else {
+        applyDeadCardOrder(originalDeadCardOrder);
+        btnSortDamage.innerText = '🩸 Damage ↑';
+        btnSortDamage.title = 'Sort dead monster cards by your damage, ascending';
+        btnSortDamage.style.background = '#3b1f2b';
+        statusBox.innerHTML = '<span style="color:#00c851;">Original monster order restored.</span>';
+      }
+    });
+
     // --- 4. Inject Checkboxes ---
     deadCards.forEach((card) => {
       const isEligible = card.dataset.eligible === '1';
@@ -148,6 +191,7 @@
     filterSel.disabled = false;
     btnAll.disabled = false;
     btnNone.disabled = false;
+    btnSortDamage.disabled = false;
     btnLoot.disabled = false;
     btnExtract.disabled = false;
     btnLevel.disabled = false;
@@ -621,6 +665,7 @@
       btnExtract.disabled = true;
       btnAll.disabled = true;
       btnNone.disabled = true;
+      btnSortDamage.disabled = true;
       filterSel.disabled = true;
       limitInput.disabled = true;
 
@@ -888,6 +933,7 @@
         btnExtract.disabled = false;
         btnAll.disabled = false;
         btnNone.disabled = false;
+        btnSortDamage.disabled = false;
         filterSel.disabled = false;
         limitInput.disabled = false;
       }
