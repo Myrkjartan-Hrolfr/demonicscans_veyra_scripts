@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Advanced Dead Monster Looter V1.7
+// @name         Advanced Dead Monster Looter V1.8
 // @namespace    http://tampermonkey.net/
-// @version      1.7
-// @description  Auto-Merges, damage sorting, fast 0-damage loot, Loot Selected, Extract & Loot
+// @version      1.8
+// @description  Auto-Merges, active/dead damage sorting, fast 0-damage loot, Loot Selected, Extract & Loot
 // @author       Gemini
 // @match        https://demonicscans.org/active_wave.php*
 // @grant        none
@@ -11,6 +11,102 @@
   'use strict';
 
   setTimeout(async () => {
+    // --- Active monster damage sort toggle ---
+    // Adds the same ascending damage sort to the normal monster filter/action row.
+    const activeActions = document.querySelector('.select-wrap .qol-select-actions');
+
+    if (activeActions && !document.getElementById('dmSortActiveDamage')) {
+      const activeSortButton = document.createElement('button');
+      activeSortButton.type = 'button';
+      activeSortButton.id = 'dmSortActiveDamage';
+      activeSortButton.className = 'btn';
+      activeSortButton.textContent = '🩸 Damage ↑';
+      activeSortButton.title = 'Sort active monster cards by your damage, ascending';
+
+      // Put it beside Select visible / Clear and before Settings when possible.
+      const settingsButton = activeActions.querySelector('.btnAttackSettings');
+      if (settingsButton) {
+        activeActions.insertBefore(activeSortButton, settingsButton);
+      } else {
+        activeActions.appendChild(activeSortButton);
+      }
+
+      const activeCards = Array.from(document.querySelectorAll('.monster-card')).filter(
+        (card) => card.dataset.dead !== '1',
+      );
+
+      // Keep each card grid/container separate. This prevents cards from being moved
+      // between unrelated sections if the page ever contains more than one active grid.
+      const originalActiveOrders = new Map();
+      activeCards.forEach((card) => {
+        const parent = card.parentElement;
+        if (!parent) return;
+        if (!originalActiveOrders.has(parent)) originalActiveOrders.set(parent, []);
+        originalActiveOrders.get(parent).push(card);
+      });
+
+      const originalActiveIndex = new Map();
+      activeCards.forEach((card, index) => originalActiveIndex.set(card, index));
+
+      const getActiveCardUserDamage = (card) => {
+        const rawDatasetDamage = card.dataset.userdmg;
+
+        if (rawDatasetDamage !== undefined && rawDatasetDamage !== '') {
+          const datasetDamage = Number.parseInt(String(rawDatasetDamage).replace(/[^\d-]/g, ''), 10);
+          if (Number.isFinite(datasetDamage)) return datasetDamage;
+        }
+
+        // Fallback for active cards where the site only renders the visible
+        // "🩸 You: 63,576,196" chip but no data-userdmg attribute.
+        const damageChip = Array.from(card.querySelectorAll('.mini-chip')).find(
+          (chip) => /your damage dealt/i.test(chip.title || '') || /🩸\s*You\s*:/i.test(chip.textContent || ''),
+        );
+
+        if (damageChip) {
+          const match = (damageChip.textContent || '').match(/You\s*:\s*([\d.,]+)/i);
+          if (match) {
+            const chipDamage = Number.parseInt(match[1].replace(/[^\d]/g, ''), 10);
+            if (Number.isFinite(chipDamage)) return chipDamage;
+          }
+        }
+
+        return 0;
+      };
+
+      let activeDamageSortEnabled = false;
+
+      activeSortButton.addEventListener('click', () => {
+        activeDamageSortEnabled = !activeDamageSortEnabled;
+
+        if (activeDamageSortEnabled) {
+          originalActiveOrders.forEach((cards, parent) => {
+            const sortedCards = [...cards].sort((a, b) => {
+              const damageDifference = getActiveCardUserDamage(a) - getActiveCardUserDamage(b);
+              if (damageDifference !== 0) return damageDifference;
+              return originalActiveIndex.get(a) - originalActiveIndex.get(b);
+            });
+
+            sortedCards.forEach((card) => parent.appendChild(card));
+          });
+
+          activeSortButton.textContent = '↩ Original Order';
+          activeSortButton.title = 'Restore the original active monster card order';
+        } else {
+          originalActiveOrders.forEach((cards, parent) => {
+            cards.forEach((card) => parent.appendChild(card));
+          });
+
+          activeSortButton.textContent = '🩸 Damage ↑';
+          activeSortButton.title = 'Sort active monster cards by your damage, ascending';
+        }
+      });
+
+      if (activeCards.length === 0) {
+        activeSortButton.disabled = true;
+        activeSortButton.title = 'No active monster cards found';
+      }
+    }
+
     const deadTitle = Array.from(document.querySelectorAll('.monster-section-title')).find((el) =>
       el.innerText.includes('Dead Monsters'),
     );
