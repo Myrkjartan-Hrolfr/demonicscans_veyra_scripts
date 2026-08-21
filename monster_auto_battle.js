@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Monster Auto Battle
 // @namespace    http://tampermonkey.net/
-// @version      1.4.4
-// @description  Auto-battle for the current monster with three attacks, potion priorities, target damage, and level-up protection.
+// @version      1.5.0
+// @description  Auto-battle for the current monster with three attacks, an own-poison attack, potion priorities, target damage, and level-up protection.
 // @match        https://demonicscans.org/battle.php*
 // @grant        none
 // @run-at       document-idle
@@ -27,10 +27,13 @@
     exp: '.game-topbar .gtb-exp ' + '.gtb-exp-top span:last-child',
     potion: '.potion-use-btn',
     potionCard: '.potion-card',
+    attackLog: '.panel.log-panel',
+    playerName: '#sideDrawer .small-name, .side-drawer .small-name',
   };
 
   const DEFAULTS = {
     attackKeys: ['', '', ''],
+    poisonAttackKey: '',
     autoStamina: false,
     autoMana: false,
     autoHealth: false,
@@ -71,6 +74,10 @@
 
     noDamageCount: 0,
     forcedAttackIndex: 0,
+
+    playerName: '',
+    poisonActive: false,
+    lastPlayerLogEntry: '',
 
     timers: {},
   };
@@ -353,6 +360,116 @@
       .replaceAll("'", '&#039;');
   }
 
+  function normalizeText(value) {
+    return String(value ?? '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function getActivePlayerName() {
+    return normalizeText(document.querySelector(SEL.playerName)?.textContent);
+  }
+
+  function getAttackLogLines() {
+    const panel = queryAll(SEL.attackLog).find((element) => {
+      return /attack log/i.test(element.textContent || '');
+    });
+
+    if (!panel) {
+      return [];
+    }
+
+    const copy = panel.cloneNode(true);
+
+    for (const breakElement of queryAll('br', copy)) {
+      breakElement.replaceWith('\n');
+    }
+
+    return String(copy.textContent || '')
+      .split(/\n+/)
+      .map(normalizeText)
+      .filter((line) => /^⚔️/.test(line));
+  }
+
+  function getLogEntryPlayerName(line) {
+    return normalizeText(line).match(/^⚔️\s*(?:\[END\]\s*)?(.+?)\s+used\s+/i)?.[1]?.trim() || '';
+  }
+
+  function logEntryShowsActivePoison(line) {
+    const text = normalizeText(line);
+
+    if (
+      /\b(?:poison (?:has )?(?:worn off|ended|expired)|no longer poisoned|resisted (?:the )?poison|failed to poison)\b/i.test(
+        text,
+      )
+    ) {
+      return false;
+    }
+
+    return (
+      /\bpoisoned\s+the\s+enemy\b/i.test(text) ||
+      /\bpoison\s+damage\b/i.test(text) ||
+      /\benemy\s+(?:is|remains|was)\s+poisoned\b/i.test(text)
+    );
+  }
+
+  function getLatestPlayerLogEntry() {
+    const playerName = state.playerName || getActivePlayerName();
+
+    if (!playerName) {
+      return '';
+    }
+
+    const normalizedPlayerName = normalizeText(playerName).toLocaleLowerCase();
+
+    return (
+      getAttackLogLines().find((line) => {
+        return getLogEntryPlayerName(line).toLocaleLowerCase() === normalizedPlayerName;
+      }) || ''
+    );
+  }
+
+  function syncPoisonStatusFromLog(force = false) {
+    const entry = getLatestPlayerLogEntry();
+
+    if (!entry || (!force && entry === state.lastPlayerLogEntry)) {
+      return false;
+    }
+
+    const wasActive = state.poisonActive;
+
+    state.lastPlayerLogEntry = entry;
+    state.poisonActive = logEntryShowsActivePoison(entry);
+
+    if (state.running && wasActive !== state.poisonActive) {
+      log(
+        state.poisonActive
+          ? `Own poison detected for ${state.playerName}. Switching to the configured poison attack.`
+          : 'Own poison is no longer reported. Returning to the normal attack priority.',
+      );
+    }
+
+    return true;
+  }
+
+  async function waitForPlayerLogUpdate(previousEntry, timeoutMs = 900) {
+    const startedAt = Date.now();
+
+    while (state.running && Date.now() - startedAt < timeoutMs) {
+      const currentEntry = getLatestPlayerLogEntry();
+
+      if (currentEntry && currentEntry !== previousEntry) {
+        syncPoisonStatusFromLog();
+
+        return true;
+      }
+
+      await sleep(75);
+    }
+
+    return false;
+  }
+
   function findMonsterCard() {
     return (
       queryAll(SEL.monsterCard).find((card) => {
@@ -548,6 +665,15 @@
 
     state.settings.attackKeys = keys;
 
+    if (
+      state.settings.poisonAttackKey &&
+      !attacks.some((attack) => {
+        return attack.key === state.settings.poisonAttackKey;
+      })
+    ) {
+      state.settings.poisonAttackKey = '';
+    }
+
     saveSettings();
 
     return changed;
@@ -557,6 +683,14 @@
     return (
       state.attacks.find((attack) => {
         return attack.key === state.settings.attackKeys[index];
+      }) || null
+    );
+  }
+
+  function getSelectedPoisonAttack() {
+    return (
+      state.attacks.find((attack) => {
+        return attack.key === state.settings.poisonAttackKey;
       }) || null
     );
   }
@@ -705,6 +839,10 @@
       manaAfter,
 
       monsterDead,
+
+      poisonActive: logEntryShowsActivePoison(
+        [message, data?.log, data?.attack_log, data?.attackLog, data?.result, raw].filter(Boolean).join(' '),
+      ),
 
       feedbackType: classifyFeedback(lowerMessage),
     };
@@ -982,6 +1120,8 @@
           afterExperience,
 
           monsterDead: result.monsterDead,
+
+          poisonActive: result.poisonActive,
 
           message: result.message,
         };
@@ -1626,9 +1766,73 @@
     return true;
   }
 
+  async function preparePoisonAttack(attack) {
+    const stamina = getCurrentStamina();
+
+    const mana = getCurrentMana();
+
+    if (Number.isFinite(mana) && mana < attack.costs.mana) {
+      if (!state.settings.autoMana) {
+        stop(
+          `The poison attack requires ${formatNumber(attack.costs.mana)} mana, but only ${formatNumber(mana)} is available.`,
+        );
+
+        return null;
+      }
+
+      const used = await usePotion('mana');
+
+      if (!used) {
+        stop('The poison attack requires mana, but no enabled mana potion is available.', 'error');
+
+        return null;
+      }
+
+      return {
+        retry: true,
+      };
+    }
+
+    if (Number.isFinite(stamina) && stamina < attack.costs.stamina) {
+      if (!state.settings.autoStamina) {
+        stop(
+          `The poison attack requires ${formatNumber(attack.costs.stamina)} stamina, but only ${formatNumber(stamina)} is available.`,
+        );
+
+        return null;
+      }
+
+      const used = await usePotion('stamina');
+
+      if (!used) {
+        stop('The poison attack requires stamina, but no enabled stamina potion is available.', 'error');
+
+        return null;
+      }
+
+      return {
+        retry: true,
+      };
+    }
+
+    return {
+      attack,
+      index: -1,
+      isPoisonAttack: true,
+    };
+  }
+
   async function prepareNextAttack() {
     if (discoverAttacks()) {
       renderAttackOptions();
+    }
+
+    syncPoisonStatusFromLog();
+
+    const poisonAttack = getSelectedPoisonAttack();
+
+    if (state.poisonActive && poisonAttack) {
+      return preparePoisonAttack(poisonAttack);
     }
 
     const attacks = [getSelectedAttack(0), getSelectedAttack(1), getSelectedAttack(2)];
@@ -1828,7 +2032,11 @@
     };
   }
 
-  async function handleFailedAttack(outcome, attackIndex) {
+  async function handleFailedAttack(outcome, prepared) {
+    const attackIndex = prepared.index;
+
+    const isPoisonAttack = prepared.isPoisonAttack === true;
+
     if (outcome.type === 'monster-dead') {
       stop('Monster defeated.', 'success');
 
@@ -1861,7 +2069,7 @@
       const used = await usePotion('mana');
 
       if (used) {
-        state.forcedAttackIndex = attackIndex;
+        state.forcedAttackIndex = isPoisonAttack ? 0 : attackIndex;
 
         await sleep(650);
       } else {
@@ -1872,6 +2080,26 @@
     }
 
     if (outcome.type === 'stamina') {
+      if (isPoisonAttack) {
+        if (!state.settings.autoStamina) {
+          stop('Not enough stamina for the poison attack and automatic stamina potions are disabled.');
+
+          return;
+        }
+
+        const used = await usePotion('stamina');
+
+        if (used) {
+          state.forcedAttackIndex = 0;
+
+          await sleep(650);
+        } else {
+          stop('No enabled stamina potion is available for the poison attack.', 'error');
+        }
+
+        return;
+      }
+
       const nextAttack = attackIndex < 2 ? getSelectedAttack(attackIndex + 1) : null;
 
       if (getCurrentStamina() !== 0 && nextAttack) {
@@ -1935,6 +2163,8 @@
       return state.panel.querySelector(`#mabAttack${number}`)?.value || state.settings.attackKeys[index] || '';
     });
 
+    state.settings.poisonAttackKey = state.panel.querySelector('#mabPoisonAttack')?.value || '';
+
     state.settings.targetDamage = state.panel.querySelector('#mabTarget')?.value.trim() || '0';
 
     state.settings.delayMs = Math.max(
@@ -1981,6 +2211,22 @@
       }
     }
 
+    if (state.settings.poisonAttackKey) {
+      const poisonAttack = getSelectedPoisonAttack();
+
+      if (!poisonAttack || !findLiveAttackButton(poisonAttack.key)) {
+        setStatus('Please select a valid poison attack.', 'error');
+
+        return false;
+      }
+
+      if (!state.playerName) {
+        setStatus('The active player name could not be read from the side drawer.', 'error');
+
+        return false;
+      }
+    }
+
     return true;
   }
 
@@ -1996,6 +2242,12 @@
     readForm();
     discoverAttacks();
     discoverPotions();
+
+    state.playerName = getActivePlayerName();
+    state.lastPlayerLogEntry = '';
+    state.poisonActive = false;
+
+    syncPoisonStatusFromLog(true);
 
     renderAttackOptions();
     renderPotionLists();
@@ -2124,8 +2376,10 @@
 
         const button = findLiveAttackButton(prepared.attack.key);
 
+        const attackLabel = prepared.isPoisonAttack ? 'Poison attack' : `Attack ${prepared.index + 1}`;
+
         if (!button) {
-          stop(`Attack ${prepared.index + 1} is no longer available.`, 'error');
+          stop(`${attackLabel} is no longer available.`, 'error');
 
           break;
         }
@@ -2150,7 +2404,9 @@
 
         const beforeFeedback = getFeedbackText();
 
-        log(`Attack ${prepared.index + 1}: ${prepared.attack.name}.`);
+        const beforePlayerLogEntry = getLatestPlayerLogEntry();
+
+        log(`${attackLabel}: ${prepared.attack.name}.`);
 
         const outcome = await performAttack(prepared.attack, button, beforeDamage, beforeExperience, beforeFeedback);
 
@@ -2168,6 +2424,22 @@
           state.lastDamage = Math.max(0, outcome.damage || 0);
 
           state.sessionDamage += state.lastDamage;
+
+          if (outcome.mode === 'api') {
+            const wasPoisonActive = state.poisonActive;
+
+            state.poisonActive = outcome.poisonActive === true;
+
+            if (wasPoisonActive !== state.poisonActive) {
+              log(
+                state.poisonActive
+                  ? `Own poison detected for ${state.playerName}. Switching to the configured poison attack.`
+                  : 'Own poison is no longer reported. Returning to the normal attack priority.',
+              );
+            }
+          } else {
+            await waitForPlayerLogUpdate(beforePlayerLogEntry);
+          }
 
           const afterExperience =
             outcome.mode === 'api' ? outcome.afterExperience : await waitForExperienceUpdate(beforeExperience);
@@ -2202,7 +2474,7 @@
             break;
           }
         } else {
-          await handleFailedAttack(outcome, prepared.index);
+          await handleFailedAttack(outcome, prepared);
         }
 
         if (state.running) {
@@ -2644,6 +2916,17 @@
 
             <label class="mab-field">
               <span>
+                Attack while poisoned
+                <small>
+                  Only when the newest own log entry reports poison
+                </small>
+              </span>
+
+              <select id="mabPoisonAttack"></select>
+            </label>
+
+            <label class="mab-field">
+              <span>
                 Total monster damage target
                 <small>
                   Includes damage dealt before Start. 0 means unlimited.
@@ -2856,7 +3139,10 @@
           <div class="mab-hint">
             Attack choices are re-read from the current
             monster card before every attack. Attack 2
-            and Attack 3 are stamina fallbacks.
+            and Attack 3 are stamina fallbacks. The poison
+            attack is used only when the newest attack-log
+            entry by the player shown in the side drawer
+            reports that the enemy is poisoned.
           </div>
         </div>
       </details>
@@ -2916,6 +3202,58 @@
 
         select.appendChild(group);
       }
+    }
+
+    const poisonSelect = state.panel.querySelector('#mabPoisonAttack');
+
+    if (!poisonSelect) {
+      return;
+    }
+
+    poisonSelect.replaceChildren();
+
+    const disabledOption = document.createElement('option');
+
+    disabledOption.value = '';
+    disabledOption.textContent = 'Disabled — use normal attack priority';
+    disabledOption.selected = !state.settings.poisonAttackKey;
+
+    poisonSelect.appendChild(disabledOption);
+
+    for (const groupName of ['Standard Attacks', 'Class Attacks']) {
+      const attacks = state.attacks.filter((attack) => {
+        return attack.group === groupName;
+      });
+
+      if (!attacks.length) {
+        continue;
+      }
+
+      const group = document.createElement('optgroup');
+
+      group.label = groupName;
+
+      for (const attack of attacks) {
+        const option = document.createElement('option');
+
+        const costs = [];
+
+        if (attack.costs.stamina) {
+          costs.push(`${formatNumber(attack.costs.stamina)} STA`);
+        }
+
+        if (attack.costs.mana) {
+          costs.push(`${formatNumber(attack.costs.mana)} MP`);
+        }
+
+        option.value = attack.key;
+        option.textContent = costs.length ? `${attack.name} · ${costs.join(' / ')}` : attack.name;
+        option.selected = attack.key === state.settings.poisonAttackKey;
+
+        group.appendChild(option);
+      }
+
+      poisonSelect.appendChild(group);
     }
   }
 
@@ -3199,6 +3537,7 @@
       '#mabAttack1',
       '#mabAttack2',
       '#mabAttack3',
+      '#mabPoisonAttack',
       '#mabDelay',
       '#mabAutoStamina',
       '#mabAutoMana',
