@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Monster Auto Battle
 // @namespace    http://tampermonkey.net/
-// @version      1.6.1
+// @version      1.6.2
 // @description  Auto-battle for the current monster with three attacks, an own-poison attack, potion priorities, target damage, and level-up protection.
 // @match        https://demonicscans.org/battle.php*
 // @grant        none
@@ -91,6 +91,33 @@
     });
 
   const queryAll = (selector, root = document) => [...root.querySelectorAll(selector)];
+
+  function getCookieValue(name) {
+    const prefix = `${name}=`;
+
+    const entry = String(document.cookie || '')
+      .split('; ')
+      .find((item) => {
+        return item.startsWith(prefix);
+      });
+
+    return entry ? decodeURIComponent(entry.slice(prefix.length)) : null;
+  }
+
+  function setLastAttackCookie(value) {
+    document.cookie =
+      `last_attack=${encodeURIComponent(String(value))}; ` + 'path=/; max-age=86400; SameSite=Lax';
+  }
+
+  function restoreLastAttackCookie(value) {
+    if (value == null) {
+      document.cookie = 'last_attack=; path=/; max-age=0; SameSite=Lax';
+
+      return;
+    }
+
+    setLastAttackCookie(value);
+  }
 
   function loadSettings() {
     try {
@@ -1240,22 +1267,35 @@
         };
       }
 
+      const previousLastAttackCookie = request.source === 'page' ? getCookieValue('last_attack') : null;
+
+      if (request.source === 'page') {
+        setLastAttackCookie(Date.now());
+      }
+
       let response;
 
       try {
-        response = await fetch(request.url, {
-          method: 'POST',
+        const fetchOptions =
+          request.source === 'page'
+            ? {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: request.body.toString(),
+              }
+            : {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: {
+                  'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                  'X-Requested-With': 'XMLHttpRequest',
+                },
+                body: request.body.toString(),
+              };
 
-          credentials: 'same-origin',
-
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-
-            'X-Requested-With': 'XMLHttpRequest',
-          },
-
-          body: request.body.toString(),
-        });
+        response = await fetch(request.url, fetchOptions);
       } catch (error) {
         console.error('[Monster Auto Battle] Fast attack request failed.', error);
 
@@ -1285,6 +1325,8 @@
         !result.ok &&
         /\binvalid request\b|\bmissing (?:request|parameter|token)\b/i.test(result.message)
       ) {
+        restoreLastAttackCookie(previousLastAttackCookie);
+
         return {
           unsupported: true,
         };
