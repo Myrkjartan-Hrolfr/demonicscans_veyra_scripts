@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Monster Auto Battle
 // @namespace    http://tampermonkey.net/
-// @version      1.6.0
+// @version      1.6.1
 // @description  Auto-battle for the current monster with three attacks, an own-poison attack, potion priorities, target damage, and level-up protection.
 // @match        https://demonicscans.org/battle.php*
 // @grant        none
@@ -16,6 +16,7 @@
 
   const RESUME_KEY = `${ID}:resume:v3:${location.host}:${location.pathname}`;
   const MAX_RATE_RETRIES = 8;
+  const PAGE_DIRECT_MIN_INTERVAL_MS = 1000;
   const SEL = {
     monsterCard: '.battle-card.monster-card',
     attack: 'button.attack-btn',
@@ -78,6 +79,8 @@
     playerName: '',
     poisonActive: false,
     lastPlayerLogEntry: '',
+
+    lastPageDirectRequestAt: 0,
 
     timers: {},
   };
@@ -1144,7 +1147,20 @@
     };
   }
 
-  async function refreshAfterFastAttack(beforeExperience, experienceGain) {
+  async function refreshAfterFastAttack(beforeExperience, experienceGain, preferKnownExperience = false) {
+    /*
+     * Active-wave responses already contain xp_delta.
+     * Applying it locally avoids a second serial request to
+     * game_dash.php after every successful wave attack.
+     */
+    if (preferKnownExperience) {
+      const knownExperience = applyKnownExperienceGain(beforeExperience, experienceGain);
+
+      if (knownExperience) {
+        return knownExperience;
+      }
+    }
+
     let snapshot = await fetchDashboardSnapshot();
 
     let afterExperience = snapshot?.experience || null;
@@ -1179,6 +1195,22 @@
     return afterExperience;
   }
 
+  async function waitForPageDirectWindow() {
+    const remaining = state.lastPageDirectRequestAt + PAGE_DIRECT_MIN_INTERVAL_MS - Date.now();
+
+    if (remaining > 0) {
+      await sleep(remaining);
+    }
+
+    if (!state.running) {
+      return false;
+    }
+
+    state.lastPageDirectRequestAt = Date.now();
+
+    return true;
+  }
+
   async function performFastAttack(attack, button, beforeDamage, beforeExperience) {
     const request = getFastAttackRequest(attack, button);
 
@@ -1195,6 +1227,13 @@
 
     for (let attempt = 0; attempt < MAX_RATE_RETRIES; attempt += 1) {
       if (!state.running) {
+        return {
+          type: 'timeout',
+          mode: 'api',
+        };
+      }
+
+      if (request.source === 'page' && !(await waitForPageDirectWindow())) {
         return {
           type: 'timeout',
           mode: 'api',
@@ -1268,7 +1307,11 @@
 
       applyFastAttackResult(result, beforeDamage);
 
-      const afterExperience = await refreshAfterFastAttack(beforeExperience, result.experienceGain);
+      const afterExperience = await refreshAfterFastAttack(
+        beforeExperience,
+        result.experienceGain,
+        request.source === 'page',
+      );
 
       let damage = result.damage;
 
