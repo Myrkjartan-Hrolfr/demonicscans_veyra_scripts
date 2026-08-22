@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Monster Auto Battle
 // @namespace    http://tampermonkey.net/
-// @version      1.5.0
+// @version      1.6.0
 // @description  Auto-battle for the current monster with three attacks, an own-poison attack, potion priorities, target damage, and level-up protection.
 // @match        https://demonicscans.org/battle.php*
 // @grant        none
@@ -707,7 +707,7 @@
     );
   }
 
-  function getFastAttackContext(button) {
+  function getDungeonFastAttackContext(button) {
     const urlParams = new URLSearchParams(location.search);
 
     const getHiddenValue = (name) => {
@@ -727,6 +727,104 @@
 
       instanceId: String(instanceId),
     };
+  }
+
+  function copySearchParams(value) {
+    if (!value || typeof value.entries !== 'function') {
+      return null;
+    }
+
+    const copy = new URLSearchParams();
+
+    try {
+      for (const [name, entryValue] of value.entries()) {
+        if (typeof entryValue !== 'string') {
+          return null;
+        }
+
+        copy.append(String(name), entryValue);
+      }
+    } catch (error) {
+      console.warn('[Monster Auto Battle] Could not copy the page attack parameters.', error);
+
+      return null;
+    }
+
+    return copy;
+  }
+
+  function getFastAttackRequest(attack, button) {
+    if (attack.skillId === '') {
+      return null;
+    }
+
+    const dungeonContext = getDungeonFastAttackContext(button);
+
+    /*
+     * Keep the known dungeon request unchanged. It does
+     * not depend on page-owned helper functions.
+     */
+    if (dungeonContext) {
+      const body = new URLSearchParams();
+
+      body.set('instance_id', dungeonContext.instanceId);
+      body.set('dgmid', dungeonContext.dgmid);
+      body.set('skill_id', attack.skillId);
+      body.set('stamina_cost', String(attack.costs.stamina));
+
+      return {
+        url: '/damage.php',
+        body,
+        source: 'dungeon',
+      };
+    }
+
+    /*
+     * Active-wave battles build their request context in
+     * baseQS() and resolve the attack endpoint through
+     * ep('ATTACK'). Reusing both page helpers preserves all
+     * current wave, event, monster, and user parameters.
+     */
+    const pageBaseQS =
+      typeof window.baseQS === 'function'
+        ? window.baseQS
+        : typeof baseQS === 'function'
+          ? baseQS
+          : null;
+
+    const pageEndpoint =
+      typeof window.ep === 'function'
+        ? window.ep
+        : typeof ep === 'function'
+          ? ep
+          : null;
+
+    if (!pageBaseQS || !pageEndpoint) {
+      return null;
+    }
+
+    try {
+      const body = copySearchParams(pageBaseQS());
+
+      const url = String(pageEndpoint('ATTACK') || '').trim();
+
+      if (!body || !url) {
+        return null;
+      }
+
+      body.set('skill_id', attack.skillId);
+      body.set('stamina_cost', String(attack.costs.stamina));
+
+      return {
+        url,
+        body,
+        source: 'page',
+      };
+    } catch (error) {
+      console.warn('[Monster Auto Battle] Could not build the page direct-attack request.', error);
+
+      return null;
+    }
   }
 
   function getRetryAfterMilliseconds(response) {
@@ -787,6 +885,7 @@
     );
 
     const experienceGain = firstGameNumber(
+      data?.xp_delta,
       data?.exp_gain,
       data?.expGained,
       data?.experience_gain,
@@ -802,9 +901,47 @@
       data?.userHpAfter,
     );
 
-    const staminaAfter = firstGameNumber(data?.stamina_after, data?.staminaAfter, data?.current_stamina);
+    const staminaAfter = firstGameNumber(
+      data?.stamina,
+      data?.stamina_after,
+      data?.staminaAfter,
+      data?.current_stamina,
+    );
 
-    const manaAfter = firstGameNumber(data?.mana_after, data?.manaAfter, data?.current_mana);
+    const manaAfter = firstGameNumber(data?.mana, data?.mana_after, data?.manaAfter, data?.current_mana);
+
+    const monsterHpAfter = firstGameNumber(
+      data?.hp?.value,
+      data?.monster_hp_after,
+      data?.monsterHpAfter,
+      data?.current_monster_hp,
+    );
+
+    const monsterHpMaximum = firstGameNumber(
+      data?.hp?.max,
+      data?.monster_hp_max,
+      data?.monsterHpMaximum,
+      data?.maximum_monster_hp,
+    );
+
+    const normalizedPlayerName = normalizeText(state.playerName || getActivePlayerName()).toLocaleLowerCase();
+
+    const playerResponseLog = Array.isArray(data?.logs)
+      ? data.logs.find((entry) => {
+          return normalizeText(entry?.USERNAME).toLocaleLowerCase() === normalizedPlayerName;
+        })
+      : null;
+
+    const playerResponseLogText = playerResponseLog
+      ? [
+          playerResponseLog.SKILL_NAME,
+          playerResponseLog.EXTRA_INFO,
+          playerResponseLog.message,
+          playerResponseLog.log,
+        ]
+          .filter(Boolean)
+          .join(' ')
+      : '';
 
     const explicitFailure = data?.status === 'error' || data?.success === false;
 
@@ -813,6 +950,7 @@
     const monsterDead =
       data?.monster_dead === true ||
       data?.monsterDead === true ||
+      monsterHpAfter === 0 ||
       lowerMessage.includes('is dead') ||
       lowerMessage.includes('defeated') ||
       lowerMessage.includes('monster died') ||
@@ -837,11 +975,14 @@
       userHpAfter,
       staminaAfter,
       manaAfter,
+      monsterHpAfter,
+      monsterHpMaximum,
 
       monsterDead,
 
       poisonActive: logEntryShowsActivePoison(
-        [message, data?.log, data?.attack_log, data?.attackLog, data?.result, raw].filter(Boolean).join(' '),
+        playerResponseLogText ||
+          [message, data?.log, data?.attack_log, data?.attackLog, data?.result, raw].filter(Boolean).join(' '),
       ),
 
       feedbackType: classifyFeedback(lowerMessage),
@@ -892,6 +1033,29 @@
 
       if (manaElement && mana) {
         manaElement.textContent = `💠 ${formatNumber(result.manaAfter)} / ${formatNumber(mana.maximum)} MP`;
+      }
+    }
+
+    if (Number.isFinite(result.monsterHpAfter)) {
+      const monsterHealthElement = state.card?.querySelector(SEL.monsterHp);
+
+      const visibleHealth = parseFraction(monsterHealthElement?.textContent);
+
+      const maximum = Number.isFinite(result.monsterHpMaximum)
+        ? result.monsterHpMaximum
+        : visibleHealth?.maximum;
+
+      if (monsterHealthElement && Number.isFinite(maximum)) {
+        monsterHealthElement.textContent =
+          `❤️ ${formatNumber(result.monsterHpAfter)} / ` + `${formatNumber(maximum)} HP`;
+      }
+
+      const healthFill = state.card?.querySelector('#hpFill');
+
+      if (healthFill && Number.isFinite(maximum) && maximum > 0) {
+        const percentage = Math.max(0, Math.min(100, (result.monsterHpAfter / maximum) * 100));
+
+        healthFill.style.width = `${percentage}%`;
       }
     }
   }
@@ -1016,28 +1180,18 @@
   }
 
   async function performFastAttack(attack, button, beforeDamage, beforeExperience) {
-    const context = getFastAttackContext(button);
+    const request = getFastAttackRequest(attack, button);
 
     /*
-     * Normal non-dungeon battle pages may not expose
-     * dgmid and instance_id. The caller will use the
-     * original button-click method in that case.
+     * If neither the known dungeon context nor the page's
+     * own active-wave request builder is available, the
+     * caller uses the original button-click method.
      */
-    if (!context || attack.skillId === '') {
+    if (!request) {
       return {
         unsupported: true,
       };
     }
-
-    const body = new URLSearchParams();
-
-    body.set('instance_id', context.instanceId);
-
-    body.set('dgmid', context.dgmid);
-
-    body.set('skill_id', attack.skillId);
-
-    body.set('stamina_cost', String(attack.costs.stamina));
 
     for (let attempt = 0; attempt < MAX_RATE_RETRIES; attempt += 1) {
       if (!state.running) {
@@ -1050,7 +1204,7 @@
       let response;
 
       try {
-        response = await fetch('/damage.php', {
+        response = await fetch(request.url, {
           method: 'POST',
 
           credentials: 'same-origin',
@@ -1061,7 +1215,7 @@
             'X-Requested-With': 'XMLHttpRequest',
           },
 
-          body: body.toString(),
+          body: request.body.toString(),
         });
       } catch (error) {
         console.error('[Monster Auto Battle] Fast attack request failed.', error);
@@ -1081,6 +1235,21 @@
       const raw = await response.text();
 
       const result = parseFastAttackResponse(response, raw);
+
+      /*
+       * The direct request was explicitly rejected before
+       * an attack was applied. It is safe to let the page's
+       * original button handler rebuild and retry it.
+       */
+      if (
+        request.source === 'page' &&
+        !result.ok &&
+        /\binvalid request\b|\bmissing (?:request|parameter|token)\b/i.test(result.message)
+      ) {
+        return {
+          unsupported: true,
+        };
+      }
 
       const rateLimited =
         response.status === 429 ||
@@ -1177,8 +1346,8 @@
     }
 
     /*
-     * Fallback for battle modes that do not support
-     * the direct /damage.php request parameters.
+     * Fallback when the page does not expose a safe direct
+     * request or explicitly rejects the generated request.
      */
     button.click();
 
