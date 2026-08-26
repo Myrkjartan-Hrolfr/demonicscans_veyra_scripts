@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Monster Auto Battle
 // @namespace    http://tampermonkey.net/
-// @version      1.6.3
+// @version      1.6.4
 // @description  Auto-battle for the current monster with three attacks, an own-poison attack, potion priorities, target damage, and level-up protection.
 // @match        https://demonicscans.org/battle.php*
 // @grant        none
@@ -88,33 +88,6 @@
     });
 
   const queryAll = (selector, root = document) => [...root.querySelectorAll(selector)];
-
-  function getCookieValue(name) {
-    const prefix = `${name}=`;
-
-    const entry = String(document.cookie || '')
-      .split('; ')
-      .find((item) => {
-        return item.startsWith(prefix);
-      });
-
-    return entry ? decodeURIComponent(entry.slice(prefix.length)) : null;
-  }
-
-  function setLastAttackCookie(value) {
-    document.cookie =
-      `last_attack=${encodeURIComponent(String(value))}; ` + 'path=/; max-age=86400; SameSite=Lax';
-  }
-
-  function restoreLastAttackCookie(value) {
-    if (value == null) {
-      document.cookie = 'last_attack=; path=/; max-age=0; SameSite=Lax';
-
-      return;
-    }
-
-    setLastAttackCookie(value);
-  }
 
   function loadSettings() {
     try {
@@ -419,7 +392,11 @@
   }
 
   function getLogEntryPlayerName(line) {
-    return normalizeText(line).match(/^⚔️\s*(?:\[END\]\s*)?(.+?)\s+used\s+/i)?.[1]?.trim() || '';
+    return (
+      normalizeText(line)
+        .match(/^⚔️\s*(?:\[END\]\s*)?(.+?)\s+used\s+/i)?.[1]
+        ?.trim() || ''
+    );
   }
 
   function logEntryShowsActivePoison(line) {
@@ -734,7 +711,7 @@
     );
   }
 
-  function getDungeonFastAttackContext(button) {
+  function getFastAttackContext(button) {
     const urlParams = new URLSearchParams(location.search);
 
     const getHiddenValue = (name) => {
@@ -754,104 +731,6 @@
 
       instanceId: String(instanceId),
     };
-  }
-
-  function copySearchParams(value) {
-    if (!value || typeof value.entries !== 'function') {
-      return null;
-    }
-
-    const copy = new URLSearchParams();
-
-    try {
-      for (const [name, entryValue] of value.entries()) {
-        if (typeof entryValue !== 'string') {
-          return null;
-        }
-
-        copy.append(String(name), entryValue);
-      }
-    } catch (error) {
-      console.warn('[Monster Auto Battle] Could not copy the page attack parameters.', error);
-
-      return null;
-    }
-
-    return copy;
-  }
-
-  function getFastAttackRequest(attack, button) {
-    if (attack.skillId === '') {
-      return null;
-    }
-
-    const dungeonContext = getDungeonFastAttackContext(button);
-
-    /*
-     * Keep the known dungeon request unchanged. It does
-     * not depend on page-owned helper functions.
-     */
-    if (dungeonContext) {
-      const body = new URLSearchParams();
-
-      body.set('instance_id', dungeonContext.instanceId);
-      body.set('dgmid', dungeonContext.dgmid);
-      body.set('skill_id', attack.skillId);
-      body.set('stamina_cost', String(attack.costs.stamina));
-
-      return {
-        url: '/damage.php',
-        body,
-        source: 'dungeon',
-      };
-    }
-
-    /*
-     * Active-wave battles build their request context in
-     * baseQS() and resolve the attack endpoint through
-     * ep('ATTACK'). Reusing both page helpers preserves all
-     * current wave, event, monster, and user parameters.
-     */
-    const pageBaseQS =
-      typeof window.baseQS === 'function'
-        ? window.baseQS
-        : typeof baseQS === 'function'
-          ? baseQS
-          : null;
-
-    const pageEndpoint =
-      typeof window.ep === 'function'
-        ? window.ep
-        : typeof ep === 'function'
-          ? ep
-          : null;
-
-    if (!pageBaseQS || !pageEndpoint) {
-      return null;
-    }
-
-    try {
-      const body = copySearchParams(pageBaseQS());
-
-      const url = String(pageEndpoint('ATTACK') || '').trim();
-
-      if (!body || !url) {
-        return null;
-      }
-
-      body.set('skill_id', attack.skillId);
-      body.set('stamina_cost', String(attack.costs.stamina));
-
-      return {
-        url,
-        body,
-        source: 'page',
-      };
-    } catch (error) {
-      console.warn('[Monster Auto Battle] Could not build the page direct-attack request.', error);
-
-      return null;
-    }
   }
 
   function getRetryAfterMilliseconds(response) {
@@ -912,7 +791,6 @@
     );
 
     const experienceGain = firstGameNumber(
-      data?.xp_delta,
       data?.exp_gain,
       data?.expGained,
       data?.experience_gain,
@@ -928,47 +806,9 @@
       data?.userHpAfter,
     );
 
-    const staminaAfter = firstGameNumber(
-      data?.stamina,
-      data?.stamina_after,
-      data?.staminaAfter,
-      data?.current_stamina,
-    );
+    const staminaAfter = firstGameNumber(data?.stamina_after, data?.staminaAfter, data?.current_stamina);
 
-    const manaAfter = firstGameNumber(data?.mana, data?.mana_after, data?.manaAfter, data?.current_mana);
-
-    const monsterHpAfter = firstGameNumber(
-      data?.hp?.value,
-      data?.monster_hp_after,
-      data?.monsterHpAfter,
-      data?.current_monster_hp,
-    );
-
-    const monsterHpMaximum = firstGameNumber(
-      data?.hp?.max,
-      data?.monster_hp_max,
-      data?.monsterHpMaximum,
-      data?.maximum_monster_hp,
-    );
-
-    const normalizedPlayerName = normalizeText(state.playerName || getActivePlayerName()).toLocaleLowerCase();
-
-    const playerResponseLog = Array.isArray(data?.logs)
-      ? data.logs.find((entry) => {
-          return normalizeText(entry?.USERNAME).toLocaleLowerCase() === normalizedPlayerName;
-        })
-      : null;
-
-    const playerResponseLogText = playerResponseLog
-      ? [
-          playerResponseLog.SKILL_NAME,
-          playerResponseLog.EXTRA_INFO,
-          playerResponseLog.message,
-          playerResponseLog.log,
-        ]
-          .filter(Boolean)
-          .join(' ')
-      : '';
+    const manaAfter = firstGameNumber(data?.mana_after, data?.manaAfter, data?.current_mana);
 
     const explicitFailure = data?.status === 'error' || data?.success === false;
 
@@ -977,7 +817,6 @@
     const monsterDead =
       data?.monster_dead === true ||
       data?.monsterDead === true ||
-      monsterHpAfter === 0 ||
       lowerMessage.includes('is dead') ||
       lowerMessage.includes('defeated') ||
       lowerMessage.includes('monster died') ||
@@ -1002,14 +841,11 @@
       userHpAfter,
       staminaAfter,
       manaAfter,
-      monsterHpAfter,
-      monsterHpMaximum,
 
       monsterDead,
 
       poisonActive: logEntryShowsActivePoison(
-        playerResponseLogText ||
-          [message, data?.log, data?.attack_log, data?.attackLog, data?.result, raw].filter(Boolean).join(' '),
+        [message, data?.log, data?.attack_log, data?.attackLog, data?.result, raw].filter(Boolean).join(' '),
       ),
 
       feedbackType: classifyFeedback(lowerMessage),
@@ -1060,29 +896,6 @@
 
       if (manaElement && mana) {
         manaElement.textContent = `💠 ${formatNumber(result.manaAfter)} / ${formatNumber(mana.maximum)} MP`;
-      }
-    }
-
-    if (Number.isFinite(result.monsterHpAfter)) {
-      const monsterHealthElement = state.card?.querySelector(SEL.monsterHp);
-
-      const visibleHealth = parseFraction(monsterHealthElement?.textContent);
-
-      const maximum = Number.isFinite(result.monsterHpMaximum)
-        ? result.monsterHpMaximum
-        : visibleHealth?.maximum;
-
-      if (monsterHealthElement && Number.isFinite(maximum)) {
-        monsterHealthElement.textContent =
-          `❤️ ${formatNumber(result.monsterHpAfter)} / ` + `${formatNumber(maximum)} HP`;
-      }
-
-      const healthFill = state.card?.querySelector('#hpFill');
-
-      if (healthFill && Number.isFinite(maximum) && maximum > 0) {
-        const percentage = Math.max(0, Math.min(100, (result.monsterHpAfter / maximum) * 100));
-
-        healthFill.style.width = `${percentage}%`;
       }
     }
   }
@@ -1171,30 +984,7 @@
     };
   }
 
-  async function refreshAfterFastAttack(beforeExperience, experienceGain, preferKnownExperience = false) {
-    /*
-     * Active-wave responses already contain xp_delta.
-     * Applying it locally avoids a second serial request to
-     * game_dash.php after every successful wave attack.
-     */
-    if (preferKnownExperience) {
-      const knownExperience = applyKnownExperienceGain(beforeExperience, experienceGain);
-
-      if (knownExperience) {
-        return knownExperience;
-      }
-
-      /*
-       * Without level-up protection, an exact EXP snapshot
-       * is not needed before the next attack. Waiting for a
-       * separate dashboard request here made every wave hit
-       * slower whenever xp_delta was missing or unusable.
-       */
-      if (!state.settings.stopBeforeLevelUp) {
-        return beforeExperience;
-      }
-    }
-
+  async function refreshAfterFastAttack(beforeExperience, experienceGain) {
     let snapshot = await fetchDashboardSnapshot();
 
     let afterExperience = snapshot?.experience || null;
@@ -1230,18 +1020,28 @@
   }
 
   async function performFastAttack(attack, button, beforeDamage, beforeExperience) {
-    const request = getFastAttackRequest(attack, button);
+    const context = getFastAttackContext(button);
 
     /*
-     * If neither the known dungeon context nor the page's
-     * own active-wave request builder is available, the
-     * caller uses the original button-click method.
+     * Normal non-dungeon battle pages may not expose
+     * dgmid and instance_id. The caller will use the
+     * original button-click method in that case.
      */
-    if (!request) {
+    if (!context || attack.skillId === '') {
       return {
         unsupported: true,
       };
     }
+
+    const body = new URLSearchParams();
+
+    body.set('instance_id', context.instanceId);
+
+    body.set('dgmid', context.dgmid);
+
+    body.set('skill_id', attack.skillId);
+
+    body.set('stamina_cost', String(attack.costs.stamina));
 
     for (let attempt = 0; attempt < MAX_RATE_RETRIES; attempt += 1) {
       if (!state.running) {
@@ -1251,35 +1051,22 @@
         };
       }
 
-      const previousLastAttackCookie = request.source === 'page' ? getCookieValue('last_attack') : null;
-
-      if (request.source === 'page') {
-        setLastAttackCookie(Date.now());
-      }
-
       let response;
 
       try {
-        const fetchOptions =
-          request.source === 'page'
-            ? {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/x-www-form-urlencoded',
-                },
-                body: request.body.toString(),
-              }
-            : {
-                method: 'POST',
-                credentials: 'same-origin',
-                headers: {
-                  'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                  'X-Requested-With': 'XMLHttpRequest',
-                },
-                body: request.body.toString(),
-              };
+        response = await fetch('/damage.php', {
+          method: 'POST',
 
-        response = await fetch(request.url, fetchOptions);
+          credentials: 'same-origin',
+
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+
+            'X-Requested-With': 'XMLHttpRequest',
+          },
+
+          body: body.toString(),
+        });
       } catch (error) {
         console.error('[Monster Auto Battle] Fast attack request failed.', error);
 
@@ -1299,23 +1086,6 @@
 
       const result = parseFastAttackResponse(response, raw);
 
-      /*
-       * The direct request was explicitly rejected before
-       * an attack was applied. It is safe to let the page's
-       * original button handler rebuild and retry it.
-       */
-      if (
-        request.source === 'page' &&
-        !result.ok &&
-        /\binvalid request\b|\bmissing (?:request|parameter|token)\b/i.test(result.message)
-      ) {
-        restoreLastAttackCookie(previousLastAttackCookie);
-
-        return {
-          unsupported: true,
-        };
-      }
-
       const rateLimited =
         response.status === 429 ||
         result.feedbackType === 'cooldown' ||
@@ -1333,11 +1103,7 @@
 
       applyFastAttackResult(result, beforeDamage);
 
-      const afterExperience = await refreshAfterFastAttack(
-        beforeExperience,
-        result.experienceGain,
-        request.source === 'page',
-      );
+      const afterExperience = await refreshAfterFastAttack(beforeExperience, result.experienceGain);
 
       let damage = result.damage;
 
@@ -1415,8 +1181,8 @@
     }
 
     /*
-     * Fallback when the page does not expose a safe direct
-     * request or explicitly rejects the generated request.
+     * Fallback for battle modes that do not support
+     * the direct /damage.php request parameters.
      */
     button.click();
 
@@ -2646,8 +2412,6 @@
 
         log(`${attackLabel}: ${prepared.attack.name}.`);
 
-        const attackStartedAt = Date.now();
-
         const outcome = await performAttack(prepared.attack, button, beforeDamage, beforeExperience, beforeFeedback);
 
         if (!state.running) {
@@ -2718,14 +2482,7 @@
         }
 
         if (state.running) {
-          /*
-           * The configured delay is the minimum time from
-           * one attack start to the next. Network and DOM
-           * processing time must not be added on top of it.
-           */
-          const remainingDelay = state.settings.delayMs - (Date.now() - attackStartedAt);
-
-          await sleep(Math.max(0, remainingDelay));
+          await sleep(Math.max(0, state.settings.delayMs));
         }
       }
     } catch (error) {
