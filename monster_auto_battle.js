@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Monster Auto Battle
 // @namespace    http://tampermonkey.net/
-// @version      1.6.2
+// @version      1.6.3
 // @description  Auto-battle for the current monster with three attacks, an own-poison attack, potion priorities, target damage, and level-up protection.
 // @match        https://demonicscans.org/battle.php*
 // @grant        none
@@ -16,7 +16,6 @@
 
   const RESUME_KEY = `${ID}:resume:v3:${location.host}:${location.pathname}`;
   const MAX_RATE_RETRIES = 8;
-  const PAGE_DIRECT_MIN_INTERVAL_MS = 1000;
   const SEL = {
     monsterCard: '.battle-card.monster-card',
     attack: 'button.attack-btn',
@@ -79,8 +78,6 @@
     playerName: '',
     poisonActive: false,
     lastPlayerLogEntry: '',
-
-    lastPageDirectRequestAt: 0,
 
     timers: {},
   };
@@ -1186,6 +1183,16 @@
       if (knownExperience) {
         return knownExperience;
       }
+
+      /*
+       * Without level-up protection, an exact EXP snapshot
+       * is not needed before the next attack. Waiting for a
+       * separate dashboard request here made every wave hit
+       * slower whenever xp_delta was missing or unusable.
+       */
+      if (!state.settings.stopBeforeLevelUp) {
+        return beforeExperience;
+      }
     }
 
     let snapshot = await fetchDashboardSnapshot();
@@ -1222,22 +1229,6 @@
     return afterExperience;
   }
 
-  async function waitForPageDirectWindow() {
-    const remaining = state.lastPageDirectRequestAt + PAGE_DIRECT_MIN_INTERVAL_MS - Date.now();
-
-    if (remaining > 0) {
-      await sleep(remaining);
-    }
-
-    if (!state.running) {
-      return false;
-    }
-
-    state.lastPageDirectRequestAt = Date.now();
-
-    return true;
-  }
-
   async function performFastAttack(attack, button, beforeDamage, beforeExperience) {
     const request = getFastAttackRequest(attack, button);
 
@@ -1254,13 +1245,6 @@
 
     for (let attempt = 0; attempt < MAX_RATE_RETRIES; attempt += 1) {
       if (!state.running) {
-        return {
-          type: 'timeout',
-          mode: 'api',
-        };
-      }
-
-      if (request.source === 'page' && !(await waitForPageDirectWindow())) {
         return {
           type: 'timeout',
           mode: 'api',
@@ -2662,6 +2646,8 @@
 
         log(`${attackLabel}: ${prepared.attack.name}.`);
 
+        const attackStartedAt = Date.now();
+
         const outcome = await performAttack(prepared.attack, button, beforeDamage, beforeExperience, beforeFeedback);
 
         if (!state.running) {
@@ -2732,7 +2718,14 @@
         }
 
         if (state.running) {
-          await sleep(Math.max(0, state.settings.delayMs));
+          /*
+           * The configured delay is the minimum time from
+           * one attack start to the next. Network and DOM
+           * processing time must not be added on top of it.
+           */
+          const remainingDelay = state.settings.delayMs - (Date.now() - attackStartedAt);
+
+          await sleep(Math.max(0, remainingDelay));
         }
       }
     } catch (error) {
