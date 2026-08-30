@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Advanced Dead Monster Looter V1.9
+// @name         Advanced Dead Monster Looter V1.10
 // @namespace    http://tampermonkey.net/
-// @version      1.9
+// @version      1.10
 // @description  Auto-Merges, robust active/dead damage sorting, fast 0-damage loot, Loot Selected, Extract & Loot
 // @author       Gemini
 // @match        https://demonicscans.org/active_wave.php*
@@ -136,7 +136,7 @@
 
   setTimeout(async () => {
     const deadTitle = Array.from(document.querySelectorAll('.monster-section-title')).find((el) =>
-      el.innerText.includes('Dead Monsters'),
+      /\bDead\s+(?:Monsters|Bosses)\b/i.test(el.textContent || ''),
     );
     if (!deadTitle) return;
 
