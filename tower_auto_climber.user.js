@@ -1,0 +1,1536 @@
+// ==UserScript==
+// @name         Demonic Tower Autopilot
+// @namespace    local.demonicscans.tower
+// @version      1.1.0
+// @description  Continuously climbs the Demonic Tower with configurable combat, potions, paths, and power priorities.
+// @author       Myrkjartan Hrolfr
+// @match        https://demonicscans.org/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  const SCRIPT_ID = 'tm-demonic-tower-autopilot';
+  const SETTINGS_VERSION = 1;
+  const RETRY_TIMEOUT_MS = 30000;
+  const MISSING_RUN_GRACE_MS = 10000;
+
+  const DEFAULTS = Object.freeze({
+    attack: 'slash',
+    guardHeavy: true,
+    potionEnabled: false,
+    potionThreshold: 30,
+    respectNoPotion: true,
+    path: 'left',
+    powerMode: 'wishlist',
+    powerFallback: 'pause',
+    preferredPowers: [],
+    unknownDecision: 'pause',
+    actionDelayMs: 1050,
+    collapsed: false,
+  });
+
+  const RARITY_RANK = Object.freeze({
+    common: 1,
+    uncommon: 2,
+    rare: 2,
+    epic: 3,
+    legendary: 4,
+    mythic: 5,
+  });
+
+  const VALID_SETTINGS = Object.freeze({
+    attack: new Set(['slash', 'magic']),
+    path: new Set(['left', 'right', 'random']),
+    powerMode: new Set(['wishlist', 'rarity', 'skip', 'pause']),
+    powerFallback: new Set(['pause', 'skip', 'rarity']),
+    unknownDecision: new Set(['pause', 'first']),
+  });
+
+  function clampNumber(value, minimum, maximum, fallback) {
+    const number = Number(value);
+
+    if (!Number.isFinite(number)) {
+      return fallback;
+    }
+
+    return Math.min(maximum, Math.max(minimum, Math.round(number)));
+  }
+
+  function normalizeText(value) {
+    return String(value ?? '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function normalizePowerKey(value) {
+    return normalizeText(value)
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/[’']/g, '')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim();
+  }
+
+  function uniquePowerNames(value) {
+    const values = Array.isArray(value) ? value : String(value ?? '').split(/\r?\n/);
+    const names = new Map();
+
+    for (const rawName of values) {
+      const name = normalizeText(rawName);
+      const key = normalizePowerKey(name);
+
+      if (key && !names.has(key)) {
+        names.set(key, name);
+      }
+    }
+
+    return [...names.values()];
+  }
+
+  function rarityRank(value) {
+    return RARITY_RANK[String(value ?? '').toLowerCase()] || 0;
+  }
+
+  function parseRatio(value) {
+    const match = String(value ?? '').match(/(\d+)\s*(?:\/|of)\s*(\d+)/i);
+
+    if (!match) {
+      return null;
+    }
+
+    const current = Number(match[1]);
+    const maximum = Number(match[2]);
+
+    if (!Number.isFinite(current) || !Number.isFinite(maximum) || maximum <= 0) {
+      return null;
+    }
+
+    return {
+      current,
+      maximum,
+    };
+  }
+
+  function sanitizeSettings(saved = {}) {
+    const source = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+
+    return {
+      attack: VALID_SETTINGS.attack.has(source.attack) ? source.attack : DEFAULTS.attack,
+      guardHeavy: source.guardHeavy !== false,
+      potionEnabled: source.potionEnabled === true,
+      potionThreshold: clampNumber(source.potionThreshold, 1, 99, DEFAULTS.potionThreshold),
+      respectNoPotion: source.respectNoPotion !== false,
+      path: VALID_SETTINGS.path.has(source.path) ? source.path : DEFAULTS.path,
+      powerMode: VALID_SETTINGS.powerMode.has(source.powerMode) ? source.powerMode : DEFAULTS.powerMode,
+      powerFallback: VALID_SETTINGS.powerFallback.has(source.powerFallback)
+        ? source.powerFallback
+        : DEFAULTS.powerFallback,
+      preferredPowers: uniquePowerNames(source.preferredPowers),
+      unknownDecision: VALID_SETTINGS.unknownDecision.has(source.unknownDecision)
+        ? source.unknownDecision
+        : DEFAULTS.unknownDecision,
+      actionDelayMs: clampNumber(source.actionDelayMs, 750, 5000, DEFAULTS.actionDelayMs),
+      collapsed: source.collapsed === true,
+    };
+  }
+
+  function makePreferenceMap(preferredPowers) {
+    return new Map(uniquePowerNames(preferredPowers).map((name, index) => [normalizePowerKey(name), index]));
+  }
+
+  function orderWishlistOffers(offers, preferredPowers) {
+    const preferenceMap = makePreferenceMap(preferredPowers);
+
+    return [...offers]
+      .filter((offer) => preferenceMap.has(offer.key))
+      .sort((left, right) => {
+        const priorityDifference = preferenceMap.get(left.key) - preferenceMap.get(right.key);
+
+        if (priorityDifference !== 0) {
+          return priorityDifference;
+        }
+
+        const rarityDifference = rarityRank(right.rarity) - rarityRank(left.rarity);
+
+        if (rarityDifference !== 0) {
+          return rarityDifference;
+        }
+
+        return left.index - right.index;
+      });
+  }
+
+  function orderRarityOffers(offers) {
+    return [...offers].sort((left, right) => {
+      const rarityDifference = rarityRank(right.rarity) - rarityRank(left.rarity);
+
+      if (rarityDifference !== 0) {
+        return rarityDifference;
+      }
+
+      return left.index - right.index;
+    });
+  }
+
+  function choosePowerPlacement(candidate, options, preferredPowers, context = {}) {
+    if (!context.hasSelect) {
+      return {
+        kind: 'direct',
+        value: null,
+        reason: 'keine Slot-Auswahl nötig',
+      };
+    }
+
+    const usableOptions = options.filter((option) => !option.disabled);
+    const freeOption = usableOptions.find((option) => option.isFree);
+    const stackIsFull =
+      Number.isFinite(candidate.ownedStacks) &&
+      Number.isFinite(candidate.maxStacks) &&
+      candidate.ownedStacks >= candidate.maxStacks;
+
+    if (freeOption && context.hasFreeCapacity !== false && !stackIsFull) {
+      return {
+        kind: 'free',
+        value: freeOption.value,
+        reason: 'nutzt einen freien Power-Slot',
+      };
+    }
+
+    if (!stackIsFull && context.hasFreeCapacity === true && !freeOption) {
+      return null;
+    }
+
+    const replacements = usableOptions.filter((option) => !option.isFree && option.value);
+    const candidateRarity = rarityRank(candidate.rarity);
+    const samePowerUpgrade = replacements
+      .filter((option) => option.key === candidate.key && rarityRank(option.rarity) < candidateRarity)
+      .sort((left, right) => rarityRank(left.rarity) - rarityRank(right.rarity))[0];
+    const upgradePlacement = samePowerUpgrade
+      ? {
+          kind: 'upgrade',
+          value: samePowerUpgrade.value,
+          reason: `wertet ${samePowerUpgrade.name || candidate.name} von ${
+            samePowerUpgrade.rarity || 'niedrigerer Seltenheit'
+          } auf`,
+        }
+      : null;
+
+    // A maxed power can only improve by replacing a lower-rarity stack of that
+    // same power. Replacing an unrelated slot would still exceed its stack cap.
+    if (stackIsFull) {
+      return upgradePlacement;
+    }
+
+    const preferenceMap = makePreferenceMap(preferredPowers);
+
+    if (context.strategy === 'wishlist') {
+      const candidatePriority = preferenceMap.get(candidate.key);
+
+      if (!Number.isFinite(candidatePriority)) {
+        return null;
+      }
+
+      const unlistedReplacement = replacements
+        .filter((option) => option.key && !preferenceMap.has(option.key))
+        .sort((left, right) => {
+          const rarityDifference = rarityRank(left.rarity) - rarityRank(right.rarity);
+
+          if (rarityDifference !== 0) {
+            return rarityDifference;
+          }
+
+          return String(left.name).localeCompare(String(right.name));
+        })[0];
+
+      if (unlistedReplacement) {
+        return {
+          kind: 'replace-unlisted',
+          value: unlistedReplacement.value,
+          reason: `ersetzt die nicht gelistete Power ${unlistedReplacement.name}`,
+        };
+      }
+
+      const lowerPriorityReplacement = replacements
+        .map((option) => ({
+          ...option,
+          priority: preferenceMap.get(option.key),
+        }))
+        .filter((option) => Number.isFinite(option.priority) && option.priority > candidatePriority)
+        .sort((left, right) => {
+          const priorityDifference = right.priority - left.priority;
+
+          if (priorityDifference !== 0) {
+            return priorityDifference;
+          }
+
+          return rarityRank(left.rarity) - rarityRank(right.rarity);
+        })[0];
+
+      if (lowerPriorityReplacement) {
+        return {
+          kind: 'replace-lower-priority',
+          value: lowerPriorityReplacement.value,
+          reason: `ersetzt die niedriger priorisierte Power ${lowerPriorityReplacement.name}`,
+        };
+      }
+
+      return upgradePlacement;
+    }
+
+    if (context.strategy === 'rarity') {
+      if (upgradePlacement) {
+        return upgradePlacement;
+      }
+
+      const lowerRarityReplacement = replacements
+        .filter((option) => {
+          const isProtected = preferenceMap.has(option.key) && option.key !== candidate.key;
+
+          return !isProtected && rarityRank(option.rarity) < candidateRarity;
+        })
+        .sort((left, right) => rarityRank(left.rarity) - rarityRank(right.rarity))[0];
+
+      if (lowerRarityReplacement) {
+        return {
+          kind: 'replace-lower-rarity',
+          value: lowerRarityReplacement.value,
+          reason: `ersetzt die Power niedrigerer Seltenheit ${lowerRarityReplacement.name}`,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  if (typeof document === 'undefined') {
+    if (typeof module !== 'undefined' && module.exports) {
+      module.exports = Object.freeze({
+        choosePowerPlacement,
+        normalizePowerKey,
+        orderRarityOffers,
+        orderWishlistOffers,
+        parseRatio,
+        rarityRank,
+        sanitizeSettings,
+        uniquePowerNames,
+      });
+    }
+
+    return;
+  }
+
+  if (!document.body?.matches('.te-run[data-tower-user][data-tower-occ]')) {
+    return;
+  }
+
+  const towerUser = document.body.dataset.towerUser;
+  const towerOccurrence = document.body.dataset.towerOcc;
+  const SETTINGS_KEY = `${SCRIPT_ID}:settings:v${SETTINGS_VERSION}:${towerUser}`;
+  const ENABLED_KEY = `${SCRIPT_ID}:enabled:v1:${towerUser}:${towerOccurrence}`;
+  const LOCK_NAME = `${SCRIPT_ID}:owner:${towerUser}:${towerOccurrence}`;
+  const NATIVE_KEY = `tower:${towerUser}:${towerOccurrence}`;
+
+  const runtime = {
+    root: null,
+    observer: null,
+    timer: 0,
+    enabled: readPersistentEnabled(),
+    running: false,
+    starting: false,
+    lockHeld: false,
+    lockGeneration: 0,
+    releaseLock: null,
+    lastActionAt: 0,
+    lastFingerprint: '',
+    lastRetryFingerprint: '',
+    retryStartedAt: 0,
+    missingRunSince: 0,
+    reacquireWhenRunAppears: false,
+    status: '',
+    tone: 'neutral',
+    stoppingNative: false,
+  };
+
+  let settings = loadSettings();
+
+  function readJson(storage, key, fallback) {
+    try {
+      const value = storage.getItem(key);
+
+      return value === null ? fallback : JSON.parse(value);
+    } catch {
+      return fallback;
+    }
+  }
+
+  function writeJson(storage, key, value) {
+    try {
+      storage.setItem(key, JSON.stringify(value));
+    } catch {
+      // Storage may be unavailable in private browsing.
+    }
+  }
+
+  function loadSettings() {
+    return sanitizeSettings(readJson(localStorage, SETTINGS_KEY, {}));
+  }
+
+  function saveSettings() {
+    writeJson(localStorage, SETTINGS_KEY, settings);
+  }
+
+  function readPersistentEnabled(fallback = false) {
+    try {
+      return localStorage.getItem(ENABLED_KEY) === '1';
+    } catch {
+      return fallback;
+    }
+  }
+
+  function persistEnabled(enabled) {
+    runtime.enabled = !!enabled;
+
+    try {
+      if (runtime.enabled) {
+        localStorage.setItem(ENABLED_KEY, '1');
+      } else {
+        localStorage.removeItem(ENABLED_KEY);
+      }
+    } catch {
+      // The current tab can still run, but cannot resume after a reload.
+    }
+
+    updateRuntimeUi();
+  }
+
+  function injectStyles() {
+    if (document.getElementById(`${SCRIPT_ID}-style`)) {
+      return;
+    }
+
+    const style = document.createElement('style');
+    style.id = `${SCRIPT_ID}-style`;
+    style.textContent = `
+      #${SCRIPT_ID} {
+        position: fixed;
+        z-index: 1000;
+        top: 14px;
+        right: 14px;
+        width: min(390px, calc(100vw - 28px));
+        color: var(--ink, #eeeaf3);
+        background: color-mix(in srgb, var(--panel, #12131e) 96%, transparent);
+        border: 1px solid var(--edge, #353747);
+        border-radius: 14px;
+        box-shadow: 0 14px 45px #000a;
+        font: 14px/1.45 Barlow, Trebuchet MS, sans-serif;
+        overflow: hidden;
+        backdrop-filter: blur(10px);
+      }
+      #${SCRIPT_ID} * { box-sizing: border-box; }
+      #${SCRIPT_ID} .tm-tower-head {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        min-height: 48px;
+        padding: 10px 13px;
+        color: inherit;
+        background: linear-gradient(120deg, #31253b, #191722);
+        border: 0;
+        cursor: pointer;
+        text-align: left;
+      }
+      #${SCRIPT_ID} .tm-tower-title { display: flex; align-items: center; gap: 9px; font-weight: 750; }
+      #${SCRIPT_ID} .tm-tower-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: #8d8996;
+        box-shadow: 0 0 0 3px #8d899622;
+      }
+      #${SCRIPT_ID}[data-running='1'] .tm-tower-dot { background: #9ed294; box-shadow: 0 0 0 3px #9ed29425; }
+      #${SCRIPT_ID}[data-tone='warning'] .tm-tower-dot { background: #e9b66f; }
+      #${SCRIPT_ID}[data-tone='error'] .tm-tower-dot { background: #e28074; }
+      #${SCRIPT_ID} .tm-tower-chevron { transition: transform 0.15s ease; }
+      #${SCRIPT_ID}.tm-collapsed .tm-tower-chevron { transform: rotate(-90deg); }
+      #${SCRIPT_ID}.tm-collapsed .tm-tower-body { display: none; }
+      #${SCRIPT_ID} .tm-tower-body {
+        max-height: calc(100dvh - 80px);
+        padding: 14px;
+        overflow: auto;
+        overscroll-behavior: contain;
+        scrollbar-width: thin;
+      }
+      #${SCRIPT_ID} .tm-tower-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+      #${SCRIPT_ID} .tm-tower-wide { grid-column: 1 / -1; }
+      #${SCRIPT_ID} label { display: block; margin: 0; color: var(--muted, #aaa8bc); font-size: 12px; }
+      #${SCRIPT_ID} select,
+      #${SCRIPT_ID} input[type='number'],
+      #${SCRIPT_ID} textarea {
+        width: 100%;
+        margin-top: 5px;
+        padding: 8px 9px;
+        color: var(--ink, #eeeaf3);
+        background: #0c0d15;
+        border: 1px solid var(--edge, #353747);
+        border-radius: 6px;
+        font: inherit;
+      }
+      #${SCRIPT_ID} textarea { min-height: 112px; resize: vertical; }
+      #${SCRIPT_ID} input[type='range'] { width: 100%; margin-top: 8px; accent-color: var(--ember, #c9b6ed); }
+      #${SCRIPT_ID} .tm-tower-check {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        padding: 5px 0;
+      }
+      #${SCRIPT_ID} .tm-tower-check input { flex: 0 0 auto; margin-top: 2px; accent-color: var(--ember, #c9b6ed); }
+      #${SCRIPT_ID} .tm-tower-section {
+        margin-top: 13px;
+        padding-top: 13px;
+        border-top: 1px solid color-mix(in srgb, var(--edge, #353747) 65%, transparent);
+      }
+      #${SCRIPT_ID} .tm-tower-section h3 {
+        margin: 0 0 9px;
+        color: var(--ink, #eeeaf3);
+        font: 700 13px/1.3 Barlow, Trebuchet MS, sans-serif;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+      #${SCRIPT_ID} .tm-tower-help { margin: 6px 0 0; color: var(--muted, #aaa8bc); font-size: 11px; line-height: 1.45; }
+      #${SCRIPT_ID} .tm-tower-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; }
+      #${SCRIPT_ID} .tm-tower-button {
+        min-height: 38px;
+        padding: 8px 11px;
+        color: var(--ink, #eeeaf3);
+        background: #29263a;
+        border: 1px solid #656078;
+        border-radius: 7px;
+        font: 650 12px/1.2 Barlow, Trebuchet MS, sans-serif;
+        cursor: pointer;
+      }
+      #${SCRIPT_ID} .tm-tower-button:hover { background: #3b3550; }
+      #${SCRIPT_ID} .tm-tower-button:disabled { opacity: 0.5; cursor: default; }
+      #${SCRIPT_ID} .tm-tower-primary { color: #181323; background: #c9b6ed; border-color: #ddd0f5; }
+      #${SCRIPT_ID} .tm-tower-primary:hover { background: #e3d5ff; }
+      #${SCRIPT_ID} .tm-tower-status {
+        margin: 12px 0 0;
+        padding: 9px 10px;
+        color: #d7d1df;
+        background: #0c0d1588;
+        border-left: 3px solid #827b91;
+        border-radius: 5px;
+        font-size: 11px;
+        overflow-wrap: anywhere;
+      }
+      #${SCRIPT_ID}[data-tone='warning'] .tm-tower-status { border-left-color: #e9b66f; }
+      #${SCRIPT_ID}[data-tone='error'] .tm-tower-status { border-left-color: #e28074; }
+      #${SCRIPT_ID}[data-tone='success'] .tm-tower-status { border-left-color: #9ed294; }
+      #${SCRIPT_ID} [hidden] { display: none !important; }
+      @media (max-width: 620px) {
+        #${SCRIPT_ID} { top: 8px; right: 8px; width: calc(100vw - 16px); }
+        #${SCRIPT_ID} .tm-tower-body { max-height: calc(100dvh - 68px); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #${SCRIPT_ID} .tm-tower-chevron { transition: none; }
+      }
+    `;
+    document.head.append(style);
+  }
+
+  function mountUi() {
+    injectStyles();
+
+    const root = document.createElement('aside');
+    root.id = SCRIPT_ID;
+    root.innerHTML = `
+      <button class="tm-tower-head" type="button" aria-expanded="true">
+        <span class="tm-tower-title"><span class="tm-tower-dot"></span>Demonic Tower Autopilot</span>
+        <span class="tm-tower-chevron" aria-hidden="true">▾</span>
+      </button>
+      <div class="tm-tower-body">
+        <div class="tm-tower-grid">
+          <label>Angriff
+            <select data-setting="attack">
+              <option value="slash">Slash</option>
+              <option value="magic">Magic</option>
+            </select>
+          </label>
+          <label>Pfad
+            <select data-setting="path">
+              <option value="left">Links</option>
+              <option value="right">Rechts</option>
+              <option value="random">Zufällig</option>
+            </select>
+          </label>
+          <label class="tm-tower-check tm-tower-wide">
+            <input type="checkbox" data-setting="guardHeavy"> Schwere angekündigte Angriffe blocken
+          </label>
+        </div>
+
+        <section class="tm-tower-section">
+          <h3>HP-Tränke</h3>
+          <label class="tm-tower-check">
+            <input type="checkbox" data-setting="potionEnabled"> HP-Tränke automatisch benutzen
+          </label>
+          <label>Bei höchstens <output data-output="potionThreshold">30</output>% HP
+            <input type="range" min="1" max="99" data-setting="potionThreshold">
+          </label>
+          <label class="tm-tower-check">
+            <input type="checkbox" data-setting="respectNoPotion"> „Keine Tränke“-Verträge respektieren
+          </label>
+        </section>
+
+        <section class="tm-tower-section">
+          <h3>Fähigkeiten / Powers</h3>
+          <label>Angebote behandeln
+            <select data-setting="powerMode">
+              <option value="wishlist">Wunschliste verwenden</option>
+              <option value="rarity">Höchste Seltenheit nehmen</option>
+              <option value="skip">Alle überspringen</option>
+              <option value="pause">Auf mich warten</option>
+            </select>
+          </label>
+          <label data-fallback-row>Wenn nichts Passendes angeboten wird
+            <select data-setting="powerFallback">
+              <option value="pause">Auf mich warten</option>
+              <option value="skip">Angebot überspringen</option>
+              <option value="rarity">Beste sichere Power nehmen, sonst überspringen</option>
+            </select>
+          </label>
+          <label>Wunschliste – eine Fähigkeit pro Zeile
+            <textarea data-setting="preferredPowers" spellcheck="false" placeholder="Skullbreaker\nRavaging Momentum\nVampiric Edge"></textarea>
+          </label>
+          <p class="tm-tower-help">Oben = höchste, strikte Priorität. Bei vollen Slots werden zuerst nicht gelistete, danach nur niedriger priorisierte Powers ersetzt. Powers auf der Liste sind auch im Seltenheitsmodus geschützt.</p>
+          <div class="tm-tower-actions">
+            <button class="tm-tower-button" type="button" data-add="offers">Aktuelle Angebote +</button>
+            <button class="tm-tower-button" type="button" data-add="owned">Eigene Powers +</button>
+          </div>
+        </section>
+
+        <section class="tm-tower-section">
+          <h3>Weiterer Ablauf</h3>
+          <div class="tm-tower-grid">
+            <label class="tm-tower-wide">Unbekannte Raumentscheidung
+              <select data-setting="unknownDecision">
+                <option value="pause">Auf mich warten (sicher)</option>
+                <option value="first">Erste verfügbare Option wählen</option>
+              </select>
+            </label>
+            <label class="tm-tower-wide">Pause zwischen Aktionen (ms)
+              <input type="number" min="750" max="5000" step="50" data-setting="actionDelayMs">
+            </label>
+          </div>
+          <p class="tm-tower-help">„Erste Option“ kann auch eine kostenpflichtige oder nachteilige Raumwahl treffen. Standardmäßig wartet der Autopilot bei unbekannten Entscheidungen.</p>
+        </section>
+
+        <div class="tm-tower-actions">
+          <button class="tm-tower-button tm-tower-primary" type="button" data-action="start">Dauerbetrieb aktivieren</button>
+          <button class="tm-tower-button" type="button" data-action="stop">Dauerbetrieb stoppen</button>
+        </div>
+        <p class="tm-tower-help">Nach dem Aktivieren läuft der Autopilot über Gegnerwechsel und Seiten-Neuladungen hinweg weiter, bis du ihn stoppst.</p>
+        <p class="tm-tower-status" role="status" aria-live="polite"></p>
+      </div>
+    `;
+
+    document.body.append(root);
+    runtime.root = root;
+    bindUi();
+    renderSettings();
+    updateRuntimeUi();
+  }
+
+  function getSettingElement(name) {
+    return runtime.root?.querySelector(`[data-setting="${name}"]`) || null;
+  }
+
+  function renderSettings() {
+    if (!runtime.root) {
+      return;
+    }
+
+    for (const name of ['attack', 'path', 'powerMode', 'powerFallback', 'unknownDecision', 'actionDelayMs']) {
+      const element = getSettingElement(name);
+
+      if (element) {
+        element.value = String(settings[name]);
+      }
+    }
+
+    for (const name of ['guardHeavy', 'potionEnabled', 'respectNoPotion']) {
+      const element = getSettingElement(name);
+
+      if (element) {
+        element.checked = settings[name];
+      }
+    }
+
+    const threshold = getSettingElement('potionThreshold');
+    const thresholdOutput = runtime.root.querySelector('[data-output="potionThreshold"]');
+    const wishlist = getSettingElement('preferredPowers');
+
+    if (threshold) {
+      threshold.value = String(settings.potionThreshold);
+    }
+
+    if (thresholdOutput) {
+      thresholdOutput.textContent = String(settings.potionThreshold);
+    }
+
+    if (wishlist) {
+      wishlist.value = settings.preferredPowers.join('\n');
+    }
+
+    runtime.root.classList.toggle('tm-collapsed', settings.collapsed);
+    runtime.root.querySelector('.tm-tower-head')?.setAttribute('aria-expanded', String(!settings.collapsed));
+    updatePowerModeUi();
+  }
+
+  function updatePowerModeUi() {
+    const fallbackRow = runtime.root?.querySelector('[data-fallback-row]');
+
+    if (fallbackRow) {
+      fallbackRow.hidden = settings.powerMode !== 'wishlist';
+    }
+  }
+
+  function readSettingsFromUi() {
+    const next = {
+      ...settings,
+      attack: getSettingElement('attack')?.value,
+      guardHeavy: !!getSettingElement('guardHeavy')?.checked,
+      potionEnabled: !!getSettingElement('potionEnabled')?.checked,
+      potionThreshold: getSettingElement('potionThreshold')?.value,
+      respectNoPotion: !!getSettingElement('respectNoPotion')?.checked,
+      path: getSettingElement('path')?.value,
+      powerMode: getSettingElement('powerMode')?.value,
+      powerFallback: getSettingElement('powerFallback')?.value,
+      preferredPowers: getSettingElement('preferredPowers')?.value,
+      unknownDecision: getSettingElement('unknownDecision')?.value,
+      actionDelayMs: getSettingElement('actionDelayMs')?.value,
+    };
+
+    settings = sanitizeSettings(next);
+    saveSettings();
+
+    const thresholdOutput = runtime.root?.querySelector('[data-output="potionThreshold"]');
+
+    if (thresholdOutput) {
+      thresholdOutput.textContent = String(settings.potionThreshold);
+    }
+
+    updatePowerModeUi();
+    scheduleStep(50);
+  }
+
+  function bindUi() {
+    runtime.root.querySelector('.tm-tower-head')?.addEventListener('click', () => {
+      settings.collapsed = !settings.collapsed;
+      saveSettings();
+      renderSettings();
+    });
+
+    const body = runtime.root.querySelector('.tm-tower-body');
+
+    body?.addEventListener('input', (event) => {
+      if (event.target.matches('[data-setting]')) {
+        readSettingsFromUi();
+      }
+    });
+
+    body?.addEventListener('change', (event) => {
+      if (event.target.matches('[data-setting]')) {
+        readSettingsFromUi();
+        renderSettings();
+      }
+    });
+
+    runtime.root.querySelector('[data-action="start"]')?.addEventListener('click', enableAutomation);
+    runtime.root.querySelector('[data-action="stop"]')?.addEventListener('click', () => {
+      stopAutomation('Autopilot gestoppt.');
+    });
+
+    runtime.root.querySelectorAll('[data-add]').forEach((button) => {
+      button.addEventListener('click', () => addCurrentPowerNames(button.dataset.add));
+    });
+  }
+
+  function addCurrentPowerNames(source) {
+    const selector = source === 'owned' ? '.te-power-owned h4' : '.te-power-choice:not([data-locked="1"]) h3';
+    const currentNames = [...document.querySelectorAll(selector)].map((element) => element.textContent);
+    const mergedNames = uniquePowerNames([...settings.preferredPowers, ...currentNames]);
+
+    if (mergedNames.length === settings.preferredPowers.length) {
+      setStatus(source === 'owned' ? 'Keine neuen eigenen Powers gefunden.' : 'Keine neuen Angebote gefunden.', 'warning');
+      return;
+    }
+
+    settings.preferredPowers = mergedNames;
+    saveSettings();
+    renderSettings();
+    setStatus('Wunschliste ergänzt. Die Reihenfolge kann im Textfeld angepasst werden.', 'success');
+    scheduleStep(50);
+  }
+
+  function setStatus(message, tone = 'neutral') {
+    runtime.status = message;
+    runtime.tone = tone;
+    updateRuntimeUi();
+  }
+
+  function updateRuntimeUi() {
+    if (!runtime.root) {
+      return;
+    }
+
+    runtime.root.dataset.running = runtime.running ? '1' : '0';
+    runtime.root.dataset.enabled = runtime.enabled ? '1' : '0';
+    runtime.root.dataset.tone = runtime.tone;
+
+    const status = runtime.root.querySelector('.tm-tower-status');
+    const startButton = runtime.root.querySelector('[data-action="start"]');
+    const stopButton = runtime.root.querySelector('[data-action="stop"]');
+
+    if (status) {
+      status.textContent =
+        runtime.status ||
+        (runtime.running
+          ? 'Dauerbetrieb läuft.'
+          : runtime.enabled
+            ? 'Dauerbetrieb ist aktiv und wartet.'
+            : 'Bereit.');
+    }
+
+    if (startButton) {
+      startButton.disabled = runtime.enabled;
+    }
+
+    if (stopButton) {
+      stopButton.disabled = !runtime.enabled;
+    }
+  }
+
+  function stopNativeAuto() {
+    runtime.stoppingNative = true;
+
+    try {
+      document.getElementById('te-auto-stop')?.click();
+    } finally {
+      runtime.stoppingNative = false;
+    }
+  }
+
+  function beginAutomation() {
+    if (!runtime.enabled || !runtime.lockHeld) {
+      return;
+    }
+
+    runtime.running = true;
+    runtime.starting = false;
+    runtime.lastFingerprint = '';
+    runtime.missingRunSince = 0;
+    runtime.reacquireWhenRunAppears = false;
+    stopNativeAuto();
+    setStatus('Dauerbetrieb läuft. Aktueller Tower-Zustand wird geprüft.', 'success');
+    // Give storage listeners in other open tabs enough time to stop their
+    // native auto-runner before this owner sends its first action.
+    scheduleStep(settings.actionDelayMs);
+  }
+
+  function tryStartAutomation() {
+    if (!runtime.enabled || runtime.running || runtime.starting) {
+      return;
+    }
+
+    // Every tab that participates in this persistent run must stop its local
+    // native runner, even when another tab ultimately owns the custom lock.
+    stopNativeAuto();
+
+    if (!navigator.locks?.request) {
+      persistEnabled(false);
+      setStatus(
+        'Dieser Browser unterstützt keinen sicheren Tab-Lock. Dauerbetrieb wurde nicht gestartet.',
+        'error',
+      );
+      return;
+    }
+
+    runtime.starting = true;
+    const generation = ++runtime.lockGeneration;
+    setStatus('Dauerbetrieb aktiv. Exklusiver Tower-Tab wird geprüft …', 'neutral');
+
+    navigator.locks
+      .request(
+        LOCK_NAME,
+        {
+          mode: 'exclusive',
+          ifAvailable: true,
+        },
+        async (lock) => {
+          if (generation !== runtime.lockGeneration || !runtime.enabled) {
+            return;
+          }
+
+          runtime.starting = false;
+
+          if (!lock) {
+            setStatus(
+              'Dauerbetrieb ist aktiv, läuft aber bereits in einem anderen Tower-Tab. Diesen Tab neu laden, wenn er übernehmen soll.',
+              'warning',
+            );
+            return;
+          }
+
+          if (!readPersistentEnabled(runtime.enabled)) {
+            runtime.enabled = false;
+            updateRuntimeUi();
+            return;
+          }
+
+          await new Promise((resolve) => {
+            runtime.releaseLock = resolve;
+            runtime.lockHeld = true;
+            beginAutomation();
+          });
+
+          if (generation === runtime.lockGeneration) {
+            runtime.releaseLock = null;
+            runtime.lockHeld = false;
+            runtime.running = false;
+            updateRuntimeUi();
+          }
+        },
+      )
+      .catch((error) => {
+        if (generation !== runtime.lockGeneration) {
+          return;
+        }
+
+        console.error('[Demonic Tower Autopilot] Could not acquire the tab lock.', error);
+        runtime.starting = false;
+        persistEnabled(false);
+        setStatus('Der exklusive Tower-Tab konnte nicht reserviert werden. Dauerbetrieb wurde gestoppt.', 'error');
+      });
+  }
+
+  function enableAutomation() {
+    persistEnabled(true);
+    tryStartAutomation();
+  }
+
+  function stopAutomation(message, tone = 'neutral', options = {}) {
+    const disable = options.disable !== false;
+
+    if (disable) {
+      persistEnabled(false);
+    }
+
+    runtime.lockGeneration += 1;
+    runtime.running = false;
+    runtime.starting = false;
+    runtime.lockHeld = false;
+    window.clearTimeout(runtime.timer);
+    runtime.timer = 0;
+
+    const releaseLock = runtime.releaseLock;
+    runtime.releaseLock = null;
+    releaseLock?.();
+
+    setStatus(message, tone);
+  }
+
+  function scheduleStep(delay = 250) {
+    if (!runtime.running || !runtime.lockHeld || !runtime.enabled) {
+      return;
+    }
+
+    window.clearTimeout(runtime.timer);
+    runtime.timer = window.setTimeout(runStep, Math.max(0, delay));
+  }
+
+  function getNativePendingRequest() {
+    return readJson(localStorage, `${NATIVE_KEY}:pending`, null);
+  }
+
+  function nativeRequestIsPending() {
+    return getNativePendingRequest() !== null;
+  }
+
+  function nativeTransportIsBusy() {
+    return document.getElementById('te-message')?.getAttribute('aria-busy') === 'true';
+  }
+
+  function nativeRequestIsBusy() {
+    return nativeTransportIsBusy() || nativeRequestIsPending();
+  }
+
+  function retryNeedsAttention() {
+    const retry = document.getElementById('te-retry');
+
+    return !!retry && !retry.hidden;
+  }
+
+  function retryPendingAction() {
+    const retry = document.getElementById('te-retry');
+    const pending = getNativePendingRequest();
+
+    if (!retry || retry.hidden || !pending) {
+      stopAutomation('Der Tower meldet einen unklaren Request ohne sichere Retry-Daten. Bitte manuell prüfen.', 'error');
+      return;
+    }
+
+    const fingerprint = JSON.stringify(pending);
+
+    if (fingerprint !== runtime.lastRetryFingerprint) {
+      runtime.lastRetryFingerprint = fingerprint;
+      runtime.retryStartedAt = Date.now();
+      setStatus('Verbindung war unklar. Wiederhole die gespeicherte Aktion einmal sicher …', 'warning');
+      retry.click();
+      scheduleStep(500);
+      return;
+    }
+
+    if (nativeTransportIsBusy() || Date.now() - runtime.retryStartedAt < RETRY_TIMEOUT_MS) {
+      setStatus('Warte auf das Ergebnis der sicher wiederholten Aktion …', 'warning');
+      scheduleStep(500);
+      return;
+    }
+
+    stopAutomation('Auch der sichere Retry blieb unklar. Dauerbetrieb wurde zur Sicherheit gestoppt.', 'error');
+  }
+
+  function getSubmitter(form) {
+    return form.querySelector('button[type="submit"], input[type="submit"], button:not([type])');
+  }
+
+  function formIsUsable(form) {
+    if (!(form instanceof HTMLFormElement) || !form.isConnected || form.closest('[hidden]')) {
+      return false;
+    }
+
+    const submitter = getSubmitter(form);
+
+    return !!submitter && !submitter.disabled;
+  }
+
+  function formFingerprint(form) {
+    const entries = [...new FormData(form).entries()].map(([name, value]) => [name, String(value)]);
+
+    return JSON.stringify(entries);
+  }
+
+  function submitDecision(decision) {
+    const { form, label } = decision;
+
+    if (!runtime.enabled || !runtime.running || !runtime.lockHeld) {
+      return;
+    }
+
+    // A storage event can arrive after this turn has already been queued. Read
+    // the shared flag again immediately before every irreversible action.
+    if (!readPersistentEnabled(runtime.enabled)) {
+      runtime.enabled = false;
+      stopAutomation('Dauerbetrieb wurde in einem anderen Tab gestoppt.', 'warning', { disable: false });
+      return;
+    }
+
+    if (nativeRequestIsBusy()) {
+      setStatus('Tower verarbeitet bereits eine Aktion …', 'neutral');
+      scheduleStep(300);
+      return;
+    }
+
+    if (!formIsUsable(form)) {
+      setStatus('Die geplante Aktion ist nicht mehr verfügbar. Warte auf den aktuellen Tower-Zustand.', 'warning');
+      scheduleStep(500);
+      return;
+    }
+
+    if (!form.reportValidity()) {
+      stopAutomation('Die geplante Aktion enthält noch eine ungültige Auswahl. Bitte manuell prüfen.', 'error');
+      return;
+    }
+
+    const fingerprint = formFingerprint(form);
+
+    if (fingerprint === runtime.lastFingerprint) {
+      const errorText = normalizeText(form.querySelector('.te-form-error:not([hidden])')?.textContent);
+      stopAutomation(
+        errorText
+          ? `Tower hat die Aktion abgelehnt: ${errorText}`
+          : 'Die letzte Aktion wurde nicht durch einen neuen Tower-Zustand bestätigt. Bitte manuell prüfen.',
+        'error',
+      );
+      return;
+    }
+
+    runtime.lastFingerprint = fingerprint;
+    runtime.lastActionAt = Date.now();
+    setStatus(label, 'success');
+
+    const submitter = getSubmitter(form);
+
+    try {
+      if (typeof form.requestSubmit === 'function') {
+        form.requestSubmit(submitter);
+      } else {
+        submitter.click();
+      }
+    } catch (error) {
+      console.error('[Demonic Tower Autopilot] Could not submit action.', error);
+      stopAutomation('Die Aktion konnte nicht abgesendet werden. Details stehen in der Konsole.', 'error');
+      return;
+    }
+
+    window.queueMicrotask(() => {
+      if (runtime.running && form.isConnected && !nativeRequestIsBusy()) {
+        stopAutomation('Der native Tower-Handler hat die Aktion nicht übernommen. Bitte Seite neu laden.', 'error');
+      }
+    });
+
+    scheduleStep(settings.actionDelayMs);
+  }
+
+  function readPowerOffers() {
+    return [...document.querySelectorAll('.te-power-choice:not([data-locked="1"])')]
+      .map((article, index) => {
+        const form = article.querySelector('form[data-action="power"]');
+        const name = normalizeText(article.querySelector('h3')?.textContent);
+        const limitElement = article.querySelector('.te-power-limit');
+        const stackLimit = parseRatio(`${limitElement?.getAttribute('aria-label') || ''} ${limitElement?.textContent || ''}`);
+
+        return {
+          article,
+          form,
+          index,
+          name,
+          key: normalizePowerKey(name),
+          rarity: String(article.dataset.rarity || '').toLowerCase(),
+          ownedStacks: stackLimit?.current,
+          maxStacks: stackLimit?.maximum,
+        };
+      })
+      .filter((offer) => offer.name && formIsUsable(offer.form));
+  }
+
+  function parseReplacementOption(option) {
+    const text = normalizeText(option.textContent);
+    const isFree = option.value === '0';
+    const rarityMatch = text.match(/\b(common|uncommon|rare|epic|legendary|mythic)\b/i);
+    const nameMatch = text.match(/^(.+?)\s*\/\s*(?:common|uncommon|rare|epic|legendary|mythic)\b/i);
+    const fallbackName = text.replace(/\s*\([^)]*remove[^)]*\).*$/i, '');
+    const name = isFree ? '' : normalizeText(nameMatch?.[1] || fallbackName);
+
+    return {
+      element: option,
+      value: option.value,
+      disabled: option.disabled,
+      isFree,
+      name,
+      key: normalizePowerKey(name),
+      rarity: String(rarityMatch?.[1] || '').toLowerCase(),
+    };
+  }
+
+  function readPowerCapacity() {
+    return parseRatio(document.querySelector('.te-power-capacity')?.textContent);
+  }
+
+  function planPowerChoice(offers, strategy) {
+    const orderedOffers =
+      strategy === 'wishlist'
+        ? orderWishlistOffers(offers, settings.preferredPowers)
+        : orderRarityOffers(offers);
+    const capacity = readPowerCapacity();
+    const hasFreeCapacity = capacity ? capacity.current < capacity.maximum : undefined;
+
+    for (const offer of orderedOffers) {
+      const select = offer.form.querySelector('select[name="replace"]');
+      const options = select ? [...select.options].map(parseReplacementOption) : [];
+      const placement = choosePowerPlacement(offer, options, settings.preferredPowers, {
+        hasSelect: !!select,
+        hasFreeCapacity,
+        strategy,
+      });
+
+      if (!placement) {
+        continue;
+      }
+
+      if (select && placement.value !== null) {
+        select.value = placement.value;
+
+        if (select.value !== placement.value) {
+          continue;
+        }
+
+        select.dispatchEvent(new Event('input', { bubbles: true }));
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+
+      const rarity = offer.rarity ? ` (${offer.rarity})` : '';
+
+      return {
+        form: offer.form,
+        label: `Wähle ${offer.name}${rarity}: ${placement.reason}.`,
+      };
+    }
+
+    return null;
+  }
+
+  function getSkipPowerDecision(reason) {
+    const form = document.querySelector('form[data-action="power"][data-power="0"]');
+
+    if (!formIsUsable(form)) {
+      return {
+        kind: 'wait',
+        message: 'Power-Angebot kann derzeit weder gewählt noch übersprungen werden.',
+      };
+    }
+
+    return {
+      kind: 'submit',
+      form,
+      label: reason || 'Überspringe das aktuelle Power-Angebot.',
+    };
+  }
+
+  function decidePower() {
+    const offers = readPowerOffers();
+    const offeredNames = offers.map((offer) => offer.name).join(', ') || 'keine wählbare Power';
+
+    if (settings.powerMode === 'pause') {
+      return {
+        kind: 'wait',
+        message: `Warte auf deine Power-Auswahl. Angeboten: ${offeredNames}.`,
+      };
+    }
+
+    if (settings.powerMode === 'skip') {
+      return getSkipPowerDecision('Überspringe das Power-Angebot wie eingestellt.');
+    }
+
+    if (settings.powerMode === 'rarity') {
+      const rarityChoice = planPowerChoice(offers, 'rarity');
+
+      return rarityChoice
+        ? { kind: 'submit', ...rarityChoice }
+        : getSkipPowerDecision('Keine Power kann sicher verbessert oder hinzugefügt werden; überspringe das Angebot.');
+    }
+
+    const wishlistChoice = planPowerChoice(offers, 'wishlist');
+
+    if (wishlistChoice) {
+      return {
+        kind: 'submit',
+        ...wishlistChoice,
+      };
+    }
+
+    if (settings.powerFallback === 'skip') {
+      return getSkipPowerDecision(`Keine passende Wunschlisten-Power angeboten (${offeredNames}); überspringe.`);
+    }
+
+    if (settings.powerFallback === 'rarity') {
+      const rarityChoice = planPowerChoice(offers, 'rarity');
+
+      return rarityChoice
+        ? { kind: 'submit', ...rarityChoice }
+        : getSkipPowerDecision('Keine sichere Ersatzwahl möglich; überspringe das Power-Angebot.');
+    }
+
+    return {
+      kind: 'wait',
+      message: `Keine nutzbare Wunschlisten-Power angeboten. Warte auf dich. Angeboten: ${offeredNames}.`,
+    };
+  }
+
+  function decidePath() {
+    const available = [...document.querySelectorAll('form[data-action="room"][data-choice]')].filter(formIsUsable);
+
+    if (!available.length) {
+      return {
+        kind: 'wait',
+        message: 'Warte auf verfügbare Pfadoptionen.',
+      };
+    }
+
+    let selectedPath = settings.path;
+
+    if (selectedPath === 'random') {
+      selectedPath = available[Math.floor(Math.random() * available.length)].dataset.choice;
+    }
+
+    const form = available.find((candidate) => candidate.dataset.choice === selectedPath) || available[0];
+
+    return {
+      kind: 'submit',
+      form,
+      label: `Wähle den Pfad „${form.dataset.choice || selectedPath}“.`,
+    };
+  }
+
+  function decideUnknown(pendingType) {
+    if (settings.unknownDecision !== 'first') {
+      return {
+        kind: 'wait',
+        message: `Warte auf deine Entscheidung für „${pendingType}“.`,
+      };
+    }
+
+    const excludedActions = new Set(['attack', 'power', 'room', 'use_item']);
+    const forms = [...document.querySelectorAll('.te-choice form.te-form')].filter((form) => {
+      return formIsUsable(form) && !excludedActions.has(form.dataset.action);
+    });
+    const form = forms[0];
+
+    if (!form) {
+      return {
+        kind: 'wait',
+        message: `Keine sichere Formularoption für „${pendingType}“ gefunden; warte auf dich.`,
+      };
+    }
+
+    const buttonText = normalizeText(getSubmitter(form)?.textContent || getSubmitter(form)?.value);
+
+    return {
+      kind: 'submit',
+      form,
+      label: `Wähle die erste Option für „${pendingType}“${buttonText ? `: ${buttonText}` : ''}.`,
+    };
+  }
+
+  function findAttackForm(attack) {
+    return [...document.querySelectorAll('form[data-action="attack"]')].find((form) => {
+      return form.querySelector('input[name="attack"]')?.value === attack && formIsUsable(form);
+    });
+  }
+
+  function decideBattle(state) {
+    const hpPercent = Number(state.dataset.hp);
+    const potionWanted =
+      settings.potionEnabled && Number.isFinite(hpPercent) && hpPercent <= settings.potionThreshold;
+    const contractBlocksPotion = settings.respectNoPotion && state.dataset.noPotion === '1';
+
+    if (potionWanted && !contractBlocksPotion) {
+      const potionForm = [...document.querySelectorAll('form[data-action="use_item"][data-heal="1"]')].find(formIsUsable);
+
+      if (potionForm) {
+        return {
+          kind: 'submit',
+          form: potionForm,
+          label: `Benutze einen HP-Trank bei ${hpPercent}% HP.`,
+        };
+      }
+    }
+
+    const shouldGuard = settings.guardHeavy && state.dataset.heavy === '1' && state.dataset.guardReady === '1';
+    const attack = shouldGuard ? 'guard' : settings.attack;
+    const form = findAttackForm(attack);
+
+    if (!form) {
+      return {
+        kind: 'wait',
+        message: `Die Aktion „${attack}“ ist gerade nicht verfügbar.`,
+      };
+    }
+
+    const potionNote =
+      potionWanted && contractBlocksPotion ? ' Der aktive „Keine Tränke“-Vertrag wird respektiert.' : '';
+
+    return {
+      kind: 'submit',
+      form,
+      label: `${shouldGuard ? 'Blocke den angekündigten schweren Angriff' : `Greife mit ${settings.attack} an`}.${potionNote}`,
+    };
+  }
+
+  function decideNextAction(state) {
+    const pendingType = String(state.dataset.pending || '');
+
+    if (pendingType === 'power') {
+      return decidePower();
+    }
+
+    if (pendingType === 'paths') {
+      return decidePath();
+    }
+
+    if (pendingType) {
+      return decideUnknown(pendingType);
+    }
+
+    return decideBattle(state);
+  }
+
+  function runStep() {
+    runtime.timer = 0;
+
+    if (!runtime.enabled || !runtime.running || !runtime.lockHeld) {
+      return;
+    }
+
+    if (retryNeedsAttention()) {
+      retryPendingAction();
+      return;
+    }
+
+    if (nativeRequestIsBusy()) {
+      setStatus('Tower verarbeitet die letzte Aktion …', 'neutral');
+      scheduleStep(300);
+      return;
+    }
+
+    const state = document.getElementById('te-run-state');
+
+    if (!state) {
+      runtime.missingRunSince ||= Date.now();
+
+      if (Date.now() - runtime.missingRunSince >= MISSING_RUN_GRACE_MS) {
+        runtime.reacquireWhenRunAppears = true;
+        stopAutomation('Kein aktiver Tower-Run gefunden. Dauerbetrieb wartet auf einen neuen Run.', 'warning', {
+          disable: false,
+        });
+        return;
+      }
+
+      setStatus('Dauerbetrieb aktiv. Warte auf einen aktiven Tower-Run …', 'warning');
+      scheduleStep(1000);
+      return;
+    }
+
+    runtime.missingRunSince = 0;
+
+    if (!nativeRequestIsPending()) {
+      runtime.lastRetryFingerprint = '';
+      runtime.retryStartedAt = 0;
+    }
+
+    const remainingDelay = settings.actionDelayMs - (Date.now() - runtime.lastActionAt);
+
+    if (remainingDelay > 0) {
+      scheduleStep(remainingDelay);
+      return;
+    }
+
+    const decision = decideNextAction(state);
+
+    if (decision.kind === 'submit') {
+      submitDecision(decision);
+      return;
+    }
+
+    setStatus(decision.message || 'Warte auf den nächsten Tower-Zustand.', 'warning');
+    scheduleStep(850);
+  }
+
+  function observeTowerContent() {
+    const content = document.getElementById('te-content');
+
+    if (!content) {
+      return;
+    }
+
+    runtime.observer = new MutationObserver(() => {
+      if (
+        runtime.enabled &&
+        !runtime.running &&
+        !runtime.starting &&
+        runtime.reacquireWhenRunAppears &&
+        document.getElementById('te-run-state')
+      ) {
+        tryStartAutomation();
+        return;
+      }
+
+      scheduleStep(80);
+    });
+    runtime.observer.observe(content, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  mountUi();
+  observeTowerContent();
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && runtime.running) {
+      scheduleStep(50);
+    }
+  });
+
+  // The page's built-in runner and this runner must never own the next action
+  // at the same time. Clicking the native Start button explicitly hands control
+  // back to the native runner; starting this Autopilot already stops it above.
+  document.addEventListener(
+    'click',
+    (event) => {
+      const nativeStart = event.target.closest?.('#te-auto-start');
+      const nativeStop = event.target.closest?.('#te-auto-stop');
+
+      if (runtime.enabled && nativeStart) {
+        stopAutomation('Native Auto-Battle gestartet; der Autopilot wurde gestoppt.', 'warning');
+      } else if (runtime.enabled && nativeStop && !runtime.stoppingNative) {
+        stopAutomation('Autopilot über den nativen Stop-Button gestoppt.', 'warning');
+      }
+    },
+    true,
+  );
+
+  window.addEventListener('pagehide', (event) => {
+    stopAutomation('Tower-Seite verlassen; Tab-Lock wurde freigegeben.', 'neutral', { disable: false });
+
+    if (!event.persisted) {
+      runtime.observer?.disconnect();
+    }
+  });
+
+  window.addEventListener('pageshow', (event) => {
+    if (!event.persisted) {
+      return;
+    }
+
+    runtime.enabled = readPersistentEnabled(runtime.enabled);
+    updateRuntimeUi();
+
+    if (runtime.enabled) {
+      setStatus('Aktualisiere den Tower-Zustand nach der Rückkehr …', 'neutral');
+      window.location.reload();
+    } else {
+      setStatus('Bereit. Einmal aktivieren; danach läuft der Autopilot selbstständig weiter.');
+    }
+  });
+
+  window.addEventListener('storage', (event) => {
+    if (event.key !== ENABLED_KEY) {
+      return;
+    }
+
+    const enabled = event.newValue === '1';
+
+    if (!enabled) {
+      runtime.enabled = false;
+      stopAutomation('Dauerbetrieb wurde in einem anderen Tab gestoppt.', 'warning', { disable: false });
+      return;
+    }
+
+    runtime.enabled = true;
+    updateRuntimeUi();
+    stopNativeAuto();
+    setStatus('Dauerbetrieb wurde in einem anderen Tab aktiviert. Dieser Tab bleibt im Standby.', 'neutral');
+  });
+
+  if (runtime.enabled) {
+    setStatus('Gespeicherter Dauerbetrieb wird automatisch fortgesetzt …', 'success');
+    tryStartAutomation();
+  } else {
+    setStatus('Bereit. Einmal aktivieren; danach läuft der Autopilot selbstständig weiter.');
+  }
+})();
