@@ -3,7 +3,11 @@ const assert = require('node:assert/strict');
 
 const {
   choosePowerPlacement,
+  formatPowerWishlist,
+  isStatusPotionName,
+  matchStatusEffect,
   normalizePowerKey,
+  normalizePowerWishlist,
   orderRarityOffers,
   orderWishlistOffers,
   parseRatio,
@@ -38,6 +42,34 @@ test('normalizes apostrophes, punctuation, spacing, and duplicate power names', 
     'Skullbreaker',
     'Raven Eye',
   ]);
+});
+
+test('normalizes wishlist target amounts while preserving legacy entries', () => {
+  assert.deepEqual(
+    normalizePowerWishlist([
+      'Skullbreaker',
+      { name: ' Raven Eye ', desiredStacks: 2 },
+      'skullbreaker | 3',
+      'Vampiric Edge | 0',
+      'Crimson Vitality | 500',
+      'Ashen Wand | invalid',
+    ]),
+    [
+      { name: 'Skullbreaker', desiredStacks: null },
+      { name: 'Raven Eye', desiredStacks: 2 },
+      { name: 'Vampiric Edge', desiredStacks: 1 },
+      { name: 'Crimson Vitality', desiredStacks: 99 },
+      { name: 'Ashen Wand', desiredStacks: 1 },
+    ],
+  );
+
+  assert.equal(
+    formatPowerWishlist([
+      { name: 'Skullbreaker', desiredStacks: null },
+      { name: 'Raven Eye', desiredStacks: 2 },
+    ]),
+    'Skullbreaker\nRaven Eye | 2',
+  );
 });
 
 test('parses global capacity and per-power stack ratios', () => {
@@ -109,6 +141,94 @@ test('does not use a free slot when a maxed stack needs a same-power rarity upgr
       strategy: 'wishlist',
     }).value,
     '42',
+  );
+});
+
+test('stops adding a wishlisted power once its requested amount is reached', () => {
+  const options = [
+    replacement('0', '', '', { isFree: true }),
+    replacement('43', 'Ashen Wand', 'common'),
+  ];
+  const belowTarget = power('Skullbreaker', 'epic', { ownedStacks: 1, maxStacks: 3 });
+  const atTarget = power('Skullbreaker', 'epic', { ownedStacks: 2, maxStacks: 3 });
+  const wishlist = [{ name: 'Skullbreaker', desiredStacks: 2 }];
+
+  assert.equal(
+    choosePowerPlacement(belowTarget, options, wishlist, {
+      hasSelect: true,
+      hasFreeCapacity: true,
+      strategy: 'wishlist',
+    }).kind,
+    'free',
+  );
+  assert.equal(
+    choosePowerPlacement(atTarget, options, wishlist, {
+      hasSelect: true,
+      hasFreeCapacity: true,
+      strategy: 'wishlist',
+    }),
+    null,
+  );
+  assert.equal(
+    choosePowerPlacement(atTarget, options, wishlist, {
+      hasSelect: true,
+      hasFreeCapacity: true,
+      strategy: 'rarity',
+    }),
+    null,
+  );
+});
+
+test('still allows a same-power rarity upgrade after the requested amount is reached', () => {
+  const candidate = power('Skullbreaker', 'epic', { ownedStacks: 2, maxStacks: 3 });
+  const options = [
+    replacement('0', '', '', { isFree: true }),
+    replacement('42', 'Skullbreaker', 'common'),
+    replacement('43', 'Ashen Wand', 'common'),
+  ];
+  const placement = choosePowerPlacement(
+    candidate,
+    options,
+    [{ name: 'Skullbreaker', desiredStacks: 2 }],
+    {
+      hasSelect: true,
+      hasFreeCapacity: true,
+      strategy: 'wishlist',
+    },
+  );
+
+  assert.equal(placement.kind, 'upgrade');
+  assert.equal(placement.value, '42');
+});
+
+test('fails closed when an explicit target has no readable owned amount', () => {
+  const candidate = power('Skullbreaker', 'epic', { maxStacks: 3 });
+  const wishlist = [{ name: 'Skullbreaker', desiredStacks: 2 }];
+
+  assert.equal(
+    choosePowerPlacement(candidate, [], wishlist, {
+      hasSelect: false,
+      hasFreeCapacity: true,
+      strategy: 'wishlist',
+    }),
+    null,
+  );
+});
+
+test('caps a requested amount at the native maximum', () => {
+  const candidate = power('Skullbreaker', 'epic', { ownedStacks: 3, maxStacks: 3 });
+  const options = [
+    replacement('0', '', '', { isFree: true }),
+    replacement('43', 'Ashen Wand', 'common'),
+  ];
+
+  assert.equal(
+    choosePowerPlacement(candidate, options, [{ name: 'Skullbreaker', desiredStacks: 99 }], {
+      hasSelect: true,
+      hasFreeCapacity: true,
+      strategy: 'wishlist',
+    }),
+    null,
   );
 });
 
@@ -206,6 +326,28 @@ test('rarity mode protects wishlisted powers and only replaces a lower rarity', 
   assert.equal(placement.kind, 'replace-lower-rarity');
 });
 
+test('matches configured harmful statuses without substring false positives', () => {
+  assert.equal(matchStatusEffect('Current status: Burned'), 'burned');
+  assert.equal(matchStatusEffect('FROZEN solid'), 'frozen');
+  assert.equal(matchStatusEffect('Poisoned (2 turns)'), 'poisoned');
+  assert.equal(matchStatusEffect('A burnished shield'), '');
+  assert.equal(matchStatusEffect('None'), '');
+  assert.equal(
+    matchStatusEffect('Burned', {
+      burned: false,
+      frozen: true,
+      poisoned: true,
+    }),
+    '',
+  );
+});
+
+test('recognizes only the exact Status Potion item name', () => {
+  assert.equal(isStatusPotionName(' Status   Potion '), true);
+  assert.equal(isStatusPotionName('Small Blood Potion'), false);
+  assert.equal(isStatusPotionName('Status Potion Bundle'), false);
+});
+
 test('sanitizes persisted settings and clamps unsafe delays and thresholds', () => {
   assert.deepEqual(
     sanitizeSettings({
@@ -220,14 +362,42 @@ test('sanitizes persisted settings and clamps unsafe delays and thresholds', () 
       guardHeavy: true,
       potionEnabled: true,
       potionThreshold: 99,
+      statusPotionEnabled: false,
+      statusPotionStatuses: {
+        burned: true,
+        frozen: true,
+        poisoned: true,
+      },
       respectNoPotion: true,
       path: 'left',
       powerMode: 'wishlist',
       powerFallback: 'pause',
-      preferredPowers: ['Raven Eye'],
+      preferredPowers: [{ name: 'Raven Eye', desiredStacks: null }],
       unknownDecision: 'pause',
       actionDelayMs: 750,
       collapsed: false,
     },
   );
+});
+
+test('sanitizes persisted wishlist amounts and status potion choices', () => {
+  const settings = sanitizeSettings({
+    statusPotionEnabled: true,
+    statusPotionStatuses: {
+      burned: false,
+      poisoned: false,
+    },
+    preferredPowers: 'Skullbreaker | 2\nRaven Eye | 4',
+  });
+
+  assert.equal(settings.statusPotionEnabled, true);
+  assert.deepEqual(settings.statusPotionStatuses, {
+    burned: false,
+    frozen: true,
+    poisoned: false,
+  });
+  assert.deepEqual(settings.preferredPowers, [
+    { name: 'Skullbreaker', desiredStacks: 2 },
+    { name: 'Raven Eye', desiredStacks: 4 },
+  ]);
 });

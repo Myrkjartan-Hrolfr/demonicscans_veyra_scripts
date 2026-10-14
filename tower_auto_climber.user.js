@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Demonic Tower Autopilot
 // @namespace    local.demonicscans.tower
-// @version      1.1.0
+// @version      1.2.0
 // @description  Continuously climbs the Demonic Tower with configurable combat, potions, paths, and power priorities.
 // @author       Myrkjartan Hrolfr
 // @match        https://demonicscans.org/*
@@ -16,12 +16,19 @@
   const SETTINGS_VERSION = 1;
   const RETRY_TIMEOUT_MS = 30000;
   const MISSING_RUN_GRACE_MS = 10000;
+  const MAX_DESIRED_POWER_STACKS = 99;
 
   const DEFAULTS = Object.freeze({
     attack: 'slash',
     guardHeavy: true,
     potionEnabled: false,
     potionThreshold: 30,
+    statusPotionEnabled: false,
+    statusPotionStatuses: Object.freeze({
+      burned: true,
+      frozen: true,
+      poisoned: true,
+    }),
     respectNoPotion: true,
     path: 'left',
     powerMode: 'wishlist',
@@ -47,6 +54,18 @@
     powerMode: new Set(['wishlist', 'rarity', 'skip', 'pause']),
     powerFallback: new Set(['pause', 'skip', 'rarity']),
     unknownDecision: new Set(['pause', 'first']),
+  });
+
+  const STATUS_PATTERNS = Object.freeze({
+    burned: /\b(?:burn|burned|burning)\b/i,
+    frozen: /\b(?:freeze|freezing|frozen)\b/i,
+    poisoned: /\b(?:poison|poisoned|poisoning)\b/i,
+  });
+
+  const STATUS_LABELS = Object.freeze({
+    burned: 'Burned',
+    frozen: 'Frozen',
+    poisoned: 'Poisoned',
   });
 
   function clampNumber(value, minimum, maximum, fallback) {
@@ -91,6 +110,73 @@
     return [...names.values()];
   }
 
+  function normalizePowerWishlist(value) {
+    const values = Array.isArray(value) ? value : String(value ?? '').split(/\r?\n/);
+    const entries = new Map();
+
+    for (const rawEntry of values) {
+      let rawName = rawEntry;
+      let rawDesiredStacks = null;
+
+      if (rawEntry && typeof rawEntry === 'object' && !Array.isArray(rawEntry)) {
+        rawName = rawEntry.name;
+        rawDesiredStacks = rawEntry.desiredStacks ?? rawEntry.quantity ?? rawEntry.amount ?? null;
+      } else {
+        const line = String(rawEntry ?? '');
+        const separatorIndex = line.lastIndexOf('|');
+
+        if (separatorIndex >= 0) {
+          rawName = line.slice(0, separatorIndex);
+          rawDesiredStacks = line.slice(separatorIndex + 1);
+        }
+      }
+
+      const name = normalizeText(rawName);
+      const key = normalizePowerKey(name);
+
+      if (!key || entries.has(key)) {
+        continue;
+      }
+
+      const desiredNumber = Number(rawDesiredStacks);
+      const hasDesiredStacks = rawDesiredStacks !== null && String(rawDesiredStacks).trim() !== '';
+      const desiredStacks = hasDesiredStacks
+        ? clampNumber(desiredNumber, 1, MAX_DESIRED_POWER_STACKS, 1)
+        : null;
+
+      entries.set(key, {
+        name,
+        desiredStacks,
+      });
+    }
+
+    return [...entries.values()];
+  }
+
+  function formatPowerWishlist(value) {
+    return normalizePowerWishlist(value)
+      .map((entry) =>
+        Number.isFinite(entry.desiredStacks) ? `${entry.name} | ${entry.desiredStacks}` : entry.name,
+      )
+      .join('\n');
+  }
+
+  function matchStatusEffect(value, enabledStatuses = DEFAULTS.statusPotionStatuses) {
+    const text = normalizeText(value);
+
+    for (const [status, pattern] of Object.entries(STATUS_PATTERNS)) {
+      if (enabledStatuses?.[status] !== false && pattern.test(text)) {
+        return status;
+      }
+    }
+
+    return '';
+  }
+
+  function isStatusPotionName(value) {
+    return normalizeText(value).toLowerCase() === 'status potion';
+  }
+
   function rarityRank(value) {
     return RARITY_RANK[String(value ?? '').toLowerCase()] || 0;
   }
@@ -117,19 +203,30 @@
 
   function sanitizeSettings(saved = {}) {
     const source = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+    const sourceStatuses =
+      source.statusPotionStatuses && typeof source.statusPotionStatuses === 'object'
+        ? source.statusPotionStatuses
+        : {};
+    const wishlistSource = source.preferredPowers ?? source.powerWishlist ?? DEFAULTS.preferredPowers;
 
     return {
       attack: VALID_SETTINGS.attack.has(source.attack) ? source.attack : DEFAULTS.attack,
       guardHeavy: source.guardHeavy !== false,
       potionEnabled: source.potionEnabled === true,
       potionThreshold: clampNumber(source.potionThreshold, 1, 99, DEFAULTS.potionThreshold),
+      statusPotionEnabled: source.statusPotionEnabled === true,
+      statusPotionStatuses: {
+        burned: sourceStatuses.burned !== false,
+        frozen: sourceStatuses.frozen !== false,
+        poisoned: sourceStatuses.poisoned !== false,
+      },
       respectNoPotion: source.respectNoPotion !== false,
       path: VALID_SETTINGS.path.has(source.path) ? source.path : DEFAULTS.path,
       powerMode: VALID_SETTINGS.powerMode.has(source.powerMode) ? source.powerMode : DEFAULTS.powerMode,
       powerFallback: VALID_SETTINGS.powerFallback.has(source.powerFallback)
         ? source.powerFallback
         : DEFAULTS.powerFallback,
-      preferredPowers: uniquePowerNames(source.preferredPowers),
+      preferredPowers: normalizePowerWishlist(wishlistSource),
       unknownDecision: VALID_SETTINGS.unknownDecision.has(source.unknownDecision)
         ? source.unknownDecision
         : DEFAULTS.unknownDecision,
@@ -139,7 +236,12 @@
   }
 
   function makePreferenceMap(preferredPowers) {
-    return new Map(uniquePowerNames(preferredPowers).map((name, index) => [normalizePowerKey(name), index]));
+    return new Map(
+      normalizePowerWishlist(preferredPowers).map((entry, index) => [
+        normalizePowerKey(entry.name),
+        { ...entry, index },
+      ]),
+    );
   }
 
   function orderWishlistOffers(offers, preferredPowers) {
@@ -148,7 +250,7 @@
     return [...offers]
       .filter((offer) => preferenceMap.has(offer.key))
       .sort((left, right) => {
-        const priorityDifference = preferenceMap.get(left.key) - preferenceMap.get(right.key);
+        const priorityDifference = preferenceMap.get(left.key).index - preferenceMap.get(right.key).index;
 
         if (priorityDifference !== 0) {
           return priorityDifference;
@@ -177,7 +279,34 @@
   }
 
   function choosePowerPlacement(candidate, options, preferredPowers, context = {}) {
+    const preferenceMap = makePreferenceMap(preferredPowers);
+    const candidatePreference = preferenceMap.get(candidate.key);
+    const desiredStacks = candidatePreference?.desiredStacks;
+    const hasDesiredStacks = Number.isFinite(desiredStacks);
+    const effectiveTarget = hasDesiredStacks
+      ? Number.isFinite(candidate.maxStacks)
+        ? Math.min(desiredStacks, candidate.maxStacks)
+        : desiredStacks
+      : null;
+    const targetIsUnknown = hasDesiredStacks && !Number.isFinite(candidate.ownedStacks);
+    const targetIsMet =
+      Number.isFinite(effectiveTarget) &&
+      Number.isFinite(candidate.ownedStacks) &&
+      candidate.ownedStacks >= effectiveTarget;
+    const stackIsFull =
+      Number.isFinite(candidate.ownedStacks) &&
+      Number.isFinite(candidate.maxStacks) &&
+      candidate.ownedStacks >= candidate.maxStacks;
+
+    if (context.strategy === 'wishlist' && !candidatePreference) {
+      return null;
+    }
+
     if (!context.hasSelect) {
+      if (targetIsUnknown || targetIsMet || stackIsFull) {
+        return null;
+      }
+
       return {
         kind: 'direct',
         value: null,
@@ -187,23 +316,6 @@
 
     const usableOptions = options.filter((option) => !option.disabled);
     const freeOption = usableOptions.find((option) => option.isFree);
-    const stackIsFull =
-      Number.isFinite(candidate.ownedStacks) &&
-      Number.isFinite(candidate.maxStacks) &&
-      candidate.ownedStacks >= candidate.maxStacks;
-
-    if (freeOption && context.hasFreeCapacity !== false && !stackIsFull) {
-      return {
-        kind: 'free',
-        value: freeOption.value,
-        reason: 'nutzt einen freien Power-Slot',
-      };
-    }
-
-    if (!stackIsFull && context.hasFreeCapacity === true && !freeOption) {
-      return null;
-    }
-
     const replacements = usableOptions.filter((option) => !option.isFree && option.value);
     const candidateRarity = rarityRank(candidate.rarity);
     const samePowerUpgrade = replacements
@@ -219,20 +331,28 @@
         }
       : null;
 
-    // A maxed power can only improve by replacing a lower-rarity stack of that
-    // same power. Replacing an unrelated slot would still exceed its stack cap.
-    if (stackIsFull) {
+    // Once either the requested amount or the native stack cap is reached, the
+    // only safe improvement is replacing a lower-rarity stack of the same power.
+    // The same restriction applies when an explicit target exists but the
+    // current amount cannot be read reliably.
+    if (targetIsUnknown || targetIsMet || stackIsFull) {
       return upgradePlacement;
     }
 
-    const preferenceMap = makePreferenceMap(preferredPowers);
+    if (freeOption && context.hasFreeCapacity !== false) {
+      return {
+        kind: 'free',
+        value: freeOption.value,
+        reason: 'nutzt einen freien Power-Slot',
+      };
+    }
+
+    if (context.hasFreeCapacity === true && !freeOption) {
+      return null;
+    }
 
     if (context.strategy === 'wishlist') {
-      const candidatePriority = preferenceMap.get(candidate.key);
-
-      if (!Number.isFinite(candidatePriority)) {
-        return null;
-      }
+      const candidatePriority = candidatePreference.index;
 
       const unlistedReplacement = replacements
         .filter((option) => option.key && !preferenceMap.has(option.key))
@@ -257,7 +377,7 @@
       const lowerPriorityReplacement = replacements
         .map((option) => ({
           ...option,
-          priority: preferenceMap.get(option.key),
+          priority: preferenceMap.get(option.key)?.index,
         }))
         .filter((option) => Number.isFinite(option.priority) && option.priority > candidatePriority)
         .sort((left, right) => {
@@ -310,7 +430,11 @@
     if (typeof module !== 'undefined' && module.exports) {
       module.exports = Object.freeze({
         choosePowerPlacement,
+        formatPowerWishlist,
+        isStatusPotionName,
+        matchStatusEffect,
         normalizePowerKey,
+        normalizePowerWishlist,
         orderRarityOffers,
         orderWishlistOffers,
         parseRatio,
@@ -333,6 +457,7 @@
   const ENABLED_KEY = `${SCRIPT_ID}:enabled:v1:${towerUser}:${towerOccurrence}`;
   const LOCK_NAME = `${SCRIPT_ID}:owner:${towerUser}:${towerOccurrence}`;
   const NATIVE_KEY = `tower:${towerUser}:${towerOccurrence}`;
+  const STATUS_POTION_LATCH_KEY = `${SCRIPT_ID}:status-potion-latch:v1:${towerUser}:${towerOccurrence}`;
 
   const runtime = {
     root: null,
@@ -353,6 +478,7 @@
     status: '',
     tone: 'neutral',
     stoppingNative: false,
+    statusPotionLatch: null,
   };
 
   let settings = loadSettings();
@@ -381,6 +507,37 @@
 
   function saveSettings() {
     writeJson(localStorage, SETTINGS_KEY, settings);
+  }
+
+  function readStatusPotionLatch() {
+    if (runtime.statusPotionLatch) {
+      return runtime.statusPotionLatch;
+    }
+
+    const latch = readJson(localStorage, STATUS_POTION_LATCH_KEY, null);
+
+    runtime.statusPotionLatch =
+      latch && typeof latch === 'object' && typeof latch.status === 'string' ? latch : null;
+
+    return runtime.statusPotionLatch;
+  }
+
+  function writeStatusPotionLatch(status) {
+    runtime.statusPotionLatch = {
+      status,
+      usedAt: Date.now(),
+    };
+    writeJson(localStorage, STATUS_POTION_LATCH_KEY, runtime.statusPotionLatch);
+  }
+
+  function clearStatusPotionLatch() {
+    runtime.statusPotionLatch = null;
+
+    try {
+      localStorage.removeItem(STATUS_POTION_LATCH_KEY);
+    } catch {
+      // The in-page automation can continue even when storage is unavailable.
+    }
   }
 
   function readPersistentEnabled(fallback = false) {
@@ -490,6 +647,13 @@
         padding: 5px 0;
       }
       #${SCRIPT_ID} .tm-tower-check input { flex: 0 0 auto; margin-top: 2px; accent-color: var(--ember, #c9b6ed); }
+      #${SCRIPT_ID} .tm-tower-check-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 4px 9px;
+        margin: 2px 0 5px 23px;
+      }
+      #${SCRIPT_ID} .tm-tower-check-grid[aria-disabled='true'] { opacity: 0.55; }
       #${SCRIPT_ID} .tm-tower-section {
         margin-top: 13px;
         padding-top: 13px;
@@ -574,7 +738,7 @@
         </div>
 
         <section class="tm-tower-section">
-          <h3>HP-Tränke</h3>
+          <h3>Tränke</h3>
           <label class="tm-tower-check">
             <input type="checkbox" data-setting="potionEnabled"> HP-Tränke automatisch benutzen
           </label>
@@ -582,8 +746,25 @@
             <input type="range" min="1" max="99" data-setting="potionThreshold">
           </label>
           <label class="tm-tower-check">
+            <input type="checkbox" data-setting="statusPotionEnabled"> Status Potion automatisch benutzen
+          </label>
+          <div class="tm-tower-check-grid" data-status-potion-options>
+            <label class="tm-tower-check">
+              <input type="checkbox" data-setting="statusPotionBurned"> Burned
+            </label>
+            <label class="tm-tower-check">
+              <input type="checkbox" data-setting="statusPotionFrozen"> Frozen
+            </label>
+            <label class="tm-tower-check">
+              <input type="checkbox" data-setting="statusPotionPoisoned"> Poisoned
+            </label>
+          </div>
+          <label class="tm-tower-check">
             <input type="checkbox" data-setting="respectNoPotion"> „Keine Tränke“-Verträge respektieren
           </label>
+          <p class="tm-tower-help">
+            Bei niedrigem HP wird zuerst geheilt. Pro unverändertem Status wird höchstens eine Status Potion benutzt.
+          </p>
         </section>
 
         <section class="tm-tower-section">
@@ -603,10 +784,19 @@
               <option value="rarity">Beste sichere Power nehmen, sonst überspringen</option>
             </select>
           </label>
-          <label>Wunschliste – eine Fähigkeit pro Zeile
-            <textarea data-setting="preferredPowers" spellcheck="false" placeholder="Skullbreaker\nRavaging Momentum\nVampiric Edge"></textarea>
+          <label>Wunschliste – Power | gewünschte Anzahl
+            <textarea
+              data-setting="preferredPowers"
+              spellcheck="false"
+              placeholder="Skullbreaker | 1\nRavaging Momentum | 2\nVampiric Edge | 3"
+            ></textarea>
           </label>
-          <p class="tm-tower-help">Oben = höchste, strikte Priorität. Bei vollen Slots werden zuerst nicht gelistete, danach nur niedriger priorisierte Powers ersetzt. Powers auf der Liste sind auch im Seltenheitsmodus geschützt.</p>
+          <p class="tm-tower-help">
+            Eine Power pro Zeile; die Zahl nach „|“ ist ihre Zielmenge. Ohne Zahl gilt wie bisher das
+            spielseitige Maximum. Oben = höchste, strikte Priorität. Bei vollen Slots werden zuerst nicht gelistete,
+            danach nur niedriger priorisierte Powers ersetzt. Powers auf der Liste sind auch im Seltenheitsmodus
+            geschützt.
+          </p>
           <div class="tm-tower-actions">
             <button class="tm-tower-button" type="button" data-add="offers">Aktuelle Angebote +</button>
             <button class="tm-tower-button" type="button" data-add="owned">Eigene Powers +</button>
@@ -662,7 +852,7 @@
       }
     }
 
-    for (const name of ['guardHeavy', 'potionEnabled', 'respectNoPotion']) {
+    for (const name of ['guardHeavy', 'potionEnabled', 'statusPotionEnabled', 'respectNoPotion']) {
       const element = getSettingElement(name);
 
       if (element) {
@@ -683,12 +873,22 @@
     }
 
     if (wishlist) {
-      wishlist.value = settings.preferredPowers.join('\n');
+      wishlist.value = formatPowerWishlist(settings.preferredPowers);
+    }
+
+    for (const status of Object.keys(STATUS_PATTERNS)) {
+      const settingName = `statusPotion${status[0].toUpperCase()}${status.slice(1)}`;
+      const element = getSettingElement(settingName);
+
+      if (element) {
+        element.checked = settings.statusPotionStatuses[status];
+      }
     }
 
     runtime.root.classList.toggle('tm-collapsed', settings.collapsed);
     runtime.root.querySelector('.tm-tower-head')?.setAttribute('aria-expanded', String(!settings.collapsed));
     updatePowerModeUi();
+    updatePotionUi();
   }
 
   function updatePowerModeUi() {
@@ -699,6 +899,19 @@
     }
   }
 
+  function updatePotionUi() {
+    const options = runtime.root?.querySelector('[data-status-potion-options]');
+
+    if (!options) {
+      return;
+    }
+
+    options.setAttribute('aria-disabled', String(!settings.statusPotionEnabled));
+    options.querySelectorAll('input').forEach((input) => {
+      input.disabled = !settings.statusPotionEnabled;
+    });
+  }
+
   function readSettingsFromUi() {
     const next = {
       ...settings,
@@ -706,6 +919,12 @@
       guardHeavy: !!getSettingElement('guardHeavy')?.checked,
       potionEnabled: !!getSettingElement('potionEnabled')?.checked,
       potionThreshold: getSettingElement('potionThreshold')?.value,
+      statusPotionEnabled: !!getSettingElement('statusPotionEnabled')?.checked,
+      statusPotionStatuses: {
+        burned: !!getSettingElement('statusPotionBurned')?.checked,
+        frozen: !!getSettingElement('statusPotionFrozen')?.checked,
+        poisoned: !!getSettingElement('statusPotionPoisoned')?.checked,
+      },
       respectNoPotion: !!getSettingElement('respectNoPotion')?.checked,
       path: getSettingElement('path')?.value,
       powerMode: getSettingElement('powerMode')?.value,
@@ -718,6 +937,10 @@
     settings = sanitizeSettings(next);
     saveSettings();
 
+    if (!settings.statusPotionEnabled) {
+      clearStatusPotionLatch();
+    }
+
     const thresholdOutput = runtime.root?.querySelector('[data-output="potionThreshold"]');
 
     if (thresholdOutput) {
@@ -725,6 +948,7 @@
     }
 
     updatePowerModeUi();
+    updatePotionUi();
     scheduleStep(50);
   }
 
@@ -762,18 +986,30 @@
 
   function addCurrentPowerNames(source) {
     const selector = source === 'owned' ? '.te-power-owned h4' : '.te-power-choice:not([data-locked="1"]) h3';
-    const currentNames = [...document.querySelectorAll(selector)].map((element) => element.textContent);
-    const mergedNames = uniquePowerNames([...settings.preferredPowers, ...currentNames]);
+    const currentNames = uniquePowerNames(
+      [...document.querySelectorAll(selector)].map((element) => element.textContent),
+    );
+    const mergedEntries = normalizePowerWishlist(settings.preferredPowers);
+    const existingKeys = new Set(mergedEntries.map((entry) => normalizePowerKey(entry.name)));
 
-    if (mergedNames.length === settings.preferredPowers.length) {
+    for (const name of currentNames) {
+      const key = normalizePowerKey(name);
+
+      if (!existingKeys.has(key)) {
+        mergedEntries.push({ name, desiredStacks: 1 });
+        existingKeys.add(key);
+      }
+    }
+
+    if (mergedEntries.length === settings.preferredPowers.length) {
       setStatus(source === 'owned' ? 'Keine neuen eigenen Powers gefunden.' : 'Keine neuen Angebote gefunden.', 'warning');
       return;
     }
 
-    settings.preferredPowers = mergedNames;
+    settings.preferredPowers = mergedEntries;
     saveSettings();
     renderSettings();
-    setStatus('Wunschliste ergänzt. Die Reihenfolge kann im Textfeld angepasst werden.', 'success');
+    setStatus('Wunschliste ergänzt. Neue Einträge haben die Zielmenge 1.', 'success');
     scheduleStep(50);
   }
 
@@ -1076,12 +1312,15 @@
     const submitter = getSubmitter(form);
 
     try {
+      decision.onSubmitting?.();
+
       if (typeof form.requestSubmit === 'function') {
         form.requestSubmit(submitter);
       } else {
         submitter.click();
       }
     } catch (error) {
+      decision.onSubmitRejected?.();
       console.error('[Demonic Tower Autopilot] Could not submit action.', error);
       stopAutomation('Die Aktion konnte nicht abgesendet werden. Details stehen in der Konsole.', 'error');
       return;
@@ -1089,6 +1328,7 @@
 
     window.queueMicrotask(() => {
       if (runtime.running && form.isConnected && !nativeRequestIsBusy()) {
+        decision.onSubmitRejected?.();
         stopAutomation('Der native Tower-Handler hat die Aktion nicht übernommen. Bitte Seite neu laden.', 'error');
       }
     });
@@ -1312,11 +1552,72 @@
     });
   }
 
+  function readPlayerStatusText(state) {
+    const stateCandidates = [
+      state?.dataset.status,
+      state?.dataset.playerStatus,
+    ].filter(Boolean);
+
+    if (stateCandidates.length) {
+      return normalizeText(stateCandidates.join(' '));
+    }
+
+    const statusElement = document.getElementById('playerStatusText');
+    const towerStatusElement = document.querySelector('.te-player-status, [data-player-status-text]');
+    const fallbackCandidates = [
+      statusElement?.textContent,
+      towerStatusElement?.dataset.playerStatusText,
+      towerStatusElement?.textContent,
+    ];
+
+    return normalizeText(fallbackCandidates.filter(Boolean).join(' '));
+  }
+
+  function findStatusPotionForm() {
+    return [...document.querySelectorAll('form[data-action="use_item"]')].find((form) => {
+      if (!formIsUsable(form)) {
+        return false;
+      }
+
+      const itemContainer = form.closest('.item, .te-item, .te-consumable, article, li');
+      const namedElement = form.querySelector('[data-item-name]') || itemContainer?.querySelector('[data-item-name]');
+      const titleElement =
+        form.querySelector('.item-title, .te-item-title, h3, h4') ||
+        itemContainer?.querySelector('.item-title, .te-item-title, h3, h4');
+      const candidates = [
+        form.dataset.itemName,
+        form.dataset.item,
+        form.querySelector('input[name="item_name"]')?.value,
+        namedElement?.dataset.itemName,
+        titleElement?.textContent,
+      ];
+
+      if (candidates.some(isStatusPotionName)) {
+        return true;
+      }
+
+      const submitLabel = normalizeText(getSubmitter(form)?.textContent);
+
+      return (
+        isStatusPotionName(submitLabel) ||
+        /^(?:use|drink)(?:\s+(?:a|one))?\s+status potion$/i.test(submitLabel)
+      );
+    });
+  }
+
   function decideBattle(state) {
     const hpPercent = Number(state.dataset.hp);
     const potionWanted =
       settings.potionEnabled && Number.isFinite(hpPercent) && hpPercent <= settings.potionThreshold;
     const contractBlocksPotion = settings.respectNoPotion && state.dataset.noPotion === '1';
+    const matchedStatus = settings.statusPotionEnabled
+      ? matchStatusEffect(readPlayerStatusText(state), settings.statusPotionStatuses)
+      : '';
+    const previousStatusPotionLatch = readStatusPotionLatch();
+
+    if (!matchedStatus || (previousStatusPotionLatch && previousStatusPotionLatch.status !== matchedStatus)) {
+      clearStatusPotionLatch();
+    }
 
     if (potionWanted && !contractBlocksPotion) {
       const potionForm = [...document.querySelectorAll('form[data-action="use_item"][data-heal="1"]')].find(formIsUsable);
@@ -1328,6 +1629,35 @@
           label: `Benutze einen HP-Trank bei ${hpPercent}% HP.`,
         };
       }
+    }
+
+    let statusPotionMissing = false;
+
+    if (matchedStatus && !contractBlocksPotion) {
+      const statusPotionLatch = readStatusPotionLatch();
+
+      if (statusPotionLatch?.status === matchedStatus) {
+        return {
+          kind: 'wait',
+          message:
+            `Für ${STATUS_LABELS[matchedStatus]} wurde bereits eine Status Potion benutzt. ` +
+            'Warte, bis sich der Status ändert, damit keine weiteren Tränke verbraucht werden.',
+        };
+      }
+
+      const statusPotionForm = findStatusPotionForm();
+
+      if (statusPotionForm) {
+        return {
+          kind: 'submit',
+          form: statusPotionForm,
+          label: `Benutze eine Status Potion gegen ${STATUS_LABELS[matchedStatus]}.`,
+          onSubmitting: () => writeStatusPotionLatch(matchedStatus),
+          onSubmitRejected: clearStatusPotionLatch,
+        };
+      }
+
+      statusPotionMissing = true;
     }
 
     const shouldGuard = settings.guardHeavy && state.dataset.heavy === '1' && state.dataset.guardReady === '1';
@@ -1342,7 +1672,11 @@
     }
 
     const potionNote =
-      potionWanted && contractBlocksPotion ? ' Der aktive „Keine Tränke“-Vertrag wird respektiert.' : '';
+      (potionWanted || matchedStatus) && contractBlocksPotion
+        ? ' Der aktive „Keine Tränke“-Vertrag wird respektiert.'
+        : statusPotionMissing
+          ? ` Keine nutzbare Status Potion gegen ${STATUS_LABELS[matchedStatus]} gefunden.`
+          : '';
 
     return {
       kind: 'submit',
@@ -1509,6 +1843,18 @@
   });
 
   window.addEventListener('storage', (event) => {
+    if (event.key === STATUS_POTION_LATCH_KEY) {
+      try {
+        const latch = event.newValue === null ? null : JSON.parse(event.newValue);
+        runtime.statusPotionLatch =
+          latch && typeof latch === 'object' && typeof latch.status === 'string' ? latch : null;
+      } catch {
+        runtime.statusPotionLatch = null;
+      }
+
+      return;
+    }
+
     if (event.key !== ENABLED_KEY) {
       return;
     }
