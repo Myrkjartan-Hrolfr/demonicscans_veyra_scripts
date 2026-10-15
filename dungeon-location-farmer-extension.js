@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Dungeon Location Farmer - Controlled
 // @namespace    http://tampermonkey.net/
-// @version      2.1.3
-// @description  Farm all alive monsters with dynamic class attacks, stamina/mana fallbacks, and configurable potion priorities.
+// @version      2.1.4
+// @description  Farm all alive monsters with dynamic class attacks, configurable damage goals, and potion priorities.
 // @author       [J4F] RacletteCestLavie / enhanced
 // @match        https://demonicscans.org/guild_dungeon_location.php*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=demonicscans.org
@@ -208,6 +208,39 @@
       if (Number.isFinite(number)) return number;
     }
     return null;
+  }
+
+  function getAllLootDamageRequirement(root) {
+    const possibleLootHeading = queryAll('strong, .h, h1, h2, h3, h4', root).find((heading) => {
+      return /\bpossible\s+loot\b/i.test(heading.textContent || '');
+    });
+    const possibleLootPanel = possibleLootHeading?.closest('.panel');
+
+    const lootGrid = possibleLootPanel?.querySelector('.loot-grid');
+    const lootCards = lootGrid ? queryAll('.loot-card', lootGrid) : [];
+    if (!lootCards.length) return null;
+
+    let maximumRequirement = 0;
+    const damageLabel = /^\s*DMG\s*(?:req(?:uired|uirement)?|requirement)\s*:\s*/i;
+
+    for (const card of lootCards) {
+      const damageChip = queryAll('.loot-stats .chip, .chip', card).find((chip) => {
+        return damageLabel.test(chip.textContent || '');
+      });
+
+      // Fail closed instead of silently stopping below an unreadable loot requirement.
+      if (!damageChip) return null;
+
+      const rawRequirement = String(damageChip.textContent || '')
+        .replace(damageLabel, '')
+        .replace(/\s+/g, '');
+      const requirement = parseGameNumber(rawRequirement);
+      if (!Number.isFinite(requirement) || requirement < 0) return null;
+
+      maximumRequirement = Math.max(maximumRequirement, requirement);
+    }
+
+    return maximumRequirement;
   }
 
   function parseTarget(value) {
@@ -514,6 +547,7 @@
 
       const html = await response.text();
       const battleDocument = new DOMParser().parseFromString(html, 'text/html');
+      const lootDamage = getAllLootDamageRequirement(battleDocument);
 
       let capDamage = null;
       for (const block of battleDocument.querySelectorAll('.stat-block')) {
@@ -542,10 +576,10 @@
         }
       }
 
-      return { capDamage, currentDamage };
+      return { capDamage, lootDamage, currentDamage };
     } catch (error) {
       console.warn('[DLF] Could not read battle data.', error);
-      return { capDamage: null, currentDamage: 0 };
+      return { capDamage: null, lootDamage: null, currentDamage: 0 };
     }
   }
 
@@ -1378,7 +1412,7 @@
     let target = null;
     let baseline = 0;
 
-    if (settings.damageMode === 'cap' || settings.damageMode === 'specific') {
+    if (['cap', 'loot', 'specific'].includes(settings.damageMode)) {
       setStatus(`Checking battle data for ${name}...`, 'running');
       const battleData = await getMonsterBattleData(dgmid, instanceId);
       baseline = battleData.currentDamage || 0;
@@ -1388,6 +1422,19 @@
         if (!Number.isFinite(target)) {
           addLog(`No EXP cap was found for ${name}. Kill mode will be used for this monster.`);
           target = null;
+        }
+      } else if (settings.damageMode === 'loot') {
+        target = battleData.lootDamage;
+        if (!Number.isFinite(target)) {
+          const message =
+            `Could not read every loot damage requirement for ${name}. ` +
+            'Farming stopped before attacking this monster.';
+          setStatus(message, 'error');
+          addLog(message);
+          line.update(`✗ ${message}`, '#e06c6c');
+          return { reason: 'loot_requirement_unavailable', totalDamage: baseline, message };
+        } else {
+          addLog(`${name}: highest listed loot damage requirement is ${formatNumber(target)}.`);
         }
       } else {
         target = settings.specificDamage;
@@ -1615,12 +1662,13 @@
 
     let killed = Math.max(0, Number(resumeData?.killed) || 0);
     let processed = Math.max(0, Number(resumeData?.processed) || 0);
+    let terminalError = null;
     let startIndex = 0;
     let resumeMonster = null;
 
     /*
      * Potion reloads rebuild the alive-monster list. Monsters that were
-     * already killed disappear from that list, while target/cap monsters can
+     * already killed disappear from that list, while target/cap/loot monsters can
      * still be present. Use the saved remaining dgmid sequence instead of an
      * array index so the farmer never has to walk the completed monsters again.
      */
@@ -1699,6 +1747,17 @@
       if (result.reason === 'dead') killed += 1;
       if (['dead', 'target_reached', 'already_done'].includes(result.reason)) processed += 1;
 
+      if (result.reason === 'loot_requirement_unavailable') {
+        terminalError = result.message;
+
+        if (state.activeRun) {
+          state.activeRun.killed = killed;
+          state.activeRun.processed = processed;
+          state.activeRun.remainingMonsterDgmids = monsters.slice(index).map((item) => String(item.dgmid));
+        }
+        break;
+      }
+
       if (state.activeRun) {
         state.activeRun.killed = killed;
         state.activeRun.processed = processed;
@@ -1711,6 +1770,22 @@
     if (runState.stopped) {
       setStatus(`Stopped. Processed ${processed}, killed ${killed}.`, 'idle');
       addLog(`Stopped. Processed ${processed}, killed ${killed}.`);
+      return;
+    }
+
+    if (terminalError) {
+      if (killed > 0) {
+        setStatus('Looting previously defeated monsters before stopping...', 'running');
+        const loot = await lootAll(instanceId, locationId);
+
+        if (loot?.status === 'success') {
+          addLog(`Looted ${killed} previously defeated monster(s) before stopping.`);
+        } else {
+          addLog(`Could not loot ${killed} previously defeated monster(s) before stopping.`);
+        }
+      }
+
+      setStatus(terminalError, 'error');
       return;
     }
 
@@ -1930,7 +2005,11 @@
           <div class="dlf-options">
             <label><input type="radio" name="dlfMode" value="kill" ${state.settings.damageMode === 'kill' ? 'checked' : ''}> Kill monster</label>
             <label><input type="radio" name="dlfMode" value="cap" ${state.settings.damageMode === 'cap' ? 'checked' : ''}> EXP cap</label>
+            <label><input type="radio" name="dlfMode" value="loot" ${state.settings.damageMode === 'loot' ? 'checked' : ''}> All loot requirements</label>
             <label><input type="radio" name="dlfMode" value="specific" ${state.settings.damageMode === 'specific' ? 'checked' : ''}> Specific damage</label>
+          </div>
+          <div class="dlf-hint" style="margin-top:7px">
+            Loot mode uses the highest “DMG req” under Possible Loot. Item drop chances still apply.
           </div>
           <label id="dlfSpecificRow" class="dlf-field" style="margin-top:9px;${state.settings.damageMode === 'specific' ? '' : 'display:none'}">
             <span>Damage amount <small>Examples: 5m, 5b, 5,000,000</small></span>
