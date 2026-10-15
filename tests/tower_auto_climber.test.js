@@ -2,10 +2,14 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  chooseMerchantAction,
+  chooseSanctuaryChoice,
   choosePowerPlacement,
   formatPowerWishlist,
+  getMerchantChoice,
   isStatusPotionName,
   matchStatusEffect,
+  merchantLatchMatchesVisit,
   normalizePowerKey,
   normalizePowerWishlist,
   orderRarityOffers,
@@ -348,6 +352,112 @@ test('recognizes only the exact Status Potion item name', () => {
   assert.equal(isStatusPotionName('Status Potion Bundle'), false);
 });
 
+test('chooses sanctuary rewards from HP, threshold, and harmful status', () => {
+  const choose = (hpPercent, hasStatus, healThreshold = 50) => {
+    return chooseSanctuaryChoice({ hpPercent, healThreshold, hasStatus });
+  };
+
+  assert.equal(choose(100, false), 'blessing');
+  assert.equal(choose(100, true), 'cleanse');
+  assert.equal(choose(75, false), 'heal');
+  assert.equal(choose(75, true), 'cleanse');
+  assert.equal(choose(50, false), 'heal');
+  assert.equal(choose(50, true), 'heal');
+  assert.equal(choose(10, false), 'heal');
+  assert.equal(choose(10, true), 'heal');
+});
+
+test('fails closed on unreadable sanctuary HP and clamps its threshold', () => {
+  assert.equal(chooseSanctuaryChoice({ hpPercent: undefined, healThreshold: 50, hasStatus: false }), null);
+  assert.equal(chooseSanctuaryChoice({ hpPercent: '', healThreshold: 50, hasStatus: false }), null);
+  assert.equal(chooseSanctuaryChoice({ hpPercent: Number.NaN, healThreshold: 50, hasStatus: false }), null);
+  assert.equal(chooseSanctuaryChoice({ hpPercent: -1, healThreshold: 50, hasStatus: false }), null);
+  assert.equal(chooseSanctuaryChoice({ hpPercent: 0.5, healThreshold: 0, hasStatus: true }), 'heal');
+  assert.equal(chooseSanctuaryChoice({ hpPercent: 98, healThreshold: 200, hasStatus: true }), 'heal');
+  assert.equal(sanitizeSettings({ sanctuaryHealThreshold: 0 }).sanctuaryHealThreshold, 1);
+  assert.equal(sanitizeSettings({ sanctuaryHealThreshold: 200 }).sanctuaryHealThreshold, 99);
+  assert.equal(sanitizeSettings({ sanctuaryHealThreshold: 'invalid' }).sanctuaryHealThreshold, 50);
+});
+
+test('clamps persisted merchant positions to choices one through four', () => {
+  assert.equal(sanitizeSettings({ merchantChoice: 1 }).merchantChoice, 1);
+  assert.equal(sanitizeSettings({ merchantChoice: 4 }).merchantChoice, 4);
+  assert.equal(sanitizeSettings({ merchantChoice: 0 }).merchantChoice, 1);
+  assert.equal(sanitizeSettings({ merchantChoice: 9 }).merchantChoice, 4);
+  assert.equal(sanitizeSettings({ merchantChoice: 'invalid' }).merchantChoice, 1);
+});
+
+test('maps merchant positions to stable choices and never shifts after a card disappears', () => {
+  assert.equal(getMerchantChoice(1), 'potion');
+  assert.equal(getMerchantChoice(2), 'common');
+  assert.equal(getMerchantChoice(3), 'epic');
+  assert.equal(getMerchantChoice(4), 'legendary');
+  assert.equal(getMerchantChoice(0), null);
+  assert.equal(getMerchantChoice(5), null);
+  assert.equal(getMerchantChoice('invalid'), null);
+
+  const shiftedChoices = ['potion', 'epic', 'legendary', 'leave'];
+  assert.equal(
+    chooseMerchantAction({ position: 2, availableChoices: shiftedChoices }),
+    null,
+    'a missing common card must not make position 2 buy the epic card',
+  );
+});
+
+test('buys one configured merchant offer and then leaves instead of buying again', () => {
+  const initialChoices = ['potion', 'common', 'epic', 'legendary', 'leave'];
+
+  assert.equal(chooseMerchantAction({ position: 3, availableChoices: initialChoices }), 'epic');
+  assert.equal(
+    chooseMerchantAction({
+      position: 3,
+      purchaseAttempted: true,
+      availableChoices: ['potion', 'common', 'legendary', 'leave'],
+    }),
+    'leave',
+    'removing the purchased card must lead to leave, not a shifted replacement',
+  );
+  assert.equal(
+    chooseMerchantAction({
+      position: 3,
+      purchaseAttempted: true,
+      availableChoices: ['potion', 'common', 'legendary'],
+    }),
+    null,
+    'after a purchase it waits when leave is temporarily unavailable',
+  );
+});
+
+test('keeps a merchant purchase latch only for the matching visit revision', () => {
+  const latch = {
+    choice: 'common',
+    requestId: 'buy-request-1',
+    revision: '21054',
+  };
+
+  assert.equal(
+    merchantLatchMatchesVisit(latch, {
+      revision: '99999',
+      requestIds: ['leave-request', 'buy-request-1'],
+    }),
+    true,
+    'the original request id identifies the same pre-response view',
+  );
+  assert.equal(merchantLatchMatchesVisit(latch, { revision: '21054' }), true);
+  assert.equal(merchantLatchMatchesVisit(latch, { revision: '21055' }), true);
+  assert.equal(
+    merchantLatchMatchesVisit(latch, { revision: '21056' }),
+    false,
+    'a later merchant visit must not inherit the old purchase latch',
+  );
+  assert.equal(merchantLatchMatchesVisit(null, { revision: '21054' }), false);
+  assert.equal(
+    merchantLatchMatchesVisit(latch, {}),
+    true,
+    'missing server tokens fail closed to avoid a duplicate purchase',
+  );
+});
+
 test('sanitizes persisted settings and clamps unsafe delays and thresholds', () => {
   assert.deepEqual(
     sanitizeSettings({
@@ -369,6 +479,8 @@ test('sanitizes persisted settings and clamps unsafe delays and thresholds', () 
         poisoned: true,
       },
       respectNoPotion: true,
+      sanctuaryHealThreshold: 50,
+      merchantChoice: 1,
       path: 'left',
       powerMode: 'wishlist',
       powerFallback: 'pause',

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Demonic Tower Autopilot
 // @namespace    local.demonicscans.tower
-// @version      1.2.0
-// @description  Continuously climbs the Demonic Tower with configurable combat, potions, paths, and power priorities.
+// @version      1.3.0
+// @description  Automates Demonic Tower combat, events, potions, paths, and power priorities.
 // @author       Myrkjartan Hrolfr
 // @match        https://demonicscans.org/*
 // @run-at       document-idle
@@ -30,6 +30,8 @@
       poisoned: true,
     }),
     respectNoPotion: true,
+    sanctuaryHealThreshold: 50,
+    merchantChoice: 1,
     path: 'left',
     powerMode: 'wishlist',
     powerFallback: 'pause',
@@ -67,6 +69,9 @@
     frozen: 'Frozen',
     poisoned: 'Poisoned',
   });
+
+  const SANCTUARY_CHOICES = Object.freeze(['heal', 'cleanse', 'blessing']);
+  const MERCHANT_CHOICES = Object.freeze(['potion', 'common', 'epic', 'legendary']);
 
   function clampNumber(value, minimum, maximum, fallback) {
     const number = Number(value);
@@ -177,6 +182,82 @@
     return normalizeText(value).toLowerCase() === 'status potion';
   }
 
+  function chooseSanctuaryChoice({ hpPercent, healThreshold, hasStatus } = {}) {
+    if (hpPercent === '' || hpPercent === null || hpPercent === undefined) {
+      return null;
+    }
+
+    const hp = Number(hpPercent);
+    if (!Number.isFinite(hp) || hp < 0) {
+      return null;
+    }
+
+    const threshold = clampNumber(healThreshold, 1, 99, DEFAULTS.sanctuaryHealThreshold);
+
+    if (hp >= 100) {
+      return hasStatus ? 'cleanse' : 'blessing';
+    }
+
+    if (hp <= threshold) {
+      return 'heal';
+    }
+
+    return hasStatus ? 'cleanse' : 'heal';
+  }
+
+  function getMerchantChoice(position) {
+    const normalizedPosition = Number(position);
+
+    if (!Number.isInteger(normalizedPosition)) {
+      return null;
+    }
+
+    return MERCHANT_CHOICES[normalizedPosition - 1] || null;
+  }
+
+  function chooseMerchantAction({ position, purchaseAttempted = false, availableChoices = [] } = {}) {
+    const choices = new Set(Array.isArray(availableChoices) ? availableChoices : []);
+
+    if (purchaseAttempted) {
+      return choices.has('leave') ? 'leave' : null;
+    }
+
+    const targetChoice = getMerchantChoice(position);
+
+    return targetChoice && choices.has(targetChoice) ? targetChoice : null;
+  }
+
+  function merchantLatchMatchesVisit(latch, { revision, requestIds = [] } = {}) {
+    if (!latch || typeof latch !== 'object') {
+      return false;
+    }
+
+    const previousRequestId = String(latch.requestId || '');
+    if (previousRequestId && requestIds.some((requestId) => String(requestId) === previousRequestId)) {
+      return true;
+    }
+
+    const previousRevisionText = String(latch.revision ?? '');
+    const currentRevisionText = String(revision ?? '');
+    const previousRevision = Number(previousRevisionText);
+    const currentRevision = Number(currentRevisionText);
+
+    if (
+      previousRevisionText &&
+      currentRevisionText &&
+      Number.isSafeInteger(previousRevision) &&
+      Number.isSafeInteger(currentRevision)
+    ) {
+      const revisionSteps = currentRevision - previousRevision;
+
+      return revisionSteps >= 0 && revisionSteps <= 1;
+    }
+
+    // Without either server token, keeping the latch is safer than risking a
+    // duplicate purchase after a markup change.
+    return true;
+  }
+
   function rarityRank(value) {
     return RARITY_RANK[String(value ?? '').toLowerCase()] || 0;
   }
@@ -221,6 +302,13 @@
         poisoned: sourceStatuses.poisoned !== false,
       },
       respectNoPotion: source.respectNoPotion !== false,
+      sanctuaryHealThreshold: clampNumber(
+        source.sanctuaryHealThreshold,
+        1,
+        99,
+        DEFAULTS.sanctuaryHealThreshold,
+      ),
+      merchantChoice: clampNumber(source.merchantChoice, 1, 4, DEFAULTS.merchantChoice),
       path: VALID_SETTINGS.path.has(source.path) ? source.path : DEFAULTS.path,
       powerMode: VALID_SETTINGS.powerMode.has(source.powerMode) ? source.powerMode : DEFAULTS.powerMode,
       powerFallback: VALID_SETTINGS.powerFallback.has(source.powerFallback)
@@ -429,10 +517,14 @@
   if (typeof document === 'undefined') {
     if (typeof module !== 'undefined' && module.exports) {
       module.exports = Object.freeze({
+        chooseMerchantAction,
+        chooseSanctuaryChoice,
         choosePowerPlacement,
         formatPowerWishlist,
+        getMerchantChoice,
         isStatusPotionName,
         matchStatusEffect,
+        merchantLatchMatchesVisit,
         normalizePowerKey,
         normalizePowerWishlist,
         orderRarityOffers,
@@ -458,6 +550,7 @@
   const LOCK_NAME = `${SCRIPT_ID}:owner:${towerUser}:${towerOccurrence}`;
   const NATIVE_KEY = `tower:${towerUser}:${towerOccurrence}`;
   const STATUS_POTION_LATCH_KEY = `${SCRIPT_ID}:status-potion-latch:v1:${towerUser}:${towerOccurrence}`;
+  const MERCHANT_PURCHASE_LATCH_KEY = `${SCRIPT_ID}:merchant-purchase-latch:v1:${towerUser}:${towerOccurrence}`;
 
   const runtime = {
     root: null,
@@ -479,6 +572,7 @@
     tone: 'neutral',
     stoppingNative: false,
     statusPotionLatch: null,
+    merchantPurchaseLatch: null,
   };
 
   let settings = loadSettings();
@@ -535,6 +629,38 @@
 
     try {
       localStorage.removeItem(STATUS_POTION_LATCH_KEY);
+    } catch {
+      // The in-page automation can continue even when storage is unavailable.
+    }
+  }
+
+  function readMerchantPurchaseLatch() {
+    if (runtime.merchantPurchaseLatch) {
+      return runtime.merchantPurchaseLatch;
+    }
+
+    const latch = readJson(localStorage, MERCHANT_PURCHASE_LATCH_KEY, null);
+
+    runtime.merchantPurchaseLatch =
+      latch && typeof latch === 'object' && MERCHANT_CHOICES.includes(latch.choice) ? latch : null;
+
+    return runtime.merchantPurchaseLatch;
+  }
+
+  function writeMerchantPurchaseLatch(choice, form) {
+    runtime.merchantPurchaseLatch = {
+      choice,
+      requestId: String(form?.querySelector('input[name="request_id"]')?.value || ''),
+      revision: String(form?.querySelector('input[name="revision"]')?.value || ''),
+    };
+    writeJson(localStorage, MERCHANT_PURCHASE_LATCH_KEY, runtime.merchantPurchaseLatch);
+  }
+
+  function clearMerchantPurchaseLatch() {
+    runtime.merchantPurchaseLatch = null;
+
+    try {
+      localStorage.removeItem(MERCHANT_PURCHASE_LATCH_KEY);
     } catch {
       // The in-page automation can continue even when storage is unavailable.
     }
@@ -804,6 +930,34 @@
         </section>
 
         <section class="tm-tower-section">
+          <h3>Vergessenes Heiligtum</h3>
+          <label>Bei höchstens <output data-output="sanctuaryHealThreshold">50</output>% HP immer heilen
+            <input type="range" min="1" max="99" data-setting="sanctuaryHealThreshold">
+          </label>
+          <p class="tm-tower-help">
+            Oberhalb der Grenze wird ein negativer Status gereinigt, sonst werden fehlende HP geheilt.
+            Bei vollen HP wird ein Status gereinigt oder – ohne Status – der nächste Treffer verstärkt.
+            Burned, Frozen und Poisoned werden unabhängig von der Trank-Automatik erkannt.
+          </p>
+        </section>
+
+        <section class="tm-tower-section">
+          <h3>Reisender Abyss-Händler</h3>
+          <label>Angebot automatisch kaufen
+            <select data-setting="merchantChoice">
+              <option value="1">1 – Trank-Angebot</option>
+              <option value="2">2 – gewöhnliches Angebot</option>
+              <option value="3">3 – episches Angebot</option>
+              <option value="4">4 – legendäres Angebot</option>
+            </select>
+          </label>
+          <p class="tm-tower-help">
+            Das gewählte Angebot wird pro Händlerbesuch genau einmal gekauft. Danach verlässt der Autopilot
+            den Händler. Ist das Angebot nicht verfügbar, wartet er sicher auf einen aktuellen Zustand.
+          </p>
+        </section>
+
+        <section class="tm-tower-section">
           <h3>Weiterer Ablauf</h3>
           <div class="tm-tower-grid">
             <label class="tm-tower-wide">Unbekannte Raumentscheidung
@@ -844,7 +998,15 @@
       return;
     }
 
-    for (const name of ['attack', 'path', 'powerMode', 'powerFallback', 'unknownDecision', 'actionDelayMs']) {
+    for (const name of [
+      'attack',
+      'path',
+      'powerMode',
+      'powerFallback',
+      'merchantChoice',
+      'unknownDecision',
+      'actionDelayMs',
+    ]) {
       const element = getSettingElement(name);
 
       if (element) {
@@ -862,6 +1024,8 @@
 
     const threshold = getSettingElement('potionThreshold');
     const thresholdOutput = runtime.root.querySelector('[data-output="potionThreshold"]');
+    const sanctuaryThreshold = getSettingElement('sanctuaryHealThreshold');
+    const sanctuaryThresholdOutput = runtime.root.querySelector('[data-output="sanctuaryHealThreshold"]');
     const wishlist = getSettingElement('preferredPowers');
 
     if (threshold) {
@@ -870,6 +1034,14 @@
 
     if (thresholdOutput) {
       thresholdOutput.textContent = String(settings.potionThreshold);
+    }
+
+    if (sanctuaryThreshold) {
+      sanctuaryThreshold.value = String(settings.sanctuaryHealThreshold);
+    }
+
+    if (sanctuaryThresholdOutput) {
+      sanctuaryThresholdOutput.textContent = String(settings.sanctuaryHealThreshold);
     }
 
     if (wishlist) {
@@ -926,6 +1098,8 @@
         poisoned: !!getSettingElement('statusPotionPoisoned')?.checked,
       },
       respectNoPotion: !!getSettingElement('respectNoPotion')?.checked,
+      sanctuaryHealThreshold: getSettingElement('sanctuaryHealThreshold')?.value,
+      merchantChoice: getSettingElement('merchantChoice')?.value,
       path: getSettingElement('path')?.value,
       powerMode: getSettingElement('powerMode')?.value,
       powerFallback: getSettingElement('powerFallback')?.value,
@@ -942,9 +1116,14 @@
     }
 
     const thresholdOutput = runtime.root?.querySelector('[data-output="potionThreshold"]');
+    const sanctuaryThresholdOutput = runtime.root?.querySelector('[data-output="sanctuaryHealThreshold"]');
 
     if (thresholdOutput) {
       thresholdOutput.textContent = String(settings.potionThreshold);
+    }
+
+    if (sanctuaryThresholdOutput) {
+      sanctuaryThresholdOutput.textContent = String(settings.sanctuaryHealThreshold);
     }
 
     updatePowerModeUi();
@@ -1245,7 +1424,7 @@
   }
 
   function formIsUsable(form) {
-    if (!(form instanceof HTMLFormElement) || !form.isConnected || form.closest('[hidden]')) {
+    if (!(form instanceof HTMLFormElement) || !form.isConnected || form.closest('[hidden], [aria-hidden="true"]')) {
       return false;
     }
 
@@ -1492,7 +1671,9 @@
   }
 
   function decidePath() {
-    const available = [...document.querySelectorAll('form[data-action="room"][data-choice]')].filter(formIsUsable);
+    const available = [...document.querySelectorAll('form[data-action="room"][data-choice]')].filter((form) => {
+      return ['left', 'right'].includes(form.dataset.choice) && formIsUsable(form);
+    });
 
     if (!available.length) {
       return {
@@ -1513,6 +1694,152 @@
       kind: 'submit',
       form,
       label: `Wähle den Pfad „${form.dataset.choice || selectedPath}“.`,
+    };
+  }
+
+  function getCurrentChoicePanels() {
+    const content = document.getElementById('te-content') || document;
+
+    return [...content.querySelectorAll('section.te-panel.te-choice')].filter((panel) => {
+      return !panel.closest('[hidden], [aria-hidden="true"]');
+    });
+  }
+
+  function findSanctuaryPanel() {
+    return getCurrentChoicePanels().find((panel) => {
+      const title = normalizeText(panel.querySelector('h2')?.textContent).toLowerCase();
+
+      const choices = new Set(
+        [...panel.querySelectorAll('form.te-form[data-action="room"][data-choice]')].map(
+          (form) => form.dataset.choice,
+        ),
+      );
+
+      return title === 'the forgotten sanctuary' || SANCTUARY_CHOICES.every((choice) => choices.has(choice));
+    });
+  }
+
+  function decideSanctuary(state) {
+    const panel = findSanctuaryPanel();
+    if (!panel) {
+      return null;
+    }
+
+    const hpPercent = state?.dataset.hp;
+    const matchedStatus = matchStatusEffect(readPlayerStatusText(state));
+    const choice = chooseSanctuaryChoice({
+      hpPercent,
+      healThreshold: settings.sanctuaryHealThreshold,
+      hasStatus: !!matchedStatus,
+    });
+
+    if (!choice) {
+      return {
+        kind: 'wait',
+        message: 'Die HP für die Entscheidung im vergessenen Heiligtum konnten nicht gelesen werden.',
+      };
+    }
+
+    const form = [...panel.querySelectorAll('form.te-form[data-action="room"][data-choice]')].find((candidate) => {
+      return candidate.dataset.choice === choice && formIsUsable(candidate);
+    });
+
+    if (!form) {
+      return {
+        kind: 'wait',
+        message: `Die benötigte Heiligtum-Option „${choice}“ ist gerade nicht verfügbar.`,
+      };
+    }
+
+    const roundedHp = Math.round(Number(hpPercent));
+    const labels = {
+      heal: `Heile im vergessenen Heiligtum HP bei ${roundedHp}% HP.`,
+      cleanse: `Reinige im vergessenen Heiligtum den Status ${STATUS_LABELS[matchedStatus] || matchedStatus}.`,
+      blessing: 'Wähle im vergessenen Heiligtum +35% Schaden für den nächsten Treffer.',
+    };
+
+    return {
+      kind: 'submit',
+      form,
+      label: labels[choice],
+    };
+  }
+
+  function findMerchantPanel() {
+    return getCurrentChoicePanels().find((panel) => {
+      const title = normalizeText(panel.querySelector('h2')?.textContent).toLowerCase();
+      const choices = new Set(
+        [...panel.querySelectorAll('form.te-form[data-action="room"][data-choice]')].map(
+          (form) => form.dataset.choice,
+        ),
+      );
+
+      return (
+        title === 'the travelling abyss merchant' ||
+        (choices.has('leave') && MERCHANT_CHOICES.every((choice) => choices.has(choice)))
+      );
+    });
+  }
+
+  function decideMerchant(panel) {
+    const position = settings.merchantChoice;
+    const forms = [...panel.querySelectorAll('form.te-form[data-action="room"][data-choice]')];
+    const usableForms = forms.filter(formIsUsable);
+    const availableChoices = usableForms.map((form) => form.dataset.choice);
+    const revision = usableForms
+      .map((form) => form.querySelector('input[name="revision"]')?.value)
+      .find((value) => value !== undefined);
+    const requestIds = usableForms
+      .map((form) => form.querySelector('input[name="request_id"]')?.value)
+      .filter((value) => value !== undefined);
+    let purchaseLatch = readMerchantPurchaseLatch();
+
+    if (purchaseLatch && !merchantLatchMatchesVisit(purchaseLatch, { revision, requestIds })) {
+      clearMerchantPurchaseLatch();
+      purchaseLatch = null;
+    }
+
+    const action = chooseMerchantAction({
+      position,
+      purchaseAttempted: !!purchaseLatch,
+      availableChoices,
+    });
+
+    if (purchaseLatch && action !== 'leave') {
+      return {
+        kind: 'wait',
+        message: 'Der Händlerkauf wurde bereits ausgelöst. Warte auf die Option zum Verlassen.',
+      };
+    }
+
+    const targetChoice = getMerchantChoice(position);
+    const form = usableForms.find((candidate) => candidate.dataset.choice === action);
+
+    if (!form) {
+      return {
+        kind: 'wait',
+        message: `Händler-Angebot ${position} (${targetChoice || 'unbekannt'}) ist gerade nicht verfügbar.`,
+      };
+    }
+
+    if (action === 'leave') {
+      return {
+        kind: 'submit',
+        form,
+        label: 'Der Händlerkauf wurde bereits ausgelöst; verlasse den Händler.',
+      };
+    }
+
+    const card = form.closest('.te-cards article');
+    const itemName = normalizeText(card?.querySelector('h3')?.textContent) || `Angebot ${position}`;
+    const price = normalizeText(card?.querySelector('p')?.textContent);
+
+    return {
+      kind: 'submit',
+      form,
+      label: `Kaufe Händler-Angebot ${position}: ${itemName}${price ? ` (${price})` : ''}.`,
+      onSubmitting: () => writeMerchantPurchaseLatch(action, form),
+      onSubmitRejected: clearMerchantPurchaseLatch,
     };
   }
 
@@ -1686,6 +2013,18 @@
   }
 
   function decideNextAction(state) {
+    const merchantPanel = findMerchantPanel();
+    if (merchantPanel) {
+      return decideMerchant(merchantPanel);
+    }
+
+    clearMerchantPurchaseLatch();
+
+    const sanctuaryDecision = decideSanctuary(state);
+    if (sanctuaryDecision) {
+      return sanctuaryDecision;
+    }
+
     const pendingType = String(state.dataset.pending || '');
 
     if (pendingType === 'power') {
@@ -1850,6 +2189,18 @@
           latch && typeof latch === 'object' && typeof latch.status === 'string' ? latch : null;
       } catch {
         runtime.statusPotionLatch = null;
+      }
+
+      return;
+    }
+
+    if (event.key === MERCHANT_PURCHASE_LATCH_KEY) {
+      try {
+        const latch = event.newValue === null ? null : JSON.parse(event.newValue);
+        runtime.merchantPurchaseLatch =
+          latch && typeof latch === 'object' && MERCHANT_CHOICES.includes(latch.choice) ? latch : null;
+      } catch {
+        runtime.merchantPurchaseLatch = null;
       }
 
       return;
