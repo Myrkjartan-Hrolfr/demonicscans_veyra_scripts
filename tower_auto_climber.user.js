@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Demonic Tower Autopilot
 // @namespace    local.demonicscans.tower
-// @version      1.4.1
+// @version      1.4.2
 // @description  Automates Demonic Tower combat, events, start floors, potions, paths, and power priorities.
 // @author       Myrkjartan Hrolfr
 // @match        https://demonicscans.org/*
@@ -132,6 +132,11 @@
     const offered = normalizeStartFloors(offeredFloors);
     const buyable = normalizeStartFloors(buyableFloors);
     const attempted = normalizeStartFloors(attemptedFloors);
+
+    if (selected.length && !offered.length) {
+      return null;
+    }
+
     const floor = START_FLOORS.find((candidate) => {
       return selected.includes(candidate) && offered.includes(candidate) && !attempted.includes(candidate);
     });
@@ -141,6 +146,30 @@
     }
 
     return declineAvailable ? { kind: 'decline', floor: null } : null;
+  }
+
+  function isStartFloorDecisionContext({ panelText, hasKnownFloor = false, roomChoices = [] } = {}) {
+    const text = normalizeText(panelText).replace(/[_-]+/g, ' ');
+    const hasStartFloorContext = /\b(?:start(?:ing)?\s*floors?|floors?\s*starts?|checkpoint)\b/i.test(text);
+
+    if (!hasStartFloorContext) {
+      return false;
+    }
+
+    if (hasKnownFloor) {
+      return true;
+    }
+
+    const choices = Array.isArray(roomChoices)
+      ? roomChoices.map((choice) => normalizeText(choice).toLowerCase()).filter(Boolean)
+      : [];
+
+    return (
+      /\bcheckpoint\b/i.test(text) &&
+      choices.length === 2 &&
+      choices.includes('buy') &&
+      choices.includes('skip')
+    );
   }
 
   function normalizePowerKey(value) {
@@ -577,6 +606,7 @@
         choosePowerPlacement,
         formatPowerWishlist,
         getMerchantChoice,
+        isStartFloorDecisionContext,
         isStatusPotionName,
         matchStatusEffect,
         merchantLatchMatchesVisit,
@@ -1844,6 +1874,16 @@
   }
 
   function getStartFloorFormIntent(form) {
+    if (form.dataset.action === 'room') {
+      if (form.dataset.choice === 'skip') {
+        return 'decline';
+      }
+
+      if (form.dataset.choice === 'buy') {
+        return 'buy';
+      }
+    }
+
     const controlText = getFormControlText(form);
     const declinePattern = /\b(?:skip|decline|leave|continue|later|cancel|no)\b|\bdo\s+not\b|\bdon't\b/i;
     const buyPattern = /\b(?:buy|purchase|unlock|acquire|confirm|yes)\b/i;
@@ -1946,17 +1986,14 @@
         panel.textContent,
         ...Object.entries(panel.dataset).flatMap(([name, value]) => [name, value]),
       ].filter(Boolean).join(' '));
-      const hasStartFloorContext = /\b(?:start(?:ing)?\s*floors?|floors?\s*starts?|checkpoint)\b/i.test(
-        panelText,
-      );
-
-      if (!hasStartFloorContext) {
-        return false;
-      }
-
       const panelFloor = parseStartFloor(panelText) || readCurrentStartFloor();
+      const hasKnownFloor =
+        !!panelFloor || forms.some((form) => readStartFloorFromForm(form, null) !== null);
+      const roomChoices = forms
+        .filter((form) => form.dataset.action === 'room')
+        .map((form) => form.dataset.choice);
 
-      return !!panelFloor || forms.some((form) => readStartFloorFromForm(form, null) !== null);
+      return isStartFloorDecisionContext({ panelText, hasKnownFloor, roomChoices });
     });
   }
 

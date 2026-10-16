@@ -7,6 +7,7 @@ const {
   choosePowerPlacement,
   formatPowerWishlist,
   getMerchantChoice,
+  isStartFloorDecisionContext,
   isStatusPotionName,
   matchStatusEffect,
   merchantLatchMatchesVisit,
@@ -402,6 +403,34 @@ test('parses only unambiguous Start Floor values from semantic labels', () => {
   assert.equal(parseStartFloor('Floor 40'), null);
 });
 
+test('recognizes an explicit buy-or-skip checkpoint even when its floor is unknown', () => {
+  const panelText =
+    'YOUR DECISION Bind this checkpoint? Boss defeated. Pay 200 Abyssal Coins to start your next run on floor 21.';
+
+  assert.equal(parseStartFloor(panelText), null);
+  assert.equal(
+    isStartFloorDecisionContext({
+      panelText,
+      roomChoices: ['buy', 'skip'],
+    }),
+    true,
+  );
+  assert.equal(
+    isStartFloorDecisionContext({
+      panelText,
+      roomChoices: ['buy'],
+    }),
+    false,
+  );
+  assert.equal(
+    isStartFloorDecisionContext({
+      panelText: 'Choose whether to buy or skip this unrelated room offer.',
+      roomChoices: ['buy', 'skip'],
+    }),
+    false,
+  );
+});
+
 test('buys only checked Start Floors and declines every unchecked offer', () => {
   assert.deepEqual(
     planStartFloorAction({
@@ -429,6 +458,24 @@ test('buys only checked Start Floors and declines every unchecked offer', () => 
       declineAvailable: true,
     }),
     { kind: 'decline', floor: null },
+  );
+  assert.deepEqual(
+    planStartFloorAction({
+      selectedFloors: [],
+      offeredFloors: [],
+      buyableFloors: [],
+      declineAvailable: true,
+    }),
+    { kind: 'decline', floor: null },
+  );
+  assert.equal(
+    planStartFloorAction({
+      selectedFloors: [20],
+      offeredFloors: [],
+      buyableFloors: [],
+      declineAvailable: true,
+    }),
+    null,
   );
 });
 
