@@ -12,9 +12,12 @@ const {
   merchantLatchMatchesVisit,
   normalizePowerKey,
   normalizePowerWishlist,
+  normalizeStartFloors,
   orderRarityOffers,
   orderWishlistOffers,
   parseRatio,
+  parseStartFloor,
+  planStartFloorAction,
   sanitizeSettings,
   uniquePowerNames,
 } = require('../tower_auto_climber.user.js');
@@ -112,7 +115,7 @@ test('uses the explicit free slot without replacing an owned power', () => {
     {
       kind: 'free',
       value: '0',
-      reason: 'nutzt einen freien Power-Slot',
+      reason: 'uses a free Power slot',
     },
   );
 });
@@ -346,8 +349,11 @@ test('matches configured harmful statuses without substring false positives', ()
   );
 });
 
-test('recognizes only the exact Status Potion item name', () => {
+test('recognizes the Status Potion item name with an optional inventory quantity', () => {
   assert.equal(isStatusPotionName(' Status   Potion '), true);
+  assert.equal(isStatusPotionName('Status Potion x2'), true);
+  assert.equal(isStatusPotionName('Status Potion × 12'), true);
+  assert.equal(isStatusPotionName('Status Potion (x3)'), true);
   assert.equal(isStatusPotionName('Small Blood Potion'), false);
   assert.equal(isStatusPotionName('Status Potion Bundle'), false);
 });
@@ -377,6 +383,85 @@ test('fails closed on unreadable sanctuary HP and clamps its threshold', () => {
   assert.equal(sanitizeSettings({ sanctuaryHealThreshold: 0 }).sanctuaryHealThreshold, 1);
   assert.equal(sanitizeSettings({ sanctuaryHealThreshold: 200 }).sanctuaryHealThreshold, 99);
   assert.equal(sanitizeSettings({ sanctuaryHealThreshold: 'invalid' }).sanctuaryHealThreshold, 50);
+});
+
+test('normalizes the independently selected Start Floor checkboxes', () => {
+  assert.deepEqual(normalizeStartFloors(), []);
+  assert.deepEqual(normalizeStartFloors('10,20'), []);
+  assert.deepEqual(normalizeStartFloors([30, '10', 20, 10, 40, 'invalid']), [10, 20, 30]);
+  assert.deepEqual(sanitizeSettings({ startFloors: [20, 40, '10'] }).startFloors, [10, 20]);
+  assert.deepEqual(sanitizeSettings({ startFloors: '10,20' }).startFloors, []);
+});
+
+test('parses only unambiguous Start Floor values from semantic labels', () => {
+  assert.equal(parseStartFloor('buy_start_floor_10'), 10);
+  assert.equal(parseStartFloor('Unlock starting floor: 20'), 20);
+  assert.equal(parseStartFloor('Purchase the 30th floor checkpoint'), 30);
+  assert.equal(parseStartFloor('Floor 10 or Floor 20'), null);
+  assert.equal(parseStartFloor('Buy for 10 coins'), null);
+  assert.equal(parseStartFloor('Floor 40'), null);
+});
+
+test('buys only checked Start Floors and declines every unchecked offer', () => {
+  assert.deepEqual(
+    planStartFloorAction({
+      selectedFloors: [10, 30],
+      offeredFloors: [10],
+      buyableFloors: [10],
+      declineAvailable: true,
+    }),
+    { kind: 'buy', floor: 10 },
+  );
+  assert.deepEqual(
+    planStartFloorAction({
+      selectedFloors: [10, 30],
+      offeredFloors: [20],
+      buyableFloors: [20],
+      declineAvailable: true,
+    }),
+    { kind: 'decline', floor: null },
+  );
+  assert.deepEqual(
+    planStartFloorAction({
+      selectedFloors: [],
+      offeredFloors: [30],
+      buyableFloors: [30],
+      declineAvailable: true,
+    }),
+    { kind: 'decline', floor: null },
+  );
+});
+
+test('Start Floor purchases fail closed and are attempted at most once per run', () => {
+  assert.equal(
+    planStartFloorAction({
+      selectedFloors: [10],
+      offeredFloors: [10],
+      buyableFloors: [],
+      declineAvailable: true,
+    }),
+    null,
+  );
+  assert.deepEqual(
+    planStartFloorAction({
+      selectedFloors: [10, 20],
+      offeredFloors: [10, 20],
+      buyableFloors: [10, 20],
+      attemptedFloors: [10],
+      declineAvailable: true,
+    }),
+    { kind: 'buy', floor: 20 },
+  );
+  assert.deepEqual(
+    planStartFloorAction({
+      selectedFloors: [10],
+      offeredFloors: [10],
+      buyableFloors: [10],
+      attemptedFloors: [10],
+      declineAvailable: true,
+    }),
+    { kind: 'decline', floor: null },
+  );
 });
 
 test('clamps persisted merchant positions to choices one through four', () => {
@@ -479,6 +564,7 @@ test('sanitizes persisted settings and clamps unsafe delays and thresholds', () 
         poisoned: true,
       },
       respectNoPotion: true,
+      startFloors: [],
       sanctuaryHealThreshold: 50,
       merchantChoice: 1,
       path: 'left',

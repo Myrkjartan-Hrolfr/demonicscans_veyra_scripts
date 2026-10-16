@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Demonic Tower Autopilot
 // @namespace    local.demonicscans.tower
-// @version      1.3.0
-// @description  Automates Demonic Tower combat, events, potions, paths, and power priorities.
+// @version      1.4.1
+// @description  Automates Demonic Tower combat, events, start floors, potions, paths, and power priorities.
 // @author       Myrkjartan Hrolfr
 // @match        https://demonicscans.org/*
 // @run-at       document-idle
@@ -30,6 +30,7 @@
       poisoned: true,
     }),
     respectNoPotion: true,
+    startFloors: Object.freeze([]),
     sanctuaryHealThreshold: 50,
     merchantChoice: 1,
     path: 'left',
@@ -72,6 +73,7 @@
 
   const SANCTUARY_CHOICES = Object.freeze(['heal', 'cleanse', 'blessing']);
   const MERCHANT_CHOICES = Object.freeze(['potion', 'common', 'epic', 'legendary']);
+  const START_FLOORS = Object.freeze([10, 20, 30]);
 
   function clampNumber(value, minimum, maximum, fallback) {
     const number = Number(value);
@@ -87,6 +89,58 @@
     return String(value ?? '')
       .replace(/\s+/g, ' ')
       .trim();
+  }
+
+  function normalizeStartFloors(value) {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+
+    const selected = new Set(value.map(Number));
+
+    return START_FLOORS.filter((floor) => selected.has(floor));
+  }
+
+  function parseStartFloor(value) {
+    const text = normalizeText(value)
+      .replace(/[_-]+/g, ' ')
+      .toLowerCase();
+    const floors = new Set();
+    const patterns = [
+      /\b(?:start(?:ing)?\s*floors?|floors?\s*starts?|checkpoint)\D{0,24}(10|20|30)\b/g,
+      /\bfloor\s*(10|20|30)\b/g,
+      /\b(10|20|30)(?:st|nd|rd|th)?\s+floor\b/g,
+    ];
+
+    for (const pattern of patterns) {
+      for (const match of text.matchAll(pattern)) {
+        floors.add(Number(match[1]));
+      }
+    }
+
+    return floors.size === 1 ? [...floors][0] : null;
+  }
+
+  function planStartFloorAction({
+    selectedFloors = [],
+    offeredFloors = [],
+    buyableFloors = [],
+    attemptedFloors = [],
+    declineAvailable = false,
+  } = {}) {
+    const selected = normalizeStartFloors(selectedFloors);
+    const offered = normalizeStartFloors(offeredFloors);
+    const buyable = normalizeStartFloors(buyableFloors);
+    const attempted = normalizeStartFloors(attemptedFloors);
+    const floor = START_FLOORS.find((candidate) => {
+      return selected.includes(candidate) && offered.includes(candidate) && !attempted.includes(candidate);
+    });
+
+    if (floor) {
+      return buyable.includes(floor) ? { kind: 'buy', floor } : null;
+    }
+
+    return declineAvailable ? { kind: 'decline', floor: null } : null;
   }
 
   function normalizePowerKey(value) {
@@ -179,7 +233,7 @@
   }
 
   function isStatusPotionName(value) {
-    return normalizeText(value).toLowerCase() === 'status potion';
+    return /^status potion(?:\s+(?:[x×]\s*\d+|\(\s*[x×]\s*\d+\s*\)))?$/i.test(normalizeText(value));
   }
 
   function chooseSanctuaryChoice({ hpPercent, healThreshold, hasStatus } = {}) {
@@ -302,6 +356,7 @@
         poisoned: sourceStatuses.poisoned !== false,
       },
       respectNoPotion: source.respectNoPotion !== false,
+      startFloors: normalizeStartFloors(source.startFloors),
       sanctuaryHealThreshold: clampNumber(
         source.sanctuaryHealThreshold,
         1,
@@ -398,7 +453,7 @@
       return {
         kind: 'direct',
         value: null,
-        reason: 'keine Slot-Auswahl nötig',
+        reason: 'no slot selection required',
       };
     }
 
@@ -413,9 +468,9 @@
       ? {
           kind: 'upgrade',
           value: samePowerUpgrade.value,
-          reason: `wertet ${samePowerUpgrade.name || candidate.name} von ${
-            samePowerUpgrade.rarity || 'niedrigerer Seltenheit'
-          } auf`,
+          reason: `upgrades ${samePowerUpgrade.name || candidate.name} from ${
+            samePowerUpgrade.rarity || 'a lower rarity'
+          }`,
         }
       : null;
 
@@ -431,7 +486,7 @@
       return {
         kind: 'free',
         value: freeOption.value,
-        reason: 'nutzt einen freien Power-Slot',
+        reason: 'uses a free Power slot',
       };
     }
 
@@ -458,7 +513,7 @@
         return {
           kind: 'replace-unlisted',
           value: unlistedReplacement.value,
-          reason: `ersetzt die nicht gelistete Power ${unlistedReplacement.name}`,
+          reason: `replaces the unlisted Power ${unlistedReplacement.name}`,
         };
       }
 
@@ -482,7 +537,7 @@
         return {
           kind: 'replace-lower-priority',
           value: lowerPriorityReplacement.value,
-          reason: `ersetzt die niedriger priorisierte Power ${lowerPriorityReplacement.name}`,
+          reason: `replaces the lower-priority Power ${lowerPriorityReplacement.name}`,
         };
       }
 
@@ -506,7 +561,7 @@
         return {
           kind: 'replace-lower-rarity',
           value: lowerRarityReplacement.value,
-          reason: `ersetzt die Power niedrigerer Seltenheit ${lowerRarityReplacement.name}`,
+          reason: `replaces the lower-rarity Power ${lowerRarityReplacement.name}`,
         };
       }
     }
@@ -527,9 +582,12 @@
         merchantLatchMatchesVisit,
         normalizePowerKey,
         normalizePowerWishlist,
+        normalizeStartFloors,
         orderRarityOffers,
         orderWishlistOffers,
         parseRatio,
+        parseStartFloor,
+        planStartFloorAction,
         rarityRank,
         sanitizeSettings,
         uniquePowerNames,
@@ -539,7 +597,7 @@
     return;
   }
 
-  if (!document.body?.matches('.te-run[data-tower-user][data-tower-occ]')) {
+  if (!document.body?.matches('[data-tower-user][data-tower-occ]')) {
     return;
   }
 
@@ -551,6 +609,7 @@
   const NATIVE_KEY = `tower:${towerUser}:${towerOccurrence}`;
   const STATUS_POTION_LATCH_KEY = `${SCRIPT_ID}:status-potion-latch:v1:${towerUser}:${towerOccurrence}`;
   const MERCHANT_PURCHASE_LATCH_KEY = `${SCRIPT_ID}:merchant-purchase-latch:v1:${towerUser}:${towerOccurrence}`;
+  const START_FLOOR_ATTEMPTS_KEY = `${SCRIPT_ID}:start-floor-attempts:v1:${towerUser}:${towerOccurrence}`;
 
   const runtime = {
     root: null,
@@ -573,6 +632,7 @@
     stoppingNative: false,
     statusPotionLatch: null,
     merchantPurchaseLatch: null,
+    startFloorAttempts: null,
   };
 
   let settings = loadSettings();
@@ -664,6 +724,28 @@
     } catch {
       // The in-page automation can continue even when storage is unavailable.
     }
+  }
+
+  function readStartFloorAttempts() {
+    if (runtime.startFloorAttempts) {
+      return runtime.startFloorAttempts;
+    }
+
+    runtime.startFloorAttempts = normalizeStartFloors(
+      readJson(localStorage, START_FLOOR_ATTEMPTS_KEY, []),
+    );
+
+    return runtime.startFloorAttempts;
+  }
+
+  function addStartFloorAttempt(floor) {
+    runtime.startFloorAttempts = normalizeStartFloors([...readStartFloorAttempts(), floor]);
+    writeJson(localStorage, START_FLOOR_ATTEMPTS_KEY, runtime.startFloorAttempts);
+  }
+
+  function removeStartFloorAttempt(floor) {
+    runtime.startFloorAttempts = readStartFloorAttempts().filter((candidate) => candidate !== floor);
+    writeJson(localStorage, START_FLOOR_ATTEMPTS_KEY, runtime.startFloorAttempts);
   }
 
   function readPersistentEnabled(fallback = false) {
@@ -845,34 +927,34 @@
       </button>
       <div class="tm-tower-body">
         <div class="tm-tower-grid">
-          <label>Angriff
+          <label>Attack
             <select data-setting="attack">
               <option value="slash">Slash</option>
               <option value="magic">Magic</option>
             </select>
           </label>
-          <label>Pfad
+          <label>Path
             <select data-setting="path">
-              <option value="left">Links</option>
-              <option value="right">Rechts</option>
-              <option value="random">Zufällig</option>
+              <option value="left">Left</option>
+              <option value="right">Right</option>
+              <option value="random">Random</option>
             </select>
           </label>
           <label class="tm-tower-check tm-tower-wide">
-            <input type="checkbox" data-setting="guardHeavy"> Schwere angekündigte Angriffe blocken
+            <input type="checkbox" data-setting="guardHeavy"> Block telegraphed heavy attacks
           </label>
         </div>
 
         <section class="tm-tower-section">
-          <h3>Tränke</h3>
+          <h3>Potions</h3>
           <label class="tm-tower-check">
-            <input type="checkbox" data-setting="potionEnabled"> HP-Tränke automatisch benutzen
+            <input type="checkbox" data-setting="potionEnabled"> Automatically use HP potions
           </label>
-          <label>Bei höchstens <output data-output="potionThreshold">30</output>% HP
+          <label>At or below <output data-output="potionThreshold">30</output>% HP
             <input type="range" min="1" max="99" data-setting="potionThreshold">
           </label>
           <label class="tm-tower-check">
-            <input type="checkbox" data-setting="statusPotionEnabled"> Status Potion automatisch benutzen
+            <input type="checkbox" data-setting="statusPotionEnabled"> Automatically use Status Potions
           </label>
           <div class="tm-tower-check-grid" data-status-potion-options>
             <label class="tm-tower-check">
@@ -886,31 +968,31 @@
             </label>
           </div>
           <label class="tm-tower-check">
-            <input type="checkbox" data-setting="respectNoPotion"> „Keine Tränke“-Verträge respektieren
+            <input type="checkbox" data-setting="respectNoPotion"> Respect “No Potions” contracts
           </label>
           <p class="tm-tower-help">
-            Bei niedrigem HP wird zuerst geheilt. Pro unverändertem Status wird höchstens eine Status Potion benutzt.
+            Low HP is healed first. At most one Status Potion is used while the status remains unchanged.
           </p>
         </section>
 
         <section class="tm-tower-section">
-          <h3>Fähigkeiten / Powers</h3>
-          <label>Angebote behandeln
+          <h3>Abilities / Powers</h3>
+          <label>Handle offers
             <select data-setting="powerMode">
-              <option value="wishlist">Wunschliste verwenden</option>
-              <option value="rarity">Höchste Seltenheit nehmen</option>
-              <option value="skip">Alle überspringen</option>
-              <option value="pause">Auf mich warten</option>
+              <option value="wishlist">Use wishlist</option>
+              <option value="rarity">Choose highest rarity</option>
+              <option value="skip">Skip all</option>
+              <option value="pause">Wait for me</option>
             </select>
           </label>
-          <label data-fallback-row>Wenn nichts Passendes angeboten wird
+          <label data-fallback-row>When no matching Power is offered
             <select data-setting="powerFallback">
-              <option value="pause">Auf mich warten</option>
-              <option value="skip">Angebot überspringen</option>
-              <option value="rarity">Beste sichere Power nehmen, sonst überspringen</option>
+              <option value="pause">Wait for me</option>
+              <option value="skip">Skip offer</option>
+              <option value="rarity">Choose the best safe Power, otherwise skip</option>
             </select>
           </label>
-          <label>Wunschliste – Power | gewünschte Anzahl
+          <label>Wishlist – Power | desired quantity
             <textarea
               data-setting="preferredPowers"
               spellcheck="false"
@@ -918,66 +1000,84 @@
             ></textarea>
           </label>
           <p class="tm-tower-help">
-            Eine Power pro Zeile; die Zahl nach „|“ ist ihre Zielmenge. Ohne Zahl gilt wie bisher das
-            spielseitige Maximum. Oben = höchste, strikte Priorität. Bei vollen Slots werden zuerst nicht gelistete,
-            danach nur niedriger priorisierte Powers ersetzt. Powers auf der Liste sind auch im Seltenheitsmodus
-            geschützt.
+            One Power per line; the number after “|” is its target quantity. Without a number, the game's maximum
+            applies as before. Top = highest, strict priority. When all slots are full, unlisted Powers are replaced
+            first, followed only by lower-priority Powers. Wishlist Powers are also protected in rarity mode.
           </p>
           <div class="tm-tower-actions">
-            <button class="tm-tower-button" type="button" data-add="offers">Aktuelle Angebote +</button>
-            <button class="tm-tower-button" type="button" data-add="owned">Eigene Powers +</button>
+            <button class="tm-tower-button" type="button" data-add="offers">Current offers +</button>
+            <button class="tm-tower-button" type="button" data-add="owned">Owned Powers +</button>
           </div>
         </section>
 
         <section class="tm-tower-section">
-          <h3>Vergessenes Heiligtum</h3>
-          <label>Bei höchstens <output data-output="sanctuaryHealThreshold">50</output>% HP immer heilen
+          <h3>Start Floor Unlocks</h3>
+          <div class="tm-tower-check-grid">
+            <label class="tm-tower-check">
+              <input type="checkbox" data-start-floor="10"> Floor 10
+            </label>
+            <label class="tm-tower-check">
+              <input type="checkbox" data-start-floor="20"> Floor 20
+            </label>
+            <label class="tm-tower-check">
+              <input type="checkbox" data-start-floor="30"> Floor 30
+            </label>
+          </div>
+          <p class="tm-tower-help">
+            Checked start floors are purchased when offered. With no boxes checked, the Autopilot buys no start
+            floor and declines the offer.
+          </p>
+        </section>
+
+        <section class="tm-tower-section">
+          <h3>Forgotten Sanctuary</h3>
+          <label>Always heal at or below <output data-output="sanctuaryHealThreshold">50</output>% HP
             <input type="range" min="1" max="99" data-setting="sanctuaryHealThreshold">
           </label>
           <p class="tm-tower-help">
-            Oberhalb der Grenze wird ein negativer Status gereinigt, sonst werden fehlende HP geheilt.
-            Bei vollen HP wird ein Status gereinigt oder – ohne Status – der nächste Treffer verstärkt.
-            Burned, Frozen und Poisoned werden unabhängig von der Trank-Automatik erkannt.
+            Above the threshold, a negative status is cleansed; otherwise, missing HP is healed.
+            At full HP, a status is cleansed or — without a status — the next hit is boosted.
+            Burned, Frozen, and Poisoned are detected independently of potion automation.
           </p>
         </section>
 
         <section class="tm-tower-section">
-          <h3>Reisender Abyss-Händler</h3>
-          <label>Angebot automatisch kaufen
+          <h3>Travelling Abyss Merchant</h3>
+          <label>Automatically buy offer
             <select data-setting="merchantChoice">
-              <option value="1">1 – Trank-Angebot</option>
-              <option value="2">2 – gewöhnliches Angebot</option>
-              <option value="3">3 – episches Angebot</option>
-              <option value="4">4 – legendäres Angebot</option>
+              <option value="1">1 – Potion offer</option>
+              <option value="2">2 – Common offer</option>
+              <option value="3">3 – Epic offer</option>
+              <option value="4">4 – Legendary offer</option>
             </select>
           </label>
           <p class="tm-tower-help">
-            Das gewählte Angebot wird pro Händlerbesuch genau einmal gekauft. Danach verlässt der Autopilot
-            den Händler. Ist das Angebot nicht verfügbar, wartet er sicher auf einen aktuellen Zustand.
+            The selected offer is purchased exactly once per merchant visit. The Autopilot then leaves the merchant.
+            If the offer is unavailable, it safely waits for the current state.
           </p>
         </section>
 
         <section class="tm-tower-section">
-          <h3>Weiterer Ablauf</h3>
+          <h3>General behavior</h3>
           <div class="tm-tower-grid">
-            <label class="tm-tower-wide">Unbekannte Raumentscheidung
+            <label class="tm-tower-wide">Unknown room decision
               <select data-setting="unknownDecision">
-                <option value="pause">Auf mich warten (sicher)</option>
-                <option value="first">Erste verfügbare Option wählen</option>
+                <option value="pause">Wait for me (safe)</option>
+                <option value="first">Choose first available option</option>
               </select>
             </label>
-            <label class="tm-tower-wide">Pause zwischen Aktionen (ms)
+            <label class="tm-tower-wide">Delay between actions (ms)
               <input type="number" min="750" max="5000" step="50" data-setting="actionDelayMs">
             </label>
           </div>
-          <p class="tm-tower-help">„Erste Option“ kann auch eine kostenpflichtige oder nachteilige Raumwahl treffen. Standardmäßig wartet der Autopilot bei unbekannten Entscheidungen.</p>
+          <p class="tm-tower-help">“First option” may also select a costly or disadvantageous room choice. By default, the Autopilot waits at unknown decisions.</p>
         </section>
 
         <div class="tm-tower-actions">
-          <button class="tm-tower-button tm-tower-primary" type="button" data-action="start">Dauerbetrieb aktivieren</button>
-          <button class="tm-tower-button" type="button" data-action="stop">Dauerbetrieb stoppen</button>
+          <button class="tm-tower-button tm-tower-primary" type="button" data-action="start">Start Autopilot</button>
+          <button class="tm-tower-button" type="button" data-action="stop">Stop Autopilot</button>
         </div>
-        <p class="tm-tower-help">Nach dem Aktivieren läuft der Autopilot über Gegnerwechsel und Seiten-Neuladungen hinweg weiter, bis du ihn stoppst.</p>
+        <p class="tm-tower-help">Once enabled, the Autopilot continues across enemy changes and page reloads until you stop it.</p>
         <p class="tm-tower-status" role="status" aria-live="polite"></p>
       </div>
     `;
@@ -1057,6 +1157,14 @@
       }
     }
 
+    for (const floor of START_FLOORS) {
+      const element = runtime.root.querySelector(`[data-start-floor="${floor}"]`);
+
+      if (element) {
+        element.checked = settings.startFloors.includes(floor);
+      }
+    }
+
     runtime.root.classList.toggle('tm-collapsed', settings.collapsed);
     runtime.root.querySelector('.tm-tower-head')?.setAttribute('aria-expanded', String(!settings.collapsed));
     updatePowerModeUi();
@@ -1098,6 +1206,9 @@
         poisoned: !!getSettingElement('statusPotionPoisoned')?.checked,
       },
       respectNoPotion: !!getSettingElement('respectNoPotion')?.checked,
+      startFloors: START_FLOORS.filter((floor) => {
+        return !!runtime.root?.querySelector(`[data-start-floor="${floor}"]`)?.checked;
+      }),
       sanctuaryHealThreshold: getSettingElement('sanctuaryHealThreshold')?.value,
       merchantChoice: getSettingElement('merchantChoice')?.value,
       path: getSettingElement('path')?.value,
@@ -1141,13 +1252,13 @@
     const body = runtime.root.querySelector('.tm-tower-body');
 
     body?.addEventListener('input', (event) => {
-      if (event.target.matches('[data-setting]')) {
+      if (event.target.matches('[data-setting], [data-start-floor]')) {
         readSettingsFromUi();
       }
     });
 
     body?.addEventListener('change', (event) => {
-      if (event.target.matches('[data-setting]')) {
+      if (event.target.matches('[data-setting], [data-start-floor]')) {
         readSettingsFromUi();
         renderSettings();
       }
@@ -1155,7 +1266,7 @@
 
     runtime.root.querySelector('[data-action="start"]')?.addEventListener('click', enableAutomation);
     runtime.root.querySelector('[data-action="stop"]')?.addEventListener('click', () => {
-      stopAutomation('Autopilot gestoppt.');
+      stopAutomation('Autopilot stopped.');
     });
 
     runtime.root.querySelectorAll('[data-add]').forEach((button) => {
@@ -1181,14 +1292,14 @@
     }
 
     if (mergedEntries.length === settings.preferredPowers.length) {
-      setStatus(source === 'owned' ? 'Keine neuen eigenen Powers gefunden.' : 'Keine neuen Angebote gefunden.', 'warning');
+      setStatus(source === 'owned' ? 'No new owned Powers found.' : 'No new offers found.', 'warning');
       return;
     }
 
     settings.preferredPowers = mergedEntries;
     saveSettings();
     renderSettings();
-    setStatus('Wunschliste ergänzt. Neue Einträge haben die Zielmenge 1.', 'success');
+    setStatus('Wishlist updated. New entries have a target quantity of 1.', 'success');
     scheduleStep(50);
   }
 
@@ -1215,10 +1326,10 @@
       status.textContent =
         runtime.status ||
         (runtime.running
-          ? 'Dauerbetrieb läuft.'
+          ? 'Autopilot is running.'
           : runtime.enabled
-            ? 'Dauerbetrieb ist aktiv und wartet.'
-            : 'Bereit.');
+            ? 'Autopilot is enabled and waiting.'
+            : 'Ready.');
     }
 
     if (startButton) {
@@ -1251,7 +1362,7 @@
     runtime.missingRunSince = 0;
     runtime.reacquireWhenRunAppears = false;
     stopNativeAuto();
-    setStatus('Dauerbetrieb läuft. Aktueller Tower-Zustand wird geprüft.', 'success');
+    setStatus('Autopilot is running. Checking the current Tower state.', 'success');
     // Give storage listeners in other open tabs enough time to stop their
     // native auto-runner before this owner sends its first action.
     scheduleStep(settings.actionDelayMs);
@@ -1269,7 +1380,7 @@
     if (!navigator.locks?.request) {
       persistEnabled(false);
       setStatus(
-        'Dieser Browser unterstützt keinen sicheren Tab-Lock. Dauerbetrieb wurde nicht gestartet.',
+        'This browser does not support a secure tab lock. Autopilot was not started.',
         'error',
       );
       return;
@@ -1277,7 +1388,7 @@
 
     runtime.starting = true;
     const generation = ++runtime.lockGeneration;
-    setStatus('Dauerbetrieb aktiv. Exklusiver Tower-Tab wird geprüft …', 'neutral');
+    setStatus('Autopilot enabled. Checking the exclusive Tower tab …', 'neutral');
 
     navigator.locks
       .request(
@@ -1295,7 +1406,7 @@
 
           if (!lock) {
             setStatus(
-              'Dauerbetrieb ist aktiv, läuft aber bereits in einem anderen Tower-Tab. Diesen Tab neu laden, wenn er übernehmen soll.',
+              'Autopilot is enabled, but is already running in another Tower tab. Reload this tab if it should take over.',
               'warning',
             );
             return;
@@ -1329,7 +1440,7 @@
         console.error('[Demonic Tower Autopilot] Could not acquire the tab lock.', error);
         runtime.starting = false;
         persistEnabled(false);
-        setStatus('Der exklusive Tower-Tab konnte nicht reserviert werden. Dauerbetrieb wurde gestoppt.', 'error');
+        setStatus('The exclusive Tower tab could not be reserved. Autopilot was stopped.', 'error');
       });
   }
 
@@ -1395,7 +1506,7 @@
     const pending = getNativePendingRequest();
 
     if (!retry || retry.hidden || !pending) {
-      stopAutomation('Der Tower meldet einen unklaren Request ohne sichere Retry-Daten. Bitte manuell prüfen.', 'error');
+      stopAutomation('The Tower reports an indeterminate request without safe retry data. Please check manually.', 'error');
       return;
     }
 
@@ -1404,19 +1515,19 @@
     if (fingerprint !== runtime.lastRetryFingerprint) {
       runtime.lastRetryFingerprint = fingerprint;
       runtime.retryStartedAt = Date.now();
-      setStatus('Verbindung war unklar. Wiederhole die gespeicherte Aktion einmal sicher …', 'warning');
+      setStatus('The connection result was unclear. Safely retrying the stored action once …', 'warning');
       retry.click();
       scheduleStep(500);
       return;
     }
 
     if (nativeTransportIsBusy() || Date.now() - runtime.retryStartedAt < RETRY_TIMEOUT_MS) {
-      setStatus('Warte auf das Ergebnis der sicher wiederholten Aktion …', 'warning');
+      setStatus('Waiting for the safely retried action to finish …', 'warning');
       scheduleStep(500);
       return;
     }
 
-    stopAutomation('Auch der sichere Retry blieb unklar. Dauerbetrieb wurde zur Sicherheit gestoppt.', 'error');
+    stopAutomation('The safe retry was also inconclusive. Autopilot was stopped for safety.', 'error');
   }
 
   function getSubmitter(form) {
@@ -1450,24 +1561,24 @@
     // the shared flag again immediately before every irreversible action.
     if (!readPersistentEnabled(runtime.enabled)) {
       runtime.enabled = false;
-      stopAutomation('Dauerbetrieb wurde in einem anderen Tab gestoppt.', 'warning', { disable: false });
+      stopAutomation('Autopilot was stopped in another tab.', 'warning', { disable: false });
       return;
     }
 
     if (nativeRequestIsBusy()) {
-      setStatus('Tower verarbeitet bereits eine Aktion …', 'neutral');
+      setStatus('The Tower is already processing an action …', 'neutral');
       scheduleStep(300);
       return;
     }
 
     if (!formIsUsable(form)) {
-      setStatus('Die geplante Aktion ist nicht mehr verfügbar. Warte auf den aktuellen Tower-Zustand.', 'warning');
+      setStatus('The planned action is no longer available. Waiting for the current Tower state.', 'warning');
       scheduleStep(500);
       return;
     }
 
     if (!form.reportValidity()) {
-      stopAutomation('Die geplante Aktion enthält noch eine ungültige Auswahl. Bitte manuell prüfen.', 'error');
+      stopAutomation('The planned action still contains an invalid selection. Please check manually.', 'error');
       return;
     }
 
@@ -1477,8 +1588,8 @@
       const errorText = normalizeText(form.querySelector('.te-form-error:not([hidden])')?.textContent);
       stopAutomation(
         errorText
-          ? `Tower hat die Aktion abgelehnt: ${errorText}`
-          : 'Die letzte Aktion wurde nicht durch einen neuen Tower-Zustand bestätigt. Bitte manuell prüfen.',
+          ? `The Tower rejected the action: ${errorText}`
+          : 'The last action was not confirmed by a new Tower state. Please check manually.',
         'error',
       );
       return;
@@ -1501,14 +1612,14 @@
     } catch (error) {
       decision.onSubmitRejected?.();
       console.error('[Demonic Tower Autopilot] Could not submit action.', error);
-      stopAutomation('Die Aktion konnte nicht abgesendet werden. Details stehen in der Konsole.', 'error');
+      stopAutomation('The action could not be submitted. Details are available in the console.', 'error');
       return;
     }
 
     window.queueMicrotask(() => {
       if (runtime.running && form.isConnected && !nativeRequestIsBusy()) {
         decision.onSubmitRejected?.();
-        stopAutomation('Der native Tower-Handler hat die Aktion nicht übernommen. Bitte Seite neu laden.', 'error');
+        stopAutomation('The native Tower handler did not accept the action. Please reload the page.', 'error');
       }
     });
 
@@ -1596,7 +1707,7 @@
 
       return {
         form: offer.form,
-        label: `Wähle ${offer.name}${rarity}: ${placement.reason}.`,
+        label: `Choose ${offer.name}${rarity}: ${placement.reason}.`,
       };
     }
 
@@ -1609,30 +1720,30 @@
     if (!formIsUsable(form)) {
       return {
         kind: 'wait',
-        message: 'Power-Angebot kann derzeit weder gewählt noch übersprungen werden.',
+        message: 'The Power offer currently cannot be selected or skipped.',
       };
     }
 
     return {
       kind: 'submit',
       form,
-      label: reason || 'Überspringe das aktuelle Power-Angebot.',
+      label: reason || 'Skip the current Power offer.',
     };
   }
 
   function decidePower() {
     const offers = readPowerOffers();
-    const offeredNames = offers.map((offer) => offer.name).join(', ') || 'keine wählbare Power';
+    const offeredNames = offers.map((offer) => offer.name).join(', ') || 'no selectable Power';
 
     if (settings.powerMode === 'pause') {
       return {
         kind: 'wait',
-        message: `Warte auf deine Power-Auswahl. Angeboten: ${offeredNames}.`,
+        message: `Waiting for your Power selection. Offered: ${offeredNames}.`,
       };
     }
 
     if (settings.powerMode === 'skip') {
-      return getSkipPowerDecision('Überspringe das Power-Angebot wie eingestellt.');
+      return getSkipPowerDecision('Skip the Power offer as configured.');
     }
 
     if (settings.powerMode === 'rarity') {
@@ -1640,7 +1751,7 @@
 
       return rarityChoice
         ? { kind: 'submit', ...rarityChoice }
-        : getSkipPowerDecision('Keine Power kann sicher verbessert oder hinzugefügt werden; überspringe das Angebot.');
+        : getSkipPowerDecision('No Power can be safely upgraded or added; skipping the offer.');
     }
 
     const wishlistChoice = planPowerChoice(offers, 'wishlist');
@@ -1653,7 +1764,7 @@
     }
 
     if (settings.powerFallback === 'skip') {
-      return getSkipPowerDecision(`Keine passende Wunschlisten-Power angeboten (${offeredNames}); überspringe.`);
+      return getSkipPowerDecision(`No matching wishlist Power offered (${offeredNames}); skipping.`);
     }
 
     if (settings.powerFallback === 'rarity') {
@@ -1661,12 +1772,12 @@
 
       return rarityChoice
         ? { kind: 'submit', ...rarityChoice }
-        : getSkipPowerDecision('Keine sichere Ersatzwahl möglich; überspringe das Power-Angebot.');
+        : getSkipPowerDecision('No safe replacement selection is possible; skipping the Power offer.');
     }
 
     return {
       kind: 'wait',
-      message: `Keine nutzbare Wunschlisten-Power angeboten. Warte auf dich. Angeboten: ${offeredNames}.`,
+      message: `No usable wishlist Power offered. Waiting for you. Offered: ${offeredNames}.`,
     };
   }
 
@@ -1678,7 +1789,7 @@
     if (!available.length) {
       return {
         kind: 'wait',
-        message: 'Warte auf verfügbare Pfadoptionen.',
+        message: 'Waiting for available path options.',
       };
     }
 
@@ -1693,7 +1804,7 @@
     return {
       kind: 'submit',
       form,
-      label: `Wähle den Pfad „${form.dataset.choice || selectedPath}“.`,
+      label: `Choose the “${form.dataset.choice || selectedPath}” path.`,
     };
   }
 
@@ -1703,6 +1814,235 @@
     return [...content.querySelectorAll('section.te-panel.te-choice')].filter((panel) => {
       return !panel.closest('[hidden], [aria-hidden="true"]');
     });
+  }
+
+  function normalizeSemanticText(value) {
+    return normalizeText(value)
+      .replace(/[_-]+/g, ' ')
+      .toLowerCase();
+  }
+
+  function getFormControlText(form) {
+    const datasetValues = Object.entries(form.dataset).flatMap(([name, value]) => [name, value]);
+    const hiddenValues = [...form.querySelectorAll('input[name]')].flatMap((input) => {
+      const name = String(input.name || '');
+
+      return /^(?:action|choice|start[_-]?floor|starting[_-]?floor|floor|checkpoint)$/i.test(name)
+        ? [name, input.value]
+        : [];
+    });
+    const submitter = getSubmitter(form);
+
+    return normalizeSemanticText([
+      ...datasetValues,
+      ...hiddenValues,
+      submitter?.textContent,
+      submitter?.value,
+      submitter?.getAttribute('aria-label'),
+      submitter?.getAttribute('title'),
+    ].filter(Boolean).join(' '));
+  }
+
+  function getStartFloorFormIntent(form) {
+    const controlText = getFormControlText(form);
+    const declinePattern = /\b(?:skip|decline|leave|continue|later|cancel|no)\b|\bdo\s+not\b|\bdon't\b/i;
+    const buyPattern = /\b(?:buy|purchase|unlock|acquire|confirm|yes)\b/i;
+
+    if (declinePattern.test(controlText)) {
+      return 'decline';
+    }
+
+    if (buyPattern.test(controlText)) {
+      return 'buy';
+    }
+
+    const cardText = normalizeSemanticText(
+      form.closest('article, li, .te-card, .te-choice-card')?.textContent,
+    );
+
+    return buyPattern.test(cardText) ? 'buy' : '';
+  }
+
+  function getKnownStartFloor(value) {
+    const floor = Number(value);
+
+    return START_FLOORS.includes(floor) ? floor : null;
+  }
+
+  function readCurrentStartFloor() {
+    const state = document.getElementById('te-run-state');
+    const directValues = [
+      state?.dataset.floor,
+      state?.dataset.currentFloor,
+      state?.dataset.level,
+      document.body.dataset.floor,
+      document.body.dataset.currentFloor,
+    ];
+
+    for (const value of directValues) {
+      const floor = getKnownStartFloor(value);
+
+      if (floor) {
+        return floor;
+      }
+    }
+
+    const floorElement = document.querySelector('.te-floor, [data-current-floor], [data-start-floor-offer]');
+
+    return (
+      getKnownStartFloor(floorElement?.dataset.currentFloor) ||
+      getKnownStartFloor(floorElement?.dataset.startFloorOffer) ||
+      parseStartFloor(floorElement?.textContent)
+    );
+  }
+
+  function readStartFloorFromForm(form, panelFloor) {
+    const container = form.closest('[data-start-floor], [data-floor], [data-checkpoint]');
+    const directValues = [
+      form.dataset.startFloor,
+      form.dataset.floor,
+      form.dataset.checkpoint,
+      container?.dataset.startFloor,
+      container?.dataset.floor,
+      container?.dataset.checkpoint,
+    ];
+
+    for (const value of directValues) {
+      const floor = getKnownStartFloor(value);
+
+      if (floor) {
+        return floor;
+      }
+    }
+
+    for (const input of form.querySelectorAll('input[name]')) {
+      if (!/(?:start.*floor|floor.*start|^floor$|checkpoint)/i.test(input.name)) {
+        continue;
+      }
+
+      const floor = getKnownStartFloor(input.value) || parseStartFloor(`${input.name} ${input.value}`);
+
+      if (floor) {
+        return floor;
+      }
+    }
+
+    const cardText = form.closest('article, li, .te-card, .te-choice-card')?.textContent;
+
+    return parseStartFloor(getFormControlText(form)) || parseStartFloor(cardText) || panelFloor;
+  }
+
+  function findStartFloorPanel() {
+    const content = document.getElementById('te-content') || document;
+    const panels = [...content.querySelectorAll('section.te-panel')].filter((panel) => {
+      return !panel.closest('[hidden], [aria-hidden="true"]');
+    });
+
+    return panels.find((panel) => {
+      const forms = [...panel.querySelectorAll('form')];
+      const panelText = normalizeSemanticText([
+        panel.querySelector('h2')?.textContent,
+        panel.querySelector('.te-eyebrow')?.textContent,
+        panel.textContent,
+        ...Object.entries(panel.dataset).flatMap(([name, value]) => [name, value]),
+      ].filter(Boolean).join(' '));
+      const hasStartFloorContext = /\b(?:start(?:ing)?\s*floors?|floors?\s*starts?|checkpoint)\b/i.test(
+        panelText,
+      );
+
+      if (!hasStartFloorContext) {
+        return false;
+      }
+
+      const panelFloor = parseStartFloor(panelText) || readCurrentStartFloor();
+
+      return !!panelFloor || forms.some((form) => readStartFloorFromForm(form, null) !== null);
+    });
+  }
+
+  function decideStartFloor(panel) {
+    const forms = [...panel.querySelectorAll('form')];
+    const panelFloor =
+      parseStartFloor(
+        [panel.querySelector('h2')?.textContent, panel.querySelector('p')?.textContent]
+          .filter(Boolean)
+          .join(' '),
+      ) || readCurrentStartFloor();
+    const buyOffers = [];
+    const declineForms = [];
+
+    for (const form of forms) {
+      const intent = getStartFloorFormIntent(form);
+
+      if (intent === 'decline') {
+        if (formIsUsable(form)) {
+          declineForms.push(form);
+        }
+        continue;
+      }
+
+      if (intent !== 'buy') {
+        continue;
+      }
+
+      const floor = readStartFloorFromForm(form, panelFloor);
+
+      if (floor) {
+        buyOffers.push({ floor, form, usable: formIsUsable(form) });
+      }
+    }
+
+    const offeredFloors = normalizeStartFloors([
+      ...buyOffers.map((offer) => offer.floor),
+      ...(panelFloor ? [panelFloor] : []),
+    ]);
+
+    if (settings.startFloors.length && !offeredFloors.length) {
+      return {
+        kind: 'wait',
+        message: 'A Start Floor offer was detected, but its floor could not be identified safely.',
+      };
+    }
+
+    const plan = planStartFloorAction({
+      selectedFloors: settings.startFloors,
+      offeredFloors,
+      buyableFloors: buyOffers.filter((offer) => offer.usable).map((offer) => offer.floor),
+      attemptedFloors: readStartFloorAttempts(),
+      declineAvailable: declineForms.length === 1,
+    });
+
+    if (!plan) {
+      return {
+        kind: 'wait',
+        message: 'The configured Start Floor action is currently unavailable or ambiguous.',
+      };
+    }
+
+    if (plan.kind === 'decline') {
+      return {
+        kind: 'submit',
+        form: declineForms[0],
+        label: 'Decline the Start Floor purchase.',
+      };
+    }
+
+    const matchingOffers = buyOffers.filter((offer) => offer.floor === plan.floor && offer.usable);
+
+    if (matchingOffers.length !== 1) {
+      return {
+        kind: 'wait',
+        message: `The Floor ${plan.floor} purchase form is unavailable or ambiguous.`,
+      };
+    }
+
+    return {
+      kind: 'submit',
+      form: matchingOffers[0].form,
+      label: `Buy the Floor ${plan.floor} start-floor unlock.`,
+      onSubmitting: () => addStartFloorAttempt(plan.floor),
+      onSubmitRejected: () => removeStartFloorAttempt(plan.floor),
+    };
   }
 
   function findSanctuaryPanel() {
@@ -1736,7 +2076,7 @@
     if (!choice) {
       return {
         kind: 'wait',
-        message: 'Die HP für die Entscheidung im vergessenen Heiligtum konnten nicht gelesen werden.',
+        message: 'HP could not be read for the Forgotten Sanctuary decision.',
       };
     }
 
@@ -1747,15 +2087,15 @@
     if (!form) {
       return {
         kind: 'wait',
-        message: `Die benötigte Heiligtum-Option „${choice}“ ist gerade nicht verfügbar.`,
+        message: `The required Sanctuary option “${choice}” is currently unavailable.`,
       };
     }
 
     const roundedHp = Math.round(Number(hpPercent));
     const labels = {
-      heal: `Heile im vergessenen Heiligtum HP bei ${roundedHp}% HP.`,
-      cleanse: `Reinige im vergessenen Heiligtum den Status ${STATUS_LABELS[matchedStatus] || matchedStatus}.`,
-      blessing: 'Wähle im vergessenen Heiligtum +35% Schaden für den nächsten Treffer.',
+      heal: `Heal HP in the Forgotten Sanctuary at ${roundedHp}% HP.`,
+      cleanse: `Cleanse ${STATUS_LABELS[matchedStatus] || matchedStatus} in the Forgotten Sanctuary.`,
+      blessing: 'Choose +35% damage for the next hit in the Forgotten Sanctuary.',
     };
 
     return {
@@ -1808,7 +2148,7 @@
     if (purchaseLatch && action !== 'leave') {
       return {
         kind: 'wait',
-        message: 'Der Händlerkauf wurde bereits ausgelöst. Warte auf die Option zum Verlassen.',
+        message: 'The merchant purchase has already been triggered. Waiting for the option to leave.',
       };
     }
 
@@ -1818,7 +2158,7 @@
     if (!form) {
       return {
         kind: 'wait',
-        message: `Händler-Angebot ${position} (${targetChoice || 'unbekannt'}) ist gerade nicht verfügbar.`,
+        message: `Merchant offer ${position} (${targetChoice || 'unknown'}) is currently unavailable.`,
       };
     }
 
@@ -1826,18 +2166,18 @@
       return {
         kind: 'submit',
         form,
-        label: 'Der Händlerkauf wurde bereits ausgelöst; verlasse den Händler.',
+        label: 'The merchant purchase has already been triggered; leave the merchant.',
       };
     }
 
     const card = form.closest('.te-cards article');
-    const itemName = normalizeText(card?.querySelector('h3')?.textContent) || `Angebot ${position}`;
+    const itemName = normalizeText(card?.querySelector('h3')?.textContent) || `Offer ${position}`;
     const price = normalizeText(card?.querySelector('p')?.textContent);
 
     return {
       kind: 'submit',
       form,
-      label: `Kaufe Händler-Angebot ${position}: ${itemName}${price ? ` (${price})` : ''}.`,
+      label: `Buy merchant offer ${position}: ${itemName}${price ? ` (${price})` : ''}.`,
       onSubmitting: () => writeMerchantPurchaseLatch(action, form),
       onSubmitRejected: clearMerchantPurchaseLatch,
     };
@@ -1847,7 +2187,7 @@
     if (settings.unknownDecision !== 'first') {
       return {
         kind: 'wait',
-        message: `Warte auf deine Entscheidung für „${pendingType}“.`,
+        message: `Waiting for your decision for “${pendingType}”.`,
       };
     }
 
@@ -1860,7 +2200,7 @@
     if (!form) {
       return {
         kind: 'wait',
-        message: `Keine sichere Formularoption für „${pendingType}“ gefunden; warte auf dich.`,
+        message: `No safe form option found for “${pendingType}”; waiting for you.`,
       };
     }
 
@@ -1869,7 +2209,7 @@
     return {
       kind: 'submit',
       form,
-      label: `Wähle die erste Option für „${pendingType}“${buttonText ? `: ${buttonText}` : ''}.`,
+      label: `Choose the first option for “${pendingType}”${buttonText ? `: ${buttonText}` : ''}.`,
     };
   }
 
@@ -1884,20 +2224,19 @@
       state?.dataset.status,
       state?.dataset.playerStatus,
     ].filter(Boolean);
-
-    if (stateCandidates.length) {
-      return normalizeText(stateCandidates.join(' '));
-    }
-
     const statusElement = document.getElementById('playerStatusText');
     const towerStatusElement = document.querySelector('.te-player-status, [data-player-status-text]');
+    const playerStatusSummaries = [
+      ...document.querySelectorAll('.te-player-stats .te-status-list .te-status > summary'),
+    ];
     const fallbackCandidates = [
       statusElement?.textContent,
       towerStatusElement?.dataset.playerStatusText,
       towerStatusElement?.textContent,
+      ...playerStatusSummaries.map((summary) => summary.textContent),
     ];
 
-    return normalizeText(fallbackCandidates.filter(Boolean).join(' '));
+    return normalizeText([...stateCandidates, ...fallbackCandidates].filter(Boolean).join(' '));
   }
 
   function findStatusPotionForm() {
@@ -1953,7 +2292,7 @@
         return {
           kind: 'submit',
           form: potionForm,
-          label: `Benutze einen HP-Trank bei ${hpPercent}% HP.`,
+          label: `Use an HP potion at ${hpPercent}% HP.`,
         };
       }
     }
@@ -1967,8 +2306,8 @@
         return {
           kind: 'wait',
           message:
-            `Für ${STATUS_LABELS[matchedStatus]} wurde bereits eine Status Potion benutzt. ` +
-            'Warte, bis sich der Status ändert, damit keine weiteren Tränke verbraucht werden.',
+            `A Status Potion has already been used for ${STATUS_LABELS[matchedStatus]}. ` +
+            'Waiting for the status to change so no additional potions are consumed.',
         };
       }
 
@@ -1978,7 +2317,7 @@
         return {
           kind: 'submit',
           form: statusPotionForm,
-          label: `Benutze eine Status Potion gegen ${STATUS_LABELS[matchedStatus]}.`,
+          label: `Use a Status Potion against ${STATUS_LABELS[matchedStatus]}.`,
           onSubmitting: () => writeStatusPotionLatch(matchedStatus),
           onSubmitRejected: clearStatusPotionLatch,
         };
@@ -1994,25 +2333,30 @@
     if (!form) {
       return {
         kind: 'wait',
-        message: `Die Aktion „${attack}“ ist gerade nicht verfügbar.`,
+        message: `The “${attack}” action is currently unavailable.`,
       };
     }
 
     const potionNote =
       (potionWanted || matchedStatus) && contractBlocksPotion
-        ? ' Der aktive „Keine Tränke“-Vertrag wird respektiert.'
+        ? ' The active “No Potions” contract is being respected.'
         : statusPotionMissing
-          ? ` Keine nutzbare Status Potion gegen ${STATUS_LABELS[matchedStatus]} gefunden.`
+          ? ` No usable Status Potion against ${STATUS_LABELS[matchedStatus]} was found.`
           : '';
 
     return {
       kind: 'submit',
       form,
-      label: `${shouldGuard ? 'Blocke den angekündigten schweren Angriff' : `Greife mit ${settings.attack} an`}.${potionNote}`,
+      label: `${shouldGuard ? 'Block the telegraphed heavy attack' : `Attack with ${settings.attack}`}.${potionNote}`,
     };
   }
 
   function decideNextAction(state) {
+    const startFloorPanel = findStartFloorPanel();
+    if (startFloorPanel) {
+      return decideStartFloor(startFloorPanel);
+    }
+
     const merchantPanel = findMerchantPanel();
     if (merchantPanel) {
       return decideMerchant(merchantPanel);
@@ -2055,7 +2399,7 @@
     }
 
     if (nativeRequestIsBusy()) {
-      setStatus('Tower verarbeitet die letzte Aktion …', 'neutral');
+      setStatus('The Tower is processing the last action …', 'neutral');
       scheduleStep(300);
       return;
     }
@@ -2063,17 +2407,40 @@
     const state = document.getElementById('te-run-state');
 
     if (!state) {
+      const startFloorPanel = findStartFloorPanel();
+
+      if (startFloorPanel) {
+        runtime.missingRunSince = 0;
+        const remainingDelay = settings.actionDelayMs - (Date.now() - runtime.lastActionAt);
+
+        if (remainingDelay > 0) {
+          scheduleStep(remainingDelay);
+          return;
+        }
+
+        const decision = decideStartFloor(startFloorPanel);
+
+        if (decision.kind === 'submit') {
+          submitDecision(decision);
+          return;
+        }
+
+        setStatus(decision.message || 'Waiting for the next Start Floor state.', 'warning');
+        scheduleStep(850);
+        return;
+      }
+
       runtime.missingRunSince ||= Date.now();
 
       if (Date.now() - runtime.missingRunSince >= MISSING_RUN_GRACE_MS) {
         runtime.reacquireWhenRunAppears = true;
-        stopAutomation('Kein aktiver Tower-Run gefunden. Dauerbetrieb wartet auf einen neuen Run.', 'warning', {
+        stopAutomation('No active Tower run found. Autopilot is waiting for a new run.', 'warning', {
           disable: false,
         });
         return;
       }
 
-      setStatus('Dauerbetrieb aktiv. Warte auf einen aktiven Tower-Run …', 'warning');
+      setStatus('Autopilot enabled. Waiting for an active Tower run …', 'warning');
       scheduleStep(1000);
       return;
     }
@@ -2099,7 +2466,7 @@
       return;
     }
 
-    setStatus(decision.message || 'Warte auf den nächsten Tower-Zustand.', 'warning');
+    setStatus(decision.message || 'Waiting for the next Tower state.', 'warning');
     scheduleStep(850);
   }
 
@@ -2116,7 +2483,7 @@
         !runtime.running &&
         !runtime.starting &&
         runtime.reacquireWhenRunAppears &&
-        document.getElementById('te-run-state')
+        (document.getElementById('te-run-state') || findStartFloorPanel())
       ) {
         tryStartAutomation();
         return;
@@ -2149,16 +2516,16 @@
       const nativeStop = event.target.closest?.('#te-auto-stop');
 
       if (runtime.enabled && nativeStart) {
-        stopAutomation('Native Auto-Battle gestartet; der Autopilot wurde gestoppt.', 'warning');
+        stopAutomation('Native Auto-Battle started; the Autopilot was stopped.', 'warning');
       } else if (runtime.enabled && nativeStop && !runtime.stoppingNative) {
-        stopAutomation('Autopilot über den nativen Stop-Button gestoppt.', 'warning');
+        stopAutomation('Autopilot stopped via the native Stop button.', 'warning');
       }
     },
     true,
   );
 
   window.addEventListener('pagehide', (event) => {
-    stopAutomation('Tower-Seite verlassen; Tab-Lock wurde freigegeben.', 'neutral', { disable: false });
+    stopAutomation('Tower page left; tab lock released.', 'neutral', { disable: false });
 
     if (!event.persisted) {
       runtime.observer?.disconnect();
@@ -2174,14 +2541,25 @@
     updateRuntimeUi();
 
     if (runtime.enabled) {
-      setStatus('Aktualisiere den Tower-Zustand nach der Rückkehr …', 'neutral');
+      setStatus('Refreshing the Tower state after returning …', 'neutral');
       window.location.reload();
     } else {
-      setStatus('Bereit. Einmal aktivieren; danach läuft der Autopilot selbstständig weiter.');
+      setStatus('Ready. Enable once; the Autopilot will then continue on its own.');
     }
   });
 
   window.addEventListener('storage', (event) => {
+    if (event.key === START_FLOOR_ATTEMPTS_KEY) {
+      try {
+        const attempts = event.newValue === null ? [] : JSON.parse(event.newValue);
+        runtime.startFloorAttempts = normalizeStartFloors(attempts);
+      } catch {
+        runtime.startFloorAttempts = [];
+      }
+
+      return;
+    }
+
     if (event.key === STATUS_POTION_LATCH_KEY) {
       try {
         const latch = event.newValue === null ? null : JSON.parse(event.newValue);
@@ -2214,20 +2592,20 @@
 
     if (!enabled) {
       runtime.enabled = false;
-      stopAutomation('Dauerbetrieb wurde in einem anderen Tab gestoppt.', 'warning', { disable: false });
+      stopAutomation('Autopilot was stopped in another tab.', 'warning', { disable: false });
       return;
     }
 
     runtime.enabled = true;
     updateRuntimeUi();
     stopNativeAuto();
-    setStatus('Dauerbetrieb wurde in einem anderen Tab aktiviert. Dieser Tab bleibt im Standby.', 'neutral');
+    setStatus('Autopilot was enabled in another tab. This tab will remain on standby.', 'neutral');
   });
 
   if (runtime.enabled) {
-    setStatus('Gespeicherter Dauerbetrieb wird automatisch fortgesetzt …', 'success');
+    setStatus('Automatically resuming the saved Autopilot state …', 'success');
     tryStartAutomation();
   } else {
-    setStatus('Bereit. Einmal aktivieren; danach läuft der Autopilot selbstständig weiter.');
+    setStatus('Ready. Enable once; the Autopilot will then continue on its own.');
   }
 })();
