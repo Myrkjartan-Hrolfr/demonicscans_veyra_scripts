@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Demonic Tower Autopilot
 // @namespace    local.demonicscans.tower
-// @version      1.11.1
+// @version      1.11.3
 // @description  Automates Demonic Tower combat, events, quests, companions, boss preparations, start floors, potions, paths, and powers.
 // @author       Myrkjartan Hrolfr
 // @match        https://demonicscans.org/*
@@ -13,6 +13,7 @@
   'use strict';
 
   const SCRIPT_ID = 'tm-demonic-tower-autopilot';
+  const SCRIPT_VERSION = '1.11.3';
   const SETTINGS_VERSION = 1;
   const RETRY_TIMEOUT_MS = 30000;
   const MISSING_RUN_GRACE_MS = 10000;
@@ -1531,7 +1532,7 @@
     root.id = SCRIPT_ID;
     root.innerHTML = `
       <button class="tm-tower-head" type="button" aria-expanded="true">
-        <span class="tm-tower-title"><span class="tm-tower-dot"></span>Demonic Tower Autopilot</span>
+        <span class="tm-tower-title"><span class="tm-tower-dot"></span>Demonic Tower Autopilot v${SCRIPT_VERSION}</span>
         <span class="tm-tower-chevron" aria-hidden="true">▾</span>
       </button>
       <div class="tm-tower-body">
@@ -1990,7 +1991,7 @@
   }
 
   function setStatus(message, tone = 'neutral') {
-    runtime.status = message;
+    runtime.status = `[v${SCRIPT_VERSION}] ${message}`;
     runtime.tone = tone;
     updateRuntimeUi();
   }
@@ -2221,7 +2222,13 @@
   }
 
   function formIsUsable(form) {
-    if (!(form instanceof HTMLFormElement) || !form.isConnected || form.closest('[hidden], [aria-hidden="true"]')) {
+    if (
+      !form ||
+      form.nodeType !== Node.ELEMENT_NODE ||
+      form.tagName !== 'FORM' ||
+      !form.isConnected ||
+      form.closest('[hidden], [aria-hidden="true"]')
+    ) {
       return false;
     }
 
@@ -3361,6 +3368,24 @@
   }
 
   function decideUnknown(pendingType) {
+    if (normalizeText(pendingType).toLowerCase() === 'dialogue') {
+      const promiseKeptPanel = [...document.querySelectorAll('section.te-panel.te-choice')].find((panel) => {
+        return normalizeText(panel.querySelector('h2')?.textContent).toLowerCase() === 'a promise kept';
+      });
+      const promiseKeptForm = promiseKeptPanel?.querySelector(
+        'form[data-action="room"][data-choice="continue"]',
+      );
+
+      if (promiseKeptForm) {
+        return {
+          kind: 'submit',
+          form: promiseKeptForm,
+          label: 'Confirm “A promise kept” and continue.',
+          onSubmitting: clearCompanionFlowLatch,
+        };
+      }
+    }
+
     if (settings.unknownDecision !== 'first') {
       return {
         kind: 'wait',
