@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Demonic Tower Autopilot
 // @namespace    local.demonicscans.tower
-// @version      1.11.0
+// @version      1.11.1
 // @description  Automates Demonic Tower combat, events, quests, companions, boss preparations, start floors, potions, paths, and powers.
 // @author       Myrkjartan Hrolfr
 // @match        https://demonicscans.org/*
@@ -2529,9 +2529,7 @@
   }
 
   function getCurrentChoicePanels() {
-    const content = document.getElementById('te-content') || document;
-
-    return [...content.querySelectorAll('section.te-panel.te-choice')].filter((panel) => {
+    return [...document.querySelectorAll('section.te-panel.te-choice')].filter((panel) => {
       return !panel.closest('[hidden], [aria-hidden="true"]');
     });
   }
@@ -3011,6 +3009,39 @@
     });
 
     return matchingPanels.length === 1 ? matchingPanels[0] : null;
+  }
+
+  function findPromiseKeptPanel() {
+    const matchingPanels = [...document.querySelectorAll('section.te-panel.te-choice')].filter((panel) => {
+      const forms = getCompanionChoiceForms(panel);
+
+      return isCompanionContinueContext({
+        latch: null,
+        panelTitle: getCompanionPanelTitle(panel),
+        panelText: panel.textContent,
+        roomChoices: forms.map((form) => form.dataset.choice),
+      });
+    });
+
+    return matchingPanels.at(-1) || null;
+  }
+
+  function decidePromiseKept(panel) {
+    const forms = getCompanionChoiceForms(panel).filter(formIsUsable);
+
+    if (forms.length !== 1 || forms[0].dataset.choice !== 'continue') {
+      return {
+        kind: 'wait',
+        message: 'The Continue action for “A promise kept” is unavailable or ambiguous.',
+      };
+    }
+
+    return {
+      kind: 'submit',
+      form: forms[0],
+      label: 'Confirm “A promise kept” and continue.',
+      onSubmitting: clearCompanionFlowLatch,
+    };
   }
 
   function decideCompanionContinue(panel) {
@@ -3500,6 +3531,11 @@
   }
 
   function decideNextAction(state) {
+    const promiseKeptPanel = findPromiseKeptPanel();
+    if (promiseKeptPanel) {
+      return decidePromiseKept(promiseKeptPanel);
+    }
+
     const startFloorPanel = findStartFloorPanel();
     if (startFloorPanel) {
       clearCompanionFlowLatch();
@@ -3595,12 +3631,15 @@
     const state = document.getElementById('te-run-state');
 
     if (!state) {
-      const startFloorPanel = findStartFloorPanel();
+      const promiseKeptPanel = findPromiseKeptPanel();
+      const startFloorPanel = promiseKeptPanel ? null : findStartFloorPanel();
       const companionRecruitmentPanel = startFloorPanel ? null : findCompanionRecruitmentPanel();
       const companionFloor19Panel =
         startFloorPanel || companionRecruitmentPanel ? null : findCompanionFloor19Panel();
 
-      if (startFloorPanel) {
+      if (promiseKeptPanel) {
+        // The dedicated result handler clears any stale companion latch on submit.
+      } else if (startFloorPanel) {
         clearCompanionFlowLatch();
         clearHpPotionFloors();
       } else if (!companionRecruitmentPanel && !companionFloor19Panel) {
@@ -3630,7 +3669,9 @@
 
       let standaloneDecision = null;
 
-      if (startFloorPanel) {
+      if (promiseKeptPanel) {
+        standaloneDecision = decidePromiseKept(promiseKeptPanel);
+      } else if (startFloorPanel) {
         standaloneDecision = decideStartFloor(startFloorPanel);
       } else if (companionRecruitmentPanel) {
         standaloneDecision = decideCompanionRecruitment(companionRecruitmentPanel);
@@ -3721,6 +3762,7 @@
         !runtime.starting &&
         runtime.reacquireWhenRunAppears &&
         (document.getElementById('te-run-state') ||
+          findPromiseKeptPanel() ||
           findStartFloorPanel() ||
           findCompanionRecruitmentPanel() ||
           findCompanionFloor19Panel() ||
