@@ -8,6 +8,7 @@ const {
   gearMatchesFilters,
   getRerollRarity,
   normalizeSearchText,
+  parseNativePendingValue,
   revisionAdvanced,
   sanitizeFilters,
 } = require('../tower_starting_gear_tools.user.js');
@@ -113,4 +114,14 @@ test('requires a newer revision before treating a reroll response as successful'
     revisionAdvanced(before, { numericMaximum: 140684, values: new Set(['140684']) }),
     false,
   );
+});
+
+test('does not mistake the Tower pending sentinel for an active request', () => {
+  assert.equal(parseNativePendingValue(null), null);
+  assert.equal(parseNativePendingValue('null'), null);
+  assert.deepEqual(parseNativePendingValue('{"url":"/tower","body":[]}'), {
+    url: '/tower',
+    body: [],
+  });
+  assert.equal(parseNativePendingValue('not-json'), null);
 });

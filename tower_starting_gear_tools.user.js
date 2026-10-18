@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Demonic Tower Starting Gear Tools
 // @namespace    local.demonicscans.tower
-// @version      1.0.0
+// @version      1.0.1
 // @description  Filters persistent Tower gear and starts the matching Merchant passive reroll from each gear card.
 // @author       Myrkjartan Hrolfr
 // @match        https://demonicscans.org/occurrence_castle.php?slug=black_crown_tower
@@ -89,6 +89,7 @@
     getRerollRarity,
     normalizeSearchText,
     normalizeText,
+    parseNativePendingValue,
     revisionAdvanced,
     sanitizeFilters,
   });
@@ -522,7 +523,19 @@
     }
 
     try {
-      return localStorage.getItem(key);
+      return parseNativePendingValue(localStorage.getItem(key));
+    } catch {
+      return null;
+    }
+  }
+
+  function parseNativePendingValue(value) {
+    if (value === null) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(value);
     } catch {
       return null;
     }
