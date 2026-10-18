@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Demonic Tower Autopilot
 // @namespace    local.demonicscans.tower
-// @version      1.7.0
+// @version      1.8.0
 // @description  Automates Demonic Tower combat, events, quests, companions, boss preparations, start floors, potions, paths, and powers.
 // @author       Myrkjartan Hrolfr
 // @match        https://demonicscans.org/*
