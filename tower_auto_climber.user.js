@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Demonic Tower Autopilot
 // @namespace    local.demonicscans.tower
-// @version      1.10.0
+// @version      1.11.0
 // @description  Automates Demonic Tower combat, events, quests, companions, boss preparations, start floors, potions, paths, and powers.
 // @author       Myrkjartan Hrolfr
 // @match        https://demonicscans.org/*
@@ -3014,8 +3014,20 @@
   }
 
   function decideCompanionContinue(panel) {
-    const latch = readCompanionFlowLatch();
+    let latch = readCompanionFlowLatch();
     const forms = getCompanionChoiceForms(panel);
+    const roomChoices = forms.map((form) => form.dataset.choice);
+    const isPromiseKept = isCompanionContinueContext({
+      latch: null,
+      panelTitle: getCompanionPanelTitle(panel),
+      panelText: panel.textContent,
+      roomChoices,
+    });
+
+    if (isPromiseKept && latch?.stage === 'continue') {
+      clearCompanionFlowLatch();
+      latch = null;
+    }
 
     if (latch?.stage === 'continue') {
       if (!companionLatchMatchesPanel(latch, forms)) {
@@ -3032,7 +3044,6 @@
       };
     }
 
-    const roomChoices = forms.map((form) => form.dataset.choice);
     const usableForms = forms.filter(formIsUsable);
     const choice = chooseCompanionContinueChoice({
       latch,
@@ -3051,19 +3062,16 @@
     }
 
     const form = matchingForms[0];
-    const companionTitle = Object.keys(COMPANION_FLOORS_BY_TITLE).find((title) => {
-      return normalizeText(panel.textContent).toLowerCase().includes(title.split(',')[0].toLowerCase());
-    });
 
     return {
       kind: 'submit',
       form,
       label: 'Continue after the Floor 19 companion decision.',
       onSubmitting: () => {
-        if (latch?.stage === 'floor19') {
+        if (isPromiseKept) {
+          clearCompanionFlowLatch();
+        } else if (latch?.stage === 'floor19') {
           writeCompanionFlowLatch('continue', latch.choice, latch.title, form);
-        } else if (companionTitle) {
-          writeCompanionFlowLatch('continue', 'defend', companionTitle, form);
         }
       },
       onSubmitRejected: () => persistCompanionFlowLatch(latch),
