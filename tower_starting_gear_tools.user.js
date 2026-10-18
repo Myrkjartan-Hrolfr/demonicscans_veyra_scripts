@@ -4,7 +4,7 @@
 // @version      1.0.0
 // @description  Filters persistent Tower gear and starts the matching Merchant passive reroll from each gear card.
 // @author       Myrkjartan Hrolfr
-// @match        https://demonicscans.org/*
+// @match        https://demonicscans.org/occurrence_castle.php?slug=black_crown_tower
 // @run-at       document-idle
 // @grant        none
 // @noframes
