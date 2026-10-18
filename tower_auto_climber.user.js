@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Demonic Tower Autopilot
 // @namespace    local.demonicscans.tower
-// @version      1.6.0
-// @description  Automates Demonic Tower combat, events, companions, boss preparations, start floors, potions, paths, and powers.
+// @version      1.7.0
+// @description  Automates Demonic Tower combat, events, quests, companions, boss preparations, start floors, potions, paths, and powers.
 // @author       Myrkjartan Hrolfr
 // @match        https://demonicscans.org/*
 // @run-at       document-idle
@@ -30,6 +30,7 @@
       poisoned: true,
     }),
     respectNoPotion: true,
+    questEnabled: true,
     companionFloor: 'none',
     companionFloor19Choice: 'defend',
     floorBossChoice: 'manual',
@@ -87,6 +88,7 @@
     'Ulgro, the Gentle Devourer': 9,
   });
   const FLOOR_BOSS_CHOICES = Object.freeze(['healing', 'armor', 'intact']);
+  const QUEST_TYPES = Object.freeze(['unchanging', 'dry_blood', 'blade_only', 'ability_lock']);
   const FLOOR_BOSS_LABELS = Object.freeze({
     healing: 'Destroy the apparatus; fight the additional elite to remove boss regeneration.',
     armor: 'Spend 60 Abyssal Coins to remove the boss’s +20% DEF enhancement.',
@@ -210,8 +212,123 @@
     return getUniqueAvailableChoice(choice, availableChoices, COMPANION_FLOOR_19_CHOICES);
   }
 
-  function chooseCompanionContinueChoice({ pending = false, roomChoices = [], availableChoices = [] } = {}) {
-    if (!pending || !hasExactChoiceSignature(roomChoices, ['continue'])) {
+  function normalizeCompanionFlowLatch(latch) {
+    if (!latch || typeof latch !== 'object') {
+      return null;
+    }
+
+    const stage = normalizeText(latch.stage).toLowerCase();
+    const choice = normalizeText(latch.choice).toLowerCase();
+    const title = normalizeText(latch.title);
+    const requestId = normalizeText(latch.requestId);
+    const revision = normalizeText(latch.revision);
+    const validChoice =
+      (stage === 'recruitment' && COMPANION_RECRUITMENT_CHOICES.includes(choice)) ||
+      (['floor19', 'continue'].includes(stage) && COMPANION_FLOOR_19_CHOICES.includes(choice));
+
+    if (
+      !validChoice ||
+      !Object.prototype.hasOwnProperty.call(COMPANION_FLOORS_BY_TITLE, title) ||
+      !requestId ||
+      !revision
+    ) {
+      return null;
+    }
+
+    return {
+      stage,
+      choice,
+      title,
+      requestId,
+      revision,
+      usedAt: Number.isFinite(Number(latch.usedAt)) ? Number(latch.usedAt) : 0,
+    };
+  }
+
+  function companionLatchMatchesVisit(latch, { requestIds = [], revisions = [] } = {}) {
+    const normalizedLatch = normalizeCompanionFlowLatch(latch);
+
+    if (!normalizedLatch) {
+      return false;
+    }
+
+    const currentRequestIds = Array.isArray(requestIds)
+      ? requestIds.map((value) => normalizeText(value)).filter(Boolean)
+      : [];
+    const currentRevisions = Array.isArray(revisions)
+      ? revisions.map((value) => normalizeText(value)).filter(Boolean)
+      : [];
+
+    if (
+      currentRequestIds.includes(normalizedLatch.requestId) ||
+      currentRevisions.includes(normalizedLatch.revision)
+    ) {
+      return true;
+    }
+
+    // Missing server tokens fail closed so a paid or destructive choice is
+    // never repeated merely because the page markup changed.
+    return !currentRequestIds.length || !currentRevisions.length;
+  }
+
+  function shouldClearCompanionFlowLatch({ latch, reportedFloor, preserveContinue = false } = {}) {
+    const normalizedLatch = normalizeCompanionFlowLatch(latch);
+
+    if (!normalizedLatch) {
+      return false;
+    }
+
+    if (normalizedLatch.stage === 'recruitment') {
+      return true;
+    }
+
+    if (normalizedLatch.stage === 'continue') {
+      return !preserveContinue;
+    }
+
+    const floorText = normalizeText(reportedFloor);
+    const floor = /^\d+$/.test(floorText) ? Number(floorText) : null;
+
+    return Number.isInteger(floor) && floor >= 1 && floor < 19;
+  }
+
+  function isCompanionContinueContext({
+    latch,
+    panelTitle,
+    panelText,
+    roomChoices = [],
+  } = {}) {
+    const normalizedLatch = normalizeCompanionFlowLatch(latch);
+
+    if (
+      !normalizedLatch ||
+      !['floor19', 'continue'].includes(normalizedLatch.stage) ||
+      !hasExactChoiceSignature(roomChoices, ['continue'])
+    ) {
+      return false;
+    }
+
+    if (
+      normalizedLatch.choice === 'defend' &&
+      normalizeText(panelTitle).toLowerCase() !== 'a promise kept'
+    ) {
+      return false;
+    }
+
+    const companionName = normalizedLatch.title.split(',')[0].toLowerCase();
+    const escapedName = companionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    return new RegExp(`\\b${escapedName}\\b`, 'i').test(normalizeText(panelText));
+  }
+
+  function chooseCompanionContinueChoice({
+    latch,
+    panelTitle,
+    panelText,
+    roomChoices = [],
+    availableChoices = [],
+  } = {}) {
+    if (!isCompanionContinueContext({ latch, panelTitle, panelText, roomChoices })) {
       return null;
     }
 
@@ -311,6 +428,117 @@
       new Set(choices).size === FLOOR_BOSS_CHOICES.length &&
       FLOOR_BOSS_CHOICES.every((choice) => choices.includes(choice))
     );
+  }
+
+  function parseQuestReward(rewardText, fallbackCoins = 0) {
+    const text = normalizeText(rewardText);
+    const coins = Number(text.match(/\b(\d+)\s+coins?\b/i)?.[1]);
+    const energy = Number(text.match(/\b(\d+)\s+(?:mutation\s+)?energy\b/i)?.[1]);
+
+    return {
+      coins: Number.isFinite(coins) ? coins : fallbackCoins,
+      energy: Number.isFinite(energy) ? energy : 0,
+    };
+  }
+
+  function classifyQuestOffer({ title, description, rewardText, choice } = {}) {
+    const normalizedTitle = normalizeText(title).toLowerCase();
+    const normalizedDescription = normalizeText(description).toLowerCase();
+    const normalizedChoice = normalizeText(choice).toLowerCase();
+    let type = '';
+    let fallbackCoins = 0;
+
+    if (
+      normalizedTitle === 'unbroken resolve' &&
+      /without replacing any power/.test(normalizedDescription)
+    ) {
+      type = 'unchanging';
+      fallbackCoins = 120;
+    } else if (
+      normalizedTitle === 'the unquenched' &&
+      /without drinking an hp potion/.test(normalizedDescription)
+    ) {
+      type = 'dry_blood';
+      fallbackCoins = 120;
+    } else if (
+      normalizedTitle === 'trial of the cleaver' &&
+      /using slash, not magic/.test(normalizedDescription)
+    ) {
+      type = 'blade_only';
+      fallbackCoins = 100;
+    } else if (
+      /\b(?:lock|locks|locked)\b/.test(normalizedDescription) &&
+      /\b(?:2|two)\b.*\b(?:ability|power)\s+slots?\b/.test(normalizedDescription) &&
+      /\b(?:3|three)\b\s+floors?\b/.test(normalizedDescription)
+    ) {
+      type = 'ability_lock';
+      fallbackCoins = 180;
+    }
+
+    if (!type || !normalizedChoice) {
+      return null;
+    }
+
+    return {
+      type,
+      title: normalizeText(title),
+      description: normalizeText(description),
+      choice: normalizedChoice,
+      ...parseQuestReward(rewardText, fallbackCoins),
+    };
+  }
+
+  function scoreQuestOffer(quest, context = {}) {
+    if (!quest || !QUEST_TYPES.includes(quest.type)) {
+      return null;
+    }
+
+    const base = quest.coins + quest.energy * 30;
+
+    switch (quest.type) {
+      case 'ability_lock':
+        return Number(context.currentFloor) === 1 ? base + 10000 : null;
+      case 'unchanging':
+        return context.wishlistEpicReady === true ? base + 5 : null;
+      case 'dry_blood':
+        if (context.hpPotionUsedRecently !== false) {
+          return null;
+        }
+        return base;
+      case 'blade_only':
+        return base;
+      default:
+        return null;
+    }
+  }
+
+  function chooseQuestOffer({ offers = [], context = {} } = {}) {
+    if (!Array.isArray(offers) || offers.length !== 2) {
+      return null;
+    }
+
+    const candidates = offers
+      .map((offer, index) => {
+        const score = scoreQuestOffer(offer, context);
+        return score === null ? null : { offer, score, index };
+      })
+      .filter(Boolean)
+      .sort((left, right) => right.score - left.score || left.index - right.index);
+
+    return candidates[0]?.offer.choice || offers.find((offer) => offer?.type === 'blade_only')?.choice || offers[0]?.choice || null;
+  }
+
+  function hasHpPotionBeenUsedRecently(usedFloors, currentFloor) {
+    const floor = Number(currentFloor);
+
+    if (!Number.isInteger(floor) || floor < 1 || !Array.isArray(usedFloors)) {
+      return null;
+    }
+
+    return usedFloors.some((usedFloor) => {
+      const value = Number(usedFloor);
+      return Number.isInteger(value) && value >= floor - 3 && value <= floor;
+    });
   }
 
   function chooseFloorBossChoice({ configuredChoice, roomChoices = [], availableChoices = [] } = {}) {
@@ -546,6 +774,7 @@
         poisoned: sourceStatuses.poisoned !== false,
       },
       respectNoPotion: source.respectNoPotion !== false,
+      questEnabled: source.questEnabled !== false,
       companionFloor: VALID_SETTINGS.companionFloor.has(String(source.companionFloor))
         ? String(source.companionFloor)
         : DEFAULTS.companionFloor,
@@ -773,21 +1002,28 @@
       module.exports = Object.freeze({
         chooseCompanionContinueChoice,
         chooseCompanionFloor19Choice,
-        chooseCompanionRecruitmentChoice,
+  chooseCompanionRecruitmentChoice,
+  chooseQuestOffer,
+  classifyQuestOffer,
+        chooseQuestOffer,
+        classifyQuestOffer,
         chooseMerchantAction,
         chooseFloorBossChoice,
         chooseSanctuaryChoice,
         choosePowerPlacement,
+        companionLatchMatchesVisit,
         formatPowerWishlist,
         getMerchantChoice,
         getCompanionRecruitmentFloor,
         hasExactChoiceSignature,
+        isCompanionContinueContext,
         isCompanionFloor19Context,
         isFloorBossDecisionContext,
         isStartFloorDecisionContext,
         isStatusPotionName,
         matchStatusEffect,
         merchantLatchMatchesVisit,
+        normalizeCompanionFlowLatch,
         normalizePowerKey,
         normalizePowerWishlist,
         normalizeStartFloors,
@@ -797,7 +1033,10 @@
         parseStartFloor,
         planStartFloorAction,
         rarityRank,
-        sanitizeSettings,
+  sanitizeSettings,
+  scoreQuestOffer,
+        scoreQuestOffer,
+        shouldClearCompanionFlowLatch,
         uniquePowerNames,
       });
     }
@@ -818,6 +1057,7 @@
   const STATUS_POTION_LATCH_KEY = `${SCRIPT_ID}:status-potion-latch:v1:${towerUser}:${towerOccurrence}`;
   const MERCHANT_PURCHASE_LATCH_KEY = `${SCRIPT_ID}:merchant-purchase-latch:v1:${towerUser}:${towerOccurrence}`;
   const COMPANION_FLOW_LATCH_KEY = `${SCRIPT_ID}:companion-flow-latch:v1:${towerUser}:${towerOccurrence}`;
+  const HP_POTION_FLOORS_KEY = `${SCRIPT_ID}:hp-potion-floors:v1:${towerUser}:${towerOccurrence}`;
   const START_FLOOR_ATTEMPTS_KEY = `${SCRIPT_ID}:start-floor-attempts:v1:${towerUser}:${towerOccurrence}`;
 
   const runtime = {
@@ -843,6 +1083,7 @@
     floorBossChoiceAttempted: '',
     merchantPurchaseLatch: null,
     companionFlowLatch: null,
+    hpPotionFloors: null,
     startFloorAttempts: null,
   };
 
@@ -905,6 +1146,49 @@
     }
   }
 
+  function readHpPotionFloors() {
+    if (runtime.hpPotionFloors) {
+      return runtime.hpPotionFloors;
+    }
+
+    const saved = readJson(localStorage, HP_POTION_FLOORS_KEY, []);
+    runtime.hpPotionFloors = Array.isArray(saved)
+      ? [...new Set(saved.map(Number).filter((floor) => Number.isInteger(floor) && floor >= 1))].slice(-12)
+      : [];
+    return runtime.hpPotionFloors;
+  }
+
+  function recordHpPotionUse(state) {
+    const floor = Number(state?.dataset.floor);
+
+    if (!Number.isInteger(floor) || floor < 1) {
+      return;
+    }
+
+    runtime.hpPotionFloors = [...readHpPotionFloors().filter((value) => value !== floor), floor].slice(-12);
+    writeJson(localStorage, HP_POTION_FLOORS_KEY, runtime.hpPotionFloors);
+  }
+
+  function forgetHpPotionUse(state) {
+    const floor = Number(state?.dataset.floor);
+
+    if (!Number.isInteger(floor)) {
+      return;
+    }
+
+    runtime.hpPotionFloors = readHpPotionFloors().filter((value) => value !== floor);
+    writeJson(localStorage, HP_POTION_FLOORS_KEY, runtime.hpPotionFloors);
+  }
+
+  function clearHpPotionFloors() {
+    runtime.hpPotionFloors = [];
+    try {
+      localStorage.removeItem(HP_POTION_FLOORS_KEY);
+    } catch {
+      // Storage is optional for in-page automation.
+    }
+  }
+
   function readMerchantPurchaseLatch() {
     if (runtime.merchantPurchaseLatch) {
       return runtime.merchantPurchaseLatch;
@@ -937,28 +1221,6 @@
     }
   }
 
-  function normalizeCompanionFlowLatch(latch) {
-    if (!latch || typeof latch !== 'object') {
-      return null;
-    }
-
-    const validChoice =
-      (latch.stage === 'recruitment' && COMPANION_RECRUITMENT_CHOICES.includes(latch.choice)) ||
-      (latch.stage === 'floor19' && COMPANION_FLOOR_19_CHOICES.includes(latch.choice));
-
-    if (!validChoice) {
-      return null;
-    }
-
-    return {
-      stage: latch.stage,
-      choice: latch.choice,
-      title: normalizeText(latch.title),
-      requestId: String(latch.requestId || ''),
-      revision: String(latch.revision || ''),
-    };
-  }
-
   function readCompanionFlowLatch() {
     if (runtime.companionFlowLatch) {
       return runtime.companionFlowLatch;
@@ -968,6 +1230,16 @@
       readJson(localStorage, COMPANION_FLOW_LATCH_KEY, null),
     );
 
+    if (!runtime.companionFlowLatch) {
+      try {
+        if (localStorage.getItem(COMPANION_FLOW_LATCH_KEY) !== null) {
+          localStorage.removeItem(COMPANION_FLOW_LATCH_KEY);
+        }
+      } catch {
+        // Invalid persisted state is ignored when storage is unavailable.
+      }
+    }
+
     return runtime.companionFlowLatch;
   }
 
@@ -976,6 +1248,13 @@
 
     if (runtime.companionFlowLatch) {
       writeJson(localStorage, COMPANION_FLOW_LATCH_KEY, runtime.companionFlowLatch);
+      return;
+    }
+
+    try {
+      localStorage.removeItem(COMPANION_FLOW_LATCH_KEY);
+    } catch {
+      // The in-page automation can continue even when storage is unavailable.
     }
   }
 
@@ -986,13 +1265,14 @@
       title,
       requestId: form?.querySelector('input[name="request_id"]')?.value,
       revision: form?.querySelector('input[name="revision"]')?.value,
+      usedAt: Date.now(),
     });
   }
 
   function clearCompanionFlowLatch(stage = '') {
     const latch = readCompanionFlowLatch();
 
-    if (stage && latch?.stage !== stage) {
+    if (stage && latch && latch.stage !== stage) {
       return;
     }
 
@@ -1006,24 +1286,10 @@
   }
 
   function companionLatchMatchesPanel(latch, forms) {
-    const requestIds = forms
-      .map((form) => String(form.querySelector('input[name="request_id"]')?.value || ''))
-      .filter(Boolean);
-    const revisions = forms
-      .map((form) => String(form.querySelector('input[name="revision"]')?.value || ''))
-      .filter(Boolean);
-
-    if (latch.requestId && requestIds.includes(latch.requestId)) {
-      return true;
-    }
-
-    if (latch.revision && revisions.includes(latch.revision)) {
-      return true;
-    }
-
-    // Missing server tokens fail closed so a paid rescue or surrender is never
-    // submitted twice merely because the markup changed.
-    return !(latch.requestId && latch.revision && requestIds.length && revisions.length);
+    return companionLatchMatchesVisit(latch, {
+      requestIds: forms.map((form) => form.querySelector('input[name="request_id"]')?.value),
+      revisions: forms.map((form) => form.querySelector('input[name="revision"]')?.value),
+    });
   }
 
   function readStartFloorAttempts() {
@@ -1311,6 +1577,18 @@
         </section>
 
         <section class="tm-tower-section">
+          <h3>Quest Contracts</h3>
+          <label class="tm-tower-check">
+            <input type="checkbox" data-setting="questEnabled"> Automatically choose the safest, best-paying quest
+          </label>
+          <p class="tm-tower-help">
+            The 180-coin slot-lock quest is always accepted on Floor 1 and never on later floors. No-HP-potion quests
+            require HP-potion automation to be off; no-replacement quests require Power offers to be skipped.
+            Slash-only quests require Slash as your configured attack. Unknown contracts are never accepted.
+          </p>
+        </section>
+
+        <section class="tm-tower-section">
           <h3>Companions</h3>
           <label>Recruit companion
             <select data-setting="companionFloor">
@@ -1328,7 +1606,8 @@
           </label>
           <p class="tm-tower-help">
             A rescue costs one HP potion. All companions on unselected floors are left behind. After the Floor 19
-            decision and any resulting fight, the following Continue action is submitted automatically.
+            decision and any resulting fight, the following Continue action is submitted automatically. Selecting
+            Surrender also authorizes its native confirmation prompt automatically.
           </p>
         </section>
 
@@ -1455,7 +1734,7 @@
       }
     }
 
-    for (const name of ['guardHeavy', 'potionEnabled', 'statusPotionEnabled', 'respectNoPotion']) {
+    for (const name of ['guardHeavy', 'potionEnabled', 'statusPotionEnabled', 'respectNoPotion', 'questEnabled']) {
       const element = getSettingElement(name);
 
       if (element) {
@@ -1548,6 +1827,7 @@
         poisoned: !!getSettingElement('statusPotionPoisoned')?.checked,
       },
       respectNoPotion: !!getSettingElement('respectNoPotion')?.checked,
+      questEnabled: !!getSettingElement('questEnabled')?.checked,
       companionFloor: getSettingElement('companionFloor')?.value,
       companionFloor19Choice: getSettingElement('companionFloor19Choice')?.value,
       floorBossChoice: getSettingElement('floorBossChoice')?.value,
@@ -1949,6 +2229,19 @@
     setStatus(label, 'success');
 
     const submitter = getSubmitter(form);
+    const confirmationText = decision.confirmationAuthorized
+      ? form.getAttribute('data-confirm')
+      : null;
+
+    if (confirmationText !== null) {
+      form.removeAttribute('data-confirm');
+    }
+
+    const restoreConfirmation = () => {
+      if (confirmationText !== null && form.isConnected && !form.hasAttribute('data-confirm')) {
+        form.setAttribute('data-confirm', confirmationText);
+      }
+    };
 
     try {
       decision.onSubmitting?.();
@@ -1959,12 +2252,14 @@
         submitter.click();
       }
     } catch (error) {
+      restoreConfirmation();
       decision.onSubmitRejected?.();
       console.error('[Demonic Tower Autopilot] Could not submit action.', error);
       stopAutomation('The action could not be submitted. Details are available in the console.', 'error');
       return;
     }
 
+    window.queueMicrotask(restoreConfirmation);
     window.queueMicrotask(() => {
       if (runtime.running && form.isConnected && !nativeRequestIsBusy()) {
         decision.onSubmitRejected?.();
@@ -2018,6 +2313,25 @@
 
   function readPowerCapacity() {
     return parseRatio(document.querySelector('.te-power-capacity')?.textContent);
+  }
+
+  function isWishlistEpicReady() {
+    const wishes = normalizePowerWishlist(settings.preferredPowers);
+
+    if (!wishes.length) {
+      return false;
+    }
+
+    const owned = [...document.querySelectorAll('.te-power-owned')].map((element) => {
+      const text = normalizeText(element.textContent);
+      const rarity = String(element.dataset.rarity || text.match(/\b(common|uncommon|rare|epic|legendary|mythic)\b/i)?.[1] || '').toLowerCase();
+      return {
+        key: normalizePowerKey(element.querySelector('h4')?.textContent),
+        rarity,
+      };
+    }).filter((power) => power.key && rarityRank(power.rarity) >= rarityRank('epic'));
+
+    return owned.length === wishes.length && wishes.every((wish) => owned.some((power) => power.key === normalizePowerKey(wish.name)));
   }
 
   function planPowerChoice(offers, strategy) {
@@ -2163,6 +2477,88 @@
     return [...content.querySelectorAll('section.te-panel.te-choice')].filter((panel) => {
       return !panel.closest('[hidden], [aria-hidden="true"]');
     });
+  }
+
+  function readQuestOffers(panel) {
+    return [...panel.querySelectorAll('.te-cards > article')]
+      .map((card) => {
+        const forms = [...card.querySelectorAll('form[data-action="room"][data-choice]')];
+
+        if (forms.length !== 1) {
+          return null;
+        }
+
+        const paragraphs = [...card.querySelectorAll('p')].map((paragraph) => paragraph.textContent);
+        const form = forms[0];
+
+        return {
+          ...classifyQuestOffer({
+            title: card.querySelector('h3')?.textContent,
+            description: paragraphs[0],
+            rewardText: paragraphs.slice(1).join(' '),
+            choice: form.dataset.choice,
+          }),
+          form,
+        };
+      })
+      .filter(Boolean);
+  }
+
+  function findQuestPanel() {
+    return getCurrentChoicePanels().find((panel) => {
+      if (normalizeText(panel.querySelector('h2')?.textContent).toLowerCase() !== 'a binding offer') {
+        return false;
+      }
+
+      const offers = readQuestOffers(panel);
+      return (
+        offers.length === 2 &&
+        new Set(offers.map((offer) => offer.choice)).size === 2
+      );
+    });
+  }
+
+  function decideQuest(panel, state) {
+    if (!settings.questEnabled) {
+      return {
+        kind: 'wait',
+        message: 'Waiting for your Quest Contract decision.',
+      };
+    }
+
+    const offers = readQuestOffers(panel);
+    const capacity = readPowerCapacity();
+    const choice = chooseQuestOffer({
+      offers,
+      context: {
+        wishlistEpicReady: isWishlistEpicReady(),
+        hpPotionUsedRecently: hasHpPotionBeenUsedRecently(readHpPotionFloors(), state?.dataset.floor),
+        currentFloor: state?.dataset.floor,
+        freePowerSlots: capacity ? capacity.maximum - capacity.current : null,
+      },
+    });
+
+    if (!choice) {
+      return {
+        kind: 'wait',
+        message: 'The Quest Contract offers are ambiguous; waiting for your decision.',
+      };
+    }
+
+    const matchingOffers = offers.filter((offer) => offer.choice === choice && formIsUsable(offer.form));
+
+    if (matchingOffers.length !== 1) {
+      return {
+        kind: 'wait',
+        message: 'The selected Quest Contract is no longer available.',
+      };
+    }
+
+    return {
+      kind: 'submit',
+      form: matchingOffers[0].form,
+      label: `Accept Quest Contract: ${matchingOffers[0].title}.`,
+    };
   }
 
   function normalizeSemanticText(value) {
@@ -2539,14 +2935,26 @@
           : `Hand over ${title} for 250 coins; the companion leaves this run.`,
       onSubmitting: () => writeCompanionFlowLatch('floor19', choice, title, form),
       onSubmitRejected: () => clearCompanionFlowLatch('floor19'),
+      confirmationAuthorized: choice === 'surrender',
     };
   }
 
   function findCompanionContinuePanel() {
+    const latch = readCompanionFlowLatch();
+
+    if (!['floor19', 'continue'].includes(latch?.stage)) {
+      return null;
+    }
+
     const matchingPanels = getCurrentChoicePanels().filter((panel) => {
       const roomChoices = getCompanionChoiceForms(panel).map((form) => form.dataset.choice);
 
-      return hasExactChoiceSignature(roomChoices, ['continue']);
+      return isCompanionContinueContext({
+        latch,
+        panelTitle: getCompanionPanelTitle(panel),
+        panelText: panel.textContent,
+        roomChoices,
+      });
     });
 
     return matchingPanels.length === 1 ? matchingPanels[0] : null;
@@ -2554,16 +2962,33 @@
 
   function decideCompanionContinue(panel) {
     const latch = readCompanionFlowLatch();
+    const forms = getCompanionChoiceForms(panel);
+
+    if (latch?.stage === 'continue') {
+      if (!companionLatchMatchesPanel(latch, forms)) {
+        clearCompanionFlowLatch();
+        return {
+          kind: 'wait',
+          message: 'The previous companion Continue is no longer identifiable; waiting for manual review.',
+        };
+      }
+
+      return {
+        kind: 'wait',
+        message: 'The companion Continue was already submitted; waiting for the next state.',
+      };
+    }
 
     if (latch?.stage !== 'floor19') {
       return null;
     }
 
-    const forms = getCompanionChoiceForms(panel);
     const roomChoices = forms.map((form) => form.dataset.choice);
     const usableForms = forms.filter(formIsUsable);
     const choice = chooseCompanionContinueChoice({
-      pending: latch?.stage === 'floor19',
+      latch,
+      panelTitle: getCompanionPanelTitle(panel),
+      panelText: panel.textContent,
       roomChoices,
       availableChoices: usableForms.map((form) => form.dataset.choice),
     });
@@ -2580,22 +3005,26 @@
       kind: 'submit',
       form: matchingForms[0],
       label: 'Continue after the Floor 19 companion decision.',
-      onSubmitting: clearCompanionFlowLatch,
+      onSubmitting: () => {
+        writeCompanionFlowLatch('continue', latch.choice, latch.title, matchingForms[0]);
+      },
       onSubmitRejected: () => persistCompanionFlowLatch(latch),
     };
   }
 
-  function clearStaleCompanionFlow(state) {
+  function clearStaleCompanionFlow(state, preserveContinue = false) {
     const latch = readCompanionFlowLatch();
 
-    if (latch?.stage === 'recruitment') {
-      clearCompanionFlowLatch();
-      return;
-    }
-
-    const floor = Number(state?.dataset.floor);
-
-    if (latch?.stage === 'floor19' && Number.isInteger(floor) && floor !== 19) {
+    // Any floor below 19 proves that a new run has begun. Higher floor numbers do not
+    // prove completion because the optional defense fight may be rendered as
+    // the next floor before its result panel appears.
+    if (
+      shouldClearCompanionFlowLatch({
+        latch,
+        reportedFloor: state?.dataset.floor,
+        preserveContinue,
+      })
+    ) {
       clearCompanionFlowLatch();
     }
   }
@@ -2908,6 +3337,8 @@
           kind: 'submit',
           form: potionForm,
           label: `Use an HP potion at ${hpPercent}% HP.`,
+          onSubmitting: () => recordHpPotionUse(state),
+          onSubmitRejected: () => forgetHpPotionUse(state),
         };
       }
     }
@@ -2969,6 +3400,8 @@
   function decideNextAction(state) {
     const startFloorPanel = findStartFloorPanel();
     if (startFloorPanel) {
+      clearCompanionFlowLatch();
+      clearHpPotionFloors();
       return decideStartFloor(startFloorPanel);
     }
 
@@ -2989,13 +3422,19 @@
       return decideCompanionFloor19(companionFloor19Panel);
     }
 
-    const companionContinuePanel =
-      readCompanionFlowLatch()?.stage === 'floor19' ? findCompanionContinuePanel() : null;
+    clearStaleCompanionFlow(state, true);
+
+    const companionContinuePanel = findCompanionContinuePanel();
     if (companionContinuePanel) {
       return decideCompanionContinue(companionContinuePanel);
     }
 
     clearStaleCompanionFlow(state);
+
+    const questPanel = findQuestPanel();
+    if (questPanel) {
+      return decideQuest(questPanel, state);
+    }
 
     const floorBossPanel = findFloorBossPanel();
     if (!floorBossPanel) {
@@ -3053,13 +3492,24 @@
       const companionRecruitmentPanel = startFloorPanel ? null : findCompanionRecruitmentPanel();
       const companionFloor19Panel =
         startFloorPanel || companionRecruitmentPanel ? null : findCompanionFloor19Panel();
+
+      if (startFloorPanel) {
+        clearCompanionFlowLatch();
+        clearHpPotionFloors();
+      } else if (!companionRecruitmentPanel && !companionFloor19Panel) {
+        clearStaleCompanionFlow(null, true);
+      }
+
       const companionContinuePanel =
-        startFloorPanel || companionRecruitmentPanel || companionFloor19Panel ||
-        readCompanionFlowLatch()?.stage !== 'floor19'
+        startFloorPanel || companionRecruitmentPanel || companionFloor19Panel
           ? null
           : findCompanionContinuePanel();
-      const floorBossPanel =
+      const questPanel =
         startFloorPanel || companionRecruitmentPanel || companionFloor19Panel || companionContinuePanel
+          ? null
+          : findQuestPanel();
+      const floorBossPanel =
+        startFloorPanel || companionRecruitmentPanel || companionFloor19Panel || companionContinuePanel || questPanel
           ? null
           : findFloorBossPanel();
 
@@ -3077,6 +3527,8 @@
         standaloneDecision = decideCompanionFloor19(companionFloor19Panel);
       } else if (companionContinuePanel) {
         standaloneDecision = decideCompanionContinue(companionContinuePanel);
+      } else if (questPanel) {
+        standaloneDecision = decideQuest(questPanel, null);
       } else if (floorBossPanel) {
         standaloneDecision = decideFloorBoss(floorBossPanel);
       }
@@ -3159,7 +3611,7 @@
           findStartFloorPanel() ||
           findCompanionRecruitmentPanel() ||
           findCompanionFloor19Panel() ||
-          (readCompanionFlowLatch()?.stage === 'floor19' && findCompanionContinuePanel()) ||
+          findCompanionContinuePanel() ||
           findFloorBossPanel())
       ) {
         tryStartAutomation();

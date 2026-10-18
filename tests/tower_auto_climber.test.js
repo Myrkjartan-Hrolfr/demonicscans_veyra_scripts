@@ -5,20 +5,25 @@ const {
   chooseCompanionContinueChoice,
   chooseCompanionFloor19Choice,
   chooseCompanionRecruitmentChoice,
+  chooseQuestOffer,
+  classifyQuestOffer,
   chooseFloorBossChoice,
   chooseMerchantAction,
   chooseSanctuaryChoice,
   choosePowerPlacement,
+  companionLatchMatchesVisit,
   formatPowerWishlist,
   getCompanionRecruitmentFloor,
   getMerchantChoice,
   hasExactChoiceSignature,
+  isCompanionContinueContext,
   isCompanionFloor19Context,
   isFloorBossDecisionContext,
   isStartFloorDecisionContext,
   isStatusPotionName,
   matchStatusEffect,
   merchantLatchMatchesVisit,
+  normalizeCompanionFlowLatch,
   normalizePowerKey,
   normalizePowerWishlist,
   normalizeStartFloors,
@@ -28,6 +33,8 @@ const {
   parseStartFloor,
   planStartFloorAction,
   sanitizeSettings,
+  scoreQuestOffer,
+  shouldClearCompanionFlowLatch,
   uniquePowerNames,
 } = require('../tower_auto_climber.user.js');
 
@@ -402,6 +409,98 @@ test('normalizes the independently selected Start Floor checkboxes', () => {
   assert.deepEqual(sanitizeSettings({ startFloors: '10,20' }).startFloors, []);
 });
 
+test('classifies known quest contracts and the unnamed two-slot contract', () => {
+  assert.deepEqual(
+    classifyQuestOffer({
+      title: 'Unbroken Resolve',
+      description: 'Clear three floors without replacing any power. New powers may use free slots.',
+      rewardText: 'Reward: 120 coins / 2 energy.',
+      choice: 'unchanging',
+    }),
+    {
+      type: 'unchanging',
+      title: 'Unbroken Resolve',
+      description: 'Clear three floors without replacing any power. New powers may use free slots.',
+      choice: 'unchanging',
+      coins: 120,
+      energy: 2,
+    },
+  );
+  assert.equal(
+    classifyQuestOffer({
+      title: 'A different name',
+      description: 'Lock 2 ability slots for 3 floors.',
+      rewardText: 'Reward: 180 coins.',
+      choice: 'mystery',
+    }).type,
+    'ability_lock',
+  );
+  assert.equal(classifyQuestOffer({ title: 'Unknown', description: 'Do a thing.', choice: 'x' }), null);
+});
+
+test('selects the best safe quest for the current build', () => {
+  const unchanging = classifyQuestOffer({
+    title: 'Unbroken Resolve',
+    description: 'Clear three floors without replacing any power.',
+    rewardText: 'Reward: 120 coins / 2 energy.',
+    choice: 'unchanging',
+  });
+  const dryBlood = classifyQuestOffer({
+    title: 'The Unquenched',
+    description: 'Clear three floors without drinking an HP potion.',
+    rewardText: 'Reward: 120 coins / 2 energy.',
+    choice: 'dry_blood',
+  });
+  const cleaver = classifyQuestOffer({
+    title: 'Trial of the Cleaver',
+    description: 'Clear three floors using Slash, not Magic. Guard is allowed.',
+    rewardText: 'Reward: 100 coins / 2 energy.',
+    choice: 'blade_only',
+  });
+  const slotLock = classifyQuestOffer({
+    title: 'Unnamed offer',
+    description: 'Locks two power slots for three floors.',
+    rewardText: 'Reward: 180 coins.',
+    choice: 'locked_slots',
+  });
+
+  assert.equal(
+    chooseQuestOffer({
+      offers: [slotLock, unchanging],
+      context: { attack: 'slash', potionEnabled: false, powerMode: 'skip', currentFloor: 1, freePowerSlots: 2 },
+    }),
+    'locked_slots',
+  );
+  assert.equal(
+    chooseQuestOffer({
+      offers: [slotLock, unchanging],
+      context: {
+        attack: 'slash',
+        potionEnabled: false,
+        wishlistEpicReady: true,
+        hpPotionUsedRecently: false,
+        freePowerSlots: 1,
+      },
+    }),
+    'unchanging',
+  );
+  assert.equal(
+    chooseQuestOffer({
+      offers: [dryBlood, cleaver],
+      context: { attack: 'slash', potionEnabled: true, powerMode: 'skip', potionThreshold: 30, hpPercent: 20 },
+    }),
+    'blade_only',
+  );
+  assert.equal(
+    chooseQuestOffer({
+      offers: [cleaver, { type: 'unknown', choice: 'unknown', coins: 999, energy: 0 }],
+      context: { attack: 'magic', potionEnabled: false, freePowerSlots: 4 },
+    }),
+    'blade_only',
+  );
+  assert.equal(scoreQuestOffer(slotLock, { currentFloor: 2 }), null);
+});
+
 test('parses only unambiguous Start Floor values from semantic labels', () => {
   assert.equal(parseStartFloor('buy_start_floor_10'), 10);
   assert.equal(parseStartFloor('Unlock starting floor: 20'), 20);
@@ -586,26 +685,48 @@ test('recognizes and maps both exact Floor 19 companion choices', () => {
   );
 });
 
-test('continues after Floor 19 only with a pending companion flow and one usable action', () => {
+test('continues only on the matching companion result with one usable action', () => {
+  const latch = {
+    stage: 'floor19',
+    choice: 'defend',
+    title: 'Ulgro, the Gentle Devourer',
+    requestId: 'defend-request',
+    revision: '109063',
+  };
+  const result = {
+    latch,
+    panelTitle: 'A promise kept',
+    panelText: 'A promise kept Ulgro crushes his collar. Nobody goes back in a cage.',
+    roomChoices: ['continue'],
+    availableChoices: ['continue'],
+  };
+
+  assert.equal(chooseCompanionContinueChoice(result), 'continue');
+  assert.equal(isCompanionContinueContext(result), true);
   assert.equal(
     chooseCompanionContinueChoice({
-      pending: true,
-      roomChoices: ['continue'],
-      availableChoices: ['continue'],
-    }),
-    'continue',
-  );
-  assert.equal(
-    chooseCompanionContinueChoice({
-      pending: false,
-      roomChoices: ['continue'],
-      availableChoices: ['continue'],
+      ...result,
+      latch: null,
     }),
     null,
   );
   assert.equal(
     chooseCompanionContinueChoice({
-      pending: true,
+      ...result,
+      panelText: 'Continue to an unrelated room without the companion.',
+    }),
+    null,
+  );
+  assert.equal(
+    chooseCompanionContinueChoice({
+      ...result,
+      panelTitle: 'Victory',
+    }),
+    null,
+  );
+  assert.equal(
+    chooseCompanionContinueChoice({
+      ...result,
       roomChoices: ['continue', 'skip'],
       availableChoices: ['continue', 'skip'],
     }),
@@ -613,19 +734,117 @@ test('continues after Floor 19 only with a pending companion flow and one usable
   );
   assert.equal(
     chooseCompanionContinueChoice({
-      pending: true,
-      roomChoices: ['continue'],
+      ...result,
       availableChoices: [],
     }),
     null,
   );
   assert.equal(
     chooseCompanionContinueChoice({
-      pending: true,
-      roomChoices: ['continue'],
+      ...result,
       availableChoices: ['continue', 'continue'],
     }),
     null,
+  );
+
+  const surrenderResult = {
+    ...result,
+    latch: { ...latch, choice: 'surrender' },
+    panelTitle: 'The hunters depart',
+    panelText: 'Ulgro leaves with the pit hunters. Continue.',
+  };
+
+  assert.equal(chooseCompanionContinueChoice(surrenderResult), 'continue');
+});
+
+test('validates and deduplicates persisted companion flow latches', () => {
+  const latch = {
+    stage: 'floor19',
+    choice: 'defend',
+    title: 'Ulgro, the Gentle Devourer',
+    requestId: 'defend-request',
+    revision: '109063',
+    usedAt: 1234,
+  };
+
+  assert.deepEqual(normalizeCompanionFlowLatch(latch), latch);
+  assert.equal(
+    normalizeCompanionFlowLatch({ ...latch, stage: 'continue' }).stage,
+    'continue',
+  );
+  assert.equal(normalizeCompanionFlowLatch({ ...latch, title: 'Unknown Companion' }), null);
+  assert.equal(normalizeCompanionFlowLatch({ ...latch, requestId: '' }), null);
+  assert.equal(normalizeCompanionFlowLatch({ ...latch, revision: '' }), null);
+  assert.equal(normalizeCompanionFlowLatch({ ...latch, stage: 'invalid' }), null);
+  assert.equal(normalizeCompanionFlowLatch({ ...latch, stage: 'recruitment', choice: 'defend' }), null);
+  assert.equal(normalizeCompanionFlowLatch({ ...latch, choice: 'rescue' }), null);
+
+  assert.equal(
+    companionLatchMatchesVisit(latch, {
+      requestIds: ['other-request', 'defend-request'],
+      revisions: ['999999'],
+    }),
+    true,
+  );
+  assert.equal(
+    companionLatchMatchesVisit(latch, {
+      requestIds: ['other-request'],
+      revisions: ['109063'],
+    }),
+    true,
+  );
+  assert.equal(
+    companionLatchMatchesVisit(latch, {
+      requestIds: ['other-request'],
+      revisions: ['109064'],
+    }),
+    false,
+  );
+  assert.equal(companionLatchMatchesVisit(latch, {}), true);
+  assert.equal(companionLatchMatchesVisit(latch, { requestIds: ['other-request'] }), true);
+  assert.equal(companionLatchMatchesVisit(latch, { revisions: ['109064'] }), true);
+});
+
+test('keeps the Floor 19 latch through a possibly renumbered defense fight', () => {
+  const floor19Latch = {
+    stage: 'floor19',
+    choice: 'defend',
+    title: 'Ulgro, the Gentle Devourer',
+    requestId: 'defend-request',
+    revision: '109063',
+  };
+
+  assert.equal(
+    shouldClearCompanionFlowLatch({ latch: floor19Latch, reportedFloor: 19 }),
+    false,
+  );
+  assert.equal(
+    shouldClearCompanionFlowLatch({ latch: floor19Latch, reportedFloor: 20 }),
+    false,
+  );
+  assert.equal(
+    shouldClearCompanionFlowLatch({ latch: floor19Latch, reportedFloor: 3 }),
+    true,
+  );
+  assert.equal(
+    shouldClearCompanionFlowLatch({ latch: floor19Latch, reportedFloor: 10 }),
+    true,
+  );
+  assert.equal(
+    shouldClearCompanionFlowLatch({ latch: floor19Latch, reportedFloor: 18 }),
+    true,
+  );
+  assert.equal(
+    shouldClearCompanionFlowLatch({ latch: floor19Latch, reportedFloor: 'unknown' }),
+    false,
+  );
+  assert.equal(
+    shouldClearCompanionFlowLatch({ latch: { ...floor19Latch, stage: 'continue' }, preserveContinue: true }),
+    false,
+  );
+  assert.equal(
+    shouldClearCompanionFlowLatch({ latch: { ...floor19Latch, stage: 'continue' } }),
+    true,
   );
 });
 
@@ -885,6 +1104,7 @@ test('sanitizes persisted settings and clamps unsafe delays and thresholds', () 
         poisoned: true,
       },
       respectNoPotion: true,
+      questEnabled: true,
       companionFloor: 'none',
       companionFloor19Choice: 'defend',
       floorBossChoice: 'manual',
@@ -900,6 +1120,11 @@ test('sanitizes persisted settings and clamps unsafe delays and thresholds', () 
       collapsed: false,
     },
   );
+});
+
+test('keeps quest automation enabled by default and permits opting out', () => {
+  assert.equal(sanitizeSettings({}).questEnabled, true);
+  assert.equal(sanitizeSettings({ questEnabled: false }).questEnabled, false);
 });
 
 test('sanitizes persisted companion preferences', () => {
