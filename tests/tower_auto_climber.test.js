@@ -437,6 +437,22 @@ test('classifies known quest contracts and the unnamed two-slot contract', () =>
     }).type,
     'ability_lock',
   );
+  assert.deepEqual(
+    classifyQuestOffer({
+      title: 'Trial of the Hex',
+      description: 'Clear three floors using Magic, not Slash. Guard is allowed.',
+      rewardText: '100 coins / 2 energy, subject to the daily energy limit.',
+      choice: 'magic_only',
+    }),
+    {
+      type: 'magic_only',
+      title: 'Trial of the Hex',
+      description: 'Clear three floors using Magic, not Slash. Guard is allowed.',
+      choice: 'magic_only',
+      coins: 100,
+      energy: 2,
+    },
+  );
   assert.equal(classifyQuestOffer({ title: 'Unknown', description: 'Do a thing.', choice: 'x' }), null);
 });
 
@@ -458,6 +474,12 @@ test('selects the best safe quest for the current build', () => {
     description: 'Clear three floors using Slash, not Magic. Guard is allowed.',
     rewardText: 'Reward: 100 coins / 2 energy.',
     choice: 'blade_only',
+  });
+  const hex = classifyQuestOffer({
+    title: 'Trial of the Hex',
+    description: 'Clear three floors using Magic, not Slash. Guard is allowed.',
+    rewardText: 'Reward: 100 coins / 2 energy.',
+    choice: 'magic_only',
   });
   const slotLock = classifyQuestOffer({
     title: 'Unnamed offer',
@@ -499,6 +521,13 @@ test('selects the best safe quest for the current build', () => {
       context: { attack: 'magic', potionEnabled: false, freePowerSlots: 4 },
     }),
     'blade_only',
+  );
+  assert.equal(
+    chooseQuestOffer({
+      offers: [hex, dryBlood],
+      context: { hpPotionUsedRecently: true },
+    }),
+    'magic_only',
   );
   assert.equal(scoreQuestOffer(slotLock, { currentFloor: 2 }), null);
 });

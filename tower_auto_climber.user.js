@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Demonic Tower Autopilot
 // @namespace    local.demonicscans.tower
-// @version      1.11.3
+// @version      1.12.0
 // @description  Automates Demonic Tower combat, events, quests, companions, boss preparations, start floors, potions, paths, and powers.
 // @author       Myrkjartan Hrolfr
 // @match        https://demonicscans.org/*
@@ -13,7 +13,7 @@
   'use strict';
 
   const SCRIPT_ID = 'tm-demonic-tower-autopilot';
-  const SCRIPT_VERSION = '1.11.3';
+  const SCRIPT_VERSION = '1.12.0';
   const SETTINGS_VERSION = 1;
   const RETRY_TIMEOUT_MS = 30000;
   const MISSING_RUN_GRACE_MS = 10000;
@@ -91,7 +91,7 @@
     'Ulgro, the Gentle Devourer': 9,
   });
   const FLOOR_BOSS_CHOICES = Object.freeze(['healing', 'armor', 'intact']);
-  const QUEST_TYPES = Object.freeze(['unchanging', 'dry_blood', 'blade_only', 'ability_lock']);
+  const QUEST_TYPES = Object.freeze(['unchanging', 'dry_blood', 'blade_only', 'magic_only', 'ability_lock']);
   const FLOOR_BOSS_LABELS = Object.freeze({
     healing: 'Destroy the apparatus; fight the additional elite to remove boss regeneration.',
     armor: 'Spend 60 Abyssal Coins to remove the boss’s +20% DEF enhancement.',
@@ -486,6 +486,12 @@
       type = 'blade_only';
       fallbackCoins = 100;
     } else if (
+      normalizedTitle === 'trial of the hex' &&
+      /using magic, not slash/.test(normalizedDescription)
+    ) {
+      type = 'magic_only';
+      fallbackCoins = 100;
+    } else if (
       /\b(?:lock|locks|locked)\b/.test(normalizedDescription) &&
       /\b(?:2|two)\b.*\b(?:ability|power)\s+slots?\b/.test(normalizedDescription) &&
       /\b(?:3|three)\b\s+floors?\b/.test(normalizedDescription)
@@ -525,6 +531,7 @@
         }
         return base;
       case 'blade_only':
+      case 'magic_only':
         return base;
       default:
         return null;
@@ -544,7 +551,7 @@
       .filter(Boolean)
       .sort((left, right) => right.score - left.score || left.index - right.index);
 
-    return candidates[0]?.offer.choice || offers.find((offer) => offer?.type === 'blade_only')?.choice || offers[0]?.choice || null;
+    return candidates[0]?.offer.choice || offers.find((offer) => ['blade_only', 'magic_only'].includes(offer?.type))?.choice || offers[0]?.choice || null;
   }
 
   function hasHpPotionBeenUsedRecently(usedFloors, currentFloor) {
@@ -1044,9 +1051,7 @@
       module.exports = Object.freeze({
         chooseCompanionContinueChoice,
         chooseCompanionFloor19Choice,
-  chooseCompanionRecruitmentChoice,
-  chooseQuestOffer,
-  classifyQuestOffer,
+        chooseCompanionRecruitmentChoice,
         chooseQuestOffer,
         classifyQuestOffer,
         chooseMerchantAction,
@@ -1077,8 +1082,7 @@
         parseStartFloor,
         planStartFloorAction,
         rarityRank,
-  sanitizeSettings,
-  scoreQuestOffer,
+        sanitizeSettings,
         scoreQuestOffer,
         shouldClearCompanionFlowLatch,
         uniquePowerNames,
@@ -1628,7 +1632,7 @@
           <p class="tm-tower-help">
             The 180-coin slot-lock quest is always accepted on Floor 1 and never on later floors. No-HP-potion quests
             require HP-potion automation to be off; no-replacement quests require Power offers to be skipped.
-            Slash-only quests require Slash as your configured attack. Unknown contracts are never accepted.
+            Slash- and Magic-only combat trials are valid fallback quests. Unknown contracts are never accepted.
           </p>
         </section>
 
