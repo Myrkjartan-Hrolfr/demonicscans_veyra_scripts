@@ -33,6 +33,7 @@ const {
   orderWishlistOffers,
   parseRatio,
   parseStartFloor,
+  planAutoRestartAction,
   planStartFloorAction,
   sanitizeSettings,
   scoreQuestOffer,
@@ -1156,6 +1157,8 @@ test('sanitizes persisted settings and clamps unsafe delays and thresholds', () 
       companionFloor19Choice: 'defend',
       floorBossChoice: 'manual',
       finalSealChoice: 'manual',
+      autoRestartEnabled: false,
+      autoRestartKeyLimit: 1,
       startFloors: [],
       sanctuaryHealThreshold: 50,
       merchantChoice: 1,
@@ -1229,6 +1232,34 @@ test('recognizes only the exact final-seal decision and maps its setting', () =>
   );
   assert.equal(sanitizeSettings({ finalSealChoice: 'leave' }).finalSealChoice, 'leave');
   assert.equal(sanitizeSettings({ finalSealChoice: 'invalid' }).finalSealChoice, 'manual');
+});
+
+test('plans automatic Tower restarts within the total key budget', () => {
+  assert.equal(planAutoRestartAction({ enabled: false }), null);
+  assert.deepEqual(
+    planAutoRestartAction({ enabled: true, keyLimit: 5, usedKeys: 0, hasActiveRun: true }),
+    { kind: 'active', usedKeys: 1, keyLimit: 5 },
+  );
+  assert.deepEqual(
+    planAutoRestartAction({ enabled: true, keyLimit: 5, usedKeys: 1, canOpenEntrance: true }),
+    { kind: 'open', usedKeys: 1, keyLimit: 5 },
+  );
+  assert.deepEqual(
+    planAutoRestartAction({
+      enabled: true,
+      keyLimit: 5,
+      usedKeys: 1,
+      entranceOpen: true,
+      canStartRun: true,
+    }),
+    { kind: 'start', usedKeys: 1, keyLimit: 5 },
+  );
+  assert.deepEqual(
+    planAutoRestartAction({ enabled: true, keyLimit: 5, usedKeys: 5, canOpenEntrance: true }),
+    { kind: 'limit', usedKeys: 5, keyLimit: 5 },
+  );
+  assert.equal(sanitizeSettings({ autoRestartEnabled: true }).autoRestartEnabled, true);
+  assert.equal(sanitizeSettings({ autoRestartKeyLimit: 5000 }).autoRestartKeyLimit, 999);
 });
 
 test('sanitizes persisted wishlist amounts and status potion choices', () => {

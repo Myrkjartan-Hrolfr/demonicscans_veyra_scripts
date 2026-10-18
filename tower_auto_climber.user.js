@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Demonic Tower Autopilot
 // @namespace    local.demonicscans.tower
-// @version      1.13.0
+// @version      1.14.0
 // @description  Automates Demonic Tower combat, events, quests, companions, boss preparations, start floors, potions, paths, and powers.
 // @author       Myrkjartan Hrolfr
 // @match        https://demonicscans.org/*
@@ -13,7 +13,7 @@
   'use strict';
 
   const SCRIPT_ID = 'tm-demonic-tower-autopilot';
-  const SCRIPT_VERSION = '1.13.0';
+  const SCRIPT_VERSION = '1.14.0';
   const SETTINGS_VERSION = 1;
   const RETRY_TIMEOUT_MS = 30000;
   const MISSING_RUN_GRACE_MS = 10000;
@@ -36,6 +36,8 @@
     companionFloor19Choice: 'defend',
     floorBossChoice: 'manual',
     finalSealChoice: 'manual',
+    autoRestartEnabled: false,
+    autoRestartKeyLimit: 1,
     startFloors: Object.freeze([]),
     sanctuaryHealThreshold: 50,
     merchantChoice: 1,
@@ -567,6 +569,37 @@
     });
   }
 
+  function planAutoRestartAction({
+    enabled = false,
+    keyLimit = 1,
+    usedKeys = 0,
+    hasActiveRun = false,
+    entranceOpen = false,
+    canOpenEntrance = false,
+    canStartRun = false,
+  } = {}) {
+    if (!enabled) {
+      return null;
+    }
+
+    const limit = clampNumber(keyLimit, 1, 999, DEFAULTS.autoRestartKeyLimit);
+    const used = Math.max(0, Math.floor(Number(usedKeys) || 0));
+
+    if (hasActiveRun) {
+      return { kind: 'active', usedKeys: Math.max(1, used), keyLimit: limit };
+    }
+
+    if (used >= limit) {
+      return { kind: 'limit', usedKeys: used, keyLimit: limit };
+    }
+
+    if (entranceOpen) {
+      return { kind: canStartRun ? 'start' : 'wait', usedKeys: used, keyLimit: limit };
+    }
+
+    return { kind: canOpenEntrance ? 'open' : 'wait', usedKeys: used, keyLimit: limit };
+  }
+
   function chooseFloorBossChoice({ configuredChoice, roomChoices = [], availableChoices = [] } = {}) {
     if (!isFloorBossDecisionContext({ roomChoices })) {
       return null;
@@ -833,6 +866,8 @@
       finalSealChoice: VALID_SETTINGS.finalSealChoice.has(source.finalSealChoice)
         ? source.finalSealChoice
         : DEFAULTS.finalSealChoice,
+      autoRestartEnabled: source.autoRestartEnabled === true,
+      autoRestartKeyLimit: clampNumber(source.autoRestartKeyLimit, 1, 999, DEFAULTS.autoRestartKeyLimit),
       startFloors: normalizeStartFloors(source.startFloors),
       sanctuaryHealThreshold: clampNumber(
         source.sanctuaryHealThreshold,
@@ -1080,6 +1115,7 @@
         orderWishlistOffers,
         parseRatio,
         parseStartFloor,
+        planAutoRestartAction,
         planStartFloorAction,
         rarityRank,
         sanitizeSettings,
@@ -1106,6 +1142,7 @@
   const MERCHANT_PURCHASE_LATCH_KEY = `${SCRIPT_ID}:merchant-purchase-latch:v1:${towerUser}:${towerOccurrence}`;
   const COMPANION_FLOW_LATCH_KEY = `${SCRIPT_ID}:companion-flow-latch:v1:${towerUser}:${towerOccurrence}`;
   const HP_POTION_FLOORS_KEY = `${SCRIPT_ID}:hp-potion-floors:v1:${towerUser}:${towerOccurrence}`;
+  const AUTO_RESTART_KEY_COUNT_KEY = `${SCRIPT_ID}:auto-restart-key-count:v1:${towerUser}:${towerOccurrence}`;
   const START_FLOOR_ATTEMPTS_KEY = `${SCRIPT_ID}:start-floor-attempts:v1:${towerUser}:${towerOccurrence}`;
 
   const runtime = {
@@ -1132,6 +1169,7 @@
     merchantPurchaseLatch: null,
     companionFlowLatch: null,
     hpPotionFloors: null,
+    autoRestartKeyCount: null,
     startFloorAttempts: null,
   };
 
@@ -1161,6 +1199,30 @@
 
   function saveSettings() {
     writeJson(localStorage, SETTINGS_KEY, settings);
+  }
+
+  function readAutoRestartKeyCount() {
+    if (runtime.autoRestartKeyCount !== null) {
+      return runtime.autoRestartKeyCount;
+    }
+
+    const saved = Number(readJson(localStorage, AUTO_RESTART_KEY_COUNT_KEY, 0));
+    runtime.autoRestartKeyCount = Number.isInteger(saved) && saved >= 0 ? saved : 0;
+    return runtime.autoRestartKeyCount;
+  }
+
+  function writeAutoRestartKeyCount(value) {
+    runtime.autoRestartKeyCount = Math.max(0, Math.floor(Number(value) || 0));
+    writeJson(localStorage, AUTO_RESTART_KEY_COUNT_KEY, runtime.autoRestartKeyCount);
+  }
+
+  function clearAutoRestartKeyCount() {
+    runtime.autoRestartKeyCount = 0;
+    try {
+      localStorage.removeItem(AUTO_RESTART_KEY_COUNT_KEY);
+    } catch {
+      // Storage is optional for in-page automation.
+    }
   }
 
   function readStatusPotionLatch() {
@@ -1360,6 +1422,15 @@
   function removeStartFloorAttempt(floor) {
     runtime.startFloorAttempts = readStartFloorAttempts().filter((candidate) => candidate !== floor);
     writeJson(localStorage, START_FLOOR_ATTEMPTS_KEY, runtime.startFloorAttempts);
+  }
+
+  function clearStartFloorAttempts() {
+    runtime.startFloorAttempts = [];
+    try {
+      localStorage.removeItem(START_FLOOR_ATTEMPTS_KEY);
+    } catch {
+      // Storage is optional for in-page automation.
+    }
   }
 
   function readPersistentEnabled(fallback = false) {
@@ -1685,6 +1756,16 @@
             </select>
           </label>
           <p class="tm-tower-help">Used only for the exact final-seal decision after the 60-floor campaign.</p>
+          <label class="tm-tower-check">
+            <input type="checkbox" data-setting="autoRestartEnabled"> Start another run automatically after returning to the refuge
+          </label>
+          <label>Total Tower Keys for this run batch
+            <input type="number" min="1" max="999" step="1" data-setting="autoRestartKeyLimit">
+          </label>
+          <p class="tm-tower-help">
+            The current run counts as the first key. Auto-restart finishes the run at the final seal, starts new
+            runs on Floor 1, and stops after the total key limit is reached.
+          </p>
         </section>
 
         <section class="tm-tower-section">
@@ -1784,6 +1865,7 @@
       'companionFloor19Choice',
       'floorBossChoice',
       'finalSealChoice',
+      'autoRestartKeyLimit',
       'merchantChoice',
       'unknownDecision',
       'actionDelayMs',
@@ -1795,7 +1877,7 @@
       }
     }
 
-    for (const name of ['guardHeavy', 'potionEnabled', 'statusPotionEnabled', 'respectNoPotion', 'questEnabled']) {
+    for (const name of ['guardHeavy', 'potionEnabled', 'statusPotionEnabled', 'respectNoPotion', 'questEnabled', 'autoRestartEnabled']) {
       const element = getSettingElement(name);
 
       if (element) {
@@ -1875,6 +1957,8 @@
 
   function readSettingsFromUi() {
     const previousFloorBossChoice = settings.floorBossChoice;
+    const previousAutoRestartEnabled = settings.autoRestartEnabled;
+    const previousAutoRestartKeyLimit = settings.autoRestartKeyLimit;
     const next = {
       ...settings,
       attack: getSettingElement('attack')?.value,
@@ -1893,6 +1977,8 @@
       companionFloor19Choice: getSettingElement('companionFloor19Choice')?.value,
       floorBossChoice: getSettingElement('floorBossChoice')?.value,
       finalSealChoice: getSettingElement('finalSealChoice')?.value,
+      autoRestartEnabled: !!getSettingElement('autoRestartEnabled')?.checked,
+      autoRestartKeyLimit: getSettingElement('autoRestartKeyLimit')?.value,
       startFloors: START_FLOORS.filter((floor) => {
         return !!runtime.root?.querySelector(`[data-start-floor="${floor}"]`)?.checked;
       }),
@@ -1911,6 +1997,16 @@
 
     if (settings.floorBossChoice !== previousFloorBossChoice) {
       runtime.floorBossChoiceAttempted = '';
+    }
+
+    if (
+      settings.autoRestartEnabled !== previousAutoRestartEnabled ||
+      settings.autoRestartKeyLimit !== previousAutoRestartKeyLimit
+    ) {
+      clearAutoRestartKeyCount();
+      if (settings.autoRestartEnabled && document.getElementById('te-run-state')) {
+        writeAutoRestartKeyCount(1);
+      }
     }
 
     if (!settings.statusPotionEnabled) {
@@ -2136,6 +2232,13 @@
   }
 
   function enableAutomation() {
+    if (!runtime.enabled && settings.autoRestartEnabled) {
+      clearAutoRestartKeyCount();
+      if (document.getElementById('te-run-state')) {
+        writeAutoRestartKeyCount(1);
+      }
+    }
+
     persistEnabled(true);
     tryStartAutomation();
   }
@@ -3210,14 +3313,16 @@
   }
 
   function decideFinalSeal(panel) {
-    if (settings.finalSealChoice === 'manual') {
+    const configuredChoice = settings.autoRestartEnabled ? 'leave' : settings.finalSealChoice;
+
+    if (configuredChoice === 'manual') {
       return { kind: 'wait', message: 'Waiting for your final-seal decision.' };
     }
 
     const forms = [...panel.querySelectorAll('form.te-form[data-action="room"][data-choice]')];
     const usableForms = forms.filter(formIsUsable);
     const choice = chooseFinalSealChoice({
-      configuredChoice: settings.finalSealChoice,
+      configuredChoice,
       title: panel.querySelector('h2')?.textContent,
       roomChoices: forms.map((form) => form.dataset.choice),
       availableChoices: usableForms.map((form) => form.dataset.choice),
@@ -3231,6 +3336,87 @@
           label: choice === 'continue' ? 'Enter the endless floors.' : 'Finish the 60-floor run.',
         }
       : { kind: 'wait', message: 'The configured final-seal option is unavailable or ambiguous.' };
+  }
+
+  function decideAutoRestart(hasActiveRun) {
+    const usedKeys = readAutoRestartKeyCount();
+    const entranceButton = document.querySelector(
+      'button.te-hub-enter[data-te-open="entrance"][aria-controls="te-modal-entrance"]',
+    );
+    const entranceDialog = document.getElementById('te-modal-entrance');
+    const entranceOpen = !!entranceDialog?.hasAttribute('open');
+
+    if (!hasActiveRun && !entranceButton && !entranceDialog) {
+      return null;
+    }
+
+    const startForms = entranceDialog
+      ? [...entranceDialog.querySelectorAll('form.te-form[data-action="start"]')].filter((form) => {
+          return form.querySelector('input[name="checkpoint"]')?.value === '0';
+        })
+      : [];
+    const usableStartForms = startForms.filter(formIsUsable);
+    const plan = planAutoRestartAction({
+      enabled: settings.autoRestartEnabled,
+      keyLimit: settings.autoRestartKeyLimit,
+      usedKeys,
+      hasActiveRun,
+      entranceOpen,
+      canOpenEntrance: !!entranceButton && !entranceButton.disabled,
+      canStartRun: usableStartForms.length === 1,
+    });
+
+    if (!plan) {
+      return null;
+    }
+
+    if (plan.kind === 'active') {
+      if (plan.usedKeys !== usedKeys) {
+        writeAutoRestartKeyCount(plan.usedKeys);
+      }
+      return null;
+    }
+
+    if (plan.kind === 'limit') {
+      return {
+        kind: 'limit',
+        message: `Tower Key limit reached (${plan.usedKeys}/${plan.keyLimit}).`,
+      };
+    }
+
+    if (plan.kind === 'open') {
+      return {
+        kind: 'click',
+        element: entranceButton,
+        label: `Open the Tower entrance (${plan.usedKeys}/${plan.keyLimit} keys used).`,
+      };
+    }
+
+    if (plan.kind === 'start') {
+      const form = usableStartForms[0];
+      return {
+        kind: 'submit',
+        form,
+        label: `Start Tower run ${plan.usedKeys + 1} of ${plan.keyLimit} from Floor 1.`,
+        confirmationAuthorized: true,
+        onSubmitting: () => {
+          clearStatusPotionLatch();
+          clearHpPotionFloors();
+          clearMerchantPurchaseLatch();
+          clearCompanionFlowLatch();
+          clearStartFloorAttempts();
+          writeAutoRestartKeyCount(plan.usedKeys + 1);
+        },
+        onSubmitRejected: () => writeAutoRestartKeyCount(plan.usedKeys),
+      };
+    }
+
+    return {
+      kind: 'wait',
+      message: entranceOpen
+        ? 'The Floor 1 Tower entrance is currently unavailable.'
+        : 'Waiting for the Tower entrance in the refuge.',
+    };
   }
 
   function findSanctuaryPanel() {
@@ -3660,6 +3846,7 @@
     const state = document.getElementById('te-run-state');
 
     if (!state) {
+      const autoRestartDecision = decideAutoRestart(false);
       const promiseKeptPanel = findPromiseKeptPanel();
       const startFloorPanel = promiseKeptPanel ? null : findStartFloorPanel();
       const companionRecruitmentPanel = startFloorPanel ? null : findCompanionRecruitmentPanel();
@@ -3696,9 +3883,9 @@
         runtime.floorBossChoiceAttempted = '';
       }
 
-      let standaloneDecision = null;
+      let standaloneDecision = autoRestartDecision;
 
-      if (promiseKeptPanel) {
+      if (!standaloneDecision && promiseKeptPanel) {
         standaloneDecision = decidePromiseKept(promiseKeptPanel);
       } else if (startFloorPanel) {
         standaloneDecision = decideStartFloor(startFloorPanel);
@@ -3730,6 +3917,25 @@
           return;
         }
 
+        if (standaloneDecision.kind === 'click') {
+          if (!standaloneDecision.element?.isConnected || standaloneDecision.element.disabled) {
+            setStatus('The Tower entrance button is no longer available.', 'warning');
+            scheduleStep(500);
+            return;
+          }
+
+          runtime.lastActionAt = Date.now();
+          setStatus(standaloneDecision.label, 'success');
+          standaloneDecision.element.click();
+          scheduleStep(300);
+          return;
+        }
+
+        if (standaloneDecision.kind === 'limit') {
+          stopAutomation(standaloneDecision.message, 'success');
+          return;
+        }
+
         setStatus(standaloneDecision.message || 'Waiting for the current Tower decision.', 'warning');
         scheduleStep(850);
         return;
@@ -3752,6 +3958,7 @@
       return;
     }
 
+    decideAutoRestart(true);
     runtime.missingRunSince = 0;
 
     if (!nativeRequestIsPending()) {
@@ -3863,6 +4070,16 @@
   });
 
   window.addEventListener('storage', (event) => {
+    if (event.key === AUTO_RESTART_KEY_COUNT_KEY) {
+      try {
+        const count = event.newValue === null ? 0 : Number(JSON.parse(event.newValue));
+        runtime.autoRestartKeyCount = Number.isInteger(count) && count >= 0 ? count : 0;
+      } catch {
+        runtime.autoRestartKeyCount = 0;
+      }
+      return;
+    }
+
     if (event.key === START_FLOOR_ATTEMPTS_KEY) {
       try {
         const attempts = event.newValue === null ? [] : JSON.parse(event.newValue);
