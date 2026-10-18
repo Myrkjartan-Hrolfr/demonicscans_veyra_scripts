@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Demonic Tower Autopilot
 // @namespace    local.demonicscans.tower
-// @version      1.5.0
-// @description  Automates Demonic Tower combat, events, boss preparations, start floors, potions, paths, and powers.
+// @version      1.6.0
+// @description  Automates Demonic Tower combat, events, companions, boss preparations, start floors, potions, paths, and powers.
 // @author       Myrkjartan Hrolfr
 // @match        https://demonicscans.org/*
 // @run-at       document-idle
@@ -30,6 +30,8 @@
       poisoned: true,
     }),
     respectNoPotion: true,
+    companionFloor: 'none',
+    companionFloor19Choice: 'defend',
     floorBossChoice: 'manual',
     startFloors: Object.freeze([]),
     sanctuaryHealThreshold: 50,
@@ -57,6 +59,8 @@
     path: new Set(['left', 'right', 'random']),
     powerMode: new Set(['wishlist', 'rarity', 'skip', 'pause']),
     powerFallback: new Set(['pause', 'skip', 'rarity']),
+    companionFloor: new Set(['none', '3', '6', '9']),
+    companionFloor19Choice: new Set(['defend', 'surrender']),
     floorBossChoice: new Set(['manual', 'healing', 'armor', 'intact']),
     unknownDecision: new Set(['pause', 'first']),
   });
@@ -75,6 +79,13 @@
 
   const SANCTUARY_CHOICES = Object.freeze(['heal', 'cleanse', 'blessing']);
   const MERCHANT_CHOICES = Object.freeze(['potion', 'common', 'epic', 'legendary']);
+  const COMPANION_RECRUITMENT_CHOICES = Object.freeze(['rescue', 'leave']);
+  const COMPANION_FLOOR_19_CHOICES = Object.freeze(['defend', 'surrender']);
+  const COMPANION_FLOORS_BY_TITLE = Object.freeze({
+    'Razek, the Disgraced Blade': 3,
+    'Veyshi, the Rune-Eater': 6,
+    'Ulgro, the Gentle Devourer': 9,
+  });
   const FLOOR_BOSS_CHOICES = Object.freeze(['healing', 'armor', 'intact']);
   const FLOOR_BOSS_LABELS = Object.freeze({
     healing: 'Destroy the apparatus; fight the additional elite to remove boss regeneration.',
@@ -97,6 +108,114 @@
     return String(value ?? '')
       .replace(/\s+/g, ' ')
       .trim();
+  }
+
+  function hasExactChoiceSignature(actualChoices, expectedChoices) {
+    if (
+      !Array.isArray(actualChoices) ||
+      !Array.isArray(expectedChoices) ||
+      actualChoices.length !== expectedChoices.length
+    ) {
+      return false;
+    }
+
+    const actual = actualChoices.map((choice) => normalizeText(choice).toLowerCase());
+    const expected = expectedChoices.map((choice) => normalizeText(choice).toLowerCase());
+
+    if (
+      actual.some((choice) => !choice) ||
+      expected.some((choice) => !choice) ||
+      new Set(actual).size !== actual.length ||
+      new Set(expected).size !== expected.length
+    ) {
+      return false;
+    }
+
+    return expected.every((choice) => actual.includes(choice));
+  }
+
+  function getUniqueAvailableChoice(targetChoice, availableChoices, allowedChoices) {
+    if (!Array.isArray(availableChoices)) {
+      return null;
+    }
+
+    const target = normalizeText(targetChoice).toLowerCase();
+    const available = availableChoices.map((choice) => normalizeText(choice).toLowerCase());
+
+    if (
+      !target ||
+      available.some((choice) => !choice || !allowedChoices.includes(choice)) ||
+      new Set(available).size !== available.length
+    ) {
+      return null;
+    }
+
+    return available.filter((choice) => choice === target).length === 1 ? target : null;
+  }
+
+  function getCompanionRecruitmentFloor({ title, roomChoices = [] } = {}) {
+    const normalizedTitle = normalizeText(title);
+
+    if (!Object.prototype.hasOwnProperty.call(COMPANION_FLOORS_BY_TITLE, normalizedTitle)) {
+      return null;
+    }
+
+    const floor = COMPANION_FLOORS_BY_TITLE[normalizedTitle];
+
+    return hasExactChoiceSignature(roomChoices, COMPANION_RECRUITMENT_CHOICES)
+      ? floor
+      : null;
+  }
+
+  function chooseCompanionRecruitmentChoice({
+    configuredFloor,
+    title,
+    roomChoices = [],
+    availableChoices = [],
+  } = {}) {
+    const offeredFloor = getCompanionRecruitmentFloor({ title, roomChoices });
+    const selectedFloor = normalizeText(configuredFloor).toLowerCase();
+
+    if (!offeredFloor || !VALID_SETTINGS.companionFloor.has(selectedFloor)) {
+      return null;
+    }
+
+    const choice = selectedFloor === String(offeredFloor) ? 'rescue' : 'leave';
+
+    return getUniqueAvailableChoice(choice, availableChoices, COMPANION_RECRUITMENT_CHOICES);
+  }
+
+  function isCompanionFloor19Context({ title, roomChoices = [] } = {}) {
+    return (
+      Object.prototype.hasOwnProperty.call(COMPANION_FLOORS_BY_TITLE, normalizeText(title)) &&
+      hasExactChoiceSignature(roomChoices, COMPANION_FLOOR_19_CHOICES)
+    );
+  }
+
+  function chooseCompanionFloor19Choice({
+    configuredChoice,
+    title,
+    roomChoices = [],
+    availableChoices = [],
+  } = {}) {
+    const choice = normalizeText(configuredChoice).toLowerCase();
+
+    if (
+      !isCompanionFloor19Context({ title, roomChoices }) ||
+      !VALID_SETTINGS.companionFloor19Choice.has(choice)
+    ) {
+      return null;
+    }
+
+    return getUniqueAvailableChoice(choice, availableChoices, COMPANION_FLOOR_19_CHOICES);
+  }
+
+  function chooseCompanionContinueChoice({ pending = false, roomChoices = [], availableChoices = [] } = {}) {
+    if (!pending || !hasExactChoiceSignature(roomChoices, ['continue'])) {
+      return null;
+    }
+
+    return getUniqueAvailableChoice('continue', availableChoices, ['continue']);
   }
 
   function normalizeStartFloors(value) {
@@ -427,6 +546,12 @@
         poisoned: sourceStatuses.poisoned !== false,
       },
       respectNoPotion: source.respectNoPotion !== false,
+      companionFloor: VALID_SETTINGS.companionFloor.has(String(source.companionFloor))
+        ? String(source.companionFloor)
+        : DEFAULTS.companionFloor,
+      companionFloor19Choice: VALID_SETTINGS.companionFloor19Choice.has(source.companionFloor19Choice)
+        ? source.companionFloor19Choice
+        : DEFAULTS.companionFloor19Choice,
       floorBossChoice: VALID_SETTINGS.floorBossChoice.has(source.floorBossChoice)
         ? source.floorBossChoice
         : DEFAULTS.floorBossChoice,
@@ -646,12 +771,18 @@
   if (typeof document === 'undefined') {
     if (typeof module !== 'undefined' && module.exports) {
       module.exports = Object.freeze({
+        chooseCompanionContinueChoice,
+        chooseCompanionFloor19Choice,
+        chooseCompanionRecruitmentChoice,
         chooseMerchantAction,
         chooseFloorBossChoice,
         chooseSanctuaryChoice,
         choosePowerPlacement,
         formatPowerWishlist,
         getMerchantChoice,
+        getCompanionRecruitmentFloor,
+        hasExactChoiceSignature,
+        isCompanionFloor19Context,
         isFloorBossDecisionContext,
         isStartFloorDecisionContext,
         isStatusPotionName,
@@ -686,6 +817,7 @@
   const NATIVE_KEY = `tower:${towerUser}:${towerOccurrence}`;
   const STATUS_POTION_LATCH_KEY = `${SCRIPT_ID}:status-potion-latch:v1:${towerUser}:${towerOccurrence}`;
   const MERCHANT_PURCHASE_LATCH_KEY = `${SCRIPT_ID}:merchant-purchase-latch:v1:${towerUser}:${towerOccurrence}`;
+  const COMPANION_FLOW_LATCH_KEY = `${SCRIPT_ID}:companion-flow-latch:v1:${towerUser}:${towerOccurrence}`;
   const START_FLOOR_ATTEMPTS_KEY = `${SCRIPT_ID}:start-floor-attempts:v1:${towerUser}:${towerOccurrence}`;
 
   const runtime = {
@@ -710,6 +842,7 @@
     statusPotionLatch: null,
     floorBossChoiceAttempted: '',
     merchantPurchaseLatch: null,
+    companionFlowLatch: null,
     startFloorAttempts: null,
   };
 
@@ -802,6 +935,95 @@
     } catch {
       // The in-page automation can continue even when storage is unavailable.
     }
+  }
+
+  function normalizeCompanionFlowLatch(latch) {
+    if (!latch || typeof latch !== 'object') {
+      return null;
+    }
+
+    const validChoice =
+      (latch.stage === 'recruitment' && COMPANION_RECRUITMENT_CHOICES.includes(latch.choice)) ||
+      (latch.stage === 'floor19' && COMPANION_FLOOR_19_CHOICES.includes(latch.choice));
+
+    if (!validChoice) {
+      return null;
+    }
+
+    return {
+      stage: latch.stage,
+      choice: latch.choice,
+      title: normalizeText(latch.title),
+      requestId: String(latch.requestId || ''),
+      revision: String(latch.revision || ''),
+    };
+  }
+
+  function readCompanionFlowLatch() {
+    if (runtime.companionFlowLatch) {
+      return runtime.companionFlowLatch;
+    }
+
+    runtime.companionFlowLatch = normalizeCompanionFlowLatch(
+      readJson(localStorage, COMPANION_FLOW_LATCH_KEY, null),
+    );
+
+    return runtime.companionFlowLatch;
+  }
+
+  function persistCompanionFlowLatch(latch) {
+    runtime.companionFlowLatch = normalizeCompanionFlowLatch(latch);
+
+    if (runtime.companionFlowLatch) {
+      writeJson(localStorage, COMPANION_FLOW_LATCH_KEY, runtime.companionFlowLatch);
+    }
+  }
+
+  function writeCompanionFlowLatch(stage, choice, title, form) {
+    persistCompanionFlowLatch({
+      stage,
+      choice,
+      title,
+      requestId: form?.querySelector('input[name="request_id"]')?.value,
+      revision: form?.querySelector('input[name="revision"]')?.value,
+    });
+  }
+
+  function clearCompanionFlowLatch(stage = '') {
+    const latch = readCompanionFlowLatch();
+
+    if (stage && latch?.stage !== stage) {
+      return;
+    }
+
+    runtime.companionFlowLatch = null;
+
+    try {
+      localStorage.removeItem(COMPANION_FLOW_LATCH_KEY);
+    } catch {
+      // The in-page automation can continue even when storage is unavailable.
+    }
+  }
+
+  function companionLatchMatchesPanel(latch, forms) {
+    const requestIds = forms
+      .map((form) => String(form.querySelector('input[name="request_id"]')?.value || ''))
+      .filter(Boolean);
+    const revisions = forms
+      .map((form) => String(form.querySelector('input[name="revision"]')?.value || ''))
+      .filter(Boolean);
+
+    if (latch.requestId && requestIds.includes(latch.requestId)) {
+      return true;
+    }
+
+    if (latch.revision && revisions.includes(latch.revision)) {
+      return true;
+    }
+
+    // Missing server tokens fail closed so a paid rescue or surrender is never
+    // submitted twice merely because the markup changed.
+    return !(latch.requestId && latch.revision && requestIds.length && revisions.length);
   }
 
   function readStartFloorAttempts() {
@@ -1089,6 +1311,28 @@
         </section>
 
         <section class="tm-tower-section">
+          <h3>Companions</h3>
+          <label>Recruit companion
+            <select data-setting="companionFloor">
+              <option value="none">None — leave every prisoner</option>
+              <option value="3">Floor 3 — Razek</option>
+              <option value="6">Floor 6 — Veyshi</option>
+              <option value="9">Floor 9 — Ulgro</option>
+            </select>
+          </label>
+          <label>Floor 19 decision
+            <select data-setting="companionFloor19Choice">
+              <option value="defend">Defend — fight to keep the companion</option>
+              <option value="surrender">Surrender — receive 250 coins and lose the companion</option>
+            </select>
+          </label>
+          <p class="tm-tower-help">
+            A rescue costs one HP potion. All companions on unselected floors are left behind. After the Floor 19
+            decision and any resulting fight, the following Continue action is submitted automatically.
+          </p>
+        </section>
+
+        <section class="tm-tower-section">
           <h3>Floor Boss Preparation</h3>
           <label>Before each tenth-floor boss
             <select data-setting="floorBossChoice">
@@ -1197,6 +1441,8 @@
       'path',
       'powerMode',
       'powerFallback',
+      'companionFloor',
+      'companionFloor19Choice',
       'floorBossChoice',
       'merchantChoice',
       'unknownDecision',
@@ -1302,6 +1548,8 @@
         poisoned: !!getSettingElement('statusPotionPoisoned')?.checked,
       },
       respectNoPotion: !!getSettingElement('respectNoPotion')?.checked,
+      companionFloor: getSettingElement('companionFloor')?.value,
+      companionFloor19Choice: getSettingElement('companionFloor19Choice')?.value,
       floorBossChoice: getSettingElement('floorBossChoice')?.value,
       startFloors: START_FLOORS.filter((floor) => {
         return !!runtime.root?.querySelector(`[data-start-floor="${floor}"]`)?.checked;
@@ -2153,6 +2401,205 @@
     };
   }
 
+  function getCompanionChoiceForms(panel) {
+    return [...panel.querySelectorAll('form.te-form[data-action="room"][data-choice]')];
+  }
+
+  function getCompanionPanelTitle(panel) {
+    return normalizeText(panel.querySelector('h2')?.textContent);
+  }
+
+  function findCompanionRecruitmentPanel() {
+    const matchingPanels = getCurrentChoicePanels().filter((panel) => {
+      const forms = getCompanionChoiceForms(panel);
+
+      return !!getCompanionRecruitmentFloor({
+        title: getCompanionPanelTitle(panel),
+        roomChoices: forms.map((form) => form.dataset.choice),
+      });
+    });
+
+    return matchingPanels.length === 1 ? matchingPanels[0] : null;
+  }
+
+  function decideCompanionRecruitment(panel) {
+    const title = getCompanionPanelTitle(panel);
+    const forms = getCompanionChoiceForms(panel);
+    const roomChoices = forms.map((form) => form.dataset.choice);
+    const floor = getCompanionRecruitmentFloor({ title, roomChoices });
+    let latch = readCompanionFlowLatch();
+
+    if (latch?.stage === 'floor19') {
+      // Encountering a recruitment panel proves that any retained Floor 19
+      // flow belongs to an older run.
+      clearCompanionFlowLatch();
+      latch = null;
+    }
+
+    if (latch?.stage === 'recruitment') {
+      if (companionLatchMatchesPanel(latch, forms)) {
+        return {
+          kind: 'wait',
+          message: `The Floor ${floor} companion choice was already submitted; waiting for the next state.`,
+        };
+      }
+
+      clearCompanionFlowLatch();
+    }
+
+    const usableForms = forms.filter(formIsUsable);
+    const choice = chooseCompanionRecruitmentChoice({
+      configuredFloor: settings.companionFloor,
+      title,
+      roomChoices,
+      availableChoices: usableForms.map((form) => form.dataset.choice),
+    });
+    const matchingForms = usableForms.filter((form) => form.dataset.choice === choice);
+
+    if (!choice || matchingForms.length !== 1) {
+      return {
+        kind: 'wait',
+        message: `The configured Floor ${floor} companion action is unavailable or ambiguous.`,
+      };
+    }
+
+    const form = matchingForms[0];
+
+    return {
+      kind: 'submit',
+      form,
+      label:
+        choice === 'rescue'
+          ? `Rescue ${title} on Floor ${floor} for one HP potion.`
+          : `Leave ${title} on Floor ${floor}.`,
+      onSubmitting: () => writeCompanionFlowLatch('recruitment', choice, title, form),
+      onSubmitRejected: () => clearCompanionFlowLatch('recruitment'),
+    };
+  }
+
+  function findCompanionFloor19Panel() {
+    const matchingPanels = getCurrentChoicePanels().filter((panel) => {
+      const forms = getCompanionChoiceForms(panel);
+
+      return isCompanionFloor19Context({
+        title: getCompanionPanelTitle(panel),
+        roomChoices: forms.map((form) => form.dataset.choice),
+      });
+    });
+
+    return matchingPanels.length === 1 ? matchingPanels[0] : null;
+  }
+
+  function decideCompanionFloor19(panel) {
+    const title = getCompanionPanelTitle(panel);
+    const forms = getCompanionChoiceForms(panel);
+    const roomChoices = forms.map((form) => form.dataset.choice);
+    let latch = readCompanionFlowLatch();
+
+    if (latch?.stage === 'recruitment') {
+      clearCompanionFlowLatch();
+      latch = null;
+    }
+
+    if (latch?.stage === 'floor19') {
+      if (companionLatchMatchesPanel(latch, forms)) {
+        return {
+          kind: 'wait',
+          message: 'The Floor 19 companion choice was already submitted; waiting for the next state.',
+        };
+      }
+
+      clearCompanionFlowLatch();
+    }
+
+    const usableForms = forms.filter(formIsUsable);
+    const choice = chooseCompanionFloor19Choice({
+      configuredChoice: settings.companionFloor19Choice,
+      title,
+      roomChoices,
+      availableChoices: usableForms.map((form) => form.dataset.choice),
+    });
+    const matchingForms = usableForms.filter((form) => form.dataset.choice === choice);
+
+    if (!choice || matchingForms.length !== 1) {
+      return {
+        kind: 'wait',
+        message: 'The configured Floor 19 companion action is unavailable or ambiguous.',
+      };
+    }
+
+    const form = matchingForms[0];
+
+    return {
+      kind: 'submit',
+      form,
+      label:
+        choice === 'defend'
+          ? `Defend ${title} to keep the companion.`
+          : `Hand over ${title} for 250 coins; the companion leaves this run.`,
+      onSubmitting: () => writeCompanionFlowLatch('floor19', choice, title, form),
+      onSubmitRejected: () => clearCompanionFlowLatch('floor19'),
+    };
+  }
+
+  function findCompanionContinuePanel() {
+    const matchingPanels = getCurrentChoicePanels().filter((panel) => {
+      const roomChoices = getCompanionChoiceForms(panel).map((form) => form.dataset.choice);
+
+      return hasExactChoiceSignature(roomChoices, ['continue']);
+    });
+
+    return matchingPanels.length === 1 ? matchingPanels[0] : null;
+  }
+
+  function decideCompanionContinue(panel) {
+    const latch = readCompanionFlowLatch();
+
+    if (latch?.stage !== 'floor19') {
+      return null;
+    }
+
+    const forms = getCompanionChoiceForms(panel);
+    const roomChoices = forms.map((form) => form.dataset.choice);
+    const usableForms = forms.filter(formIsUsable);
+    const choice = chooseCompanionContinueChoice({
+      pending: latch?.stage === 'floor19',
+      roomChoices,
+      availableChoices: usableForms.map((form) => form.dataset.choice),
+    });
+    const matchingForms = usableForms.filter((form) => form.dataset.choice === choice);
+
+    if (!choice || matchingForms.length !== 1) {
+      return {
+        kind: 'wait',
+        message: 'The Continue action after the Floor 19 companion decision is unavailable or ambiguous.',
+      };
+    }
+
+    return {
+      kind: 'submit',
+      form: matchingForms[0],
+      label: 'Continue after the Floor 19 companion decision.',
+      onSubmitting: clearCompanionFlowLatch,
+      onSubmitRejected: () => persistCompanionFlowLatch(latch),
+    };
+  }
+
+  function clearStaleCompanionFlow(state) {
+    const latch = readCompanionFlowLatch();
+
+    if (latch?.stage === 'recruitment') {
+      clearCompanionFlowLatch();
+      return;
+    }
+
+    const floor = Number(state?.dataset.floor);
+
+    if (latch?.stage === 'floor19' && Number.isInteger(floor) && floor !== 19) {
+      clearCompanionFlowLatch();
+    }
+  }
+
   function getFloorBossChoiceForms(panel) {
     return [...panel.querySelectorAll('form.te-form[data-action="room"][data-choice]')];
   }
@@ -2532,6 +2979,24 @@
 
     clearMerchantPurchaseLatch();
 
+    const companionRecruitmentPanel = findCompanionRecruitmentPanel();
+    if (companionRecruitmentPanel) {
+      return decideCompanionRecruitment(companionRecruitmentPanel);
+    }
+
+    const companionFloor19Panel = findCompanionFloor19Panel();
+    if (companionFloor19Panel) {
+      return decideCompanionFloor19(companionFloor19Panel);
+    }
+
+    const companionContinuePanel =
+      readCompanionFlowLatch()?.stage === 'floor19' ? findCompanionContinuePanel() : null;
+    if (companionContinuePanel) {
+      return decideCompanionContinue(companionContinuePanel);
+    }
+
+    clearStaleCompanionFlow(state);
+
     const floorBossPanel = findFloorBossPanel();
     if (!floorBossPanel) {
       runtime.floorBossChoiceAttempted = '';
@@ -2585,17 +3050,36 @@
 
     if (!state) {
       const startFloorPanel = findStartFloorPanel();
-      const floorBossPanel = startFloorPanel ? null : findFloorBossPanel();
+      const companionRecruitmentPanel = startFloorPanel ? null : findCompanionRecruitmentPanel();
+      const companionFloor19Panel =
+        startFloorPanel || companionRecruitmentPanel ? null : findCompanionFloor19Panel();
+      const companionContinuePanel =
+        startFloorPanel || companionRecruitmentPanel || companionFloor19Panel ||
+        readCompanionFlowLatch()?.stage !== 'floor19'
+          ? null
+          : findCompanionContinuePanel();
+      const floorBossPanel =
+        startFloorPanel || companionRecruitmentPanel || companionFloor19Panel || companionContinuePanel
+          ? null
+          : findFloorBossPanel();
 
       if (!floorBossPanel) {
         runtime.floorBossChoiceAttempted = '';
       }
 
-      const standaloneDecision = startFloorPanel
-        ? decideStartFloor(startFloorPanel)
-        : floorBossPanel
-          ? decideFloorBoss(floorBossPanel)
-          : null;
+      let standaloneDecision = null;
+
+      if (startFloorPanel) {
+        standaloneDecision = decideStartFloor(startFloorPanel);
+      } else if (companionRecruitmentPanel) {
+        standaloneDecision = decideCompanionRecruitment(companionRecruitmentPanel);
+      } else if (companionFloor19Panel) {
+        standaloneDecision = decideCompanionFloor19(companionFloor19Panel);
+      } else if (companionContinuePanel) {
+        standaloneDecision = decideCompanionContinue(companionContinuePanel);
+      } else if (floorBossPanel) {
+        standaloneDecision = decideFloorBoss(floorBossPanel);
+      }
 
       if (standaloneDecision) {
         runtime.missingRunSince = 0;
@@ -2615,6 +3099,8 @@
         scheduleStep(850);
         return;
       }
+
+      clearStaleCompanionFlow(null);
 
       runtime.missingRunSince ||= Date.now();
 
@@ -2669,7 +3155,12 @@
         !runtime.running &&
         !runtime.starting &&
         runtime.reacquireWhenRunAppears &&
-        (document.getElementById('te-run-state') || findStartFloorPanel() || findFloorBossPanel())
+        (document.getElementById('te-run-state') ||
+          findStartFloorPanel() ||
+          findCompanionRecruitmentPanel() ||
+          findCompanionFloor19Panel() ||
+          (readCompanionFlowLatch()?.stage === 'floor19' && findCompanionContinuePanel()) ||
+          findFloorBossPanel())
       ) {
         tryStartAutomation();
         return;
@@ -2765,6 +3256,17 @@
           latch && typeof latch === 'object' && MERCHANT_CHOICES.includes(latch.choice) ? latch : null;
       } catch {
         runtime.merchantPurchaseLatch = null;
+      }
+
+      return;
+    }
+
+    if (event.key === COMPANION_FLOW_LATCH_KEY) {
+      try {
+        const latch = event.newValue === null ? null : JSON.parse(event.newValue);
+        runtime.companionFlowLatch = normalizeCompanionFlowLatch(latch);
+      } catch {
+        runtime.companionFlowLatch = null;
       }
 
       return;

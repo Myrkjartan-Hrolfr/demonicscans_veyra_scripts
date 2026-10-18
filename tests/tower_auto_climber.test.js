@@ -2,12 +2,18 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  chooseCompanionContinueChoice,
+  chooseCompanionFloor19Choice,
+  chooseCompanionRecruitmentChoice,
   chooseFloorBossChoice,
   chooseMerchantAction,
   chooseSanctuaryChoice,
   choosePowerPlacement,
   formatPowerWishlist,
+  getCompanionRecruitmentFloor,
   getMerchantChoice,
+  hasExactChoiceSignature,
+  isCompanionFloor19Context,
   isFloorBossDecisionContext,
   isStartFloorDecisionContext,
   isStatusPotionName,
@@ -433,6 +439,196 @@ test('recognizes an explicit buy-or-skip checkpoint even when its floor is unkno
   );
 });
 
+test('recognizes companion recruitment only from an exact title and choice signature', () => {
+  const companions = [
+    ['Razek, the Disgraced Blade', 3],
+    ['Veyshi, the Rune-Eater', 6],
+    ['Ulgro, the Gentle Devourer', 9],
+  ];
+
+  for (const [title, floor] of companions) {
+    assert.equal(getCompanionRecruitmentFloor({ title, roomChoices: ['rescue', 'leave'] }), floor);
+    assert.equal(getCompanionRecruitmentFloor({ title, roomChoices: ['leave', 'rescue'] }), floor);
+  }
+
+  assert.equal(
+    getCompanionRecruitmentFloor({ title: 'Unknown Prisoner', roomChoices: ['rescue', 'leave'] }),
+    null,
+  );
+  assert.equal(
+    getCompanionRecruitmentFloor({
+      title: 'Razek, the Disgraced Blade!',
+      roomChoices: ['rescue', 'leave'],
+    }),
+    null,
+  );
+
+  for (const roomChoices of [
+    ['rescue'],
+    ['rescue', 'leave', 'skip'],
+    ['rescue', 'rescue'],
+    ['rescue', ''],
+    [],
+    null,
+    'rescue,leave',
+  ]) {
+    assert.equal(
+      getCompanionRecruitmentFloor({ title: 'Razek, the Disgraced Blade', roomChoices }),
+      null,
+      String(roomChoices),
+    );
+  }
+
+  assert.equal(hasExactChoiceSignature(['leave', 'rescue'], ['rescue', 'leave']), true);
+  assert.equal(hasExactChoiceSignature(['rescue', 'rescue'], ['rescue', 'leave']), false);
+});
+
+test('recruits only the configured floor and leaves all other companion offers', () => {
+  const companions = [
+    ['Razek, the Disgraced Blade', '3'],
+    ['Veyshi, the Rune-Eater', '6'],
+    ['Ulgro, the Gentle Devourer', '9'],
+  ];
+  const roomChoices = ['rescue', 'leave'];
+
+  for (const configuredFloor of ['none', '3', '6', '9']) {
+    for (const [title, offeredFloor] of companions) {
+      assert.equal(
+        chooseCompanionRecruitmentChoice({
+          configuredFloor,
+          title,
+          roomChoices,
+          availableChoices: roomChoices,
+        }),
+        configuredFloor === offeredFloor ? 'rescue' : 'leave',
+      );
+    }
+  }
+});
+
+test('companion recruitment fails closed for invalid, unavailable, or ambiguous actions', () => {
+  const base = {
+    configuredFloor: '3',
+    title: 'Razek, the Disgraced Blade',
+    roomChoices: ['rescue', 'leave'],
+  };
+
+  assert.equal(chooseCompanionRecruitmentChoice({ ...base, configuredFloor: 'manual' }), null);
+  assert.equal(chooseCompanionRecruitmentChoice({ ...base, availableChoices: ['leave'] }), null);
+  assert.equal(
+    chooseCompanionRecruitmentChoice({
+      ...base,
+      availableChoices: ['rescue', 'rescue', 'leave'],
+    }),
+    null,
+  );
+  assert.equal(
+    chooseCompanionRecruitmentChoice({
+      ...base,
+      roomChoices: ['rescue', 'leave', 'skip'],
+      availableChoices: ['rescue', 'leave', 'skip'],
+    }),
+    null,
+  );
+});
+
+test('recognizes and maps both exact Floor 19 companion choices', () => {
+  const roomChoices = ['defend', 'surrender'];
+
+  assert.equal(
+    isCompanionFloor19Context({ title: 'Ulgro, the Gentle Devourer', roomChoices }),
+    true,
+  );
+  assert.equal(
+    isCompanionFloor19Context({ title: 'Veyshi, the Rune-Eater', roomChoices: [...roomChoices].reverse() }),
+    true,
+  );
+
+  for (const configuredChoice of roomChoices) {
+    assert.equal(
+      chooseCompanionFloor19Choice({
+        configuredChoice,
+        title: 'Razek, the Disgraced Blade',
+        roomChoices,
+        availableChoices: roomChoices,
+      }),
+      configuredChoice,
+    );
+  }
+
+  assert.equal(isCompanionFloor19Context({ title: 'Unknown Companion', roomChoices }), false);
+  assert.equal(
+    chooseCompanionFloor19Choice({
+      configuredChoice: 'defend',
+      title: 'Ulgro, the Gentle Devourer',
+      roomChoices: ['defend', 'surrender', 'leave'],
+      availableChoices: ['defend', 'surrender', 'leave'],
+    }),
+    null,
+  );
+  assert.equal(
+    chooseCompanionFloor19Choice({
+      configuredChoice: 'surrender',
+      title: 'Ulgro, the Gentle Devourer',
+      roomChoices,
+      availableChoices: ['defend'],
+    }),
+    null,
+  );
+  assert.equal(
+    chooseCompanionFloor19Choice({
+      configuredChoice: 'defend',
+      title: 'Ulgro, the Gentle Devourer',
+      roomChoices,
+      availableChoices: ['defend', 'defend'],
+    }),
+    null,
+  );
+});
+
+test('continues after Floor 19 only with a pending companion flow and one usable action', () => {
+  assert.equal(
+    chooseCompanionContinueChoice({
+      pending: true,
+      roomChoices: ['continue'],
+      availableChoices: ['continue'],
+    }),
+    'continue',
+  );
+  assert.equal(
+    chooseCompanionContinueChoice({
+      pending: false,
+      roomChoices: ['continue'],
+      availableChoices: ['continue'],
+    }),
+    null,
+  );
+  assert.equal(
+    chooseCompanionContinueChoice({
+      pending: true,
+      roomChoices: ['continue', 'skip'],
+      availableChoices: ['continue', 'skip'],
+    }),
+    null,
+  );
+  assert.equal(
+    chooseCompanionContinueChoice({
+      pending: true,
+      roomChoices: ['continue'],
+      availableChoices: [],
+    }),
+    null,
+  );
+  assert.equal(
+    chooseCompanionContinueChoice({
+      pending: true,
+      roomChoices: ['continue'],
+      availableChoices: ['continue', 'continue'],
+    }),
+    null,
+  );
+});
+
 test('recognizes only the exact Floor Boss preparation choices', () => {
   const matches = (roomChoices) => isFloorBossDecisionContext({ roomChoices });
 
@@ -689,6 +885,8 @@ test('sanitizes persisted settings and clamps unsafe delays and thresholds', () 
         poisoned: true,
       },
       respectNoPotion: true,
+      companionFloor: 'none',
+      companionFloor19Choice: 'defend',
       floorBossChoice: 'manual',
       startFloors: [],
       sanctuaryHealThreshold: 50,
@@ -702,6 +900,24 @@ test('sanitizes persisted settings and clamps unsafe delays and thresholds', () 
       collapsed: false,
     },
   );
+});
+
+test('sanitizes persisted companion preferences', () => {
+  for (const companionFloor of ['none', '3', '6', '9']) {
+    assert.equal(sanitizeSettings({ companionFloor }).companionFloor, companionFloor);
+  }
+
+  for (const companionFloor19Choice of ['defend', 'surrender']) {
+    assert.equal(
+      sanitizeSettings({ companionFloor19Choice }).companionFloor19Choice,
+      companionFloor19Choice,
+    );
+  }
+
+  assert.equal(sanitizeSettings({ companionFloor: '19' }).companionFloor, 'none');
+  assert.equal(sanitizeSettings({ companionFloor19Choice: 'pay' }).companionFloor19Choice, 'defend');
+  assert.equal(sanitizeSettings({}).companionFloor, 'none');
+  assert.equal(sanitizeSettings({}).companionFloor19Choice, 'defend');
 });
 
 test('sanitizes the persisted Floor Boss preference', () => {
