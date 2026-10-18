@@ -8,6 +8,7 @@ const {
   chooseQuestOffer,
   classifyQuestOffer,
   chooseFloorBossChoice,
+  chooseFinalSealChoice,
   chooseMerchantAction,
   chooseSanctuaryChoice,
   choosePowerPlacement,
@@ -19,6 +20,7 @@ const {
   isCompanionContinueContext,
   isCompanionFloor19Context,
   isFloorBossDecisionContext,
+  isFinalSealDecisionContext,
   isStartFloorDecisionContext,
   isStatusPotionName,
   matchStatusEffect,
@@ -1108,6 +1110,7 @@ test('sanitizes persisted settings and clamps unsafe delays and thresholds', () 
       companionFloor: 'none',
       companionFloor19Choice: 'defend',
       floorBossChoice: 'manual',
+      finalSealChoice: 'manual',
       startFloors: [],
       sanctuaryHealThreshold: 50,
       merchantChoice: 1,
@@ -1152,6 +1155,35 @@ test('sanitizes the persisted Floor Boss preference', () => {
 
   assert.equal(sanitizeSettings({ floorBossChoice: 'invalid' }).floorBossChoice, 'manual');
   assert.equal(sanitizeSettings({}).floorBossChoice, 'manual');
+});
+
+test('recognizes only the exact final-seal decision and maps its setting', () => {
+  const title = 'The final seal is broken.';
+  const roomChoices = ['continue', 'leave'];
+
+  assert.equal(isFinalSealDecisionContext({ title, roomChoices }), true);
+  assert.equal(isFinalSealDecisionContext({ title: `${title}!`, roomChoices }), false);
+  assert.equal(isFinalSealDecisionContext({ title, roomChoices: ['continue'] }), false);
+  assert.equal(
+    chooseFinalSealChoice({
+      configuredChoice: 'continue',
+      title,
+      roomChoices,
+      availableChoices: roomChoices,
+    }),
+    'continue',
+  );
+  assert.equal(
+    chooseFinalSealChoice({
+      configuredChoice: 'leave',
+      title,
+      roomChoices,
+      availableChoices: roomChoices,
+    }),
+    'leave',
+  );
+  assert.equal(sanitizeSettings({ finalSealChoice: 'leave' }).finalSealChoice, 'leave');
+  assert.equal(sanitizeSettings({ finalSealChoice: 'invalid' }).finalSealChoice, 'manual');
 });
 
 test('sanitizes persisted wishlist amounts and status potion choices', () => {

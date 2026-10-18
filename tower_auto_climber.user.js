@@ -34,6 +34,7 @@
     companionFloor: 'none',
     companionFloor19Choice: 'defend',
     floorBossChoice: 'manual',
+    finalSealChoice: 'manual',
     startFloors: Object.freeze([]),
     sanctuaryHealThreshold: 50,
     merchantChoice: 1,
@@ -63,6 +64,7 @@
     companionFloor: new Set(['none', '3', '6', '9']),
     companionFloor19Choice: new Set(['defend', 'surrender']),
     floorBossChoice: new Set(['manual', 'healing', 'armor', 'intact']),
+    finalSealChoice: new Set(['manual', 'continue', 'leave']),
     unknownDecision: new Set(['pause', 'first']),
   });
 
@@ -94,6 +96,7 @@
     armor: 'Spend 60 Abyssal Coins to remove the boss’s +20% DEF enhancement.',
     intact: 'Keep both boss enhancements and challenge it for 2 extra mutation energy.',
   });
+  const FINAL_SEAL_CHOICES = Object.freeze(['continue', 'leave']);
   const START_FLOORS = Object.freeze([10, 20, 30]);
 
   function clampNumber(value, minimum, maximum, fallback) {
@@ -561,6 +564,26 @@
       : null;
   }
 
+  function isFinalSealDecisionContext({ title, roomChoices = [] } = {}) {
+    return (
+      normalizeText(title).toLowerCase() === 'the final seal is broken.' &&
+      hasExactChoiceSignature(roomChoices, FINAL_SEAL_CHOICES)
+    );
+  }
+
+  function chooseFinalSealChoice({ configuredChoice, title, roomChoices = [], availableChoices = [] } = {}) {
+    const choice = normalizeText(configuredChoice).toLowerCase();
+
+    if (
+      !isFinalSealDecisionContext({ title, roomChoices }) ||
+      !FINAL_SEAL_CHOICES.includes(choice)
+    ) {
+      return null;
+    }
+
+    return getUniqueAvailableChoice(choice, availableChoices, FINAL_SEAL_CHOICES);
+  }
+
   function normalizePowerKey(value) {
     return normalizeText(value)
       .normalize('NFKD')
@@ -784,6 +807,9 @@
       floorBossChoice: VALID_SETTINGS.floorBossChoice.has(source.floorBossChoice)
         ? source.floorBossChoice
         : DEFAULTS.floorBossChoice,
+      finalSealChoice: VALID_SETTINGS.finalSealChoice.has(source.finalSealChoice)
+        ? source.finalSealChoice
+        : DEFAULTS.finalSealChoice,
       startFloors: normalizeStartFloors(source.startFloors),
       sanctuaryHealThreshold: clampNumber(
         source.sanctuaryHealThreshold,
@@ -1009,6 +1035,7 @@
         classifyQuestOffer,
         chooseMerchantAction,
         chooseFloorBossChoice,
+        chooseFinalSealChoice,
         chooseSanctuaryChoice,
         choosePowerPlacement,
         companionLatchMatchesVisit,
@@ -1019,6 +1046,7 @@
         isCompanionContinueContext,
         isCompanionFloor19Context,
         isFloorBossDecisionContext,
+        isFinalSealDecisionContext,
         isStartFloorDecisionContext,
         isStatusPotionName,
         matchStatusEffect,
@@ -1628,6 +1656,18 @@
         </section>
 
         <section class="tm-tower-section">
+          <h3>After Floor 60</h3>
+          <label>When the final seal breaks
+            <select data-setting="finalSealChoice">
+              <option value="manual">Wait for me (manual)</option>
+              <option value="continue">Enter the endless floors</option>
+              <option value="leave">Finish this run</option>
+            </select>
+          </label>
+          <p class="tm-tower-help">Used only for the exact final-seal decision after the 60-floor campaign.</p>
+        </section>
+
+        <section class="tm-tower-section">
           <h3>Start Floor Unlocks</h3>
           <div class="tm-tower-check-grid">
             <label class="tm-tower-check">
@@ -1723,6 +1763,7 @@
       'companionFloor',
       'companionFloor19Choice',
       'floorBossChoice',
+      'finalSealChoice',
       'merchantChoice',
       'unknownDecision',
       'actionDelayMs',
@@ -1831,6 +1872,7 @@
       companionFloor: getSettingElement('companionFloor')?.value,
       companionFloor19Choice: getSettingElement('companionFloor19Choice')?.value,
       floorBossChoice: getSettingElement('floorBossChoice')?.value,
+      finalSealChoice: getSettingElement('finalSealChoice')?.value,
       startFloors: START_FLOORS.filter((floor) => {
         return !!runtime.root?.querySelector(`[data-start-floor="${floor}"]`)?.checked;
       }),
@@ -3089,6 +3131,42 @@
     };
   }
 
+  function findFinalSealPanel() {
+    const panels = getCurrentChoicePanels().filter((panel) => {
+      const forms = [...panel.querySelectorAll('form.te-form[data-action="room"][data-choice]')];
+      return isFinalSealDecisionContext({
+        title: panel.querySelector('h2')?.textContent,
+        roomChoices: forms.map((form) => form.dataset.choice),
+      });
+    });
+
+    return panels.length === 1 ? panels[0] : null;
+  }
+
+  function decideFinalSeal(panel) {
+    if (settings.finalSealChoice === 'manual') {
+      return { kind: 'wait', message: 'Waiting for your final-seal decision.' };
+    }
+
+    const forms = [...panel.querySelectorAll('form.te-form[data-action="room"][data-choice]')];
+    const usableForms = forms.filter(formIsUsable);
+    const choice = chooseFinalSealChoice({
+      configuredChoice: settings.finalSealChoice,
+      title: panel.querySelector('h2')?.textContent,
+      roomChoices: forms.map((form) => form.dataset.choice),
+      availableChoices: usableForms.map((form) => form.dataset.choice),
+    });
+    const matchingForms = usableForms.filter((form) => form.dataset.choice === choice);
+
+    return matchingForms.length === 1
+      ? {
+          kind: 'submit',
+          form: matchingForms[0],
+          label: choice === 'continue' ? 'Enter the endless floors.' : 'Finish the 60-floor run.',
+        }
+      : { kind: 'wait', message: 'The configured final-seal option is unavailable or ambiguous.' };
+  }
+
   function findSanctuaryPanel() {
     return getCurrentChoicePanels().find((panel) => {
       const title = normalizeText(panel.querySelector('h2')?.textContent).toLowerCase();
@@ -3436,6 +3514,11 @@
       return decideQuest(questPanel, state);
     }
 
+    const finalSealPanel = findFinalSealPanel();
+    if (finalSealPanel) {
+      return decideFinalSeal(finalSealPanel);
+    }
+
     const floorBossPanel = findFloorBossPanel();
     if (!floorBossPanel) {
       runtime.floorBossChoiceAttempted = '';
@@ -3508,8 +3591,12 @@
         startFloorPanel || companionRecruitmentPanel || companionFloor19Panel || companionContinuePanel
           ? null
           : findQuestPanel();
-      const floorBossPanel =
+      const finalSealPanel =
         startFloorPanel || companionRecruitmentPanel || companionFloor19Panel || companionContinuePanel || questPanel
+          ? null
+          : findFinalSealPanel();
+      const floorBossPanel =
+        startFloorPanel || companionRecruitmentPanel || companionFloor19Panel || companionContinuePanel || questPanel || finalSealPanel
           ? null
           : findFloorBossPanel();
 
@@ -3529,6 +3616,8 @@
         standaloneDecision = decideCompanionContinue(companionContinuePanel);
       } else if (questPanel) {
         standaloneDecision = decideQuest(questPanel, null);
+      } else if (finalSealPanel) {
+        standaloneDecision = decideFinalSeal(finalSealPanel);
       } else if (floorBossPanel) {
         standaloneDecision = decideFloorBoss(floorBossPanel);
       }
@@ -3612,6 +3701,7 @@
           findCompanionRecruitmentPanel() ||
           findCompanionFloor19Panel() ||
           findCompanionContinuePanel() ||
+          findFinalSealPanel() ||
           findFloorBossPanel())
       ) {
         tryStartAutomation();
