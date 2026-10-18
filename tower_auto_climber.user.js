@@ -309,16 +309,21 @@
       return false;
     }
 
-    if (!normalizedLatch) {
-      return (
-        normalizedPanelTitle === 'a promise kept' &&
-        Object.keys(COMPANION_FLOORS_BY_TITLE).some((title) => {
-          const companionName = title.split(',')[0];
-          const escapedName = companionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const isPromiseKeptResult =
+      normalizedPanelTitle === 'a promise kept' &&
+      Object.keys(COMPANION_FLOORS_BY_TITLE).some((title) => {
+        const companionName = title.split(',')[0];
+        const escapedName = companionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-          return new RegExp(`\\b${escapedName}\\b`, 'i').test(normalizedPanelText);
-        })
-      );
+        return new RegExp(`\\b${escapedName}\\b`, 'i').test(normalizedPanelText);
+      });
+
+    if (isPromiseKeptResult) {
+      return true;
+    }
+
+    if (!normalizedLatch) {
+      return false;
     }
 
     if (

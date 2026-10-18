@@ -723,6 +723,14 @@ test('continues only on the matching companion result with one usable action', (
   assert.equal(
     chooseCompanionContinueChoice({
       ...result,
+      latch: { ...latch, title: 'Razek, the Disgraced Blade' },
+    }),
+    'continue',
+    'the exact result must not be blocked by a stale companion latch',
+  );
+  assert.equal(
+    chooseCompanionContinueChoice({
+      ...result,
       panelText: 'Continue to an unrelated room without the companion.',
     }),
     null,
