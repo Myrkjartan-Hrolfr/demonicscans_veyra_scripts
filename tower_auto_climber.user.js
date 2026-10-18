@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Demonic Tower Autopilot
 // @namespace    local.demonicscans.tower
-// @version      1.4.2
-// @description  Automates Demonic Tower combat, events, start floors, potions, paths, and power priorities.
+// @version      1.5.0
+// @description  Automates Demonic Tower combat, events, boss preparations, start floors, potions, paths, and powers.
 // @author       Myrkjartan Hrolfr
 // @match        https://demonicscans.org/*
 // @run-at       document-idle
@@ -30,6 +30,7 @@
       poisoned: true,
     }),
     respectNoPotion: true,
+    floorBossChoice: 'manual',
     startFloors: Object.freeze([]),
     sanctuaryHealThreshold: 50,
     merchantChoice: 1,
@@ -56,6 +57,7 @@
     path: new Set(['left', 'right', 'random']),
     powerMode: new Set(['wishlist', 'rarity', 'skip', 'pause']),
     powerFallback: new Set(['pause', 'skip', 'rarity']),
+    floorBossChoice: new Set(['manual', 'healing', 'armor', 'intact']),
     unknownDecision: new Set(['pause', 'first']),
   });
 
@@ -73,6 +75,12 @@
 
   const SANCTUARY_CHOICES = Object.freeze(['heal', 'cleanse', 'blessing']);
   const MERCHANT_CHOICES = Object.freeze(['potion', 'common', 'epic', 'legendary']);
+  const FLOOR_BOSS_CHOICES = Object.freeze(['healing', 'armor', 'intact']);
+  const FLOOR_BOSS_LABELS = Object.freeze({
+    healing: 'Destroy the apparatus; fight the additional elite to remove boss regeneration.',
+    armor: 'Spend 60 Abyssal Coins to remove the boss’s +20% DEF enhancement.',
+    intact: 'Keep both boss enhancements and challenge it for 2 extra mutation energy.',
+  });
   const START_FLOORS = Object.freeze([10, 20, 30]);
 
   function clampNumber(value, minimum, maximum, fallback) {
@@ -170,6 +178,40 @@
       choices.includes('buy') &&
       choices.includes('skip')
     );
+  }
+
+  function isFloorBossDecisionContext({ roomChoices = [] } = {}) {
+    if (!Array.isArray(roomChoices)) {
+      return false;
+    }
+
+    const choices = roomChoices.map((choice) => normalizeText(choice).toLowerCase()).filter(Boolean);
+
+    return (
+      choices.length === FLOOR_BOSS_CHOICES.length &&
+      new Set(choices).size === FLOOR_BOSS_CHOICES.length &&
+      FLOOR_BOSS_CHOICES.every((choice) => choices.includes(choice))
+    );
+  }
+
+  function chooseFloorBossChoice({ configuredChoice, roomChoices = [], availableChoices = [] } = {}) {
+    if (!isFloorBossDecisionContext({ roomChoices })) {
+      return null;
+    }
+
+    const choice = normalizeText(configuredChoice).toLowerCase();
+
+    if (!FLOOR_BOSS_CHOICES.includes(choice) || !Array.isArray(availableChoices)) {
+      return null;
+    }
+
+    const usableChoices = availableChoices
+      .map((availableChoice) => normalizeText(availableChoice).toLowerCase())
+      .filter(Boolean);
+
+    return usableChoices.filter((availableChoice) => availableChoice === choice).length === 1
+      ? choice
+      : null;
   }
 
   function normalizePowerKey(value) {
@@ -385,6 +427,9 @@
         poisoned: sourceStatuses.poisoned !== false,
       },
       respectNoPotion: source.respectNoPotion !== false,
+      floorBossChoice: VALID_SETTINGS.floorBossChoice.has(source.floorBossChoice)
+        ? source.floorBossChoice
+        : DEFAULTS.floorBossChoice,
       startFloors: normalizeStartFloors(source.startFloors),
       sanctuaryHealThreshold: clampNumber(
         source.sanctuaryHealThreshold,
@@ -602,10 +647,12 @@
     if (typeof module !== 'undefined' && module.exports) {
       module.exports = Object.freeze({
         chooseMerchantAction,
+        chooseFloorBossChoice,
         chooseSanctuaryChoice,
         choosePowerPlacement,
         formatPowerWishlist,
         getMerchantChoice,
+        isFloorBossDecisionContext,
         isStartFloorDecisionContext,
         isStatusPotionName,
         matchStatusEffect,
@@ -661,6 +708,7 @@
     tone: 'neutral',
     stoppingNative: false,
     statusPotionLatch: null,
+    floorBossChoiceAttempted: '',
     merchantPurchaseLatch: null,
     startFloorAttempts: null,
   };
@@ -1041,6 +1089,22 @@
         </section>
 
         <section class="tm-tower-section">
+          <h3>Floor Boss Preparation</h3>
+          <label>Before each tenth-floor boss
+            <select data-setting="floorBossChoice">
+              <option value="manual">Wait for me (manual)</option>
+              <option value="healing">Destroy apparatus — extra elite, remove regeneration</option>
+              <option value="armor">Sabotage armor — 60 coins, remove +20% DEF</option>
+              <option value="intact">Face it intact — keep both buffs, +2 mutation energy</option>
+            </select>
+          </label>
+          <p class="tm-tower-help">
+            The selected option is used only when the exact apparatus, armor, and intact choices are offered.
+            Manual mode always waits for your decision.
+          </p>
+        </section>
+
+        <section class="tm-tower-section">
           <h3>Start Floor Unlocks</h3>
           <div class="tm-tower-check-grid">
             <label class="tm-tower-check">
@@ -1133,6 +1197,7 @@
       'path',
       'powerMode',
       'powerFallback',
+      'floorBossChoice',
       'merchantChoice',
       'unknownDecision',
       'actionDelayMs',
@@ -1223,6 +1288,7 @@
   }
 
   function readSettingsFromUi() {
+    const previousFloorBossChoice = settings.floorBossChoice;
     const next = {
       ...settings,
       attack: getSettingElement('attack')?.value,
@@ -1236,6 +1302,7 @@
         poisoned: !!getSettingElement('statusPotionPoisoned')?.checked,
       },
       respectNoPotion: !!getSettingElement('respectNoPotion')?.checked,
+      floorBossChoice: getSettingElement('floorBossChoice')?.value,
       startFloors: START_FLOORS.filter((floor) => {
         return !!runtime.root?.querySelector(`[data-start-floor="${floor}"]`)?.checked;
       }),
@@ -1251,6 +1318,10 @@
 
     settings = sanitizeSettings(next);
     saveSettings();
+
+    if (settings.floorBossChoice !== previousFloorBossChoice) {
+      runtime.floorBossChoiceAttempted = '';
+    }
 
     if (!settings.statusPotionEnabled) {
       clearStatusPotionLatch();
@@ -2082,6 +2153,66 @@
     };
   }
 
+  function getFloorBossChoiceForms(panel) {
+    return [...panel.querySelectorAll('form.te-form[data-action="room"][data-choice]')];
+  }
+
+  function findFloorBossPanel() {
+    const matchingPanels = getCurrentChoicePanels().filter((panel) => {
+      const roomChoices = getFloorBossChoiceForms(panel).map((form) => form.dataset.choice);
+
+      return isFloorBossDecisionContext({ roomChoices });
+    });
+
+    return matchingPanels.length === 1 ? matchingPanels[0] : null;
+  }
+
+  function decideFloorBoss(panel) {
+    const forms = getFloorBossChoiceForms(panel);
+    const roomChoices = forms.map((form) => form.dataset.choice);
+
+    if (settings.floorBossChoice === 'manual') {
+      return {
+        kind: 'wait',
+        message: 'Waiting for your Floor Boss preparation choice.',
+      };
+    }
+
+    if (runtime.floorBossChoiceAttempted) {
+      return {
+        kind: 'wait',
+        message: 'The configured Floor Boss preparation was already submitted; waiting for the next state.',
+      };
+    }
+
+    const usableForms = forms.filter(formIsUsable);
+    const choice = chooseFloorBossChoice({
+      configuredChoice: settings.floorBossChoice,
+      roomChoices,
+      availableChoices: usableForms.map((form) => form.dataset.choice),
+    });
+    const matchingForms = usableForms.filter((form) => form.dataset.choice === choice);
+
+    if (!choice || matchingForms.length !== 1) {
+      return {
+        kind: 'wait',
+        message: 'The configured Floor Boss preparation option is unavailable or ambiguous.',
+      };
+    }
+
+    return {
+      kind: 'submit',
+      form: matchingForms[0],
+      label: FLOOR_BOSS_LABELS[choice],
+      onSubmitting: () => {
+        runtime.floorBossChoiceAttempted = choice;
+      },
+      onSubmitRejected: () => {
+        runtime.floorBossChoiceAttempted = '';
+      },
+    };
+  }
+
   function findSanctuaryPanel() {
     return getCurrentChoicePanels().find((panel) => {
       const title = normalizeText(panel.querySelector('h2')?.textContent).toLowerCase();
@@ -2401,9 +2532,18 @@
 
     clearMerchantPurchaseLatch();
 
+    const floorBossPanel = findFloorBossPanel();
+    if (!floorBossPanel) {
+      runtime.floorBossChoiceAttempted = '';
+    }
+
     const sanctuaryDecision = decideSanctuary(state);
     if (sanctuaryDecision) {
       return sanctuaryDecision;
+    }
+
+    if (floorBossPanel) {
+      return decideFloorBoss(floorBossPanel);
     }
 
     const pendingType = String(state.dataset.pending || '');
@@ -2445,8 +2585,19 @@
 
     if (!state) {
       const startFloorPanel = findStartFloorPanel();
+      const floorBossPanel = startFloorPanel ? null : findFloorBossPanel();
 
-      if (startFloorPanel) {
+      if (!floorBossPanel) {
+        runtime.floorBossChoiceAttempted = '';
+      }
+
+      const standaloneDecision = startFloorPanel
+        ? decideStartFloor(startFloorPanel)
+        : floorBossPanel
+          ? decideFloorBoss(floorBossPanel)
+          : null;
+
+      if (standaloneDecision) {
         runtime.missingRunSince = 0;
         const remainingDelay = settings.actionDelayMs - (Date.now() - runtime.lastActionAt);
 
@@ -2455,14 +2606,12 @@
           return;
         }
 
-        const decision = decideStartFloor(startFloorPanel);
-
-        if (decision.kind === 'submit') {
-          submitDecision(decision);
+        if (standaloneDecision.kind === 'submit') {
+          submitDecision(standaloneDecision);
           return;
         }
 
-        setStatus(decision.message || 'Waiting for the next Start Floor state.', 'warning');
+        setStatus(standaloneDecision.message || 'Waiting for the current Tower decision.', 'warning');
         scheduleStep(850);
         return;
       }
@@ -2520,7 +2669,7 @@
         !runtime.running &&
         !runtime.starting &&
         runtime.reacquireWhenRunAppears &&
-        (document.getElementById('te-run-state') || findStartFloorPanel())
+        (document.getElementById('te-run-state') || findStartFloorPanel() || findFloorBossPanel())
       ) {
         tryStartAutomation();
         return;

@@ -2,11 +2,13 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  chooseFloorBossChoice,
   chooseMerchantAction,
   chooseSanctuaryChoice,
   choosePowerPlacement,
   formatPowerWishlist,
   getMerchantChoice,
+  isFloorBossDecisionContext,
   isStartFloorDecisionContext,
   isStatusPotionName,
   matchStatusEffect,
@@ -431,6 +433,82 @@ test('recognizes an explicit buy-or-skip checkpoint even when its floor is unkno
   );
 });
 
+test('recognizes only the exact Floor Boss preparation choices', () => {
+  const matches = (roomChoices) => isFloorBossDecisionContext({ roomChoices });
+
+  assert.equal(matches(['healing', 'armor', 'intact']), true);
+  assert.equal(matches(['intact', 'healing', 'armor']), true);
+
+  for (const roomChoices of [
+    ['healing', 'armor'],
+    ['healing', 'armor', 'intact', 'skip'],
+    ['healing', 'armor', 'armor'],
+    ['heal', 'armor', 'intact'],
+    [],
+    null,
+    'healing,armor,intact',
+  ]) {
+    assert.equal(matches(roomChoices), false, String(roomChoices));
+  }
+});
+
+test('maps configured Floor Boss choices and leaves manual decisions untouched', () => {
+  const roomChoices = ['healing', 'armor', 'intact'];
+
+  for (const configuredChoice of roomChoices) {
+    assert.equal(
+      chooseFloorBossChoice({ configuredChoice, roomChoices, availableChoices: roomChoices }),
+      configuredChoice,
+    );
+  }
+
+  assert.equal(
+    chooseFloorBossChoice({ configuredChoice: 'manual', roomChoices, availableChoices: roomChoices }),
+    null,
+  );
+  assert.equal(
+    chooseFloorBossChoice({ configuredChoice: 'invalid', roomChoices, availableChoices: roomChoices }),
+    null,
+  );
+});
+
+test('Floor Boss automation fails closed for malformed or unavailable choices', () => {
+  const roomChoices = ['healing', 'armor', 'intact'];
+
+  assert.equal(
+    chooseFloorBossChoice({
+      configuredChoice: 'healing',
+      roomChoices: ['healing', 'armor'],
+      availableChoices: ['healing', 'armor'],
+    }),
+    null,
+  );
+  assert.equal(
+    chooseFloorBossChoice({
+      configuredChoice: 'healing',
+      roomChoices: [...roomChoices, 'skip'],
+      availableChoices: [...roomChoices, 'skip'],
+    }),
+    null,
+  );
+  assert.equal(
+    chooseFloorBossChoice({
+      configuredChoice: 'armor',
+      roomChoices,
+      availableChoices: ['healing', 'intact'],
+    }),
+    null,
+  );
+  assert.equal(
+    chooseFloorBossChoice({
+      configuredChoice: 'healing',
+      roomChoices,
+      availableChoices: ['healing', 'healing', 'armor', 'intact'],
+    }),
+    null,
+  );
+});
+
 test('buys only checked Start Floors and declines every unchecked offer', () => {
   assert.deepEqual(
     planStartFloorAction({
@@ -611,6 +689,7 @@ test('sanitizes persisted settings and clamps unsafe delays and thresholds', () 
         poisoned: true,
       },
       respectNoPotion: true,
+      floorBossChoice: 'manual',
       startFloors: [],
       sanctuaryHealThreshold: 50,
       merchantChoice: 1,
@@ -623,6 +702,15 @@ test('sanitizes persisted settings and clamps unsafe delays and thresholds', () 
       collapsed: false,
     },
   );
+});
+
+test('sanitizes the persisted Floor Boss preference', () => {
+  for (const floorBossChoice of ['healing', 'armor', 'intact', 'manual']) {
+    assert.equal(sanitizeSettings({ floorBossChoice }).floorBossChoice, floorBossChoice);
+  }
+
+  assert.equal(sanitizeSettings({ floorBossChoice: 'invalid' }).floorBossChoice, 'manual');
+  assert.equal(sanitizeSettings({}).floorBossChoice, 'manual');
 });
 
 test('sanitizes persisted wishlist amounts and status potion choices', () => {
