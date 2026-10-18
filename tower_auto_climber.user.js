@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Demonic Tower Autopilot
 // @namespace    local.demonicscans.tower
-// @version      1.8.0
+// @version      1.9.0
 // @description  Automates Demonic Tower combat, events, quests, companions, boss preparations, start floors, potions, paths, and powers.
 // @author       Myrkjartan Hrolfr
 // @match        https://demonicscans.org/*
@@ -302,18 +302,28 @@
     roomChoices = [],
   } = {}) {
     const normalizedLatch = normalizeCompanionFlowLatch(latch);
+    const normalizedPanelTitle = normalizeText(panelTitle).toLowerCase();
+    const normalizedPanelText = normalizeText(panelText);
 
-    if (
-      !normalizedLatch ||
-      !['floor19', 'continue'].includes(normalizedLatch.stage) ||
-      !hasExactChoiceSignature(roomChoices, ['continue'])
-    ) {
+    if (!hasExactChoiceSignature(roomChoices, ['continue'])) {
       return false;
     }
 
+    if (!normalizedLatch) {
+      return (
+        normalizedPanelTitle === 'a promise kept' &&
+        Object.keys(COMPANION_FLOORS_BY_TITLE).some((title) => {
+          const companionName = title.split(',')[0];
+          const escapedName = companionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+          return new RegExp(`\\b${escapedName}\\b`, 'i').test(normalizedPanelText);
+        })
+      );
+    }
+
     if (
-      normalizedLatch.choice === 'defend' &&
-      normalizeText(panelTitle).toLowerCase() !== 'a promise kept'
+      !['floor19', 'continue'].includes(normalizedLatch.stage) ||
+      (normalizedLatch.choice === 'defend' && normalizedPanelTitle !== 'a promise kept')
     ) {
       return false;
     }
@@ -321,7 +331,7 @@
     const companionName = normalizedLatch.title.split(',')[0].toLowerCase();
     const escapedName = companionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-    return new RegExp(`\\b${escapedName}\\b`, 'i').test(normalizeText(panelText));
+    return new RegExp(`\\b${escapedName}\\b`, 'i').test(normalizedPanelText);
   }
 
   function chooseCompanionContinueChoice({
@@ -2984,10 +2994,6 @@
   function findCompanionContinuePanel() {
     const latch = readCompanionFlowLatch();
 
-    if (!['floor19', 'continue'].includes(latch?.stage)) {
-      return null;
-    }
-
     const matchingPanels = getCurrentChoicePanels().filter((panel) => {
       const roomChoices = getCompanionChoiceForms(panel).map((form) => form.dataset.choice);
 
@@ -3021,10 +3027,6 @@
       };
     }
 
-    if (latch?.stage !== 'floor19') {
-      return null;
-    }
-
     const roomChoices = forms.map((form) => form.dataset.choice);
     const usableForms = forms.filter(formIsUsable);
     const choice = chooseCompanionContinueChoice({
@@ -3043,12 +3045,21 @@
       };
     }
 
+    const form = matchingForms[0];
+    const companionTitle = Object.keys(COMPANION_FLOORS_BY_TITLE).find((title) => {
+      return normalizeText(panel.textContent).toLowerCase().includes(title.split(',')[0].toLowerCase());
+    });
+
     return {
       kind: 'submit',
-      form: matchingForms[0],
+      form,
       label: 'Continue after the Floor 19 companion decision.',
       onSubmitting: () => {
-        writeCompanionFlowLatch('continue', latch.choice, latch.title, matchingForms[0]);
+        if (latch?.stage === 'floor19') {
+          writeCompanionFlowLatch('continue', latch.choice, latch.title, form);
+        } else if (companionTitle) {
+          writeCompanionFlowLatch('continue', 'defend', companionTitle, form);
+        }
       },
       onSubmitRejected: () => persistCompanionFlowLatch(latch),
     };

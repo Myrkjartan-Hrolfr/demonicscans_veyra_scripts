@@ -710,7 +710,15 @@ test('continues only on the matching companion result with one usable action', (
       ...result,
       latch: null,
     }),
-    null,
+    'continue',
+  );
+  assert.equal(
+    chooseCompanionContinueChoice({
+      ...result,
+      latch: null,
+      panelText: 'A promise kept Razek cuts through his collar and steps forward.',
+    }),
+    'continue',
   );
   assert.equal(
     chooseCompanionContinueChoice({
