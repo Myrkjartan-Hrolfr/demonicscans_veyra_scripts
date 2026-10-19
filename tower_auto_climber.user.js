@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Demonic Tower Autopilot
 // @namespace    local.demonicscans.tower
-// @version      1.15.0
+// @version      1.15.1
 // @description  Automates Demonic Tower combat, events, quests, companions, boss preparations, start floors, potions, paths, and powers.
 // @author       Myrkjartan Hrolfr
 // @match        https://demonicscans.org/*
@@ -13,7 +13,7 @@
   'use strict';
 
   const SCRIPT_ID = 'tm-demonic-tower-autopilot';
-  const SCRIPT_VERSION = '1.15.0';
+  const SCRIPT_VERSION = '1.15.1';
   const SETTINGS_VERSION = 1;
   const RETRY_TIMEOUT_MS = 30000;
   const MISSING_RUN_GRACE_MS = 10000;
@@ -1777,8 +1777,8 @@
             <input type="number" min="1" max="999" step="1" data-setting="autoRestartKeyLimit">
           </label>
           <p class="tm-tower-help">
-            The current run counts as the first key. Auto-restart finishes the run at the final seal, starts new
-            runs on Floor 1, and stops after the total key limit is reached.
+            The current run counts as the first key. Your final-seal setting remains authoritative. After a run
+            actually ends, Auto-restart starts the next run on Floor 1 and stops at the total key limit.
           </p>
         </section>
 
@@ -3327,7 +3327,7 @@
   }
 
   function decideFinalSeal(panel) {
-    const configuredChoice = settings.autoRestartEnabled ? 'leave' : settings.finalSealChoice;
+    const configuredChoice = settings.finalSealChoice;
 
     if (configuredChoice === 'manual') {
       return { kind: 'wait', message: 'Waiting for your final-seal decision.' };
