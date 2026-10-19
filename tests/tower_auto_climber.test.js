@@ -454,6 +454,22 @@ test('classifies known quest contracts and the unnamed two-slot contract', () =>
       energy: 2,
     },
   );
+  assert.deepEqual(
+    classifyQuestOffer({
+      title: 'The Bound Ascendant',
+      description: 'Clear three floors with two power slots sealed. Requires at most eight stacks when accepting.',
+      rewardText: '180 coins / 3 energy, subject to the daily energy limit.',
+      choice: 'sealed_power',
+    }),
+    {
+      type: 'ability_lock',
+      title: 'The Bound Ascendant',
+      description: 'Clear three floors with two power slots sealed. Requires at most eight stacks when accepting.',
+      choice: 'sealed_power',
+      coins: 180,
+      energy: 3,
+    },
+  );
   assert.equal(classifyQuestOffer({ title: 'Unknown', description: 'Do a thing.', choice: 'x' }), null);
 });
 
@@ -487,6 +503,12 @@ test('selects the best safe quest for the current build', () => {
     description: 'Locks two power slots for three floors.',
     rewardText: 'Reward: 180 coins.',
     choice: 'locked_slots',
+  });
+  const boundAscendant = classifyQuestOffer({
+    title: 'The Bound Ascendant',
+    description: 'Clear three floors with two power slots sealed. Requires at most eight stacks when accepting.',
+    rewardText: 'Reward: 180 coins / 3 energy.',
+    choice: 'sealed_power',
   });
 
   assert.equal(
@@ -531,6 +553,21 @@ test('selects the best safe quest for the current build', () => {
     'magic_only',
   );
   assert.equal(scoreQuestOffer(slotLock, { currentFloor: 2 }), null);
+  assert.equal(
+    chooseQuestOffer({
+      offers: [boundAscendant, unchanging],
+      context: { currentFloor: 1, wishlistEpicReady: true },
+    }),
+    'sealed_power',
+  );
+  assert.equal(
+    chooseQuestOffer({
+      offers: [boundAscendant, unchanging],
+      context: { currentFloor: 2, wishlistEpicReady: false },
+    }),
+    'unchanging',
+    'the sealed-power quest must never be the forced fallback after Floor 1',
+  );
 });
 
 test('parses only unambiguous Start Floor values from semantic labels', () => {

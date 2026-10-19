@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Demonic Tower Autopilot
 // @namespace    local.demonicscans.tower
-// @version      1.14.0
+// @version      1.15.0
 // @description  Automates Demonic Tower combat, events, quests, companions, boss preparations, start floors, potions, paths, and powers.
 // @author       Myrkjartan Hrolfr
 // @match        https://demonicscans.org/*
@@ -13,7 +13,7 @@
   'use strict';
 
   const SCRIPT_ID = 'tm-demonic-tower-autopilot';
-  const SCRIPT_VERSION = '1.14.0';
+  const SCRIPT_VERSION = '1.15.0';
   const SETTINGS_VERSION = 1;
   const RETRY_TIMEOUT_MS = 30000;
   const MISSING_RUN_GRACE_MS = 10000;
@@ -494,6 +494,14 @@
       type = 'magic_only';
       fallbackCoins = 100;
     } else if (
+      normalizedTitle === 'the bound ascendant' &&
+      normalizedChoice === 'sealed_power' &&
+      /two power slots sealed/.test(normalizedDescription) &&
+      /at most eight stacks/.test(normalizedDescription)
+    ) {
+      type = 'ability_lock';
+      fallbackCoins = 180;
+    } else if (
       /\b(?:lock|locks|locked)\b/.test(normalizedDescription) &&
       /\b(?:2|two)\b.*\b(?:ability|power)\s+slots?\b/.test(normalizedDescription) &&
       /\b(?:3|three)\b\s+floors?\b/.test(normalizedDescription)
@@ -553,7 +561,13 @@
       .filter(Boolean)
       .sort((left, right) => right.score - left.score || left.index - right.index);
 
-    return candidates[0]?.offer.choice || offers.find((offer) => ['blade_only', 'magic_only'].includes(offer?.type))?.choice || offers[0]?.choice || null;
+    return (
+      candidates[0]?.offer.choice ||
+      offers.find((offer) => ['blade_only', 'magic_only'].includes(offer?.type))?.choice ||
+      offers.find((offer) => offer?.type !== 'ability_lock')?.choice ||
+      offers[0]?.choice ||
+      null
+    );
   }
 
   function hasHpPotionBeenUsedRecently(usedFloors, currentFloor) {
