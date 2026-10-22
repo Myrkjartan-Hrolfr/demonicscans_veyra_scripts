@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dungeon Location Farmer - Controlled
 // @namespace    http://tampermonkey.net/
-// @version      2.1.4
+// @version      2.1.5
 // @description  Farm all alive monsters with dynamic class attacks, configurable damage goals, and potion priorities.
 // @author       [J4F] RacletteCestLavie / enhanced
 // @match        https://demonicscans.org/guild_dungeon_location.php*
@@ -749,28 +749,6 @@
       feedbackType,
       retryAfterMs: getRetryAfterMilliseconds(response),
     };
-  }
-
-  async function lootAll(instanceId, locationId) {
-    const body = new URLSearchParams();
-    body.set('action', 'loot_all');
-    body.set('instance_id', String(instanceId));
-    body.set('location_id', String(locationId));
-
-    try {
-      const response = await fetch('/dungeon_loot.php', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-          'X-Requested-With': 'XMLHttpRequest',
-        },
-        body: body.toString(),
-      });
-      return await response.json();
-    } catch (error) {
-      return { status: 'error', message: String(error) };
-    }
   }
 
   function getPotionType(name, description) {
@@ -1645,7 +1623,6 @@
 
   async function runFarm(
     instanceId,
-    locationId,
     settings,
     runState,
     setStatus,
@@ -1775,14 +1752,7 @@
 
     if (terminalError) {
       if (killed > 0) {
-        setStatus('Looting previously defeated monsters before stopping...', 'running');
-        const loot = await lootAll(instanceId, locationId);
-
-        if (loot?.status === 'success') {
-          addLog(`Looted ${killed} previously defeated monster(s) before stopping.`);
-        } else {
-          addLog(`Could not loot ${killed} previously defeated monster(s) before stopping.`);
-        }
+        addLog(`Loot from ${killed} defeated monster(s) was left for manual collection.`);
       }
 
       setStatus(terminalError, 'error');
@@ -1790,22 +1760,11 @@
     }
 
     if (killed > 0) {
-      setStatus('Looting dead monsters...', 'running');
-      const loot = await lootAll(instanceId, locationId);
-
-      if (loot?.status === 'success') {
-        const summary = loot.summary || {};
-        const message =
-          `Done. Killed ${killed}, processed ${processed}. ` +
-          `EXP: ${formatNumber(summary.exp || 0)}, Gold: ${formatNumber(summary.gold || 0)}, ` +
-          `Items: ${Array.isArray(loot.items) ? loot.items.length : 0}.`;
-        setStatus(message, 'success');
-        addLog(message);
-      } else {
-        const message = `Done, but looting failed. Killed ${killed}, processed ${processed}.`;
-        setStatus(message, 'error');
-        addLog(message);
-      }
+      const message =
+        `Done. Killed ${killed}, processed ${processed}. ` +
+        'Loot was left for manual collection.';
+      setStatus(message, 'success');
+      addLog(message);
     } else {
       const message = `Done. Processed ${processed} monster(s), none killed.`;
       setStatus(message, 'success');
@@ -2527,7 +2486,6 @@
     try {
       await runFarm(
         instanceId,
-        locationId,
         settings,
         state.runState,
         setStatus,
