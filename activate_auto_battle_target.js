@@ -1,381 +1,759 @@
 // ==UserScript==
-// @name         AF Targets – Exclusive Activate Button
-// @namespace    af-target-exclusive-activate
-// @version      1.0.0
-// @description  Fügt jedem Target einen Button hinzu, der nur dieses Target aktiviert.
-// @match        https://demonicscans.org/active_wave.php*
+// @name         Veyra - Smart Solo PvP Battle
+// @namespace    local.veyra.smart-solo-pvp-battle
+// @version      2.0.0
+// @description  Enables 1-second enemy turns and chooses Solo PvP attacks around Final Wish.
+// @match        https://demonicscans.org/pvp*
+// @run-at       document-idle
 // @grant        none
-// @grant        none
+// @noframes
 // ==/UserScript==
 
 (() => {
   'use strict';
 
-  const SELECTORS = {
-    targetsContainer: '.af-targets',
+  const CONFIG = Object.freeze({
+    scanIntervalMs: 200,
+    scanDebounceMs: 40,
+    modeRetryMs: 250,
+    targetWaitMs: 1000,
+    skillWaitMs: 1000,
+    slashTokenGain: 3,
+    resourceGainPerAction: 25,
+    finalWishCost: 15,
+    resourceMaximum: 100,
+  });
 
-    // Gruppierte Ansicht
-    groupRow: '.af-group-row',
-    groupEnabled: '.grp-enabled',
-    groupActions: '.btn-group-actions',
-    groupSave: '.grp-save',
-    groupDelete: '.grp-del-all',
+  const SKILL_KEYS = Object.freeze({
+    slash: 'slash',
+    powerSlash: 'powerSlash',
+    venomRend: 'venomRend',
+    deathMark: 'deathMark',
+    finalWish: 'finalWish',
+  });
 
-    // Normale Detailansicht
-    detailRow: '.af-row[data-target-id]',
-    detailEnabled: '.afTEnabled',
-  };
+  const SKILL_IDS = Object.freeze({
+    [SKILL_KEYS.slash]: '0',
+    [SKILL_KEYS.powerSlash]: '-1',
+    [SKILL_KEYS.venomRend]: 'adv:18',
+    [SKILL_KEYS.deathMark]: 'adv:19',
+    [SKILL_KEYS.finalWish]: 'adv:20',
+  });
 
-  const BUTTON_CLASS = 'af-exclusive-activate-btn';
-  const PROCESSING_CLASS = 'af-exclusive-processing';
+  const SKILL_NAMES = Object.freeze({
+    [SKILL_KEYS.slash]: 'Slash',
+    [SKILL_KEYS.powerSlash]: 'Power Slash',
+    [SKILL_KEYS.venomRend]: 'Venom Rend',
+    [SKILL_KEYS.deathMark]: 'Death Mark',
+    [SKILL_KEYS.finalWish]: 'Final Wish',
+  });
 
-  let scanScheduled = false;
-  let activationRunning = false;
+  function finiteNumber(value) {
+    if (value === null || value === undefined || String(value).trim() === '') {
+      return null;
+    }
+
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
 
   /**
-   * Löst Events aus, damit die Seite die Änderung genauso behandelt,
-   * als wäre das Select manuell verändert worden.
+   * Calculates how many preparation actions are needed when every remaining
+   * preparation action is Slash. Slash is the only skill that adds tokens.
    */
-  function setSelectValue(select, value) {
-    if (!select || select.value === value) {
+  function roundsUntilFinalWish({
+    tokens,
+    resource,
+    finalCost = CONFIG.finalWishCost,
+    resourceMaximum = CONFIG.resourceMaximum,
+    slashTokenGain = CONFIG.slashTokenGain,
+    resourceGainPerAction = CONFIG.resourceGainPerAction,
+  }) {
+    const tokenValue = finiteNumber(tokens);
+    const resourceValue = finiteNumber(resource);
+    const cost = finiteNumber(finalCost);
+    const maximum = finiteNumber(resourceMaximum);
+
+    if (
+      tokenValue === null ||
+      resourceValue === null ||
+      cost === null ||
+      maximum === null ||
+      slashTokenGain <= 0 ||
+      resourceGainPerAction <= 0
+    ) {
+      return Number.POSITIVE_INFINITY;
+    }
+
+    const tokenRounds = Math.ceil(Math.max(0, cost - tokenValue) / slashTokenGain);
+    const resourceRounds = Math.ceil(Math.max(0, maximum - resourceValue) / resourceGainPerAction);
+
+    return Math.max(tokenRounds, resourceRounds);
+  }
+
+  /**
+   * A paid setup skill may occupy the current preparation action, but it may
+   * not move the already calculated Final-Wish turn. All later preparation
+   * actions are conservatively treated as Slash.
+   */
+  function canSpendWithoutDelayingFinal({
+    tokens,
+    skillCost,
+    rounds,
+    finalCost = CONFIG.finalWishCost,
+    slashTokenGain = CONFIG.slashTokenGain,
+  }) {
+    const tokenValue = finiteNumber(tokens);
+    const cost = finiteNumber(skillCost);
+
+    if (tokenValue === null || cost === null || !Number.isFinite(rounds) || rounds < 1) {
       return false;
     }
 
-    select.value = value;
+    const remainingSlashActions = Math.max(0, Math.floor(rounds) - 1);
+    const tokensOnFinalTurn = tokenValue - cost + remainingSlashActions * slashTokenGain;
 
-    select.dispatchEvent(
-      new Event('input', {
-        bubbles: true,
-      }),
-    );
+    return tokensOnFinalTurn >= finalCost;
+  }
 
-    select.dispatchEvent(
-      new Event('change', {
-        bubbles: true,
-      }),
+  function canUseSkill(skill, snapshot) {
+    if (!skill?.available) {
+      return false;
+    }
+
+    const cost = finiteNumber(skill.cost);
+    const resourceCost = finiteNumber(skill.resourceCost);
+
+    // Skill metadata comes from the native, freshly rendered modal. If that
+    // contract changes, do not guess that a paid skill is free.
+    if (cost === null || resourceCost === null || cost < 0 || resourceCost < 0) {
+      return false;
+    }
+
+    if (snapshot.tokens < cost) {
+      return false;
+    }
+
+    if (snapshot.resource < resourceCost) {
+      return false;
+    }
+
+    return !skill.requiresFullResource || snapshot.resource >= snapshot.resourceMaximum;
+  }
+
+  function makeDecision(skillKey, reason, rounds, options = {}) {
+    return {
+      skillKey,
+      reason,
+      roundsUntilFinalWish: rounds,
+      prepareBridge: options.prepareBridge === true,
+      consumeBridge: options.consumeBridge === true,
+      resetCycle: options.resetCycle === true,
+    };
+  }
+
+  function isConfirmedSkillUse(logText, actorName, skillName) {
+    const text = normalizeComparableText(logText);
+    const actor = normalizeComparableText(actorName);
+    const skill = normalizeComparableText(skillName);
+
+    if (!text || !actor || !skill) return false;
+
+    const prefix = `${actor} used ${skill}`;
+    if (!text.startsWith(prefix)) return false;
+
+    const boundary = text.charAt(prefix.length);
+    return boundary === '' || /[\s.,!?:;()-]/.test(boundary);
+  }
+
+  function normalizeComparableText(value) {
+    return String(value || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+  }
+
+  /**
+   * Pure attack planner. The bridge flag means Death Mark was confirmed two
+   * preparation actions before Final Wish and this is its single follow-up.
+   */
+  function chooseAttackPlan(input) {
+    const tokens = finiteNumber(input?.tokens);
+    const resource = finiteNumber(input?.resource);
+    const resourceMaximum = finiteNumber(input?.resourceMaximum) ?? CONFIG.resourceMaximum;
+    const skills = input?.skills || {};
+    const bridgePending = input?.bridgePending === true;
+    const enemyPoisoned = input?.enemyPoisoned === true;
+    const slash = skills[SKILL_KEYS.slash];
+    const finalWish = skills[SKILL_KEYS.finalWish];
+    const finalCost = finiteNumber(finalWish?.cost) ?? CONFIG.finalWishCost;
+
+    if (tokens === null || resource === null) {
+      return makeDecision(null, 'Battle values are unavailable.', Number.POSITIVE_INFINITY, {
+        consumeBridge: bridgePending,
+      });
+    }
+
+    const snapshot = { tokens, resource, resourceMaximum };
+    const rounds = roundsUntilFinalWish({
+      tokens,
+      resource,
+      finalCost,
+      resourceMaximum,
+    });
+
+    if (rounds === 0 && canUseSkill(finalWish, snapshot)) {
+      return makeDecision(SKILL_KEYS.finalWish, 'Final Wish is ready now.', rounds, {
+        consumeBridge: bridgePending,
+        resetCycle: true,
+      });
+    }
+
+    if (!slash?.available) {
+      return makeDecision(null, 'Slash is unavailable.', rounds, {
+        consumeBridge: bridgePending,
+      });
+    }
+
+    // Explicit user rule: below the Final-Wish cost, only Slash may build up.
+    if (tokens < finalCost) {
+      return makeDecision(SKILL_KEYS.slash, `Only ${tokens} token(s): build with Slash.`, rounds, {
+        consumeBridge: bridgePending,
+      });
+    }
+
+    if (bridgePending) {
+      const followUpKey = enemyPoisoned ? SKILL_KEYS.venomRend : SKILL_KEYS.powerSlash;
+      const followUp = skills[followUpKey];
+      const followUpName = SKILL_NAMES[followUpKey];
+
+      if (
+        rounds === 1 &&
+        canUseSkill(followUp, snapshot) &&
+        canSpendWithoutDelayingFinal({
+          tokens,
+          skillCost: followUp.cost,
+          rounds,
+          finalCost,
+        })
+      ) {
+        return makeDecision(
+          followUpKey,
+          enemyPoisoned
+            ? `${followUpName}: Death Mark is prepared and the enemy is poisoned.`
+            : `${followUpName}: Death Mark is prepared and the enemy is not poisoned.`,
+          rounds,
+          { consumeBridge: true },
+        );
+      }
+
+      return makeDecision(
+        SKILL_KEYS.slash,
+        `${followUpName} would delay Final Wish or is unavailable; use Slash.`,
+        rounds,
+        { consumeBridge: true },
+      );
+    }
+
+    const deathMark = skills[SKILL_KEYS.deathMark];
+    if (
+      (rounds === 1 || rounds === 2) &&
+      canUseSkill(deathMark, snapshot) &&
+      canSpendWithoutDelayingFinal({
+        tokens,
+        skillCost: deathMark.cost,
+        rounds,
+        finalCost,
+      })
+    ) {
+      return makeDecision(
+        SKILL_KEYS.deathMark,
+        `Death Mark prepares Final Wish ${rounds === 1 ? 'next turn' : 'in two turns'}.`,
+        rounds,
+        { prepareBridge: rounds === 2 },
+      );
+    }
+
+    return makeDecision(
+      SKILL_KEYS.slash,
+      Number.isFinite(rounds)
+        ? `Build for Final Wish (${rounds} preparation turn(s) remaining).`
+        : 'Could not calculate Final Wish safely; use Slash.',
+      rounds,
     );
+  }
+
+  const testExports = Object.freeze({
+    CONFIG,
+    SKILL_KEYS,
+    canSpendWithoutDelayingFinal,
+    canUseSkill,
+    chooseAttackPlan,
+    isConfirmedSkillUse,
+    roundsUntilFinalWish,
+  });
+
+  if (typeof document === 'undefined') {
+    if (typeof module === 'object' && module.exports) {
+      module.exports = testExports;
+    }
+    return;
+  }
+
+  const SELECTORS = Object.freeze({
+    attackButton: '#attackBtn',
+    autoPlayButton: '#autoPlayBtn',
+    fastEnemyButton: '#fastEnemyBtn',
+    viewerMode: '#viewerModeBadge',
+    matchStatus: '#matchStatusBadge',
+    rewardsModal: '#rewardsModal',
+    allySlot: '#allyFormation .pSlot[data-side="ally"][data-alive="1"]',
+    enemySlot: '#enemyFormation .pSlot[data-side="enemy"][data-alive="1"]:not(.dead)',
+    targetName: '#targetName',
+    tokenValue: '#myTokens',
+    resourceValue: '#advancedResourceValue',
+    nativeSkillModal: '#skillsModal',
+    nativeSkillGrid: '#skillsGrid',
+    logLines: '#logBox .logLine[data-log-id]',
+  });
+
+  const runtime = {
+    scanRunning: false,
+    scanTimer: null,
+    interval: null,
+    observer: null,
+    lastModeClickAt: 0,
+    handledTurnKey: '',
+    bridge: null,
+    pendingAction: null,
+    statusKey: '',
+  };
+
+  // Lets the continuous matchmaking script know that this script owns combat.
+  document.documentElement.dataset.veyraSmartPvp = '1';
+
+  function normalizeText(value) {
+    return normalizeComparableText(value);
+  }
+
+  function parseInteger(value) {
+    const match = String(value ?? '').match(/-?\d[\d.,\s]*/);
+    if (!match) return null;
+
+    const number = Number.parseInt(match[0].replace(/\D/g, ''), 10);
+    if (!Number.isFinite(number)) return null;
+
+    return match[0].trim().startsWith('-') ? -number : number;
+  }
+
+  function parseFraction(value) {
+    const match = String(value ?? '').match(/(\d[\d.,\s]*)\s*\/\s*(\d[\d.,\s]*)/);
+    if (!match) return null;
+
+    const current = parseInteger(match[1]);
+    const maximum = parseInteger(match[2]);
+
+    return current === null || maximum === null ? null : { current, maximum };
+  }
+
+  function report(message, level = 'info') {
+    const key = `${level}:${message}`;
+    if (runtime.statusKey === key) return;
+
+    runtime.statusKey = key;
+    const method = level === 'error' ? 'warn' : 'info';
+    console[method](`[Smart Solo PvP] ${message}`);
+  }
+
+  function isBattlePage() {
+    return Boolean(
+      document.querySelector(SELECTORS.fastEnemyButton) &&
+        document.querySelector('#battleControlCard') &&
+        document.querySelector('#enemyFormation'),
+    );
+  }
+
+  function isBattleEnded() {
+    const status = normalizeText(document.querySelector(SELECTORS.matchStatus)?.textContent);
+    const rewardsModal = document.querySelector(SELECTORS.rewardsModal);
+
+    return (
+      /victory|defeat|draw|battle ended|match ended|finished/.test(status) ||
+      rewardsModal?.classList.contains('show') ||
+      !document.querySelector(SELECTORS.allySlot) ||
+      !document.querySelector(SELECTORS.enemySlot)
+    );
+  }
+
+  function isAutoPlayActive() {
+    const button = document.querySelector(SELECTORS.autoPlayButton);
+    const viewerMode = normalizeText(document.querySelector(SELECTORS.viewerMode)?.textContent);
+
+    return Boolean(
+      button?.classList.contains('active') ||
+        button?.getAttribute('aria-pressed') === 'true' ||
+        normalizeText(button?.textContent).includes('auto play on') ||
+        viewerMode.includes('auto play enabled'),
+    );
+  }
+
+  function isFastEnemyActive() {
+    const button = document.querySelector(SELECTORS.fastEnemyButton);
+    const viewerMode = normalizeText(document.querySelector(SELECTORS.viewerMode)?.textContent);
+    const buttonText = normalizeText(button?.textContent);
+
+    return Boolean(
+      button?.classList.contains('active') ||
+        button?.getAttribute('aria-pressed') === 'true' ||
+        buttonText.includes('enemy turns 1s on') ||
+        viewerMode.includes('enemy turns set to 1s'),
+    );
+  }
+
+  function ensureBattleMode() {
+    const now = Date.now();
+
+    if (isAutoPlayActive()) {
+      const button = document.querySelector(SELECTORS.autoPlayButton);
+      if (button && !button.disabled && now - runtime.lastModeClickAt >= CONFIG.modeRetryMs) {
+        runtime.lastModeClickAt = now;
+        report('Disabling Auto Play.');
+        button.click();
+      }
+      return false;
+    }
+
+    if (!isFastEnemyActive()) {
+      const button = document.querySelector(SELECTORS.fastEnemyButton);
+      if (button && !button.disabled && now - runtime.lastModeClickAt >= CONFIG.modeRetryMs) {
+        runtime.lastModeClickAt = now;
+        report('Enabling Enemy Turns 1s.');
+        button.click();
+      }
+      return false;
+    }
 
     return true;
   }
 
-  /**
-   * Ermittelt den Namen eines Targets für Statusmeldungen.
-   */
-  function getTargetName(row) {
-    const groupedName = row.querySelector('.af-group-names');
-    if (groupedName) {
-      return (groupedName.getAttribute('title') || groupedName.textContent || 'Target').trim();
-    }
-
-    const monsterSelect = row.querySelector('.afTMonster');
-    if (monsterSelect) {
-      return monsterSelect.selectedOptions[0]?.textContent.trim() || 'Target';
-    }
-
-    return 'Target';
+  function getAllyName() {
+    const slot = document.querySelector(SELECTORS.allySlot);
+    return String(slot?.dataset.username || document.querySelector('#allyBadge')?.textContent || '').trim();
   }
 
-  /**
-   * Findet in einer Detailzeile den vorhandenen Save-Button.
-   */
-  function findDetailSaveButton(row) {
-    return Array.from(row.querySelectorAll('button')).find((button) => {
-      const onclick = button.getAttribute('onclick') || '';
+  function getLatestTurnStart() {
+    const lines = Array.from(document.querySelectorAll(SELECTORS.logLines));
 
-      return (
-        onclick.includes('afUpdateTarget') || button.textContent.includes('Save') || button.textContent.includes('💾')
-      );
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const line = lines[index];
+      const text = String(line.querySelector('.logText')?.textContent || '').trim();
+      const match = text.match(/^(.+?)\s+takes the turn\.?$/i);
+
+      if (match) {
+        return {
+          key: String(line.dataset.logId || ''),
+          numericId: parseInteger(line.dataset.logId),
+          actor: match[1].trim(),
+        };
+      }
+    }
+
+    return null;
+  }
+
+  function isOwnActionableTurn(turn) {
+    const allyName = getAllyName();
+    const attackButton = document.querySelector(SELECTORS.attackButton);
+
+    return Boolean(
+      turn?.key &&
+        allyName &&
+        normalizeText(turn.actor) === normalizeText(allyName) &&
+        attackButton &&
+        !attackButton.disabled,
+    );
+  }
+
+  function findLiveTarget() {
+    return document.querySelector(SELECTORS.enemySlot);
+  }
+
+  function isTargetPoisoned(target) {
+    // The native renderer adds this class only for effect.key === 'poison'.
+    // Text such as "Poison Resistance" must not count as an active poison.
+    return Boolean(target?.classList.contains('hasPoison'));
+  }
+
+  function skillKeyFromButton(button) {
+    const id = String(button?.dataset.skillId || '');
+    const byId = Object.entries(SKILL_IDS).find(([, skillId]) => skillId === id);
+    if (byId) return byId[0];
+
+    const name = normalizeText(button?.querySelector('.skillName')?.textContent || button?.textContent);
+    return Object.keys(SKILL_NAMES).find((key) => normalizeText(SKILL_NAMES[key]) === name) || null;
+  }
+
+  function getSkillGrid() {
+    return document.querySelector(SELECTORS.nativeSkillGrid);
+  }
+
+  function readSkills() {
+    const skills = {};
+    const grid = getSkillGrid();
+
+    for (const button of grid?.querySelectorAll('button.skillCard[data-skill-id]') || []) {
+      const key = skillKeyFromButton(button);
+      if (!key) continue;
+
+      const cost = parseInteger(button.dataset.cost);
+      const resourceCost = parseInteger(button.dataset.resourceCost);
+      const metadataValid = cost !== null && resourceCost !== null && cost >= 0 && resourceCost >= 0;
+
+      skills[key] = {
+        key,
+        id: String(button.dataset.skillId || ''),
+        name: String(button.querySelector('.skillName')?.textContent || SKILL_NAMES[key]).trim(),
+        cost,
+        resourceCost,
+        requiresFullResource: button.dataset.requiresFullResource === '1',
+        available: !button.disabled && metadataValid,
+        button,
+      };
+    }
+
+    return skills;
+  }
+
+  function readBattleSnapshot(target) {
+    const resource = parseFraction(document.querySelector(SELECTORS.resourceValue)?.textContent);
+
+    return {
+      tokens: parseInteger(document.querySelector(SELECTORS.tokenValue)?.textContent),
+      resource: resource?.current ?? null,
+      resourceMaximum: resource?.maximum ?? CONFIG.resourceMaximum,
+      enemyPoisoned: isTargetPoisoned(target),
+      bridgePending: Boolean(runtime.bridge && runtime.bridge.targetKey === target?.dataset.key),
+      skills: readSkills(),
+    };
+  }
+
+  function waitFor(predicate, timeoutMs) {
+    return new Promise((resolve) => {
+      const startedAt = Date.now();
+
+      const check = () => {
+        const result = predicate();
+        if (result || Date.now() - startedAt >= timeoutMs) {
+          resolve(result || null);
+          return;
+        }
+
+        window.setTimeout(check, 40);
+      };
+
+      check();
     });
   }
 
-  /**
-   * Speichert alle geänderten Zeilen.
-   *
-   * Die Klicks werden bewusst direkt nacheinander ausgelöst.
-   * So können alle Save-Handler starten, bevor die Seite ihre Ansicht
-   * eventuell neu rendert.
-   */
-  function saveRows(rows, viewType) {
-    const saveButtons = [];
+  function openSkillsForTarget(target) {
+    const nativeModal = document.querySelector(SELECTORS.nativeSkillModal);
 
-    for (const row of rows) {
-      const saveButton = viewType === 'group' ? row.querySelector(SELECTORS.groupSave) : findDetailSaveButton(row);
-
-      if (saveButton) {
-        saveButtons.push(saveButton);
-      }
-    }
-
-    for (const saveButton of saveButtons) {
-      saveButton.click();
-    }
-
-    return saveButtons.length;
-  }
-
-  /**
-   * Aktiviert exklusiv eine Zeile in der gruppierten Ansicht.
-   */
-  function activateGroupedTarget(targetRow) {
-    const rows = Array.from(document.querySelectorAll(`${SELECTORS.targetsContainer} ${SELECTORS.groupRow}`));
-
-    const changedRows = [];
-
-    for (const row of rows) {
-      const enabledSelect = row.querySelector(SELECTORS.groupEnabled);
-      const desiredValue = row === targetRow ? '1' : '0';
-
-      if (setSelectValue(enabledSelect, desiredValue)) {
-        changedRows.push(row);
-      }
-    }
-
-    /*
-     * Wenn bereits nur dieses Ziel aktiv war, speichern wir es trotzdem.
-     * Dadurch verhält sich der Button immer wie eine bewusste Aktivierung.
-     */
-    if (!changedRows.includes(targetRow)) {
-      changedRows.push(targetRow);
-    }
-
-    return saveRows(changedRows, 'group');
-  }
-
-  /**
-   * Aktiviert exklusiv eine Zeile in der normalen Detailansicht.
-   */
-  function activateDetailTarget(targetRow) {
-    const rows = Array.from(document.querySelectorAll(`${SELECTORS.targetsContainer} ${SELECTORS.detailRow}`));
-
-    const changedRows = [];
-
-    for (const row of rows) {
-      const enabledSelect = row.querySelector(SELECTORS.detailEnabled);
-      const desiredValue = row === targetRow ? '1' : '0';
-
-      if (setSelectValue(enabledSelect, desiredValue)) {
-        changedRows.push(row);
-      }
-    }
-
-    if (!changedRows.includes(targetRow)) {
-      changedRows.push(targetRow);
-    }
-
-    return saveRows(changedRows, 'detail');
-  }
-
-  /**
-   * Temporärer Status direkt auf dem geklickten Button.
-   */
-  function showButtonStatus(button, text) {
-    if (!button?.isConnected) {
+    if (!target.classList.contains('targeted')) {
+      target.click();
       return;
     }
 
-    button.textContent = text;
+    if (nativeModal && !nativeModal.classList.contains('show')) {
+      document.querySelector(SELECTORS.attackButton)?.click();
+    }
+  }
 
-    window.setTimeout(() => {
-      if (!button.isConnected) {
+  function getLogTextsAfter(logId) {
+    const numericLogId = finiteNumber(logId);
+    if (numericLogId === null) return [];
+
+    return Array.from(document.querySelectorAll(SELECTORS.logLines))
+      .filter((line) => {
+        const currentId = parseInteger(line.dataset.logId);
+        return currentId !== null && currentId > numericLogId;
+      })
+      .map((line) => String(line.querySelector('.logText')?.textContent || '').trim());
+  }
+
+  function settlePendingAction() {
+    const pending = runtime.pendingAction;
+    if (!pending) return;
+
+    const allyName = normalizeText(pending.allyName);
+    const confirmed = getLogTextsAfter(pending.turnNumericId).some((text) =>
+      isConfirmedSkillUse(text, pending.allyName, pending.skillName),
+    );
+
+    if (confirmed) {
+      if (pending.prepareBridge) {
+        runtime.bridge = { targetKey: pending.targetKey };
+      }
+      if (pending.consumeBridge || pending.resetCycle) {
+        runtime.bridge = null;
+      }
+      runtime.pendingAction = null;
+      return;
+    }
+
+    const latestTurn = getLatestTurnStart();
+    const newerOwnTurn =
+      latestTurn?.key &&
+      latestTurn.key !== pending.turnKey &&
+      normalizeText(latestTurn.actor) === allyName;
+
+    if (newerOwnTurn) {
+      // The click was intentionally not retried. If its log cannot be found,
+      // do not arm a Death-Mark follow-up based on an unconfirmed action.
+      if (pending.consumeBridge || pending.resetCycle) {
+        runtime.bridge = null;
+      }
+      runtime.pendingAction = null;
+    }
+  }
+
+  async function actOnTurn(turn) {
+    const initialTarget = findLiveTarget();
+    if (!initialTarget) return;
+
+    openSkillsForTarget(initialTarget);
+
+    const modalReady = await waitFor(() => {
+      const modal = document.querySelector(SELECTORS.nativeSkillModal);
+      const grid = getSkillGrid();
+      return modal?.classList.contains('show') && grid?.querySelector('button.skillCard[data-skill-id]')
+        ? grid
+        : null;
+    }, CONFIG.skillWaitMs);
+
+    if (!modalReady) return;
+
+    const currentTurn = getLatestTurnStart();
+    const attackButton = document.querySelector(SELECTORS.attackButton);
+    const target = findLiveTarget();
+
+    if (
+      !currentTurn ||
+      currentTurn.key !== turn.key ||
+      !target ||
+      !attackButton ||
+      attackButton.disabled ||
+      isAutoPlayActive()
+    ) {
+      return;
+    }
+
+    if (!target.classList.contains('targeted')) {
+      target.click();
+      await waitFor(() => findLiveTarget()?.classList.contains('targeted'), CONFIG.targetWaitMs);
+    }
+
+    const stableTurn = getLatestTurnStart();
+    const stableTarget = findLiveTarget();
+    const stableModal = document.querySelector(SELECTORS.nativeSkillModal);
+    if (
+      !stableTurn ||
+      stableTurn.key !== turn.key ||
+      !isOwnActionableTurn(stableTurn) ||
+      !stableTarget?.classList.contains('targeted') ||
+      !stableModal?.classList.contains('show') ||
+      isAutoPlayActive() ||
+      !isFastEnemyActive()
+    ) {
+      return;
+    }
+
+    const snapshot = readBattleSnapshot(stableTarget);
+    const decision = chooseAttackPlan(snapshot);
+    const selectedSkill = decision.skillKey ? snapshot.skills[decision.skillKey] : null;
+
+    if (
+      !selectedSkill ||
+      !canUseSkill(selectedSkill, snapshot) ||
+      !selectedSkill.button.isConnected ||
+      !selectedSkill.button.closest(SELECTORS.nativeSkillGrid)
+    ) {
+      report(decision.reason, 'error');
+      return;
+    }
+
+    // A skill click spends the turn. Mark it before dispatch and never retry
+    // this turn, even if the subsequent network result is ambiguous.
+    runtime.handledTurnKey = turn.key;
+    runtime.pendingAction = {
+      turnKey: turn.key,
+      turnNumericId: turn.numericId,
+      allyName: getAllyName(),
+      skillKey: decision.skillKey,
+      skillName: selectedSkill.name,
+      targetKey: stableTarget.dataset.key || '',
+      prepareBridge: decision.prepareBridge,
+      consumeBridge: decision.consumeBridge,
+      resetCycle: decision.resetCycle,
+    };
+
+    report(
+      `${selectedSkill.name} | Tokens ${snapshot.tokens}, Energy ${snapshot.resource}/${snapshot.resourceMaximum} | ${decision.reason}`,
+    );
+    selectedSkill.button.click();
+  }
+
+  async function scanPage() {
+    if (runtime.scanRunning) return;
+    runtime.scanRunning = true;
+
+    try {
+      if (!isBattlePage()) return;
+
+      settlePendingAction();
+
+      if (isBattleEnded()) {
+        runtime.bridge = null;
+        runtime.pendingAction = null;
+        report('Battle ended.');
         return;
       }
 
-      button.textContent = '⚡ Activate';
-      button.disabled = false;
-      button.classList.remove(PROCESSING_CLASS);
-    }, 1200);
-  }
+      if (!ensureBattleMode()) return;
 
-  /**
-   * Zentraler Click-Handler für dynamisch erzeugte Buttons.
-   */
-  function handleActivateClick(event) {
-    const button = event.target.closest(`.${BUTTON_CLASS}`);
+      const turn = getLatestTurnStart();
+      if (!isOwnActionableTurn(turn) || runtime.handledTurnKey === turn.key) return;
 
-    if (!button || activationRunning) {
-      return;
-    }
-
-    const row = button.closest(`${SELECTORS.groupRow}, ${SELECTORS.detailRow}`);
-
-    if (!row) {
-      return;
-    }
-
-    event.preventDefault();
-    event.stopPropagation();
-
-    activationRunning = true;
-    button.disabled = true;
-    button.classList.add(PROCESSING_CLASS);
-    button.textContent = '⏳ Activating…';
-
-    const targetName = getTargetName(row);
-
-    try {
-      let saveCount = 0;
-
-      if (row.matches(SELECTORS.groupRow)) {
-        saveCount = activateGroupedTarget(row);
-      } else {
-        saveCount = activateDetailTarget(row);
-      }
-
-      if (saveCount > 0) {
-        console.info(`[AF Exclusive Activate] "${targetName}" aktiviert. ` + `${saveCount} Target(s) gespeichert.`);
-
-        showButtonStatus(button, '✅ Active');
-      } else {
-        console.warn('[AF Exclusive Activate] Kein Save-Button gefunden.');
-
-        showButtonStatus(button, '⚠️ No Save');
-      }
+      await actOnTurn(turn);
     } catch (error) {
-      console.error('[AF Exclusive Activate] Aktivierung fehlgeschlagen:', error);
-
-      showButtonStatus(button, '❌ Error');
+      console.error('[Smart Solo PvP] Scan failed:', error);
     } finally {
-      window.setTimeout(() => {
-        activationRunning = false;
-      }, 300);
+      runtime.scanRunning = false;
     }
-  }
-
-  function createActivateButton(viewType) {
-    const button = document.createElement('button');
-
-    button.type = 'button';
-    button.className = `btn ${BUTTON_CLASS}`;
-    button.dataset.afView = viewType;
-    button.textContent = '⚡ Activate';
-    button.title = 'Dieses Target aktivieren und alle anderen deaktivieren';
-
-    return button;
-  }
-
-  /**
-   * Ergänzt Buttons in der gruppierten Ansicht.
-   */
-  function decorateGroupedRows(root = document) {
-    const rows = root.matches?.(SELECTORS.groupRow) ? [root] : root.querySelectorAll?.(SELECTORS.groupRow) || [];
-
-    for (const row of rows) {
-      if (row.querySelector(`.${BUTTON_CLASS}`)) {
-        continue;
-      }
-
-      const actions = row.querySelector(SELECTORS.groupActions);
-
-      if (!actions) {
-        continue;
-      }
-
-      const button = createActivateButton('group');
-      const deleteButton = actions.querySelector(SELECTORS.groupDelete);
-
-      // Direkt vor Delete einfügen.
-      if (deleteButton) {
-        actions.insertBefore(button, deleteButton);
-      } else {
-        actions.appendChild(button);
-      }
-    }
-  }
-
-  /**
-   * Ergänzt Buttons in der normalen Detailansicht.
-   */
-  function decorateDetailRows(root = document) {
-    const rows = root.matches?.(SELECTORS.detailRow) ? [root] : root.querySelectorAll?.(SELECTORS.detailRow) || [];
-
-    for (const row of rows) {
-      if (row.querySelector(`.${BUTTON_CLASS}`)) {
-        continue;
-      }
-
-      const button = createActivateButton('detail');
-
-      const removeButton = Array.from(row.querySelectorAll(':scope > button')).find((candidate) => {
-        const onclick = candidate.getAttribute('onclick') || '';
-
-        return (
-          onclick.includes('afRemoveTarget') ||
-          candidate.textContent.includes('Remove') ||
-          candidate.textContent.includes('🗑')
-        );
-      });
-
-      if (removeButton) {
-        row.insertBefore(button, removeButton);
-      } else {
-        row.appendChild(button);
-      }
-    }
-  }
-
-  function scanForTargets() {
-    scanScheduled = false;
-
-    const container = document.querySelector(SELECTORS.targetsContainer);
-
-    if (!container) {
-      return;
-    }
-
-    decorateGroupedRows(container);
-    decorateDetailRows(container);
   }
 
   function scheduleScan() {
-    if (scanScheduled) {
-      return;
-    }
+    if (runtime.scanTimer !== null) return;
 
-    scanScheduled = true;
-    requestAnimationFrame(scanForTargets);
+    runtime.scanTimer = window.setTimeout(() => {
+      runtime.scanTimer = null;
+      void scanPage();
+    }, CONFIG.scanDebounceMs);
   }
 
-  /**
-   * Styles für den neuen Button.
-   */
-  function injectStyles() {
-    if (document.getElementById('af-exclusive-activate-style')) {
-      return;
-    }
-
-    const style = document.createElement('style');
-    style.id = 'af-exclusive-activate-style';
-    style.textContent = `
-            .${BUTTON_CLASS} {
-                border-color: #5dce8a !important;
-                background: rgba(44, 160, 90, 0.16) !important;
-                color: #bfffd5 !important;
-                white-space: nowrap;
-            }
-
-            .${BUTTON_CLASS}:hover:not(:disabled) {
-                background: rgba(44, 160, 90, 0.3) !important;
-                box-shadow: 0 0 10px rgba(93, 206, 138, 0.25);
-            }
-
-            .${BUTTON_CLASS}:disabled,
-            .${BUTTON_CLASS}.${PROCESSING_CLASS} {
-                cursor: progress;
-                opacity: 0.75;
-            }
-        `;
-
-    document.head.appendChild(style);
-  }
-
-  injectStyles();
-  document.addEventListener('click', handleActivateClick, true);
-
-  const observer = new MutationObserver(scheduleScan);
-  observer.observe(document.documentElement, {
+  runtime.observer = new MutationObserver(scheduleScan);
+  runtime.observer.observe(document.documentElement, {
     childList: true,
     subtree: true,
+    attributes: true,
+    attributeFilter: ['class', 'disabled', 'data-alive'],
   });
 
-  scanForTargets();
+  runtime.interval = window.setInterval(scheduleScan, CONFIG.scanIntervalMs);
+  window.addEventListener('pagehide', () => {
+    runtime.observer?.disconnect();
+    window.clearInterval(runtime.interval);
+    window.clearTimeout(runtime.scanTimer);
+  });
+
+  scheduleScan();
 })();

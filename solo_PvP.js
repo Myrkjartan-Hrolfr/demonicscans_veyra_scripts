@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Veyra - Continuous Solo PvP
 // @namespace    local.veyra.continuous-solo-pvp
-// @version      1.0.0
-// @description  Starts Solo PvP whenever a token is available, enables Auto Play, and continues with the next match.
+// @version      1.0.1
+// @description  Starts Solo PvP, delegates combat to Smart Battle when present, and continues with the next match.
 // @match        https://demonicscans.org/pvp*
 // @run-at       document-idle
 // @grant        none
@@ -316,6 +316,17 @@
 
     if (isBattleEnded()) {
       scheduleReturnToLobby();
+      return;
+    }
+
+    /*
+     * The dedicated smart battle userscript owns manual combat when present.
+     * Keep matchmaking/return-to-lobby active, but do not race it by turning
+     * Auto Play back on every 750 ms.
+     */
+    if (document.documentElement.dataset.veyraSmartPvp === '1') {
+      state.battlePageSeenAt = 0;
+      setStatus('Smart Battle steuert den Kampf.', 'active');
       return;
     }
 
