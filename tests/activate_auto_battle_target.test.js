@@ -9,6 +9,8 @@ const {
   canUseSkill,
   chooseAttackPlan,
   isConfirmedSkillUse,
+  isFinishedBattleState,
+  parseInteger,
   roundsUntilFinalWish,
 } = require('../activate_auto_battle_target.js');
 
@@ -235,4 +237,28 @@ test('confirms skill logs only for the exact actor at the start of the line', ()
     false,
   );
   assert.equal(isConfirmedSkillUse('Ron used Death Marker.', 'Ron', 'Death Mark'), false);
+});
+
+test('recognizes all native battle-end signals used for the lobby return', () => {
+  const running = {
+    statusText: 'Battle in progress',
+    rewardsVisible: false,
+    allyAlive: true,
+    enemyAlive: true,
+  };
+
+  assert.equal(isFinishedBattleState(running), false);
+  assert.equal(isFinishedBattleState({ ...running, statusText: 'Allied victory' }), true);
+  assert.equal(isFinishedBattleState({ ...running, statusText: 'Enemy victory' }), true);
+  assert.equal(isFinishedBattleState({ ...running, statusText: 'Draw' }), true);
+  assert.equal(isFinishedBattleState({ ...running, rewardsVisible: true }), true);
+  assert.equal(isFinishedBattleState({ ...running, enemyAlive: false }), true);
+  assert.equal(isFinishedBattleState({ ...running, allyAlive: false }), true);
+});
+
+test('parses the Solo token values used by the lobby', () => {
+  assert.equal(parseInteger('17'), 17);
+  assert.equal(parseInteger('1.234'), 1234);
+  assert.equal(parseInteger('Tokens: 5'), 5);
+  assert.equal(parseInteger(''), null);
 });

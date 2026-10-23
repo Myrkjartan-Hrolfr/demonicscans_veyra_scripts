@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Veyra - Continuous Solo PvP
 // @namespace    local.veyra.continuous-solo-pvp
-// @version      1.0.1
-// @description  Starts Solo PvP, delegates combat to Smart Battle when present, and continues with the next match.
+// @version      1.1.0
+// @description  Runs continuous Solo PvP or yields the full loop to Smart Battle when present.
 // @match        https://demonicscans.org/pvp*
 // @run-at       document-idle
 // @grant        none
@@ -366,6 +366,12 @@
   }
 
   function scanPage() {
+    if (document.documentElement.dataset.veyraSmartPvpLifecycle === '1') {
+      clearLobbyPollTimer();
+      setStatus('Smart Battle steuert Kampf und Matchfolge.', 'active');
+      return;
+    }
+
     if (isSoloBattlePage()) {
       handleBattlePage(document.querySelector(SELECTORS.autoPlayButton));
       return;

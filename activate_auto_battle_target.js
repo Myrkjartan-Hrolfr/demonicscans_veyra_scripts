@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Veyra - Smart Solo PvP Battle
 // @namespace    local.veyra.smart-solo-pvp-battle
-// @version      2.0.0
-// @description  Enables 1-second enemy turns and chooses Solo PvP attacks around Final Wish.
+// @version      2.1.0
+// @description  Runs continuous Solo PvP and chooses attacks around Final Wish.
 // @match        https://demonicscans.org/pvp*
 // @run-at       document-idle
 // @grant        none
@@ -18,6 +18,10 @@
     modeRetryMs: 250,
     targetWaitMs: 1000,
     skillWaitMs: 1000,
+    matchmakeRetryMs: 15_000,
+    lobbyPollIntervalMs: 30_000,
+    lobbyRequestTimeoutMs: 15_000,
+    returnToLobbyDelayMs: 3_000,
     slashTokenGain: 3,
     resourceGainPerAction: 25,
     finalWishCost: 15,
@@ -55,6 +59,16 @@
 
     const number = Number(value);
     return Number.isFinite(number) ? number : null;
+  }
+
+  function parseInteger(value) {
+    const match = String(value ?? '').match(/-?\d[\d.,\s]*/);
+    if (!match) return null;
+
+    const number = Number.parseInt(match[0].replace(/\D/g, ''), 10);
+    if (!Number.isFinite(number)) return null;
+
+    return match[0].trim().startsWith('-') ? -number : number;
   }
 
   /**
@@ -171,6 +185,17 @@
       .replace(/\s+/g, ' ')
       .trim()
       .toLowerCase();
+  }
+
+  function isFinishedBattleState({ statusText, rewardsVisible, allyAlive, enemyAlive }) {
+    const status = normalizeComparableText(statusText);
+
+    return Boolean(
+      /victory|defeat|draw|battle ended|match ended|finished/.test(status) ||
+        rewardsVisible ||
+        !allyAlive ||
+        !enemyAlive,
+    );
   }
 
   /**
@@ -290,6 +315,8 @@
     canUseSkill,
     chooseAttackPlan,
     isConfirmedSkillUse,
+    isFinishedBattleState,
+    parseInteger,
     roundsUntilFinalWish,
   });
 
@@ -315,6 +342,10 @@
     nativeSkillModal: '#skillsModal',
     nativeSkillGrid: '#skillsGrid',
     logLines: '#logBox .logLine[data-log-id]',
+    soloMatchButton: '.js-matchmake[data-ladder="solo"]',
+    section: 'section',
+    sectionTitle: '.section-title',
+    infoPill: '.info-pill',
   });
 
   const runtime = {
@@ -327,23 +358,21 @@
     bridge: null,
     pendingAction: null,
     statusKey: '',
+    returnToLobbyTimer: null,
+    matchmakeTimer: null,
+    lastMatchmakeClickAt: 0,
+    lobbyPollTimer: null,
+    lobbyPollRunning: false,
+    lobbyAbortController: null,
+    stopped: false,
   };
 
-  // Lets the continuous matchmaking script know that this script owns combat.
-  document.documentElement.dataset.veyraSmartPvp = '1';
+  // A separately installed legacy loop can stand down completely. This file
+  // owns lobby polling, matchmaking, combat, and the return to the lobby.
+  document.documentElement.dataset.veyraSmartPvpLifecycle = '1';
 
   function normalizeText(value) {
     return normalizeComparableText(value);
-  }
-
-  function parseInteger(value) {
-    const match = String(value ?? '').match(/-?\d[\d.,\s]*/);
-    if (!match) return null;
-
-    const number = Number.parseInt(match[0].replace(/\D/g, ''), 10);
-    if (!Number.isFinite(number)) return null;
-
-    return match[0].trim().startsWith('-') ? -number : number;
   }
 
   function parseFraction(value) {
@@ -374,15 +403,158 @@
   }
 
   function isBattleEnded() {
-    const status = normalizeText(document.querySelector(SELECTORS.matchStatus)?.textContent);
     const rewardsModal = document.querySelector(SELECTORS.rewardsModal);
 
+    return isFinishedBattleState({
+      statusText: document.querySelector(SELECTORS.matchStatus)?.textContent,
+      rewardsVisible: rewardsModal?.classList.contains('show'),
+      allyAlive: Boolean(document.querySelector(SELECTORS.allySlot)),
+      enemyAlive: Boolean(document.querySelector(SELECTORS.enemySlot)),
+    });
+  }
+
+  function findSoloSection(root = document) {
+    const matchButton = root.querySelector(SELECTORS.soloMatchButton);
+    if (matchButton) return matchButton.closest(SELECTORS.section);
+
     return (
-      /victory|defeat|draw|battle ended|match ended|finished/.test(status) ||
-      rewardsModal?.classList.contains('show') ||
-      !document.querySelector(SELECTORS.allySlot) ||
-      !document.querySelector(SELECTORS.enemySlot)
+      Array.from(root.querySelectorAll(SELECTORS.section)).find((section) => {
+        const title = normalizeText(section.querySelector(SELECTORS.sectionTitle)?.textContent);
+        return title.includes('solo') && title.includes('ladder');
+      }) || null
     );
+  }
+
+  function readSoloTokenCount(root = document) {
+    const section = findSoloSection(root);
+    if (!section) return null;
+
+    const tokenPill = Array.from(section.querySelectorAll(SELECTORS.infoPill)).find((pill) =>
+      normalizeText(pill.querySelector('strong')?.textContent).startsWith('tokens'),
+    );
+
+    return tokenPill ? parseInteger(tokenPill.querySelector('span')?.textContent) : null;
+  }
+
+  function getLobbySnapshot(root = document) {
+    const section = findSoloSection(root);
+    const button = root.querySelector(SELECTORS.soloMatchButton);
+    const tokens = readSoloTokenCount(root);
+
+    return {
+      section,
+      button,
+      tokens,
+      canStart: Boolean(button) && Number.isFinite(tokens) && tokens > 0,
+    };
+  }
+
+  function isLobbyPage() {
+    return /\/pvp\.php\/?$/i.test(window.location.pathname) || Boolean(findSoloSection());
+  }
+
+  function clearLobbyPollTimer() {
+    if (runtime.lobbyPollTimer !== null) {
+      window.clearTimeout(runtime.lobbyPollTimer);
+      runtime.lobbyPollTimer = null;
+    }
+  }
+
+  function scheduleLobbyPoll(delay = CONFIG.lobbyPollIntervalMs) {
+    if (runtime.stopped || runtime.lobbyPollTimer !== null || runtime.lobbyPollRunning) return;
+
+    runtime.lobbyPollTimer = window.setTimeout(() => {
+      runtime.lobbyPollTimer = null;
+      void pollLobbyForTokens();
+    }, delay);
+  }
+
+  async function pollLobbyForTokens() {
+    if (runtime.stopped || runtime.lobbyPollRunning || !isLobbyPage()) return;
+
+    runtime.lobbyPollRunning = true;
+    const controller = new AbortController();
+    runtime.lobbyAbortController = controller;
+    const timeout = window.setTimeout(() => controller.abort(), CONFIG.lobbyRequestTimeoutMs);
+
+    try {
+      const response = await window.fetch(window.location.href, {
+        method: 'GET',
+        credentials: 'same-origin',
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+      const html = await response.text();
+      const nextDocument = new DOMParser().parseFromString(html, 'text/html');
+      const snapshot = getLobbySnapshot(nextDocument);
+
+      if (!snapshot.section) throw new Error('Solo ladder missing from lobby response.');
+
+      if (snapshot.canStart) {
+        report('Solo token available; refreshing the lobby.');
+        window.location.reload();
+        return;
+      }
+
+      report(`${snapshot.tokens ?? 0} Solo token(s); checking again in 30 seconds.`);
+    } catch (error) {
+      if (error?.name !== 'AbortError') {
+        console.warn('[Smart Solo PvP] Lobby token check failed:', error);
+      }
+      report('Lobby token check failed; retrying in 30 seconds.', 'error');
+    } finally {
+      window.clearTimeout(timeout);
+      if (runtime.lobbyAbortController === controller) runtime.lobbyAbortController = null;
+      runtime.lobbyPollRunning = false;
+      scheduleLobbyPoll();
+    }
+  }
+
+  function handleLobbyPage() {
+    const snapshot = getLobbySnapshot();
+
+    if (!snapshot.section) {
+      report('Solo ladder was not found; waiting for the lobby.', 'error');
+      scheduleLobbyPoll();
+      return;
+    }
+
+    if (!snapshot.canStart) {
+      report(`${snapshot.tokens ?? 0} Solo token(s); waiting for the next token.`);
+      scheduleLobbyPoll();
+      return;
+    }
+
+    clearLobbyPollTimer();
+    if (snapshot.button.disabled) {
+      report('Solo matchmaking is already running.');
+      return;
+    }
+
+    const now = Date.now();
+    if (now - runtime.lastMatchmakeClickAt < CONFIG.matchmakeRetryMs) return;
+
+    runtime.lastMatchmakeClickAt = now;
+    report(`${snapshot.tokens} Solo token(s); starting a new match.`);
+
+    window.clearTimeout(runtime.matchmakeTimer);
+    runtime.matchmakeTimer = window.setTimeout(() => {
+      runtime.matchmakeTimer = null;
+      const current = getLobbySnapshot();
+      if (current.canStart && current.button && !current.button.disabled) current.button.click();
+    }, 250);
+  }
+
+  function scheduleReturnToLobby() {
+    if (runtime.returnToLobbyTimer !== null) return;
+
+    report('Battle ended; returning to the PvP lobby.');
+    runtime.returnToLobbyTimer = window.setTimeout(() => {
+      window.location.replace(new URL('/pvp.php', window.location.origin).href);
+    }, CONFIG.returnToLobbyDelayMs);
   }
 
   function isAutoPlayActive() {
@@ -707,14 +879,22 @@
     runtime.scanRunning = true;
 
     try {
-      if (!isBattlePage()) return;
+      if (!isBattlePage()) {
+        delete document.documentElement.dataset.veyraSmartPvp;
+        if (isLobbyPage()) handleLobbyPage();
+        return;
+      }
+
+      // This marker only describes ownership of an actual battle page.
+      document.documentElement.dataset.veyraSmartPvp = '1';
+      clearLobbyPollTimer();
 
       settlePendingAction();
 
       if (isBattleEnded()) {
         runtime.bridge = null;
         runtime.pendingAction = null;
-        report('Battle ended.');
+        scheduleReturnToLobby();
         return;
       }
 
@@ -750,9 +930,14 @@
 
   runtime.interval = window.setInterval(scheduleScan, CONFIG.scanIntervalMs);
   window.addEventListener('pagehide', () => {
+    runtime.stopped = true;
     runtime.observer?.disconnect();
     window.clearInterval(runtime.interval);
     window.clearTimeout(runtime.scanTimer);
+    window.clearTimeout(runtime.returnToLobbyTimer);
+    window.clearTimeout(runtime.matchmakeTimer);
+    clearLobbyPollTimer();
+    runtime.lobbyAbortController?.abort();
   });
 
   scheduleScan();
