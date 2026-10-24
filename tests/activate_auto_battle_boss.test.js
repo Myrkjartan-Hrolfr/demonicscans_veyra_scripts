@@ -13,6 +13,7 @@ const {
   BOSS_CONFIG,
   BOSS_PHASES,
   createDefaultBossCycleState,
+  formatBossCheckCountdown,
   isFightableBossData,
   isMonsterAutoBattleSuccess,
 } = require(scriptPath);
@@ -38,6 +39,7 @@ function createStorage(initial = {}) {
 function createTimers() {
   let nextId = 1;
   const timeouts = [];
+  const intervals = [];
 
   return {
     api: {
@@ -50,10 +52,15 @@ function createTimers() {
         const entry = timeouts.find((candidate) => candidate.id === id);
         if (entry) entry.cleared = true;
       },
-      setInterval() {
-        return nextId++;
+      setInterval(callback, delay) {
+        const entry = { id: nextId++, callback, delay, cleared: false };
+        intervals.push(entry);
+        return entry.id;
       },
-      clearInterval() {},
+      clearInterval(id) {
+        const entry = intervals.find((candidate) => candidate.id === id);
+        if (entry) entry.cleared = true;
+      },
     },
     run(delay) {
       const entry = timeouts.find((candidate) => !candidate.cleared && candidate.delay === delay);
@@ -61,19 +68,42 @@ function createTimers() {
       entry.cleared = true;
       entry.callback();
     },
+    runInterval(delay) {
+      const entry = intervals.find((candidate) => !candidate.cleared && candidate.delay === delay);
+      assert.ok(entry, `expected an active ${delay}ms interval`);
+      entry.callback();
+    },
   };
 }
 
 function createDocument({ nodes = {}, nodeLists = {} } = {}) {
   const documentElement = { dataset: {} };
+  const elementsById = new Map();
 
   return {
     documentElement,
+    createElement(tagName) {
+      return {
+        tagName: String(tagName || '').toUpperCase(),
+        id: '',
+        dataset: {},
+        style: { cssText: '' },
+        textContent: '',
+        parentElement: null,
+        setAttribute() {},
+      };
+    },
+    getElementById(id) {
+      return elementsById.get(String(id)) || null;
+    },
     querySelector(selector) {
       return nodes[selector] || null;
     },
     querySelectorAll(selector) {
       return nodeLists[selector] || [];
+    },
+    registerElement(element) {
+      if (element?.id) elementsById.set(String(element.id), element);
     },
   };
 }
@@ -169,6 +199,7 @@ function createLobbyDocument(tokens = 1) {
   const label = { textContent: 'Tokens:' };
   const value = { textContent: String(tokens) };
   const pill = {
+    children: [label, value],
     querySelector(selector) {
       if (selector === 'strong') return label;
       if (selector === 'span') return value;
@@ -193,32 +224,66 @@ function createLobbyDocument(tokens = 1) {
     },
   };
 
-  return createDocument({
+  const document = createDocument({
     nodes: { '.js-matchmake[data-ladder="solo"]': matchButton },
     nodeLists: { section: [section] },
   });
+  pill.appendChild = (element) => {
+    element.parentElement = pill;
+    pill.children.push(element);
+    document.registerElement(element);
+  };
+  document.soloTokenPill = pill;
+  document.soloTokenValue = value;
+  return document;
 }
 
 function createRunningPvpDocument() {
   const activeClassList = { contains: (name) => name === 'active' };
   const inactiveClassList = { contains: () => false };
-
-  return createDocument({
-    nodes: {
-      '#fastEnemyBtn': {
-        disabled: false,
-        classList: activeClassList,
-        getAttribute: () => null,
-        textContent: 'Enemy Turns 1s: ON',
-      },
-      '#battleControlCard': {},
-      '#enemyFormation': {},
-      '#matchStatusBadge': { textContent: 'Battle in progress' },
-      '#rewardsModal': { classList: inactiveClassList },
-      '#allyFormation .pSlot[data-side="ally"][data-alive="1"]': { dataset: { username: 'Hero' } },
-      '#enemyFormation .pSlot[data-side="enemy"][data-alive="1"]:not(.dead)': {},
+  const nodes = {
+    '#fastEnemyBtn': {
+      disabled: false,
+      classList: activeClassList,
+      getAttribute: () => null,
+      textContent: 'Enemy Turns 1s: ON',
     },
-  });
+    '#battleControlCard': {},
+    '#enemyFormation': {},
+    '#matchStatusBadge': { textContent: 'Battle in progress' },
+    '#rewardsModal': { classList: inactiveClassList },
+    '#allyFormation .pSlot[data-side="ally"][data-alive="1"]': { dataset: { username: 'Hero' } },
+    '#enemyFormation .pSlot[data-side="enemy"][data-alive="1"]:not(.dead)': {},
+  };
+  const document = createDocument({ nodes });
+  const targetHint = {};
+  const combatTokenPanel = {
+    children: [],
+    querySelector(selector) {
+      return selector === '#targetHint' ? targetHint : null;
+    },
+    insertBefore(element) {
+      element.parentElement = combatTokenPanel;
+      combatTokenPanel.children.push(element);
+      document.registerElement(element);
+    },
+    appendChild(element) {
+      element.parentElement = combatTokenPanel;
+      combatTokenPanel.children.push(element);
+      document.registerElement(element);
+    },
+  };
+  const tokenValue = {
+    textContent: '40',
+    closest(selector) {
+      return selector === '.combatTokenPanel' ? combatTokenPanel : null;
+    },
+  };
+  nodes['#myTokens'] = tokenValue;
+  document.combatTokenPanel = combatTokenPanel;
+  document.combatTokenValue = tokenValue;
+
+  return document;
 }
 
 test('metadata covers the Grakthar wave and monster battle routes', () => {
@@ -231,6 +296,65 @@ test('the first boss check is scheduled for 30 minutes after initialization', ()
 
   assert.equal(state.active, false);
   assert.equal(state.nextCheckAt, FIXED_NOW + 30 * 60 * 1000);
+});
+
+test('formats the time until the next boss check without negative countdowns', () => {
+  const waiting = createDefaultBossCycleState(FIXED_NOW);
+
+  assert.equal(formatBossCheckCountdown(waiting, FIXED_NOW), 'Bossprüfung in 30:00');
+  assert.equal(
+    formatBossCheckCountdown({ ...waiting, nextCheckAt: FIXED_NOW + 90_001 }, FIXED_NOW),
+    'Bossprüfung in 01:31',
+  );
+  assert.equal(
+    formatBossCheckCountdown({ ...waiting, nextCheckAt: FIXED_NOW - 1 }, FIXED_NOW),
+    'Bossprüfung jetzt',
+  );
+  assert.equal(
+    formatBossCheckCountdown({ ...waiting, active: true, nextCheckAt: FIXED_NOW - 1 }, FIXED_NOW),
+    'Bossprüfung läuft',
+  );
+});
+
+test('shows one boss countdown directly in the Solo token pill', () => {
+  const state = {
+    ...createDefaultBossCycleState(FIXED_NOW),
+    nextCheckAt: FIXED_NOW + 90_001,
+  };
+  const storage = storageWithBossState(state);
+  const document = createLobbyDocument(0);
+  const { timers } = runUserscript({ document, localStorage: storage });
+
+  timers.run(40);
+  const countdown = document.getElementById('tm-boss-check-countdown');
+  assert.ok(countdown);
+  assert.equal(countdown.parentElement, document.soloTokenPill);
+  assert.equal(countdown.textContent, 'Bossprüfung in 01:31');
+  assert.equal(document.soloTokenValue.textContent, '0');
+
+  timers.runInterval(200);
+  timers.run(40);
+  assert.equal(
+    document.soloTokenPill.children.filter((element) => element.id === 'tm-boss-check-countdown').length,
+    1,
+  );
+});
+
+test('shows the boss countdown inside the PvP combat token panel', () => {
+  const storage = storageWithBossState(createDefaultBossCycleState(FIXED_NOW));
+  const document = createRunningPvpDocument();
+  const { timers } = runUserscript({
+    document,
+    href: 'https://demonicscans.org/pvp_battle.php?match_id=44',
+    localStorage: storage,
+  });
+
+  timers.run(40);
+  const countdown = document.getElementById('tm-boss-check-countdown');
+  assert.ok(countdown);
+  assert.equal(countdown.parentElement, document.combatTokenPanel);
+  assert.equal(countdown.textContent, 'Bossprüfung in 30:00');
+  assert.equal(document.combatTokenValue.textContent, '40');
 });
 
 test('recognizes active, alive bosses below the 3b personal-damage target', () => {

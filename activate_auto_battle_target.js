@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Smart Solo PvP Battle
 // @namespace    local.veyra.smart-solo-pvp-battle
-// @version      2.3.1
+// @version      2.4.0
 // @description  Runs continuous Solo PvP and periodically deals 3b damage to fightable Grakthar bosses.
 // @match        https://demonicscans.org/pvp*
 // @match        https://demonicscans.org/active_wave.php*
@@ -56,6 +56,8 @@
     attacking: 'attacking',
     returningHub: 'returningHub',
   });
+
+  const BOSS_COUNTDOWN_ID = 'tm-boss-check-countdown';
 
   const SKILL_KEYS = Object.freeze({
     slash: 'slash',
@@ -379,6 +381,27 @@
     return allyAlive === false || enemyAlive === false;
   }
 
+  function formatBossCheckCountdown(state, now = Date.now()) {
+    if (state?.active) return 'Bossprüfung läuft';
+
+    const nextCheckAt = finiteNumber(state?.nextCheckAt);
+    if (nextCheckAt === null) return 'Bossprüfung --:--';
+
+    const totalSeconds = Math.max(0, Math.ceil((nextCheckAt - now) / 1000));
+    if (totalSeconds === 0) return 'Bossprüfung jetzt';
+
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    const padded = (value) => String(value).padStart(2, '0');
+    const time =
+      hours > 0
+        ? `${hours}:${padded(minutes)}:${padded(seconds)}`
+        : `${padded(minutes)}:${padded(seconds)}`;
+
+    return `Bossprüfung in ${time}`;
+  }
+
   /**
    * Pure attack planner. The bridge flag means Death Mark was confirmed two
    * preparation actions before Final Wish and this is its single follow-up.
@@ -498,6 +521,7 @@
     canUseSkill,
     chooseAttackPlan,
     createDefaultBossCycleState,
+    formatBossCheckCountdown,
     isAliveBossData,
     isConfirmedSkillUse,
     isFinishedBattleState,
@@ -580,6 +604,7 @@
     bossOwnerId: '',
     bossNavigationPending: false,
     bossActionPending: false,
+    bossCountdownTick: -1,
     stopped: false,
   };
 
@@ -1490,15 +1515,71 @@
     );
   }
 
-  function readSoloTokenCount(root = document) {
+  function findSoloTokenPill(root = document) {
     const section = findSoloSection(root);
     if (!section) return null;
 
-    const tokenPill = Array.from(section.querySelectorAll(SELECTORS.infoPill)).find((pill) =>
-      normalizeText(pill.querySelector('strong')?.textContent).startsWith('tokens'),
+    return (
+      Array.from(section.querySelectorAll?.(SELECTORS.infoPill) || []).find((pill) =>
+        normalizeText(pill.querySelector?.('strong')?.textContent).startsWith('tokens'),
+      ) || null
     );
+  }
+
+  function readSoloTokenCount(root = document) {
+    const tokenPill = findSoloTokenPill(root);
 
     return tokenPill ? parseInteger(tokenPill.querySelector('span')?.textContent) : null;
+  }
+
+  function ensureBossCountdownElement() {
+    const battleTokenValue = document.querySelector(SELECTORS.tokenValue);
+    const battlePanel = battleTokenValue?.closest?.('.combatTokenPanel') || null;
+    const lobbyTokenPill = battlePanel ? null : findSoloTokenPill();
+    const host = battlePanel || lobbyTokenPill;
+    if (!host) return null;
+
+    let countdown = document.getElementById?.(BOSS_COUNTDOWN_ID) || null;
+    if (!countdown) {
+      countdown = document.createElement?.('small') || null;
+      if (!countdown) return null;
+
+      countdown.id = BOSS_COUNTDOWN_ID;
+      countdown.setAttribute?.('aria-label', 'Countdown bis zur nächsten Bossprüfung');
+    }
+
+    const placement = battlePanel ? 'battle' : 'lobby';
+    if (countdown.dataset?.placement !== placement) {
+      if (countdown.dataset) countdown.dataset.placement = placement;
+      if (countdown.style) {
+        countdown.style.cssText = battlePanel
+          ? 'display:block;width:100%;margin-top:4px;font-size:11px;font-weight:700;opacity:.78;white-space:nowrap;'
+          : 'margin-left:2px;padding-left:8px;border-left:1px solid rgba(148,163,184,.38);font-size:10px;font-weight:700;opacity:.82;white-space:nowrap;';
+      }
+    }
+
+    if (countdown.parentElement !== host) {
+      const targetHint = battlePanel?.querySelector?.('#targetHint') || null;
+      if (targetHint && typeof host.insertBefore === 'function') {
+        host.insertBefore(countdown, targetHint);
+      } else {
+        host.appendChild?.(countdown);
+      }
+    }
+
+    return countdown;
+  }
+
+  function updateBossCheckCountdown(now = Date.now()) {
+    const countdown = ensureBossCountdownElement();
+    if (!countdown) return;
+
+    const tick = Math.floor(now / 1000);
+    if (runtime.bossCountdownTick === tick && countdown.textContent) return;
+    runtime.bossCountdownTick = tick;
+
+    const text = formatBossCheckCountdown(loadBossCycleState(now), now);
+    if (countdown.textContent !== text) countdown.textContent = text;
   }
 
   function getLobbySnapshot(root = document) {
@@ -1965,6 +2046,7 @@
       if (!isBattlePage()) {
         delete document.documentElement.dataset.veyraSmartPvp;
         if (isLobbyPage()) {
+          updateBossCheckCountdown();
           if (startBossCycleFromLobby()) return;
           handleLobbyPage();
         }
@@ -1974,6 +2056,7 @@
       // This marker only describes ownership of an actual battle page.
       document.documentElement.dataset.veyraSmartPvp = '1';
       clearLobbyPollTimer();
+      updateBossCheckCountdown();
 
       settlePendingAction();
 
