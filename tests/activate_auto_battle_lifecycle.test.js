@@ -14,6 +14,7 @@ const scriptSource = fs.readFileSync(
 function createTimers() {
   let nextId = 1;
   const timeouts = [];
+  const intervals = [];
 
   return {
     api: {
@@ -26,10 +27,15 @@ function createTimers() {
         const entry = timeouts.find((candidate) => candidate.id === id);
         if (entry) entry.cleared = true;
       },
-      setInterval() {
-        return nextId++;
+      setInterval(callback, delay) {
+        const entry = { id: nextId++, callback, delay, cleared: false };
+        intervals.push(entry);
+        return entry.id;
       },
-      clearInterval() {},
+      clearInterval(id) {
+        const entry = intervals.find((candidate) => candidate.id === id);
+        if (entry) entry.cleared = true;
+      },
     },
     run(delay) {
       const entry = timeouts.find((candidate) => !candidate.cleared && candidate.delay === delay);
@@ -39,6 +45,11 @@ function createTimers() {
     },
     has(delay) {
       return timeouts.some((entry) => !entry.cleared && entry.delay === delay);
+    },
+    runInterval(delay) {
+      const entry = intervals.find((candidate) => !candidate.cleared && candidate.delay === delay);
+      assert.ok(entry, `expected an active ${delay}ms interval`);
+      entry.callback();
     },
   };
 }
@@ -137,11 +148,20 @@ function createLobbyDocument(tokens) {
 }
 
 function createEndedBattleDocument() {
+  const matchStatus = { textContent: 'Allied victory' };
   const nodes = new Map([
-    ['#fastEnemyBtn', {}],
+    [
+      '#fastEnemyBtn',
+      {
+        disabled: false,
+        textContent: 'Enemy Turns 1s On',
+        classList: { contains: (name) => name === 'active' },
+        getAttribute: (name) => (name === 'aria-pressed' ? 'true' : null),
+      },
+    ],
     ['#battleControlCard', {}],
     ['#enemyFormation', {}],
-    ['#matchStatusBadge', { textContent: 'Allied victory' }],
+    ['#matchStatusBadge', matchStatus],
     ['#rewardsModal', { classList: { contains: () => false } }],
     ['#allyFormation .pSlot[data-side="ally"][data-alive="1"]', {}],
   ]);
@@ -149,6 +169,7 @@ function createEndedBattleDocument() {
 
   return {
     documentElement,
+    matchStatus,
     querySelector(selector) {
       return nodes.get(selector) || null;
     },
@@ -206,4 +227,49 @@ test('returns an ended battle to the PvP lobby', () => {
   assert.equal(battleDocument.documentElement.dataset.veyraSmartPvp, '1');
   timers.run(3000);
   assert.equal(navigation.replacedWith, 'https://demonicscans.org/pvp.php');
+});
+
+test('does not treat temporarily missing desktop formation slots as a finished battle', () => {
+  const battleDocument = createEndedBattleDocument();
+  battleDocument.matchStatus.textContent = 'Battle in progress';
+  const { navigation, timers } = runUserscript(battleDocument, {
+    href: 'https://demonicscans.org/pvp_battle.php?match_id=2',
+    pathname: '/pvp_battle.php',
+  });
+
+  timers.run(40);
+  assert.equal(timers.has(3000), false);
+  assert.equal(navigation.replacedWith, null);
+});
+
+test('rechecks the battle before a scheduled desktop lobby return', () => {
+  const battleDocument = createEndedBattleDocument();
+  const { navigation, timers } = runUserscript(battleDocument, {
+    href: 'https://demonicscans.org/pvp_battle.php?match_id=3',
+    pathname: '/pvp_battle.php',
+  });
+
+  timers.run(40);
+  assert.equal(timers.has(3000), true);
+
+  battleDocument.matchStatus.textContent = 'Battle in progress';
+  timers.run(3000);
+  assert.equal(navigation.replacedWith, null);
+});
+
+test('cancels a pending desktop lobby return as soon as the battle is running', () => {
+  const battleDocument = createEndedBattleDocument();
+  const { navigation, timers } = runUserscript(battleDocument, {
+    href: 'https://demonicscans.org/pvp_battle.php?match_id=4',
+    pathname: '/pvp_battle.php',
+  });
+
+  timers.run(40);
+  assert.equal(timers.has(3000), true);
+
+  battleDocument.matchStatus.textContent = 'Battle in progress';
+  timers.runInterval(200);
+  timers.run(40);
+  assert.equal(timers.has(3000), false);
+  assert.equal(navigation.replacedWith, null);
 });

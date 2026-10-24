@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Continuous Solo PvP
 // @namespace    local.veyra.continuous-solo-pvp
-// @version      1.1.0
+// @version      1.1.1
 // @description  Runs continuous Solo PvP or yields the full loop to Smart Battle when present.
 // @match        https://demonicscans.org/pvp*
 // @run-at       document-idle
@@ -39,7 +39,7 @@
     lobbyPollTimer: null,
     lobbyPollRunning: false,
     battlePageSeenAt: 0,
-    returnScheduled: false,
+    returnToLobbyTimer: null,
     statusKey: '',
   };
 
@@ -298,15 +298,28 @@
     );
   }
 
-  function scheduleReturnToLobby() {
-    if (state.returnScheduled) {
-      return;
-    }
+  function cancelReturnToLobby() {
+    if (state.returnToLobbyTimer === null) return;
 
-    state.returnScheduled = true;
+    window.clearTimeout(state.returnToLobbyTimer);
+    state.returnToLobbyTimer = null;
+  }
+
+  function scheduleReturnToLobby() {
+    if (state.returnToLobbyTimer !== null) return;
+
     setStatus('Kampf beendet - zurück zur Lobby ...', 'active');
 
-    window.setTimeout(() => {
+    state.returnToLobbyTimer = window.setTimeout(() => {
+      state.returnToLobbyTimer = null;
+      if (
+        document.documentElement.dataset.veyraSmartPvpLifecycle === '1'
+        || !isSoloBattlePage()
+        || !isBattleEnded()
+      ) {
+        return;
+      }
+
       window.location.replace(new URL('/pvp.php', window.location.origin).href);
     }, CONFIG.returnToLobbyDelayMs);
   }
@@ -318,6 +331,8 @@
       scheduleReturnToLobby();
       return;
     }
+
+    cancelReturnToLobby();
 
     /*
      * The dedicated smart battle userscript owns manual combat when present.
@@ -368,6 +383,7 @@
   function scanPage() {
     if (document.documentElement.dataset.veyraSmartPvpLifecycle === '1') {
       clearLobbyPollTimer();
+      cancelReturnToLobby();
       setStatus('Smart Battle steuert Kampf und Matchfolge.', 'active');
       return;
     }

@@ -252,8 +252,15 @@ test('recognizes all native battle-end signals used for the lobby return', () =>
   assert.equal(isFinishedBattleState({ ...running, statusText: 'Enemy victory' }), true);
   assert.equal(isFinishedBattleState({ ...running, statusText: 'Draw' }), true);
   assert.equal(isFinishedBattleState({ ...running, rewardsVisible: true }), true);
-  assert.equal(isFinishedBattleState({ ...running, enemyAlive: false }), true);
-  assert.equal(isFinishedBattleState({ ...running, allyAlive: false }), true);
+  assert.equal(isFinishedBattleState({ ...running, allyAlive: null, enemyAlive: null }), false);
+  assert.equal(
+    isFinishedBattleState({ ...running, statusText: '', allyAlive: null, enemyAlive: null }),
+    false,
+  );
+  assert.equal(isFinishedBattleState({ ...running, enemyAlive: false }), false);
+  assert.equal(isFinishedBattleState({ ...running, allyAlive: false }), false);
+  assert.equal(isFinishedBattleState({ ...running, statusText: '', enemyAlive: false }), true);
+  assert.equal(isFinishedBattleState({ ...running, statusText: '', allyAlive: false }), true);
 });
 
 test('parses the Solo token values used by the lobby', () => {
