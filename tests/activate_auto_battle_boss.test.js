@@ -80,12 +80,22 @@ function createTimers() {
   };
 }
 
-function createDocument({ nodes = {}, nodeLists = {} } = {}) {
+function createDocument({
+  nodes = {},
+  nodeLists = {},
+  cookies = {
+    hide_dead_monsters: '1',
+    show_dead_bosses_only: '0',
+  },
+} = {}) {
   const documentElement = { dataset: {} };
   const elementsById = new Map();
   const eventListeners = new Map();
+  const cookieValues = new Map(
+    Object.entries(cookies).map(([key, value]) => [String(key), String(value)]),
+  );
 
-  return {
+  const document = {
     documentElement,
     hidden: false,
     visibilityState: 'visible',
@@ -129,6 +139,21 @@ function createDocument({ nodes = {}, nodeLists = {} } = {}) {
       if (element?.id) elementsById.set(String(element.id), element);
     },
   };
+
+  Object.defineProperty(document, 'cookie', {
+    get() {
+      return [...cookieValues].map(([key, value]) => `${key}=${value}`).join('; ');
+    },
+    set(serialized) {
+      const [pair] = String(serialized || '').split(';');
+      const separator = pair.indexOf('=');
+      if (separator < 0) return;
+      cookieValues.set(pair.slice(0, separator).trim(), pair.slice(separator + 1).trim());
+    },
+  });
+
+  document.cookieValues = cookieValues;
+  return document;
 }
 
 function bossState(overrides = {}, now = FIXED_NOW) {
@@ -485,6 +510,96 @@ test('a due boss check never interrupts an ongoing PvP battle', () => {
   const state = readBossState(storage);
   assert.equal(state.active, false);
   assert.equal(state.nextCheckAt, FIXED_NOW - 1);
+});
+
+test('forces the alive-monsters filter before evaluating Wave 3 bosses', () => {
+  let joinClicks = 0;
+  const joinButton = {
+    textContent: 'Join Battle',
+    getAttribute: () => null,
+    click() {
+      joinClicks += 1;
+    },
+  };
+  const card = {
+    dataset: {
+      boss: '1',
+      dead: '0',
+      joined: '0',
+      userdmg: '0',
+      monsterId: '811',
+      expire: '99',
+    },
+    querySelector() {
+      return null;
+    },
+    querySelectorAll(selector) {
+      return selector === 'button, a, input[type="button"], input[type="submit"]'
+        ? [joinButton]
+        : [];
+    },
+  };
+  const storage = storageWithBossState(bossState());
+  const document = createDocument({
+    cookies: {
+      hide_dead_monsters: '0',
+      show_dead_bosses_only: '1',
+    },
+    nodes: { '.monster-container': {} },
+    nodeLists: {
+      '.monster-card[data-boss][data-dead][data-monster-id]': [card],
+    },
+  });
+  const { navigation, timers } = runUserscript({
+    document,
+    href: 'https://demonicscans.org/active_wave.php?gate=3&wave=8&dead_page=4',
+    localStorage: storage,
+  });
+
+  timers.run(40);
+
+  assert.equal(joinClicks, 0);
+  assert.equal(
+    navigation.replacedWith,
+    'https://demonicscans.org/active_wave.php?gate=3&wave=8',
+  );
+  assert.equal(document.cookieValues.get('hide_dead_monsters'), '1');
+  assert.equal(document.cookieValues.get('show_dead_bosses_only'), '0');
+  assert.equal(readBossState(storage).actionKind, 'wave-filter');
+
+  timers.runInterval(200);
+  timers.run(40);
+  assert.equal(joinClicks, 0);
+});
+
+test('stops reloading when the alive-monsters filter cannot be saved', () => {
+  const storage = storageWithBossState(
+    bossState({
+      actionKind: 'wave-filter',
+      actionAt: FIXED_NOW - BOSS_CONFIG.actionRetryMs,
+      actionAttempts: BOSS_CONFIG.maxActionAttempts,
+    }),
+  );
+  const document = createDocument({
+    cookies: {
+      hide_dead_monsters: '0',
+      show_dead_bosses_only: '1',
+    },
+    nodes: { '.monster-container': {} },
+  });
+  const { navigation, timers } = runUserscript({
+    document,
+    href: 'https://demonicscans.org/active_wave.php?gate=3&wave=8',
+    localStorage: storage,
+  });
+
+  timers.run(40);
+
+  assert.equal(navigation.replacedWith, null);
+  const state = readBossState(storage);
+  assert.equal(state.active, true);
+  assert.equal(state.actionAttempts, BOSS_CONFIG.maxActionAttempts);
+  assert.match(state.lastError, /alive-monsters filter could not be saved/i);
 });
 
 test('joins the first active boss below 3b on the wave hub', () => {
@@ -1624,7 +1739,8 @@ test('a stale boss fight returns to Wave 3 for another attempt instead of PvP', 
   assert.equal(readBossState(storage).active, true);
 });
 
-test('an empty wave hub returns to PvP and schedules the next check in 30 minutes', () => {
+test('an empty wave hub waits for rendering before returning to PvP', () => {
+  let currentNow = FIXED_NOW;
   const storage = storageWithBossState(bossState());
   const document = createDocument({
     nodes: { '.monster-container': {} },
@@ -1636,13 +1752,21 @@ test('an empty wave hub returns to PvP and schedules the next check in 30 minute
     document,
     href: 'https://demonicscans.org/active_wave.php?gate=3&wave=8',
     localStorage: storage,
+    now: () => currentNow,
   });
 
+  timers.run(40);
+
+  assert.equal(navigation.replacedWith, null);
+  assert.equal(readBossState(storage).active, true);
+
+  currentNow += BOSS_CONFIG.hubEmptyWaitMs;
+  timers.runInterval(200);
   timers.run(40);
 
   assert.equal(navigation.replacedWith, 'https://demonicscans.org/pvp.php');
   const state = readBossState(storage);
   assert.equal(state.active, false);
   assert.equal(state.phase, BOSS_PHASES.idle);
-  assert.equal(state.nextCheckAt, FIXED_NOW + 30 * 60 * 1000);
+  assert.equal(state.nextCheckAt, currentNow + BOSS_CONFIG.checkIntervalMs);
 });

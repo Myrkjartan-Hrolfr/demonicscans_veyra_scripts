@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Smart Solo PvP Battle
 // @namespace    local.veyra.smart-solo-pvp-battle
-// @version      2.5.1
+// @version      2.5.2
 // @description  Runs continuous Solo PvP, handles Grakthar bosses, and adds exclusive Auto-Farm activation.
 // @match        https://demonicscans.org/pvp*
 // @match        https://demonicscans.org/active_wave.php*
@@ -37,12 +37,13 @@
     storageKey: 'veyra-smart-solo-pvp:boss-cycle:v1',
     ownerStorageKey: 'veyra-smart-solo-pvp:boss-owner:v1',
     stateVersion: 1,
-    checkIntervalMs: 1 * 60 * 1000,
+    checkIntervalMs: 30 * 60 * 1000,
     leaseMs: 5 * 60_000,
     leaseRenewWindowMs: 60_000,
     actionRetryMs: 5_000,
     actionTimeoutMs: 30_000,
     hubSettleMs: 1_000,
+    hubEmptyWaitMs: 30_000,
     cycleTimeoutMs: 2 * 60 * 60 * 1000,
     maxActionAttempts: 3,
     wavePath: '/active_wave.php?gate=3&wave=8',
@@ -627,6 +628,7 @@
     bossNavigationPending: false,
     bossActionPending: false,
     bossSuspendedAt: 0,
+    bossEmptySince: 0,
     bossCountdownTick: -1,
     autoFarmObserver: null,
     autoFarmActivationRunning: false,
@@ -1020,6 +1022,31 @@
     }
   }
 
+  function getCookieValue(name) {
+    try {
+      const prefix = `${name}=`;
+      const entry = String(document.cookie || '')
+        .split(';')
+        .map((part) => part.trim())
+        .find((part) => part.startsWith(prefix));
+      return entry ? decodeURIComponent(entry.slice(prefix.length)) : null;
+    } catch (error) {
+      console.warn(`[Smart Solo PvP] Could not read the ${name} cookie.`, error);
+      return null;
+    }
+  }
+
+  function setCookieValue(name, value, days = 30) {
+    try {
+      const maxAge = days * 24 * 60 * 60;
+      document.cookie = `${name}=${encodeURIComponent(value)}; Max-Age=${maxAge}; Path=/; SameSite=Lax`;
+      return true;
+    } catch (error) {
+      console.warn(`[Smart Solo PvP] Could not set the ${name} cookie.`, error);
+      return false;
+    }
+  }
+
   function isBossHubPage() {
     const url = currentUrl();
     return (
@@ -1057,6 +1084,85 @@
     window.clearTimeout(runtime.matchmakeTimer);
     runtime.matchmakeTimer = null;
     runtime.lobbyAbortController?.abort();
+  }
+
+  function ensureAliveMonsterWaveFilter(state, now = Date.now()) {
+    if (runtime.bossNavigationPending) return null;
+
+    const url = currentUrl();
+    const hideDeadMonsters = getCookieValue('hide_dead_monsters');
+    const showDeadBossesOnly = getCookieValue('show_dead_bosses_only');
+    const deadPageSelected = url.searchParams.has('dead_page');
+    const filterIsCorrect =
+      hideDeadMonsters === '1' && showDeadBossesOnly === '0' && !deadPageSelected;
+
+    if (filterIsCorrect) {
+      if (state.actionKind !== 'wave-filter') return state;
+
+      return patchBossCycleState(
+        state,
+        {
+          phase: BOSS_PHASES.checking,
+          phaseUpdatedAt: now,
+          actionKind: '',
+          actionAt: 0,
+          actionAttempts: 0,
+          lastError: '',
+        },
+        now,
+      );
+    }
+
+    const attempts = state.actionKind === 'wave-filter' ? state.actionAttempts + 1 : 1;
+    if (
+      state.actionKind === 'wave-filter' &&
+      now - state.actionAt < BOSS_CONFIG.actionRetryMs
+    ) {
+      report('Waiting for the Wave 3 alive-monsters filter to be applied.');
+      return null;
+    }
+
+    if (attempts > BOSS_CONFIG.maxActionAttempts) {
+      patchBossCycleState(
+        state,
+        {
+          lastError: 'The Wave 3 alive-monsters filter could not be saved.',
+        },
+        now,
+      );
+      report('Could not save the Wave 3 alive-monsters filter; automatic reloads are paused.', 'error');
+      return null;
+    }
+
+    patchBossCycleState(
+      state,
+      {
+        phase: BOSS_PHASES.checking,
+        phaseUpdatedAt: now,
+        actionKind: 'wave-filter',
+        actionAt: now,
+        actionAttempts: attempts,
+        lastError: '',
+      },
+      now,
+    );
+
+    const hideDeadSaved = setCookieValue('hide_dead_monsters', '1');
+    const deadBossFilterSaved = setCookieValue('show_dead_bosses_only', '0');
+    const cookiesVerified =
+      getCookieValue('hide_dead_monsters') === '1' &&
+      getCookieValue('show_dead_bosses_only') === '0';
+
+    if (!hideDeadSaved || !deadBossFilterSaved || !cookiesVerified) {
+      report('The Wave 3 alive-monsters filter has not been accepted yet.', 'error');
+      return null;
+    }
+
+    url.searchParams.delete('dead_page');
+
+    report('Switching Wave 3 to the alive-monsters view before checking bosses.');
+    navigateTo(`${url.pathname}${url.search}${url.hash}`);
+    return null;
   }
 
   function isPageHidden() {
@@ -1460,6 +1566,9 @@
       report('The boss cycle safety window elapsed; continuing the Wave 3 scan.', 'error');
     }
 
+    state = ensureAliveMonsterWaveFilter(state, now);
+    if (!state) return;
+
     if (!document.querySelector(SELECTORS.bossContainer)) {
       if (now - state.phaseUpdatedAt >= BOSS_CONFIG.actionTimeoutMs) {
         patchBossCycleState(state, {
@@ -1483,6 +1592,16 @@
     if (now - state.phaseUpdatedAt < BOSS_CONFIG.hubSettleMs) {
       report('Waiting briefly for all boss cards to render.');
       return;
+    }
+
+    if (cards.length === 0) {
+      if (runtime.bossEmptySince === 0) runtime.bossEmptySince = now;
+      if (now - runtime.bossEmptySince < BOSS_CONFIG.hubEmptyWaitMs) {
+        report('Waiting for the alive boss list to finish loading.');
+        return;
+      }
+    } else {
+      runtime.bossEmptySince = 0;
     }
 
     const targetCard = state.targetBossId
