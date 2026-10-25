@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Veyra - Smart Solo PvP Battle
 // @namespace    local.veyra.smart-solo-pvp-battle
-// @version      2.4.0
-// @description  Runs continuous Solo PvP and periodically deals 3b damage to fightable Grakthar bosses.
+// @version      2.5.0
+// @description  Runs continuous Solo PvP, handles Grakthar bosses, and adds exclusive Auto-Farm activation.
 // @match        https://demonicscans.org/pvp*
 // @match        https://demonicscans.org/active_wave.php*
 // @match        https://demonicscans.org/battle.php*
@@ -58,6 +58,21 @@
   });
 
   const BOSS_COUNTDOWN_ID = 'tm-boss-check-countdown';
+
+  const AUTO_FARM_SELECTORS = Object.freeze({
+    targets: '.af-targets',
+    groupRow: '.af-group-row',
+    enabled: '.grp-enabled',
+    actions: '.btn-group-actions',
+    save: '.grp-save',
+    delete: '.grp-del-all',
+  });
+
+  const AUTO_FARM_ACTIVATE = Object.freeze({
+    buttonClass: 'af-exclusive-activate-btn',
+    processingClass: 'af-exclusive-processing',
+    styleId: 'af-exclusive-activate-style',
+  });
 
   const SKILL_KEYS = Object.freeze({
     slash: 'slash',
@@ -572,6 +587,9 @@
     infoPill: '.info-pill',
     bossContainer: '.monster-container',
     bossCard: '.monster-card[data-boss][data-dead][data-monster-id]',
+    monsterCard: '.monster-card[data-dead][data-monster-id]',
+    activeAutoSummonBossLink:
+      '.auto-summon-card[data-alive="1"] a[href*="battle.php"]',
     monsterAutoPanel: '#tm-monster-auto-battle',
     monsterAutoTarget: '#mabTarget',
     monsterAutoStart: '#mabStart',
@@ -605,6 +623,11 @@
     bossNavigationPending: false,
     bossActionPending: false,
     bossCountdownTick: -1,
+    autoFarmObserver: null,
+    autoFarmActivationRunning: false,
+    autoFarmScanScheduled: false,
+    autoFarmScanHandle: null,
+    autoFarmScanUsesAnimationFrame: false,
     stopped: false,
   };
 
@@ -633,6 +656,229 @@
     runtime.statusKey = key;
     const method = level === 'error' ? 'warn' : 'info';
     console[method](`[Smart Solo PvP] ${message}`);
+  }
+
+  function getAutoFarmGroupRows() {
+    return Array.from(
+      document.querySelectorAll?.(
+        `${AUTO_FARM_SELECTORS.targets} ${AUTO_FARM_SELECTORS.groupRow}`,
+      ) || [],
+    );
+  }
+
+  function setAutoFarmEnabled(select, value) {
+    if (!select || String(select.value) === value) return false;
+
+    select.value = value;
+    const EventConstructor = window.Event || globalThis.Event;
+
+    if (typeof select.dispatchEvent === 'function' && typeof EventConstructor === 'function') {
+      select.dispatchEvent(new EventConstructor('input', { bubbles: true }));
+      select.dispatchEvent(new EventConstructor('change', { bubbles: true }));
+    }
+
+    return true;
+  }
+
+  function saveAutoFarmRows(rows) {
+    // Collect every button before the first click. The native Save handler can
+    // synchronously rebuild the target list and detach the remaining rows.
+    const saveButtons = rows
+      .map((row) => row.querySelector?.(AUTO_FARM_SELECTORS.save))
+      .filter((button) => typeof button?.click === 'function');
+
+    for (const saveButton of saveButtons) {
+      saveButton.click();
+    }
+
+    return saveButtons.length;
+  }
+
+  function activateExclusiveAutoFarmGroup(targetRow) {
+    const rows = getAutoFarmGroupRows();
+    if (!targetRow || !rows.includes(targetRow)) return 0;
+    if (!targetRow.querySelector?.(AUTO_FARM_SELECTORS.enabled)) return 0;
+
+    const changedRows = [];
+
+    for (const row of rows) {
+      const enabled = row.querySelector?.(AUTO_FARM_SELECTORS.enabled);
+      const desiredValue = row === targetRow ? '1' : '0';
+
+      if (setAutoFarmEnabled(enabled, desiredValue)) {
+        changedRows.push(row);
+      }
+    }
+
+    // Saving the selected row even when it was already the only active target
+    // keeps this action equivalent to an explicit activation by the user.
+    if (!changedRows.includes(targetRow)) {
+      changedRows.push(targetRow);
+    }
+
+    return saveAutoFarmRows(changedRows);
+  }
+
+  function getAutoFarmTargetName(row) {
+    const names = row?.querySelector?.('.af-group-names');
+    return String(names?.getAttribute?.('title') || names?.textContent || 'Target').trim();
+  }
+
+  function showAutoFarmActivateStatus(button, text) {
+    if (!button || button.isConnected === false) return;
+
+    button.textContent = text;
+    window.setTimeout(() => {
+      if (button.isConnected === false) return;
+
+      button.textContent = '⚡ Activate';
+      button.disabled = false;
+      button.classList?.remove(AUTO_FARM_ACTIVATE.processingClass);
+    }, 1_200);
+  }
+
+  function handleAutoFarmActivateClick(event) {
+    const button = event.target?.closest?.(`.${AUTO_FARM_ACTIVATE.buttonClass}`);
+    if (!button || runtime.autoFarmActivationRunning) return;
+
+    const container = button.closest?.(AUTO_FARM_SELECTORS.targets);
+    const row = button.closest?.(AUTO_FARM_SELECTORS.groupRow);
+    if (!container || !row || !getAutoFarmGroupRows().includes(row)) return;
+
+    event.preventDefault?.();
+    event.stopPropagation?.();
+
+    runtime.autoFarmActivationRunning = true;
+    button.disabled = true;
+    button.classList?.add(AUTO_FARM_ACTIVATE.processingClass);
+    button.textContent = '⏳ Activating…';
+
+    const targetName = getAutoFarmTargetName(row);
+
+    try {
+      const saveCount = activateExclusiveAutoFarmGroup(row);
+
+      if (saveCount > 0) {
+        console.info(
+          `[AF Exclusive Activate] "${targetName}" activated; ${saveCount} target(s) saved.`,
+        );
+        showAutoFarmActivateStatus(button, '✅ Active');
+      } else {
+        console.warn('[AF Exclusive Activate] No matching target or Save button was found.');
+        showAutoFarmActivateStatus(button, '⚠️ No Save');
+      }
+    } catch (error) {
+      console.error('[AF Exclusive Activate] Activation failed:', error);
+      showAutoFarmActivateStatus(button, '❌ Error');
+    } finally {
+      window.setTimeout(() => {
+        runtime.autoFarmActivationRunning = false;
+      }, 300);
+    }
+  }
+
+  function injectAutoFarmActivateStyles() {
+    if (document.getElementById?.(AUTO_FARM_ACTIVATE.styleId)) return;
+    if (!document.head || typeof document.createElement !== 'function') return;
+
+    const style = document.createElement('style');
+    style.id = AUTO_FARM_ACTIVATE.styleId;
+    style.textContent = `
+      .${AUTO_FARM_ACTIVATE.buttonClass} {
+        border-color: #5dce8a !important;
+        background: rgba(44, 160, 90, 0.16) !important;
+        color: #bfffd5 !important;
+        white-space: nowrap;
+      }
+
+      .${AUTO_FARM_ACTIVATE.buttonClass}:hover:not(:disabled) {
+        background: rgba(44, 160, 90, 0.3) !important;
+        box-shadow: 0 0 10px rgba(93, 206, 138, 0.25);
+      }
+
+      .${AUTO_FARM_ACTIVATE.buttonClass}:disabled,
+      .${AUTO_FARM_ACTIVATE.buttonClass}.${AUTO_FARM_ACTIVATE.processingClass} {
+        cursor: progress;
+        opacity: 0.75;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function decorateAutoFarmGroupRows() {
+    const rows = getAutoFarmGroupRows();
+    if (rows.length === 0) return;
+
+    injectAutoFarmActivateStyles();
+
+    for (const row of rows) {
+      if (row.querySelector?.(`.${AUTO_FARM_ACTIVATE.buttonClass}`)) continue;
+
+      const actions = row.querySelector?.(AUTO_FARM_SELECTORS.actions);
+      const enabled = row.querySelector?.(AUTO_FARM_SELECTORS.enabled);
+      const saveButton = row.querySelector?.(AUTO_FARM_SELECTORS.save);
+      if (!actions || !enabled || !saveButton || typeof document.createElement !== 'function') {
+        continue;
+      }
+
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = `btn ${AUTO_FARM_ACTIVATE.buttonClass}`;
+      button.textContent = '⚡ Activate';
+      button.title = 'Dieses Target aktivieren und alle anderen deaktivieren';
+
+      const deleteButton = actions.querySelector?.(AUTO_FARM_SELECTORS.delete);
+      if (deleteButton && typeof actions.insertBefore === 'function') {
+        actions.insertBefore(button, deleteButton);
+      } else {
+        actions.appendChild?.(button);
+      }
+    }
+  }
+
+  function scheduleAutoFarmDecoration() {
+    if (runtime.autoFarmScanScheduled) return;
+
+    runtime.autoFarmScanScheduled = true;
+    const run = () => {
+      runtime.autoFarmScanScheduled = false;
+      runtime.autoFarmScanHandle = null;
+      decorateAutoFarmGroupRows();
+    };
+
+    if (typeof window.requestAnimationFrame === 'function') {
+      runtime.autoFarmScanUsesAnimationFrame = true;
+      runtime.autoFarmScanHandle = window.requestAnimationFrame(run);
+    } else {
+      runtime.autoFarmScanUsesAnimationFrame = false;
+      runtime.autoFarmScanHandle = window.setTimeout(run, 0);
+    }
+  }
+
+  function cancelAutoFarmDecoration() {
+    if (!runtime.autoFarmScanScheduled) return;
+
+    if (runtime.autoFarmScanUsesAnimationFrame) {
+      window.cancelAnimationFrame?.(runtime.autoFarmScanHandle);
+    } else {
+      window.clearTimeout(runtime.autoFarmScanHandle);
+    }
+
+    runtime.autoFarmScanScheduled = false;
+    runtime.autoFarmScanHandle = null;
+  }
+
+  function initializeAutoFarmExclusiveActivation() {
+    if (!/\/active_wave\.php\/?$/i.test(window.location.pathname)) return;
+
+    decorateAutoFarmGroupRows();
+    document.addEventListener?.('click', handleAutoFarmActivateClick, true);
+
+    runtime.autoFarmObserver = new MutationObserver(scheduleAutoFarmDecoration);
+    runtime.autoFarmObserver.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+    });
   }
 
   function getBrowserStorage(name) {
@@ -897,12 +1143,56 @@
     return allowBattleLink ? root?.querySelector?.('a[href*="battle.php?id="]') || null : null;
   }
 
-  function sortedBossCards() {
-    return Array.from(document.querySelectorAll(SELECTORS.bossCard)).sort((left, right) => {
+  function getMonsterIdFromBattleLink(link) {
+    const href = link?.getAttribute?.('href') || link?.href;
+    if (!href) return '';
+
+    try {
+      const url = new URL(href, window.location.origin);
+      return String(url.searchParams.get('id') || url.searchParams.get('monster_id') || '').trim();
+    } catch {
+      return '';
+    }
+  }
+
+  function getActiveAutoSummonBossIds() {
+    return new Set(
+      Array.from(document.querySelectorAll(SELECTORS.activeAutoSummonBossLink))
+        .map(getMonsterIdFromBattleLink)
+        .filter(Boolean),
+    );
+  }
+
+  function isRecognizedBossCard(card, activeAutoSummonBossIds) {
+    const bossId = String(card?.dataset?.monsterId || '').trim();
+    return Boolean(
+      bossId &&
+        (String(card.dataset.boss || '') === '1' || activeAutoSummonBossIds.has(bossId)),
+    );
+  }
+
+  function isFightableBossCard(card, activeAutoSummonBossIds) {
+    if (!isRecognizedBossCard(card, activeAutoSummonBossIds)) return false;
+
+    const dataset = card.dataset;
+    return isFightableBossData(
+      String(dataset.boss || '') === '1' ? dataset : { ...dataset, boss: '1' },
+    );
+  }
+
+  function sortedBossCards(activeAutoSummonBossIds) {
+    const cards = new Set([
+      ...document.querySelectorAll(SELECTORS.bossCard),
+      ...document.querySelectorAll(SELECTORS.monsterCard),
+    ]);
+
+    return Array.from(cards)
+      .filter((card) => isRecognizedBossCard(card, activeAutoSummonBossIds))
+      .sort((left, right) => {
       const leftExpiry = finiteNumber(left.dataset.expire) ?? Number.POSITIVE_INFINITY;
       const rightExpiry = finiteNumber(right.dataset.expire) ?? Number.POSITIVE_INFINITY;
       return leftExpiry - rightExpiry;
-    });
+      });
   }
 
   function recordBossAction(state, { phase, kind, startIssued = state.startIssued }, now = Date.now()) {
@@ -1073,7 +1363,8 @@
       return;
     }
 
-    const cards = sortedBossCards();
+    const activeAutoSummonBossIds = getActiveAutoSummonBossIds();
+    const cards = sortedBossCards(activeAutoSummonBossIds);
     if (now - state.phaseUpdatedAt < BOSS_CONFIG.hubSettleMs) {
       report('Waiting briefly for all boss cards to render.');
       return;
@@ -1087,7 +1378,7 @@
     );
     let card =
       targetCard &&
-      isFightableBossData(targetCard.dataset) &&
+      isFightableBossCard(targetCard, activeAutoSummonBossIds) &&
       !targetBossFailed
         ? targetCard
         : null;
@@ -1115,7 +1406,11 @@
     if (!card) {
       card = cards.find((candidate) => {
         const bossId = String(candidate.dataset.monsterId || '');
-        return isFightableBossData(candidate.dataset) && !state.failedBossIds.includes(bossId);
+        return (
+          isFightableBossCard(candidate, activeAutoSummonBossIds) &&
+          !state.processedBossIds.includes(bossId) &&
+          !state.failedBossIds.includes(bossId)
+        );
       });
     }
 
@@ -2091,6 +2386,8 @@
     }, CONFIG.scanDebounceMs);
   }
 
+  initializeAutoFarmExclusiveActivation();
+
   runtime.observer = new MutationObserver(scheduleScan);
   runtime.observer.observe(document.documentElement, {
     childList: true,
@@ -2102,6 +2399,9 @@
   runtime.interval = window.setInterval(scheduleScan, CONFIG.scanIntervalMs);
   window.addEventListener('pagehide', () => {
     runtime.stopped = true;
+    document.removeEventListener?.('click', handleAutoFarmActivateClick, true);
+    runtime.autoFarmObserver?.disconnect();
+    cancelAutoFarmDecoration();
     runtime.observer?.disconnect();
     window.clearInterval(runtime.interval);
     window.clearTimeout(runtime.scanTimer);

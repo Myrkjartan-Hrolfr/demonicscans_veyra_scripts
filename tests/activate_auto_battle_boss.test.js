@@ -490,6 +490,77 @@ test('joins the first active boss below 3b on the wave hub', () => {
   assert.equal(state.actionKind, 'join');
 });
 
+test('joins an active auto-summon boss even when its monster card reports data-boss zero', () => {
+  let joinClicks = 0;
+  const joinButton = {
+    textContent: 'Join Battle',
+    getAttribute: () => null,
+    click() {
+      joinClicks += 1;
+    },
+  };
+  const bossCard = {
+    dataset: {
+      boss: '0',
+      dead: '0',
+      joined: '0',
+      userdmg: '0',
+      monsterId: '556650107',
+      expire: '1793084522',
+      name: 'general skarn the radiant bastion',
+    },
+    querySelector() {
+      return null;
+    },
+    querySelectorAll(selector) {
+      return selector === 'button, a, input[type="button"], input[type="submit"]'
+        ? [joinButton]
+        : [];
+    },
+  };
+  const activeBossLink = {
+    href: 'https://demonicscans.org/battle.php?id=556650107',
+    getAttribute(name) {
+      return name === 'href' ? 'battle.php?id=556650107' : null;
+    },
+  };
+  const autoSummonCard = {
+    dataset: { alive: '1' },
+    querySelector(selector) {
+      return selector.includes('battle.php?id=') ? activeBossLink : null;
+    },
+    querySelectorAll(selector) {
+      return selector.includes('battle.php?id=') ? [activeBossLink] : [];
+    },
+  };
+  const storage = storageWithBossState(bossState());
+  const document = createDocument({
+    nodes: { '.monster-container': {} },
+    nodeLists: {
+      '.monster-card[data-boss][data-dead][data-monster-id]': [bossCard],
+      '.auto-summon-card[data-alive="1"]': [autoSummonCard],
+      '.auto-summon-card[data-alive="1"] a[href*="battle.php"]': [activeBossLink],
+      '.auto-summon-card[data-alive="1"] a[href*="battle.php?id="]': [activeBossLink],
+      '.auto-summon-card[data-alive="1"] a[href^="battle.php?id="]': [activeBossLink],
+      '.auto-summon-card[data-alive="1"] a[href="battle.php?id=556650107"]': [activeBossLink],
+    },
+  });
+  const { navigation, timers } = runUserscript({
+    document,
+    href: 'https://demonicscans.org/active_wave.php?gate=3&wave=8',
+    localStorage: storage,
+  });
+
+  timers.run(40);
+
+  assert.equal(joinClicks, 1);
+  assert.equal(navigation.replacedWith, null);
+  const state = readBossState(storage);
+  assert.equal(state.targetBossId, '556650107');
+  assert.equal(state.phase, BOSS_PHASES.joining);
+  assert.equal(state.actionKind, 'join');
+});
+
 test('an already joined partially damaged boss clicks Enter Battle once without joining again', () => {
   let joinClicks = 0;
   let enterClicks = 0;
