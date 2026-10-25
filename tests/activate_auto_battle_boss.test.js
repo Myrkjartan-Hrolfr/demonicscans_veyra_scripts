@@ -8,6 +8,10 @@ const vm = require('node:vm');
 
 const scriptPath = path.resolve(__dirname, '../activate_auto_battle_target.js');
 const scriptSource = fs.readFileSync(scriptPath, 'utf8');
+const monsterAutoBattleSource = fs.readFileSync(
+  path.resolve(__dirname, '../monster_auto_battle.js'),
+  'utf8',
+);
 
 const {
   BOSS_CONFIG,
@@ -79,9 +83,12 @@ function createTimers() {
 function createDocument({ nodes = {}, nodeLists = {} } = {}) {
   const documentElement = { dataset: {} };
   const elementsById = new Map();
+  const eventListeners = new Map();
 
   return {
     documentElement,
+    hidden: false,
+    visibilityState: 'visible',
     createElement(tagName) {
       return {
         tagName: String(tagName || '').toUpperCase(),
@@ -101,6 +108,22 @@ function createDocument({ nodes = {}, nodeLists = {} } = {}) {
     },
     querySelectorAll(selector) {
       return nodeLists[selector] || [];
+    },
+    addEventListener(type, listener) {
+      const listeners = eventListeners.get(type) || [];
+      listeners.push(listener);
+      eventListeners.set(type, listeners);
+    },
+    removeEventListener(type, listener) {
+      const listeners = eventListeners.get(type) || [];
+      eventListeners.set(
+        type,
+        listeners.filter((candidate) => candidate !== listener),
+      );
+    },
+    dispatchEvent(event) {
+      for (const listener of eventListeners.get(event?.type) || []) listener.call(this, event);
+      return true;
     },
     registerElement(element) {
       if (element?.id) elementsById.set(String(element.id), element);
@@ -133,15 +156,17 @@ function runUserscript({
   href = 'https://demonicscans.org/pvp.php',
   localStorage = createStorage(),
   sessionStorage = createStorage(),
+  navigator: navigatorObject,
   now = FIXED_NOW,
 }) {
   const timers = createTimers();
   const navigation = { replacedWith: null, reloads: 0 };
   const url = new URL(href);
+  const windowEventListeners = new Map();
 
   class FixedDate extends Date {
     static now() {
-      return now;
+      return typeof now === 'function' ? now() : now;
     }
   }
 
@@ -155,7 +180,23 @@ function runUserscript({
   const window = {
     ...timers.api,
     Event: EventStub,
-    addEventListener() {},
+    navigator: navigatorObject,
+    addEventListener(type, listener) {
+      const listeners = windowEventListeners.get(type) || [];
+      listeners.push(listener);
+      windowEventListeners.set(type, listeners);
+    },
+    removeEventListener(type, listener) {
+      const listeners = windowEventListeners.get(type) || [];
+      windowEventListeners.set(
+        type,
+        listeners.filter((candidate) => candidate !== listener),
+      );
+    },
+    dispatchEvent(event) {
+      for (const listener of windowEventListeners.get(event?.type) || []) listener.call(window, event);
+      return true;
+    },
     fetch() {
       throw new Error('unexpected fetch');
     },
@@ -191,7 +232,7 @@ function runUserscript({
     window,
   });
 
-  return { localStorage, navigation, timers };
+  return { localStorage, navigation, timers, window };
 }
 
 function createLobbyDocument(tokens = 1) {
@@ -289,6 +330,12 @@ function createRunningPvpDocument() {
 test('metadata covers the Grakthar wave and monster battle routes', () => {
   assert.match(scriptSource, /^\/\/ @match\s+https:\/\/demonicscans\.org\/active_wave\.php\*$/m);
   assert.match(scriptSource, /^\/\/ @match\s+https:\/\/demonicscans\.org\/battle\.php\*$/m);
+  assert.match(scriptSource, /^\/\/ @match\s+https:\/\/www\.demonicscans\.org\/active_wave\.php\*$/m);
+  assert.match(scriptSource, /^\/\/ @match\s+https:\/\/www\.demonicscans\.org\/battle\.php\*$/m);
+  assert.match(
+    monsterAutoBattleSource,
+    /^\/\/ @match\s+https:\/\/www\.demonicscans\.org\/battle\.php\*$/m,
+  );
 });
 
 test('the first boss check is scheduled for 30 minutes after initialization', () => {
@@ -487,6 +534,305 @@ test('joins the first active boss below 3b on the wave hub', () => {
   const state = readBossState(storage);
   assert.equal(state.targetBossId, '812');
   assert.equal(state.phase, BOSS_PHASES.joining);
+  assert.equal(state.actionKind, 'join');
+});
+
+test('recognizes a localized button.join-btn structurally and clicks it only once', () => {
+  let joinClicks = 0;
+  const joinButton = {
+    disabled: false,
+    textContent: 'Dem Kampf beitreten',
+    classList: { contains: (name) => name === 'join-btn' },
+    getAttribute: () => null,
+    matches: (selector) => selector.includes('.join-btn'),
+    click() {
+      joinClicks += 1;
+    },
+  };
+  const card = {
+    dataset: {
+      boss: '1',
+      dead: '0',
+      joined: '0',
+      userdmg: '0',
+      monsterId: '813',
+      expire: '99',
+    },
+    querySelector(selector) {
+      return selector.includes('.join-btn') ? joinButton : null;
+    },
+    querySelectorAll(selector) {
+      if (selector.includes('.join-btn')) return [joinButton];
+      return selector === 'button, a, input[type="button"], input[type="submit"]'
+        ? [joinButton]
+        : [];
+    },
+  };
+  const storage = storageWithBossState(bossState());
+  const document = createDocument({
+    nodes: { '.monster-container': {} },
+    nodeLists: {
+      '.monster-card[data-boss][data-dead][data-monster-id]': [card],
+    },
+  });
+  const { timers } = runUserscript({
+    document,
+    href: 'https://demonicscans.org/active_wave.php?gate=3&wave=8',
+    localStorage: storage,
+  });
+
+  timers.run(40);
+  timers.runInterval(200);
+  timers.run(40);
+
+  assert.equal(joinClicks, 1);
+  const state = readBossState(storage);
+  assert.equal(state.targetBossId, '813');
+  assert.equal(state.actionKind, 'join');
+  assert.equal(state.actionAttempts, 1);
+});
+
+test('does not click or record a disabled Join control and eventually skips it', () => {
+  let currentNow = FIXED_NOW;
+  let joinClicks = 0;
+  const joinButton = {
+    disabled: true,
+    textContent: 'Join Battle',
+    classList: { contains: (name) => name === 'join-btn' },
+    getAttribute: () => null,
+    matches: (selector) => selector.includes('.join-btn'),
+    click() {
+      joinClicks += 1;
+    },
+  };
+  const card = {
+    dataset: {
+      boss: '1',
+      dead: '0',
+      joined: '0',
+      userdmg: '0',
+      monsterId: '814',
+      expire: '99',
+    },
+    querySelector(selector) {
+      return selector.includes('.join-btn') ? joinButton : null;
+    },
+    querySelectorAll(selector) {
+      if (selector.includes('.join-btn')) return [joinButton];
+      return selector === 'button, a, input[type="button"], input[type="submit"]'
+        ? [joinButton]
+        : [];
+    },
+  };
+  const storage = storageWithBossState(bossState());
+  const document = createDocument({
+    nodes: { '.monster-container': {} },
+    nodeLists: {
+      '.monster-card[data-boss][data-dead][data-monster-id]': [card],
+    },
+  });
+  const { timers, navigation } = runUserscript({
+    document,
+    href: 'https://demonicscans.org/active_wave.php?gate=3&wave=8',
+    localStorage: storage,
+    now: () => currentNow,
+  });
+
+  timers.run(40);
+
+  assert.equal(joinClicks, 0);
+  const state = readBossState(storage);
+  assert.equal(state.targetBossId, '814');
+  assert.equal(state.actionKind, '');
+  assert.equal(state.actionAttempts, 0);
+
+  currentNow += BOSS_CONFIG.actionTimeoutMs;
+  timers.runInterval(200);
+  timers.run(40);
+
+  assert.equal(joinClicks, 0);
+  assert.equal(navigation.replacedWith, 'https://demonicscans.org/active_wave.php?gate=3&wave=8');
+  const timedOutState = readBossState(storage);
+  assert.equal(timedOutState.targetBossId, '');
+  assert.deepEqual(timedOutState.failedBossIds, ['814']);
+});
+
+test('falls back to a direct Join click when navigator.locks fails', async () => {
+  for (const failureMode of ['throw', 'reject']) {
+    let joinClicks = 0;
+    let lockRequests = 0;
+    const joinButton = {
+      disabled: false,
+      textContent: 'Join Battle',
+      getAttribute: () => null,
+      click() {
+        joinClicks += 1;
+      },
+    };
+    const card = {
+      dataset: {
+        boss: '1',
+        dead: '0',
+        joined: '0',
+        userdmg: '0',
+        monsterId: failureMode === 'throw' ? '815' : '816',
+        expire: '99',
+      },
+      querySelector() {
+        return null;
+      },
+      querySelectorAll(selector) {
+        return selector === 'button, a, input[type="button"], input[type="submit"]'
+          ? [joinButton]
+          : [];
+      },
+    };
+    const storage = storageWithBossState(bossState());
+    const document = createDocument({
+      nodes: { '.monster-container': {} },
+      nodeLists: {
+        '.monster-card[data-boss][data-dead][data-monster-id]': [card],
+      },
+    });
+    const navigatorObject = {
+      locks: {
+        request() {
+          lockRequests += 1;
+          if (failureMode === 'throw') throw new Error('locks unavailable');
+          return Promise.reject(new Error('locks unavailable'));
+        },
+      },
+    };
+    const { timers } = runUserscript({
+      document,
+      href: 'https://demonicscans.org/active_wave.php?gate=3&wave=8',
+      localStorage: storage,
+      navigator: navigatorObject,
+    });
+
+    timers.run(40);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(lockRequests, 1, failureMode);
+    assert.equal(joinClicks, 1, failureMode);
+    const state = readBossState(storage);
+    assert.equal(state.actionKind, 'join', failureMode);
+    assert.equal(state.actionAttempts, 1, failureMode);
+  }
+});
+
+test('a persisted pagehide followed by pageshow resumes the boss scan', () => {
+  let currentNow = FIXED_NOW;
+  let joinClicks = 0;
+  const joinButton = {
+    disabled: false,
+    textContent: 'Join Battle',
+    getAttribute: () => null,
+    click() {
+      joinClicks += 1;
+    },
+  };
+  const card = {
+    dataset: {
+      boss: '1',
+      dead: '0',
+      joined: '0',
+      userdmg: '0',
+      monsterId: '817',
+      expire: '99',
+    },
+    querySelector() {
+      return null;
+    },
+    querySelectorAll(selector) {
+      return selector === 'button, a, input[type="button"], input[type="submit"]'
+        ? [joinButton]
+        : [];
+    },
+  };
+  const storage = storageWithBossState(bossState());
+  const document = createDocument({
+    nodes: { '.monster-container': {} },
+    nodeLists: {
+      '.monster-card[data-boss][data-dead][data-monster-id]': [card],
+    },
+  });
+  const { timers, window } = runUserscript({
+    document,
+    href: 'https://demonicscans.org/active_wave.php?gate=3&wave=8',
+    localStorage: storage,
+    now: () => currentNow,
+  });
+
+  window.dispatchEvent({ type: 'pagehide', persisted: true });
+  window.dispatchEvent({ type: 'pageshow', persisted: true });
+  timers.run(40);
+  currentNow += BOSS_CONFIG.hubSettleMs;
+  timers.runInterval(200);
+  timers.run(40);
+
+  assert.equal(joinClicks, 1);
+  assert.equal(readBossState(storage).actionKind, 'join');
+});
+
+test('a boss route takes over its active lease after mobile navigation loses sessionStorage', () => {
+  let joinClicks = 0;
+  const joinButton = {
+    disabled: false,
+    textContent: 'Join Battle',
+    getAttribute: () => null,
+    click() {
+      joinClicks += 1;
+    },
+  };
+  const card = {
+    dataset: {
+      boss: '1',
+      dead: '0',
+      joined: '0',
+      userdmg: '0',
+      monsterId: '818',
+      expire: '99',
+    },
+    querySelector() {
+      return null;
+    },
+    querySelectorAll(selector) {
+      return selector === 'button, a, input[type="button"], input[type="submit"]'
+        ? [joinButton]
+        : [];
+    },
+  };
+  const storage = storageWithBossState(
+    bossState({
+      ownerId: 'owner-from-pvp-page',
+      leaseUntil: FIXED_NOW + BOSS_CONFIG.leaseMs,
+    }),
+  );
+  const document = createDocument({
+    nodes: { '.monster-container': {} },
+    nodeLists: {
+      '.monster-card[data-boss][data-dead][data-monster-id]': [card],
+    },
+  });
+  const mobileSessionStorage = createStorage();
+  const { timers } = runUserscript({
+    document,
+    href: 'https://demonicscans.org/active_wave.php?gate=3&wave=8',
+    localStorage: storage,
+    sessionStorage: mobileSessionStorage,
+  });
+
+  timers.run(40);
+
+  assert.equal(joinClicks, 1);
+  const state = readBossState(storage);
+  assert.equal(state.ownerId, 'owner-from-pvp-page');
+  assert.equal(
+    mobileSessionStorage.getItem(BOSS_CONFIG.ownerStorageKey),
+    'owner-from-pvp-page',
+  );
+  assert.equal(state.targetBossId, '818');
   assert.equal(state.actionKind, 'join');
 });
 
@@ -845,6 +1191,44 @@ test('marks a battle-page join as unavailable after bounded attempts', () => {
   timers.run(40);
 
   assert.equal(joinClicks, 0);
+  assert.equal(
+    navigation.replacedWith,
+    'https://demonicscans.org/active_wave.php?gate=3&wave=8',
+  );
+  assert.deepEqual(readBossState(storage).failedBossIds, ['812']);
+});
+
+test('a disabled battle-page Enter control times out instead of stalling forever', () => {
+  let enterClicks = 0;
+  const enterButton = {
+    disabled: true,
+    textContent: 'Enter Battle',
+    getAttribute: () => null,
+    click() {
+      enterClicks += 1;
+    },
+  };
+  const storage = storageWithBossState(
+    bossState({
+      phase: BOSS_PHASES.entering,
+      phaseUpdatedAt: FIXED_NOW - BOSS_CONFIG.actionTimeoutMs,
+      targetBossId: '812',
+    }),
+  );
+  const document = createDocument({
+    nodeLists: {
+      'button, a, input[type="button"], input[type="submit"]': [enterButton],
+    },
+  });
+  const { navigation, timers } = runUserscript({
+    document,
+    href: 'https://demonicscans.org/battle.php?id=812',
+    localStorage: storage,
+  });
+
+  timers.run(40);
+
+  assert.equal(enterClicks, 0);
   assert.equal(
     navigation.replacedWith,
     'https://demonicscans.org/active_wave.php?gate=3&wave=8',

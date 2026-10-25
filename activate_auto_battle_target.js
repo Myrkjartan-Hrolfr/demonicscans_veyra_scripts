@@ -1,11 +1,14 @@
 // ==UserScript==
 // @name         Veyra - Smart Solo PvP Battle
 // @namespace    local.veyra.smart-solo-pvp-battle
-// @version      2.5.0
+// @version      2.5.1
 // @description  Runs continuous Solo PvP, handles Grakthar bosses, and adds exclusive Auto-Farm activation.
 // @match        https://demonicscans.org/pvp*
 // @match        https://demonicscans.org/active_wave.php*
 // @match        https://demonicscans.org/battle.php*
+// @match        https://www.demonicscans.org/pvp*
+// @match        https://www.demonicscans.org/active_wave.php*
+// @match        https://www.demonicscans.org/battle.php*
 // @run-at       document-idle
 // @grant        none
 // @noframes
@@ -34,7 +37,7 @@
     storageKey: 'veyra-smart-solo-pvp:boss-cycle:v1',
     ownerStorageKey: 'veyra-smart-solo-pvp:boss-owner:v1',
     stateVersion: 1,
-    checkIntervalMs: 30 * 60 * 1000,
+    checkIntervalMs: 1 * 60 * 1000,
     leaseMs: 5 * 60_000,
     leaseRenewWindowMs: 60_000,
     actionRetryMs: 5_000,
@@ -620,8 +623,10 @@
     lobbyAbortController: null,
     bossStorage: null,
     bossOwnerId: '',
+    bossOwnerRestored: false,
     bossNavigationPending: false,
     bossActionPending: false,
+    bossSuspendedAt: 0,
     bossCountdownTick: -1,
     autoFarmObserver: null,
     autoFarmActivationRunning: false,
@@ -896,7 +901,10 @@
 
     try {
       const saved = storage.getItem(BOSS_CONFIG.ownerStorageKey);
-      if (saved) return saved;
+      if (saved) {
+        runtime.bossOwnerRestored = true;
+        return saved;
+      }
 
       const ownerId = `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       storage.setItem(BOSS_CONFIG.ownerStorageKey, ownerId);
@@ -970,6 +978,28 @@
   }
 
   function renewBossCycleLease(state, now = Date.now()) {
+    // Some mobile userscript environments isolate or clear sessionStorage on
+    // full-page navigation. On an active boss route, adopt the still-valid
+    // owner from the persisted cycle so the new page does not wait five
+    // minutes for its own previous lease to expire.
+    if (
+      state?.active &&
+      state.ownerId &&
+      state.ownerId !== runtime.bossOwnerId &&
+      state.leaseUntil > now &&
+      !runtime.bossOwnerRestored &&
+      (isBossHubPage() || isMonsterBattlePage())
+    ) {
+      runtime.bossOwnerId = state.ownerId;
+      runtime.bossOwnerRestored = true;
+
+      try {
+        getBrowserStorage('sessionStorage')?.setItem(BOSS_CONFIG.ownerStorageKey, state.ownerId);
+      } catch (error) {
+        console.warn('[Smart Solo PvP] Could not restore the mobile boss-cycle owner.', error);
+      }
+    }
+
     if (!state || state.ownerId !== runtime.bossOwnerId) return claimBossCycleLease(state, now);
     if (state.leaseUntil - now > BOSS_CONFIG.leaseRenewWindowMs) return state;
 
@@ -1027,6 +1057,46 @@
     window.clearTimeout(runtime.matchmakeTimer);
     runtime.matchmakeTimer = null;
     runtime.lobbyAbortController?.abort();
+  }
+
+  function isPageHidden() {
+    return document.hidden === true || document.visibilityState === 'hidden';
+  }
+
+  function refreshBossCycleAfterMobileResume() {
+    const now = Date.now();
+    let state = loadBossCycleState(now);
+    if (!state?.active) return;
+
+    state = renewBossCycleLease(state, now);
+    if (!state || state.ownerId !== runtime.bossOwnerId) return;
+
+    patchBossCycleState(
+      state,
+      {
+        phaseUpdatedAt: now,
+        actionAt: state.actionAt > 0 ? now : 0,
+        leaseUntil: now + BOSS_CONFIG.leaseMs,
+      },
+      now,
+    );
+  }
+
+  function handleVisibilityChange() {
+    if (isPageHidden()) {
+      runtime.bossSuspendedAt = Date.now();
+      return;
+    }
+
+    if (runtime.bossSuspendedAt > 0) {
+      window.clearTimeout(runtime.scanTimer);
+      runtime.scanTimer = null;
+      runtime.bossActionPending = false;
+      refreshBossCycleAfterMobileResume();
+      runtime.bossSuspendedAt = 0;
+    }
+
+    scheduleScan();
   }
 
   function finishBossCycle(state, message = '') {
@@ -1130,7 +1200,12 @@
 
   function findJoinBossControl(card) {
     const control = findTextControl(card, ['join', 'join battle', 'join the battle']);
-    return control && !controlText(control).includes('quick join') ? control : null;
+    if (control && !controlText(control).includes('quick join')) return control;
+
+    // Mobile browsers can translate visible button text. The live wave page
+    // uses a stable button.join-btn next to an anchor.join-btn (View), so the
+    // element type is a safe language-independent fallback.
+    return card?.querySelector?.('button.join-btn') || null;
   }
 
   function findEnterBattleControl(root, allowBattleLink = false) {
@@ -1215,18 +1290,28 @@
     return state.actionKind !== kind || now - state.actionAt >= BOSS_CONFIG.actionRetryMs;
   }
 
+  function isDisabledControl(control) {
+    return Boolean(
+      control?.disabled === true ||
+        control?.getAttribute?.('aria-disabled') === 'true' ||
+        control?.classList?.contains?.('disabled'),
+    );
+  }
+
   function clickBossControl(state, control, options) {
-    if (!control || runtime.bossActionPending) return;
+    if (!control || runtime.bossActionPending || isDisabledControl(control)) return;
 
     const perform = () => {
       const now = Date.now();
       const latest = loadBossCycleState(now);
       if (
+        isPageHidden() ||
         !latest?.active ||
         latest.ownerId !== runtime.bossOwnerId ||
         latest.leaseUntil <= now ||
         latest.targetBossId !== state.targetBossId ||
         control.isConnected === false ||
+        isDisabledControl(control) ||
         (options.allowedPhases && !options.allowedPhases.includes(latest.phase)) ||
         (options.once && (latest.actionKind === options.kind || latest.startIssued)) ||
         (options.maxAttempts &&
@@ -1258,11 +1343,36 @@
     }
 
     runtime.bossActionPending = true;
-    void locks
-      .request('veyra-smart-solo-pvp:boss-action', { mode: 'exclusive' }, perform)
-      .catch((error) => {
-        console.warn('[Smart Solo PvP] Boss action lock failed:', error);
-      })
+    let lockCallbackRan = false;
+    const performWithLock = () => {
+      lockCallbackRan = true;
+      perform();
+    };
+
+    let lockRequest;
+    try {
+      lockRequest = locks.request(
+        'veyra-smart-solo-pvp:boss-action',
+        { mode: 'exclusive' },
+        performWithLock,
+      );
+    } catch (error) {
+      runtime.bossActionPending = false;
+      console.warn('[Smart Solo PvP] Boss action lock failed; using the mobile fallback:', error);
+      perform();
+      return;
+    }
+
+    void Promise.resolve(lockRequest)
+      .then(
+        () => {
+          if (!lockCallbackRan) performWithLock();
+        },
+        (error) => {
+          console.warn('[Smart Solo PvP] Boss action lock failed; using the mobile fallback:', error);
+          if (!lockCallbackRan) performWithLock();
+        },
+      )
       .finally(() => {
         runtime.bossActionPending = false;
         scheduleScan();
@@ -1320,6 +1430,11 @@
     const now = Date.now();
     let state = loadBossCycleState(now);
     if (!state?.active) return;
+
+    if (isPageHidden()) {
+      if (runtime.bossSuspendedAt === 0) runtime.bossSuspendedAt = now;
+      return;
+    }
 
     state = renewBossCycleLease(state, now);
     if (!state) {
@@ -1435,7 +1550,8 @@
     const joined = String(card.dataset.joined || '') === '1';
     const joinControl = findJoinBossControl(card);
     const enterControl = findEnterBattleControl(card, joined);
-    const joinConfirmedByUi = !joinControl && Boolean(enterControl);
+    const joinConfirmedByUi =
+      (!joinControl || isDisabledControl(joinControl)) && Boolean(enterControl);
 
     if (joined || joinConfirmedByUi) {
       if (!enterControl) {
@@ -1443,6 +1559,15 @@
           abandonCurrentBoss(state, 'Enter Battle was not found. The missing HTML can be added later.');
         } else {
           report(`Boss ${bossId} is joined; waiting for Enter Battle.`);
+        }
+        return;
+      }
+
+      if (isDisabledControl(enterControl)) {
+        if (now - state.phaseUpdatedAt >= BOSS_CONFIG.actionTimeoutMs) {
+          abandonCurrentBoss(state, 'Enter Battle stayed disabled.');
+        } else {
+          report(`Boss ${bossId} is joined; waiting for Enter Battle to become available.`);
         }
         return;
       }
@@ -1468,6 +1593,15 @@
         abandonCurrentBoss(state, 'Join Battle was not found.');
       } else {
         report(`Waiting for Join Battle on boss ${bossId}.`);
+      }
+      return;
+    }
+
+    if (isDisabledControl(joinControl)) {
+      if (now - state.phaseUpdatedAt >= BOSS_CONFIG.actionTimeoutMs) {
+        abandonCurrentBoss(state, 'Join Battle stayed disabled.');
+      } else {
+        report(`Waiting for Join Battle on boss ${bossId} to become available.`);
       }
       return;
     }
@@ -1510,6 +1644,11 @@
     const now = Date.now();
     let state = loadBossCycleState(now);
     if (!state?.active) return;
+
+    if (isPageHidden()) {
+      if (runtime.bossSuspendedAt === 0) runtime.bossSuspendedAt = now;
+      return;
+    }
 
     state = renewBossCycleLease(state, now);
     if (!state) {
@@ -1573,6 +1712,16 @@
       document.querySelector(SELECTORS.monsterJoin) ||
       findTextControl(document, ['join the battle', 'join battle']);
     if (pageJoinControl) {
+      if (isDisabledControl(pageJoinControl)) {
+        const waitStartedAt = state.actionKind === 'join-page' ? state.actionAt : state.phaseUpdatedAt;
+        if (now - waitStartedAt >= BOSS_CONFIG.actionTimeoutMs) {
+          abandonCurrentBoss(state, 'Join the Battle stayed disabled.');
+        } else {
+          report(`Waiting for boss ${state.targetBossId} to enable Join the Battle.`);
+        }
+        return;
+      }
+
       if (state.actionKind === 'join-page') {
         if (now - state.actionAt < BOSS_CONFIG.actionTimeoutMs) {
           report(`Waiting for boss ${state.targetBossId} to accept the battle-page join.`);
@@ -1663,6 +1812,15 @@
       }
 
       const enterControl = findEnterBattleControl(document, false);
+      if (enterControl && isDisabledControl(enterControl)) {
+        if (now - state.phaseUpdatedAt >= BOSS_CONFIG.actionTimeoutMs) {
+          abandonCurrentBoss(state, 'Enter Battle stayed disabled on the battle page.');
+        } else {
+          report(`Waiting for boss ${state.targetBossId} to enable Enter Battle.`);
+        }
+        return;
+      }
+
       if (enterControl && actionCanRun(state, 'enter', now)) {
         if (state.actionKind === 'enter' && state.actionAttempts >= BOSS_CONFIG.maxActionAttempts) {
           abandonCurrentBoss(state, 'Enter Battle did not reveal the monster fight.');
@@ -2397,9 +2555,31 @@
   });
 
   runtime.interval = window.setInterval(scheduleScan, CONFIG.scanIntervalMs);
-  window.addEventListener('pagehide', () => {
+  document.addEventListener?.('visibilitychange', handleVisibilityChange);
+  window.addEventListener('pageshow', (event) => {
+    if (event?.persisted) {
+      window.clearTimeout(runtime.scanTimer);
+      runtime.scanTimer = null;
+      runtime.bossActionPending = false;
+      runtime.bossNavigationPending = false;
+      refreshBossCycleAfterMobileResume();
+      runtime.bossSuspendedAt = 0;
+    }
+
+    scheduleScan();
+  });
+  window.addEventListener('pagehide', (event) => {
+    // A BFCache page is only frozen and can be restored without re-running the
+    // userscript. Keep its observers/timers registered so mobile Safari can
+    // continue immediately on pageshow.
+    if (event?.persisted) {
+      runtime.bossSuspendedAt = Date.now();
+      return;
+    }
+
     runtime.stopped = true;
     document.removeEventListener?.('click', handleAutoFarmActivateClick, true);
+    document.removeEventListener?.('visibilitychange', handleVisibilityChange);
     runtime.autoFarmObserver?.disconnect();
     cancelAutoFarmDecoration();
     runtime.observer?.disconnect();

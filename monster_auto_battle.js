@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Monster Auto Battle
 // @namespace    http://tampermonkey.net/
-// @version      1.6.4
+// @version      1.6.5
 // @description  Auto-battle for the current monster with three attacks, an own-poison attack, potion priorities, target damage, and level-up protection.
 // @match        https://demonicscans.org/battle.php*
+// @match        https://www.demonicscans.org/battle.php*
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
