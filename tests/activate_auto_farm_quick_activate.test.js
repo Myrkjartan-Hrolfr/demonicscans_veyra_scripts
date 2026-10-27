@@ -7,7 +7,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const scriptSource = fs.readFileSync(
-  path.resolve(__dirname, '../activate_auto_battle_target.js'),
+  path.resolve(__dirname, '../auto_farm_activate_buttons.js'),
   'utf8',
 );
 

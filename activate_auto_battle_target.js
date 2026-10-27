@@ -1,14 +1,10 @@
 // ==UserScript==
-// @name         Veyra - Smart Solo PvP Battle
+// @name         Veyra - Smart Solo PvP Manager
 // @namespace    local.veyra.smart-solo-pvp-battle
-// @version      2.5.2
-// @description  Runs continuous Solo PvP, handles Grakthar bosses, and adds exclusive Auto-Farm activation.
+// @version      3.0.0
+// @description  Manages Solo PvP matchmaking, battle speed, and deliberate skill selection.
 // @match        https://demonicscans.org/pvp*
-// @match        https://demonicscans.org/active_wave.php*
-// @match        https://demonicscans.org/battle.php*
 // @match        https://www.demonicscans.org/pvp*
-// @match        https://www.demonicscans.org/active_wave.php*
-// @match        https://www.demonicscans.org/battle.php*
 // @run-at       document-idle
 // @grant        none
 // @noframes
@@ -16,6 +12,11 @@
 
 (() => {
   'use strict';
+
+  const COMMAND_KEY = 'veyra:orchestrator:command:v1';
+  const STATUS_KEY = 'veyra:worker:pvp:status:v1';
+  const PROTOCOL_VERSION = 1;
+  const WORKER_ID = 'pvp';
 
   const CONFIG = Object.freeze({
     scanIntervalMs: 200,
@@ -27,55 +28,11 @@
     lobbyPollIntervalMs: 30_000,
     lobbyRequestTimeoutMs: 15_000,
     returnToLobbyDelayMs: 3_000,
+    statusHeartbeatMs: 5_000,
     slashTokenGain: 3,
     resourceGainPerAction: 25,
     finalWishCost: 15,
     resourceMaximum: 100,
-  });
-
-  const BOSS_CONFIG = Object.freeze({
-    storageKey: 'veyra-smart-solo-pvp:boss-cycle:v1',
-    ownerStorageKey: 'veyra-smart-solo-pvp:boss-owner:v1',
-    stateVersion: 1,
-    checkIntervalMs: 30 * 60 * 1000,
-    leaseMs: 5 * 60_000,
-    leaseRenewWindowMs: 60_000,
-    actionRetryMs: 5_000,
-    actionTimeoutMs: 30_000,
-    hubSettleMs: 1_000,
-    hubEmptyWaitMs: 30_000,
-    cycleTimeoutMs: 2 * 60 * 60 * 1000,
-    maxActionAttempts: 3,
-    wavePath: '/active_wave.php?gate=3&wave=8',
-    pvpPath: '/pvp.php',
-    targetDamage: '3b',
-    targetDamageValue: 3_000_000_000,
-  });
-
-  const BOSS_PHASES = Object.freeze({
-    idle: 'idle',
-    checking: 'checking',
-    joining: 'joining',
-    entering: 'entering',
-    attacking: 'attacking',
-    returningHub: 'returningHub',
-  });
-
-  const BOSS_COUNTDOWN_ID = 'tm-boss-check-countdown';
-
-  const AUTO_FARM_SELECTORS = Object.freeze({
-    targets: '.af-targets',
-    groupRow: '.af-group-row',
-    enabled: '.grp-enabled',
-    actions: '.btn-group-actions',
-    save: '.grp-save',
-    delete: '.grp-del-all',
-  });
-
-  const AUTO_FARM_ACTIVATE = Object.freeze({
-    buttonClass: 'af-exclusive-activate-btn',
-    processingClass: 'af-exclusive-processing',
-    styleId: 'af-exclusive-activate-style',
   });
 
   const SKILL_KEYS = Object.freeze({
@@ -103,9 +60,7 @@
   });
 
   function finiteNumber(value) {
-    if (value === null || value === undefined || String(value).trim() === '') {
-      return null;
-    }
+    if (value === null || value === undefined || String(value).trim() === '') return null;
 
     const number = Number(value);
     return Number.isFinite(number) ? number : null;
@@ -121,149 +76,47 @@
     return match[0].trim().startsWith('-') ? -number : number;
   }
 
-  function parseGameNumber(value) {
-    if (typeof value === 'number') {
-      return Number.isFinite(value) ? value : null;
-    }
-
-    const match = String(value ?? '').match(/(-?[\d.,]+(?:\s[\d.,]+)*)\s*([kmbtq])?/i);
-    if (!match) return null;
-
-    const suffix = String(match[2] || '').toLowerCase();
-    if (!suffix) return parseInteger(match[1]);
-
-    let numberText = match[1].replace(/\s/g, '');
-    if (numberText.includes('.') && numberText.includes(',')) {
-      const decimal = numberText.lastIndexOf(',') > numberText.lastIndexOf('.') ? ',' : '.';
-      const thousands = decimal === ',' ? '.' : ',';
-      numberText = numberText.split(thousands).join('').replace(decimal, '.');
-    } else {
-      numberText = numberText.replace(',', '.');
-    }
-
-    const number = Number.parseFloat(numberText);
-    const multiplier = { k: 1e3, m: 1e6, b: 1e9, t: 1e12, q: 1e15 }[suffix];
-    return Number.isFinite(number) ? Math.round(number * multiplier) : null;
+  function normalizeComparableText(value) {
+    return String(value || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
   }
 
-  function createDefaultBossCycleState(now = Date.now()) {
-    return {
-      version: BOSS_CONFIG.stateVersion,
-      active: false,
-      phase: BOSS_PHASES.idle,
-      nextCheckAt: now + BOSS_CONFIG.checkIntervalMs,
-      cycleStartedAt: 0,
-      phaseUpdatedAt: now,
-      targetBossId: '',
-      processedBossIds: [],
-      failedBossIds: [],
-      ownerId: '',
-      leaseUntil: 0,
-      actionKind: '',
-      actionAt: 0,
-      actionAttempts: 0,
-      startIssued: false,
-      lastError: '',
-    };
-  }
-
-  function normalizeBossIdList(value) {
-    if (!Array.isArray(value)) return [];
-    return [...new Set(value.map((entry) => String(entry || '').trim()).filter(Boolean))];
-  }
-
-  function normalizeBossCycleState(value, now = Date.now()) {
-    const defaults = createDefaultBossCycleState(now);
-    if (!value || typeof value !== 'object' || value.version !== BOSS_CONFIG.stateVersion) {
-      return defaults;
+  function normalizeOrchestratorCommand(value) {
+    if (!value || typeof value !== 'object' || Number(value.version) !== PROTOCOL_VERSION) {
+      return null;
     }
 
-    const phases = new Set(Object.values(BOSS_PHASES));
-    const active = value.active === true;
-    const phase = phases.has(value.phase) ? value.phase : active ? BOSS_PHASES.checking : BOSS_PHASES.idle;
-    const numberOr = (candidate, fallback) => {
-      const number = Number(candidate);
-      return Number.isFinite(number) && number >= 0 ? number : fallback;
-    };
+    const visitId = String(value.visitId || '').trim();
+    const taskId = String(value.taskId || '').trim();
+    const phase = String(value.phase || '').trim();
+    const returnPath = String(value.returnPath || '').trim();
+    const issuedAt = finiteNumber(value.issuedAt);
+    const deadlineAt = finiteNumber(value.deadlineAt);
+
+    if (
+      !visitId ||
+      !taskId ||
+      !['draining', 'running'].includes(phase) ||
+      !returnPath.startsWith('/') ||
+      issuedAt === null ||
+      deadlineAt === null ||
+      issuedAt < 0 ||
+      deadlineAt < issuedAt
+    ) {
+      return null;
+    }
 
     return {
-      version: BOSS_CONFIG.stateVersion,
-      active,
-      phase: active ? phase : BOSS_PHASES.idle,
-      nextCheckAt: numberOr(value.nextCheckAt, defaults.nextCheckAt),
-      cycleStartedAt: numberOr(value.cycleStartedAt, 0),
-      phaseUpdatedAt: numberOr(value.phaseUpdatedAt, now),
-      targetBossId: String(value.targetBossId || ''),
-      processedBossIds: normalizeBossIdList(value.processedBossIds),
-      failedBossIds: normalizeBossIdList(value.failedBossIds),
-      ownerId: String(value.ownerId || ''),
-      leaseUntil: numberOr(value.leaseUntil, 0),
-      actionKind: String(value.actionKind || ''),
-      actionAt: numberOr(value.actionAt, 0),
-      actionAttempts: Math.max(0, Math.floor(numberOr(value.actionAttempts, 0))),
-      startIssued: value.startIssued === true,
-      lastError: String(value.lastError || ''),
+      version: PROTOCOL_VERSION,
+      visitId,
+      taskId,
+      phase,
+      returnPath,
+      issuedAt,
+      deadlineAt,
     };
-  }
-
-  function isUntouchedActiveBossData(dataset) {
-    if (!dataset) return false;
-
-    return (
-      String(dataset.boss || '') === '1' &&
-      String(dataset.dead || '') === '0' &&
-      parseGameNumber(dataset.userdmg) === 0 &&
-      Boolean(String(dataset.monsterId || '').trim())
-    );
-  }
-
-  function isAliveBossData(dataset) {
-    return Boolean(
-      dataset &&
-        String(dataset.boss || '') === '1' &&
-        String(dataset.dead || '') === '0' &&
-        String(dataset.monsterId || '').trim(),
-    );
-  }
-
-  function isFightableBossData(dataset) {
-    if (!isAliveBossData(dataset)) return false;
-
-    const joined = String(dataset.joined || '');
-    const damage = parseGameNumber(dataset.userdmg);
-
-    return joined === '0' || !Number.isFinite(damage) || damage < BOSS_CONFIG.targetDamageValue;
-  }
-
-  function monsterAutoBattleCompletionReason({ statusText, damageText, hpText }) {
-    const status = normalizeComparableText(statusText);
-    const damage = parseGameNumber(damageText);
-    const hp = String(hpText || '').trim();
-
-    // The status belongs to another userscript and can be stale. Only the
-    // game's own per-player damage value proves that the 3b goal was reached.
-    if (Number.isFinite(damage) && damage >= BOSS_CONFIG.targetDamageValue) {
-      return 'target';
-    }
-
-    if (/(?:^|[^\d])0(?:[.,]0+)?\s*\//.test(hp) || /monster defeated/.test(status)) {
-      return 'defeated';
-    }
-
-    return null;
-  }
-
-  function isMonsterAutoBattleSuccess(snapshot) {
-    return monsterAutoBattleCompletionReason(snapshot) !== null;
-  }
-
-  function isMonsterAutoBattleFailure(statusText) {
-    const status = normalizeComparableText(statusText);
-    if (!status || isMonsterAutoBattleSuccess({ statusText })) return false;
-
-    return /invalid|please select|not available|could not|not enough|safety stop|level-up protection|no enabled|requires .*potion|error|stopped manually|remained disabled/.test(
-      status,
-    );
   }
 
   /**
@@ -326,9 +179,7 @@
   }
 
   function canUseSkill(skill, snapshot) {
-    if (!skill?.available) {
-      return false;
-    }
+    if (!skill?.available) return false;
 
     const cost = finiteNumber(skill.cost);
     const resourceCost = finiteNumber(skill.resourceCost);
@@ -339,13 +190,7 @@
       return false;
     }
 
-    if (snapshot.tokens < cost) {
-      return false;
-    }
-
-    if (snapshot.resource < resourceCost) {
-      return false;
-    }
+    if (snapshot.tokens < cost || snapshot.resource < resourceCost) return false;
 
     return !skill.requiresFullResource || snapshot.resource >= snapshot.resourceMaximum;
   }
@@ -375,13 +220,6 @@
     return boundary === '' || /[\s.,!?:;()-]/.test(boundary);
   }
 
-  function normalizeComparableText(value) {
-    return String(value || '')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .toLowerCase();
-  }
-
   function isFinishedBattleState({ statusText, rewardsVisible, allyAlive, enemyAlive }) {
     const status = normalizeComparableText(statusText);
 
@@ -393,32 +231,9 @@
     // that short window no living slot exists in the DOM, which is unknown
     // state rather than proof that a side was defeated. An explicit running
     // status is authoritative until the native UI publishes an end signal.
-    if (/battle in progress|match in progress/.test(status)) {
-      return false;
-    }
+    if (/battle in progress|match in progress/.test(status)) return false;
 
     return allyAlive === false || enemyAlive === false;
-  }
-
-  function formatBossCheckCountdown(state, now = Date.now()) {
-    if (state?.active) return 'Bossprüfung läuft';
-
-    const nextCheckAt = finiteNumber(state?.nextCheckAt);
-    if (nextCheckAt === null) return 'Bossprüfung --:--';
-
-    const totalSeconds = Math.max(0, Math.ceil((nextCheckAt - now) / 1000));
-    if (totalSeconds === 0) return 'Bossprüfung jetzt';
-
-    const hours = Math.floor(totalSeconds / 3600);
-    const minutes = Math.floor((totalSeconds % 3600) / 60);
-    const seconds = totalSeconds % 60;
-    const padded = (value) => String(value).padStart(2, '0');
-    const time =
-      hours > 0
-        ? `${hours}:${padded(minutes)}:${padded(seconds)}`
-        : `${padded(minutes)}:${padded(seconds)}`;
-
-    return `Bossprüfung in ${time}`;
   }
 
   /**
@@ -443,12 +258,7 @@
     }
 
     const snapshot = { tokens, resource, resourceMaximum };
-    const rounds = roundsUntilFinalWish({
-      tokens,
-      resource,
-      finalCost,
-      resourceMaximum,
-    });
+    const rounds = roundsUntilFinalWish({ tokens, resource, finalCost, resourceMaximum });
 
     if (rounds === 0 && canUseSkill(finalWish, snapshot)) {
       return makeDecision(SKILL_KEYS.finalWish, 'Final Wish is ready now.', rounds, {
@@ -532,33 +342,24 @@
   }
 
   const testExports = Object.freeze({
-    BOSS_CONFIG,
-    BOSS_PHASES,
+    COMMAND_KEY,
     CONFIG,
+    PROTOCOL_VERSION,
     SKILL_KEYS,
+    STATUS_KEY,
+    WORKER_ID,
     canSpendWithoutDelayingFinal,
     canUseSkill,
     chooseAttackPlan,
-    createDefaultBossCycleState,
-    formatBossCheckCountdown,
-    isAliveBossData,
     isConfirmedSkillUse,
     isFinishedBattleState,
-    isFightableBossData,
-    isMonsterAutoBattleFailure,
-    isMonsterAutoBattleSuccess,
-    isUntouchedActiveBossData,
-    monsterAutoBattleCompletionReason,
-    normalizeBossCycleState,
-    parseGameNumber,
+    normalizeOrchestratorCommand,
     parseInteger,
     roundsUntilFinalWish,
   });
 
   if (typeof document === 'undefined') {
-    if (typeof module === 'object' && module.exports) {
-      module.exports = testExports;
-    }
+    if (typeof module === 'object' && module.exports) module.exports = testExports;
     return;
   }
 
@@ -589,21 +390,6 @@
     section: 'section',
     sectionTitle: '.section-title',
     infoPill: '.info-pill',
-    bossContainer: '.monster-container',
-    bossCard: '.monster-card[data-boss][data-dead][data-monster-id]',
-    monsterCard: '.monster-card[data-dead][data-monster-id]',
-    activeAutoSummonBossLink:
-      '.auto-summon-card[data-alive="1"] a[href*="battle.php"]',
-    monsterAutoPanel: '#tm-monster-auto-battle',
-    monsterAutoTarget: '#mabTarget',
-    monsterAutoStart: '#mabStart',
-    monsterAutoStop: '#mabStop',
-    monsterAutoStatus: '#mabStatus',
-    monsterDamage: '#yourDamageValue',
-    monsterHp: '#hpText',
-    monsterJoin: '#join-battle',
-    playerHp: '#pHpText',
-    healPotion: '#usePotionBtn',
   });
 
   const runtime = {
@@ -615,31 +401,23 @@
     handledTurnKey: '',
     bridge: null,
     pendingAction: null,
-    statusKey: '',
+    reportKey: '',
     returnToLobbyTimer: null,
     matchmakeTimer: null,
     lastMatchmakeClickAt: 0,
     lobbyPollTimer: null,
     lobbyPollRunning: false,
     lobbyAbortController: null,
-    bossStorage: null,
-    bossOwnerId: '',
-    bossOwnerRestored: false,
-    bossNavigationPending: false,
-    bossActionPending: false,
-    bossSuspendedAt: 0,
-    bossEmptySince: 0,
-    bossCountdownTick: -1,
-    autoFarmObserver: null,
-    autoFarmActivationRunning: false,
-    autoFarmScanScheduled: false,
-    autoFarmScanHandle: null,
-    autoFarmScanUsesAnimationFrame: false,
+    storage: null,
+    workerStatus: null,
+    workerStatusSignature: '',
+    workerStatusWrittenAt: 0,
+    suspended: false,
     stopped: false,
   };
 
   // A separately installed legacy loop can stand down completely. This file
-  // owns lobby polling, matchmaking, combat, and the return to the lobby.
+  // owns only Solo PvP matchmaking, combat, and the internal lobby return.
   document.documentElement.dataset.veyraSmartPvpLifecycle = '1';
 
   function normalizeText(value) {
@@ -652,1391 +430,109 @@
 
     const current = parseInteger(match[1]);
     const maximum = parseInteger(match[2]);
-
     return current === null || maximum === null ? null : { current, maximum };
   }
 
   function report(message, level = 'info') {
     const key = `${level}:${message}`;
-    if (runtime.statusKey === key) return;
+    if (runtime.reportKey === key) return;
 
-    runtime.statusKey = key;
-    const method = level === 'error' ? 'warn' : 'info';
-    console[method](`[Smart Solo PvP] ${message}`);
+    runtime.reportKey = key;
+    console[level === 'error' ? 'warn' : 'info'](`[Smart Solo PvP] ${message}`);
   }
 
-  function getAutoFarmGroupRows() {
-    return Array.from(
-      document.querySelectorAll?.(
-        `${AUTO_FARM_SELECTORS.targets} ${AUTO_FARM_SELECTORS.groupRow}`,
-      ) || [],
-    );
-  }
-
-  function setAutoFarmEnabled(select, value) {
-    if (!select || String(select.value) === value) return false;
-
-    select.value = value;
-    const EventConstructor = window.Event || globalThis.Event;
-
-    if (typeof select.dispatchEvent === 'function' && typeof EventConstructor === 'function') {
-      select.dispatchEvent(new EventConstructor('input', { bubbles: true }));
-      select.dispatchEvent(new EventConstructor('change', { bubbles: true }));
-    }
-
-    return true;
-  }
-
-  function saveAutoFarmRows(rows) {
-    // Collect every button before the first click. The native Save handler can
-    // synchronously rebuild the target list and detach the remaining rows.
-    const saveButtons = rows
-      .map((row) => row.querySelector?.(AUTO_FARM_SELECTORS.save))
-      .filter((button) => typeof button?.click === 'function');
-
-    for (const saveButton of saveButtons) {
-      saveButton.click();
-    }
-
-    return saveButtons.length;
-  }
-
-  function activateExclusiveAutoFarmGroup(targetRow) {
-    const rows = getAutoFarmGroupRows();
-    if (!targetRow || !rows.includes(targetRow)) return 0;
-    if (!targetRow.querySelector?.(AUTO_FARM_SELECTORS.enabled)) return 0;
-
-    const changedRows = [];
-
-    for (const row of rows) {
-      const enabled = row.querySelector?.(AUTO_FARM_SELECTORS.enabled);
-      const desiredValue = row === targetRow ? '1' : '0';
-
-      if (setAutoFarmEnabled(enabled, desiredValue)) {
-        changedRows.push(row);
-      }
-    }
-
-    // Saving the selected row even when it was already the only active target
-    // keeps this action equivalent to an explicit activation by the user.
-    if (!changedRows.includes(targetRow)) {
-      changedRows.push(targetRow);
-    }
-
-    return saveAutoFarmRows(changedRows);
-  }
-
-  function getAutoFarmTargetName(row) {
-    const names = row?.querySelector?.('.af-group-names');
-    return String(names?.getAttribute?.('title') || names?.textContent || 'Target').trim();
-  }
-
-  function showAutoFarmActivateStatus(button, text) {
-    if (!button || button.isConnected === false) return;
-
-    button.textContent = text;
-    window.setTimeout(() => {
-      if (button.isConnected === false) return;
-
-      button.textContent = '⚡ Activate';
-      button.disabled = false;
-      button.classList?.remove(AUTO_FARM_ACTIVATE.processingClass);
-    }, 1_200);
-  }
-
-  function handleAutoFarmActivateClick(event) {
-    const button = event.target?.closest?.(`.${AUTO_FARM_ACTIVATE.buttonClass}`);
-    if (!button || runtime.autoFarmActivationRunning) return;
-
-    const container = button.closest?.(AUTO_FARM_SELECTORS.targets);
-    const row = button.closest?.(AUTO_FARM_SELECTORS.groupRow);
-    if (!container || !row || !getAutoFarmGroupRows().includes(row)) return;
-
-    event.preventDefault?.();
-    event.stopPropagation?.();
-
-    runtime.autoFarmActivationRunning = true;
-    button.disabled = true;
-    button.classList?.add(AUTO_FARM_ACTIVATE.processingClass);
-    button.textContent = '⏳ Activating…';
-
-    const targetName = getAutoFarmTargetName(row);
-
+  function getLocalStorage() {
     try {
-      const saveCount = activateExclusiveAutoFarmGroup(row);
-
-      if (saveCount > 0) {
-        console.info(
-          `[AF Exclusive Activate] "${targetName}" activated; ${saveCount} target(s) saved.`,
-        );
-        showAutoFarmActivateStatus(button, '✅ Active');
-      } else {
-        console.warn('[AF Exclusive Activate] No matching target or Save button was found.');
-        showAutoFarmActivateStatus(button, '⚠️ No Save');
-      }
+      return window.localStorage || null;
     } catch (error) {
-      console.error('[AF Exclusive Activate] Activation failed:', error);
-      showAutoFarmActivateStatus(button, '❌ Error');
-    } finally {
-      window.setTimeout(() => {
-        runtime.autoFarmActivationRunning = false;
-      }, 300);
-    }
-  }
-
-  function injectAutoFarmActivateStyles() {
-    if (document.getElementById?.(AUTO_FARM_ACTIVATE.styleId)) return;
-    if (!document.head || typeof document.createElement !== 'function') return;
-
-    const style = document.createElement('style');
-    style.id = AUTO_FARM_ACTIVATE.styleId;
-    style.textContent = `
-      .${AUTO_FARM_ACTIVATE.buttonClass} {
-        border-color: #5dce8a !important;
-        background: rgba(44, 160, 90, 0.16) !important;
-        color: #bfffd5 !important;
-        white-space: nowrap;
-      }
-
-      .${AUTO_FARM_ACTIVATE.buttonClass}:hover:not(:disabled) {
-        background: rgba(44, 160, 90, 0.3) !important;
-        box-shadow: 0 0 10px rgba(93, 206, 138, 0.25);
-      }
-
-      .${AUTO_FARM_ACTIVATE.buttonClass}:disabled,
-      .${AUTO_FARM_ACTIVATE.buttonClass}.${AUTO_FARM_ACTIVATE.processingClass} {
-        cursor: progress;
-        opacity: 0.75;
-      }
-    `;
-    document.head.appendChild(style);
-  }
-
-  function decorateAutoFarmGroupRows() {
-    const rows = getAutoFarmGroupRows();
-    if (rows.length === 0) return;
-
-    injectAutoFarmActivateStyles();
-
-    for (const row of rows) {
-      if (row.querySelector?.(`.${AUTO_FARM_ACTIVATE.buttonClass}`)) continue;
-
-      const actions = row.querySelector?.(AUTO_FARM_SELECTORS.actions);
-      const enabled = row.querySelector?.(AUTO_FARM_SELECTORS.enabled);
-      const saveButton = row.querySelector?.(AUTO_FARM_SELECTORS.save);
-      if (!actions || !enabled || !saveButton || typeof document.createElement !== 'function') {
-        continue;
-      }
-
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.className = `btn ${AUTO_FARM_ACTIVATE.buttonClass}`;
-      button.textContent = '⚡ Activate';
-      button.title = 'Dieses Target aktivieren und alle anderen deaktivieren';
-
-      const deleteButton = actions.querySelector?.(AUTO_FARM_SELECTORS.delete);
-      if (deleteButton && typeof actions.insertBefore === 'function') {
-        actions.insertBefore(button, deleteButton);
-      } else {
-        actions.appendChild?.(button);
-      }
-    }
-  }
-
-  function scheduleAutoFarmDecoration() {
-    if (runtime.autoFarmScanScheduled) return;
-
-    runtime.autoFarmScanScheduled = true;
-    const run = () => {
-      runtime.autoFarmScanScheduled = false;
-      runtime.autoFarmScanHandle = null;
-      decorateAutoFarmGroupRows();
-    };
-
-    if (typeof window.requestAnimationFrame === 'function') {
-      runtime.autoFarmScanUsesAnimationFrame = true;
-      runtime.autoFarmScanHandle = window.requestAnimationFrame(run);
-    } else {
-      runtime.autoFarmScanUsesAnimationFrame = false;
-      runtime.autoFarmScanHandle = window.setTimeout(run, 0);
-    }
-  }
-
-  function cancelAutoFarmDecoration() {
-    if (!runtime.autoFarmScanScheduled) return;
-
-    if (runtime.autoFarmScanUsesAnimationFrame) {
-      window.cancelAnimationFrame?.(runtime.autoFarmScanHandle);
-    } else {
-      window.clearTimeout(runtime.autoFarmScanHandle);
-    }
-
-    runtime.autoFarmScanScheduled = false;
-    runtime.autoFarmScanHandle = null;
-  }
-
-  function initializeAutoFarmExclusiveActivation() {
-    if (!/\/active_wave\.php\/?$/i.test(window.location.pathname)) return;
-
-    decorateAutoFarmGroupRows();
-    document.addEventListener?.('click', handleAutoFarmActivateClick, true);
-
-    runtime.autoFarmObserver = new MutationObserver(scheduleAutoFarmDecoration);
-    runtime.autoFarmObserver.observe(document.documentElement, {
-      childList: true,
-      subtree: true,
-    });
-  }
-
-  function getBrowserStorage(name) {
-    try {
-      return window[name] || null;
-    } catch (error) {
-      console.warn(`[Smart Solo PvP] ${name} is unavailable:`, error);
+      console.warn('[Smart Solo PvP] localStorage is unavailable:', error);
       return null;
     }
   }
 
-  function getBossOwnerId() {
-    const storage = getBrowserStorage('sessionStorage');
-    if (!storage) return `page-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  runtime.storage = getLocalStorage();
+
+  function loadOrchestratorCommand() {
+    if (!runtime.storage) return null;
 
     try {
-      const saved = storage.getItem(BOSS_CONFIG.ownerStorageKey);
-      if (saved) {
-        runtime.bossOwnerRestored = true;
-        return saved;
-      }
-
-      const ownerId = `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      storage.setItem(BOSS_CONFIG.ownerStorageKey, ownerId);
-      return ownerId;
+      const raw = runtime.storage.getItem(COMMAND_KEY);
+      return raw ? normalizeOrchestratorCommand(JSON.parse(raw)) : null;
     } catch (error) {
-      console.warn('[Smart Solo PvP] Could not initialize the boss-cycle owner.', error);
-      return `page-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    }
-  }
-
-  runtime.bossStorage = getBrowserStorage('localStorage');
-  runtime.bossOwnerId = getBossOwnerId();
-
-  function saveBossCycleState(value, now = Date.now()) {
-    if (!runtime.bossStorage) return null;
-
-    const state = normalizeBossCycleState(value, now);
-    try {
-      runtime.bossStorage.setItem(BOSS_CONFIG.storageKey, JSON.stringify(state));
-      return state;
-    } catch (error) {
-      console.warn('[Smart Solo PvP] Could not save the boss cycle.', error);
-      runtime.bossStorage = null;
+      console.warn('[Smart Solo PvP] Could not read the orchestrator command:', error);
       return null;
     }
   }
 
-  function loadBossCycleState(now = Date.now()) {
-    if (!runtime.bossStorage) return null;
-
-    try {
-      const raw = runtime.bossStorage.getItem(BOSS_CONFIG.storageKey);
-      if (!raw) return saveBossCycleState(createDefaultBossCycleState(now), now);
-      return normalizeBossCycleState(JSON.parse(raw), now);
-    } catch (error) {
-      console.warn('[Smart Solo PvP] Resetting an invalid boss-cycle state.', error);
-      return saveBossCycleState(createDefaultBossCycleState(now), now);
-    }
+  function matchingRunningVisit(command = loadOrchestratorCommand()) {
+    return command?.taskId === WORKER_ID && command.phase === 'running' ? command : null;
   }
 
-  function patchBossCycleState(state, patch, now = Date.now()) {
-    const phaseChanged = patch.phase !== undefined && patch.phase !== state.phase;
-    return saveBossCycleState(
-      {
-        ...state,
-        ...patch,
-        phaseUpdatedAt: phaseChanged ? now : (patch.phaseUpdatedAt ?? state.phaseUpdatedAt),
-      },
-      now,
-    );
+  function matchingPvpCommand(command = loadOrchestratorCommand()) {
+    return command?.taskId === WORKER_ID ? command : null;
   }
 
-  function claimBossCycleLease(state, now = Date.now()) {
-    if (!state) return null;
-
-    const heldByOther = state.ownerId && state.ownerId !== runtime.bossOwnerId && state.leaseUntil > now;
-    if (heldByOther) return null;
-
-    const claimed = saveBossCycleState(
-      {
-        ...state,
-        ownerId: runtime.bossOwnerId,
-        leaseUntil: now + BOSS_CONFIG.leaseMs,
-      },
-      now,
-    );
-    if (!claimed) return null;
-
-    const verified = loadBossCycleState(now);
-    return verified?.ownerId === runtime.bossOwnerId ? verified : null;
+  function isDrainingCommand(command = loadOrchestratorCommand()) {
+    return command?.phase === 'draining';
   }
 
-  function renewBossCycleLease(state, now = Date.now()) {
-    // Some mobile userscript environments isolate or clear sessionStorage on
-    // full-page navigation. On an active boss route, adopt the still-valid
-    // owner from the persisted cycle so the new page does not wait five
-    // minutes for its own previous lease to expire.
-    if (
-      state?.active &&
-      state.ownerId &&
-      state.ownerId !== runtime.bossOwnerId &&
-      state.leaseUntil > now &&
-      !runtime.bossOwnerRestored &&
-      (isBossHubPage() || isMonsterBattlePage())
-    ) {
-      runtime.bossOwnerId = state.ownerId;
-      runtime.bossOwnerRestored = true;
-
-      try {
-        getBrowserStorage('sessionStorage')?.setItem(BOSS_CONFIG.ownerStorageKey, state.ownerId);
-      } catch (error) {
-        console.warn('[Smart Solo PvP] Could not restore the mobile boss-cycle owner.', error);
-      }
-    }
-
-    if (!state || state.ownerId !== runtime.bossOwnerId) return claimBossCycleLease(state, now);
-    if (state.leaseUntil - now > BOSS_CONFIG.leaseRenewWindowMs) return state;
-
-    return patchBossCycleState(state, { leaseUntil: now + BOSS_CONFIG.leaseMs }, now);
-  }
-
-  function isBossCycleStale(state, now = Date.now()) {
+  function shouldYieldToOtherTask(command = loadOrchestratorCommand()) {
     return Boolean(
-      state?.active && state.cycleStartedAt > 0 && now - state.cycleStartedAt > BOSS_CONFIG.cycleTimeoutMs,
+      command &&
+        command.taskId !== WORKER_ID &&
+        (command.phase === 'draining' || command.phase === 'running'),
     );
   }
 
-  function currentUrl() {
-    try {
-      return new URL(window.location.href, window.location.origin);
-    } catch {
-      return new URL(window.location.origin);
-    }
-  }
+  function publishWorkerStatus(state, safeToLeave, message = '', visitId = '') {
+    if (!runtime.storage) return null;
 
-  function getCookieValue(name) {
-    try {
-      const prefix = `${name}=`;
-      const entry = String(document.cookie || '')
-        .split(';')
-        .map((part) => part.trim())
-        .find((part) => part.startsWith(prefix));
-      return entry ? decodeURIComponent(entry.slice(prefix.length)) : null;
-    } catch (error) {
-      console.warn(`[Smart Solo PvP] Could not read the ${name} cookie.`, error);
-      return null;
-    }
-  }
-
-  function setCookieValue(name, value, days = 30) {
-    try {
-      const maxAge = days * 24 * 60 * 60;
-      document.cookie = `${name}=${encodeURIComponent(value)}; Max-Age=${maxAge}; Path=/; SameSite=Lax`;
-      return true;
-    } catch (error) {
-      console.warn(`[Smart Solo PvP] Could not set the ${name} cookie.`, error);
-      return false;
-    }
-  }
-
-  function isBossHubPage() {
-    const url = currentUrl();
-    return (
-      /\/active_wave\.php\/?$/i.test(url.pathname) &&
-      url.searchParams.get('gate') === '3' &&
-      url.searchParams.get('wave') === '8'
-    );
-  }
-
-  function isMonsterBattlePage() {
-    return /\/battle\.php\/?$/i.test(currentUrl().pathname);
-  }
-
-  function getBattleMonsterId() {
-    const url = currentUrl();
-    const urlId = String(url.searchParams.get('id') || url.searchParams.get('monster_id') || '').trim();
-    const cardId = document.querySelector('.battle-card.monster-card[data-monster-id]')?.dataset?.monsterId;
-    const inputId = document.querySelector('input[name="monster_id"], #monster_id')?.value;
-    const ids = [urlId, cardId, inputId]
-      .map((value) => String(value || '').trim())
-      .filter(Boolean);
-
-    if (ids.length === 0) return '';
-    return new Set(ids).size === 1 ? ids[0] : '';
-  }
-
-  function navigateTo(path) {
-    if (runtime.bossNavigationPending) return;
-    runtime.bossNavigationPending = true;
-    window.location.replace(new URL(path, window.location.origin).href);
-  }
-
-  function stopLobbyActivity() {
-    clearLobbyPollTimer();
-    window.clearTimeout(runtime.matchmakeTimer);
-    runtime.matchmakeTimer = null;
-    runtime.lobbyAbortController?.abort();
-  }
-
-  function ensureAliveMonsterWaveFilter(state, now = Date.now()) {
-    if (runtime.bossNavigationPending) return null;
-
-    const url = currentUrl();
-    const hideDeadMonsters = getCookieValue('hide_dead_monsters');
-    const showDeadBossesOnly = getCookieValue('show_dead_bosses_only');
-    const deadPageSelected = url.searchParams.has('dead_page');
-    const filterIsCorrect =
-      hideDeadMonsters === '1' && showDeadBossesOnly === '0' && !deadPageSelected;
-
-    if (filterIsCorrect) {
-      if (state.actionKind !== 'wave-filter') return state;
-
-      return patchBossCycleState(
-        state,
-        {
-          phase: BOSS_PHASES.checking,
-          phaseUpdatedAt: now,
-          actionKind: '',
-          actionAt: 0,
-          actionAttempts: 0,
-          lastError: '',
-        },
-        now,
-      );
-    }
-
-    const attempts = state.actionKind === 'wave-filter' ? state.actionAttempts + 1 : 1;
-    if (
-      state.actionKind === 'wave-filter' &&
-      now - state.actionAt < BOSS_CONFIG.actionRetryMs
-    ) {
-      report('Waiting for the Wave 3 alive-monsters filter to be applied.');
-      return null;
-    }
-
-    if (attempts > BOSS_CONFIG.maxActionAttempts) {
-      patchBossCycleState(
-        state,
-        {
-          lastError: 'The Wave 3 alive-monsters filter could not be saved.',
-        },
-        now,
-      );
-      report('Could not save the Wave 3 alive-monsters filter; automatic reloads are paused.', 'error');
-      return null;
-    }
-
-    patchBossCycleState(
-      state,
-      {
-        phase: BOSS_PHASES.checking,
-        phaseUpdatedAt: now,
-        actionKind: 'wave-filter',
-        actionAt: now,
-        actionAttempts: attempts,
-        lastError: '',
-      },
-      now,
-    );
-
-    const hideDeadSaved = setCookieValue('hide_dead_monsters', '1');
-    const deadBossFilterSaved = setCookieValue('show_dead_bosses_only', '0');
-    const cookiesVerified =
-      getCookieValue('hide_dead_monsters') === '1' &&
-      getCookieValue('show_dead_bosses_only') === '0';
-
-    if (!hideDeadSaved || !deadBossFilterSaved || !cookiesVerified) {
-      report('The Wave 3 alive-monsters filter has not been accepted yet.', 'error');
-      return null;
-    }
-
-    url.searchParams.delete('dead_page');
-
-    report('Switching Wave 3 to the alive-monsters view before checking bosses.');
-    navigateTo(`${url.pathname}${url.search}${url.hash}`);
-    return null;
-  }
-
-  function isPageHidden() {
-    return document.hidden === true || document.visibilityState === 'hidden';
-  }
-
-  function refreshBossCycleAfterMobileResume() {
     const now = Date.now();
-    let state = loadBossCycleState(now);
-    if (!state?.active) return;
-
-    state = renewBossCycleLease(state, now);
-    if (!state || state.ownerId !== runtime.bossOwnerId) return;
-
-    patchBossCycleState(
+    const status = {
+      version: PROTOCOL_VERSION,
+      workerId: WORKER_ID,
+      visitId: String(visitId || ''),
       state,
-      {
-        phaseUpdatedAt: now,
-        actionAt: state.actionAt > 0 ? now : 0,
-        leaseUntil: now + BOSS_CONFIG.leaseMs,
-      },
-      now,
-    );
-  }
-
-  function handleVisibilityChange() {
-    if (isPageHidden()) {
-      runtime.bossSuspendedAt = Date.now();
-      return;
-    }
-
-    if (runtime.bossSuspendedAt > 0) {
-      window.clearTimeout(runtime.scanTimer);
-      runtime.scanTimer = null;
-      runtime.bossActionPending = false;
-      refreshBossCycleAfterMobileResume();
-      runtime.bossSuspendedAt = 0;
-    }
-
-    scheduleScan();
-  }
-
-  function finishBossCycle(state, message = '') {
-    const now = Date.now();
-    const failures = state?.failedBossIds?.length || 0;
-    const next = createDefaultBossCycleState(now);
-    next.lastError = failures > 0 ? `${failures} boss fight(s) could not be completed.` : '';
-    saveBossCycleState(next, now);
-
-    report(
-      message ||
-        (failures > 0
-          ? `Boss check finished with ${failures} incomplete fight(s); returning to PvP.`
-          : 'Boss check finished; returning to PvP.'),
-      failures > 0 ? 'error' : 'info',
-    );
-    navigateTo(BOSS_CONFIG.pvpPath);
-  }
-
-  function startBossCycleFromLobby() {
-    const now = Date.now();
-    let state = loadBossCycleState(now);
-    if (!state) return false;
-
-    if (isBossCycleStale(state, now)) {
-      state = saveBossCycleState(
-        {
-          ...state,
-          active: true,
-          phase: BOSS_PHASES.checking,
-          cycleStartedAt: now,
-          phaseUpdatedAt: now,
-          targetBossId: '',
-          ownerId: runtime.bossOwnerId,
-          leaseUntil: now + BOSS_CONFIG.leaseMs,
-          actionKind: '',
-          actionAt: 0,
-          actionAttempts: 0,
-          startIssued: false,
-          lastError: 'The previous boss cycle was stale and has been resumed.',
-        },
-        now,
-      );
-    }
-
-    if (!state.active && now < state.nextCheckAt) return false;
-
-    if (!state.active) {
-      state = saveBossCycleState(
-        {
-          ...state,
-          active: true,
-          phase: BOSS_PHASES.checking,
-          cycleStartedAt: now,
-          phaseUpdatedAt: now,
-          targetBossId: '',
-          processedBossIds: [],
-          failedBossIds: [],
-          ownerId: runtime.bossOwnerId,
-          leaseUntil: now + BOSS_CONFIG.leaseMs,
-          actionKind: '',
-          actionAt: 0,
-          actionAttempts: 0,
-          startIssued: false,
-          lastError: '',
-        },
-        now,
-      );
-    }
-
-    // Once a cycle is due, cancel callbacks that may already have been queued
-    // by the lobby loop even when another tab currently owns the boss lease.
-    stopLobbyActivity();
-
-    const owned = claimBossCycleLease(state, now);
-    if (!owned) {
-      report('Another tab is handling the scheduled boss check; PvP matchmaking is paused.');
-      return true;
-    }
-
-    report('Boss check is due; opening Grakthar Wave 3.');
-    navigateTo(BOSS_CONFIG.wavePath);
-    return true;
-  }
-
-  function controlText(control) {
-    return normalizeText(control?.value || control?.textContent || control?.getAttribute?.('aria-label'));
-  }
-
-  function findTextControl(root, acceptedTexts) {
-    const accepted = new Set(acceptedTexts.map(normalizeText));
-    return (
-      Array.from(root?.querySelectorAll?.('button, a, input[type="button"], input[type="submit"]') || []).find(
-        (control) => {
-          const text = controlText(control);
-          return accepted.has(text) || [...accepted].some((candidate) => text.endsWith(` ${candidate}`));
-        },
-      ) || null
-    );
-  }
-
-  function findJoinBossControl(card) {
-    const control = findTextControl(card, ['join', 'join battle', 'join the battle']);
-    if (control && !controlText(control).includes('quick join')) return control;
-
-    // Mobile browsers can translate visible button text. The live wave page
-    // uses a stable button.join-btn next to an anchor.join-btn (View), so the
-    // element type is a safe language-independent fallback.
-    return card?.querySelector?.('button.join-btn') || null;
-  }
-
-  function findEnterBattleControl(root, allowBattleLink = false) {
-    const exact = findTextControl(root, ['enter battle', 'continue battle']);
-    if (exact) return exact;
-
-    const continueButton = root?.querySelector?.('.continue-btn');
-    if (continueButton) return continueButton;
-
-    return allowBattleLink ? root?.querySelector?.('a[href*="battle.php?id="]') || null : null;
-  }
-
-  function getMonsterIdFromBattleLink(link) {
-    const href = link?.getAttribute?.('href') || link?.href;
-    if (!href) return '';
-
-    try {
-      const url = new URL(href, window.location.origin);
-      return String(url.searchParams.get('id') || url.searchParams.get('monster_id') || '').trim();
-    } catch {
-      return '';
-    }
-  }
-
-  function getActiveAutoSummonBossIds() {
-    return new Set(
-      Array.from(document.querySelectorAll(SELECTORS.activeAutoSummonBossLink))
-        .map(getMonsterIdFromBattleLink)
-        .filter(Boolean),
-    );
-  }
-
-  function isRecognizedBossCard(card, activeAutoSummonBossIds) {
-    const bossId = String(card?.dataset?.monsterId || '').trim();
-    return Boolean(
-      bossId &&
-        (String(card.dataset.boss || '') === '1' || activeAutoSummonBossIds.has(bossId)),
-    );
-  }
-
-  function isFightableBossCard(card, activeAutoSummonBossIds) {
-    if (!isRecognizedBossCard(card, activeAutoSummonBossIds)) return false;
-
-    const dataset = card.dataset;
-    return isFightableBossData(
-      String(dataset.boss || '') === '1' ? dataset : { ...dataset, boss: '1' },
-    );
-  }
-
-  function sortedBossCards(activeAutoSummonBossIds) {
-    const cards = new Set([
-      ...document.querySelectorAll(SELECTORS.bossCard),
-      ...document.querySelectorAll(SELECTORS.monsterCard),
-    ]);
-
-    return Array.from(cards)
-      .filter((card) => isRecognizedBossCard(card, activeAutoSummonBossIds))
-      .sort((left, right) => {
-      const leftExpiry = finiteNumber(left.dataset.expire) ?? Number.POSITIVE_INFINITY;
-      const rightExpiry = finiteNumber(right.dataset.expire) ?? Number.POSITIVE_INFINITY;
-      return leftExpiry - rightExpiry;
-      });
-  }
-
-  function recordBossAction(state, { phase, kind, startIssued = state.startIssued }, now = Date.now()) {
-    const attempts = state.actionKind === kind ? state.actionAttempts + 1 : 1;
-    return patchBossCycleState(
-      state,
-      {
-        phase,
-        phaseUpdatedAt: now,
-        actionKind: kind,
-        actionAt: now,
-        actionAttempts: attempts,
-        startIssued,
-      },
-      now,
-    );
-  }
-
-  function actionCanRun(state, kind, now = Date.now()) {
-    return state.actionKind !== kind || now - state.actionAt >= BOSS_CONFIG.actionRetryMs;
-  }
-
-  function isDisabledControl(control) {
-    return Boolean(
-      control?.disabled === true ||
-        control?.getAttribute?.('aria-disabled') === 'true' ||
-        control?.classList?.contains?.('disabled'),
-    );
-  }
-
-  function clickBossControl(state, control, options) {
-    if (!control || runtime.bossActionPending || isDisabledControl(control)) return;
-
-    const perform = () => {
-      const now = Date.now();
-      const latest = loadBossCycleState(now);
-      if (
-        isPageHidden() ||
-        !latest?.active ||
-        latest.ownerId !== runtime.bossOwnerId ||
-        latest.leaseUntil <= now ||
-        latest.targetBossId !== state.targetBossId ||
-        control.isConnected === false ||
-        isDisabledControl(control) ||
-        (options.allowedPhases && !options.allowedPhases.includes(latest.phase)) ||
-        (options.once && (latest.actionKind === options.kind || latest.startIssued)) ||
-        (options.maxAttempts &&
-          latest.actionKind === options.kind &&
-          latest.actionAttempts >= options.maxAttempts) ||
-        !actionCanRun(latest, options.kind, now)
-      ) {
-        return;
-      }
-
-      if (typeof options.beforeClick === 'function' && !options.beforeClick()) return;
-
-      recordBossAction(
-        latest,
-        {
-          phase: options.phase,
-          kind: options.kind,
-          startIssued: options.startIssued ?? latest.startIssued,
-        },
-        now,
-      );
-      control.click();
+      safeToLeave: safeToLeave === true,
+      updatedAt: now,
+      message: String(message || ''),
     };
+    const signature = JSON.stringify({ ...status, updatedAt: 0 });
+    const semanticChange = signature !== runtime.workerStatusSignature;
 
-    const locks = window.navigator?.locks;
-    if (!locks?.request) {
-      perform();
-      return;
+    if (!semanticChange && now - runtime.workerStatusWrittenAt < CONFIG.statusHeartbeatMs) {
+      return runtime.workerStatus;
     }
 
-    runtime.bossActionPending = true;
-    let lockCallbackRan = false;
-    const performWithLock = () => {
-      lockCallbackRan = true;
-      perform();
-    };
-
-    let lockRequest;
     try {
-      lockRequest = locks.request(
-        'veyra-smart-solo-pvp:boss-action',
-        { mode: 'exclusive' },
-        performWithLock,
-      );
+      runtime.storage.setItem(STATUS_KEY, JSON.stringify(status));
+      runtime.workerStatus = status;
+      runtime.workerStatusSignature = signature;
+      runtime.workerStatusWrittenAt = now;
+      return status;
     } catch (error) {
-      runtime.bossActionPending = false;
-      console.warn('[Smart Solo PvP] Boss action lock failed; using the mobile fallback:', error);
-      perform();
-      return;
+      console.warn('[Smart Solo PvP] Could not publish worker status:', error);
+      runtime.storage = null;
+      return null;
     }
-
-    void Promise.resolve(lockRequest)
-      .then(
-        () => {
-          if (!lockCallbackRan) performWithLock();
-        },
-        (error) => {
-          console.warn('[Smart Solo PvP] Boss action lock failed; using the mobile fallback:', error);
-          if (!lockCallbackRan) performWithLock();
-        },
-      )
-      .finally(() => {
-        runtime.bossActionPending = false;
-        scheduleScan();
-      });
   }
 
-  function abandonCurrentBoss(state, reason) {
-    const bossId = state.targetBossId;
-    const processedBossIds = normalizeBossIdList([...state.processedBossIds, bossId]);
-    const failedBossIds = normalizeBossIdList([...state.failedBossIds, bossId]);
-    const next = patchBossCycleState(state, {
-      phase: BOSS_PHASES.returningHub,
-      targetBossId: '',
-      processedBossIds,
-      failedBossIds,
-      actionKind: '',
-      actionAt: 0,
-      actionAttempts: 0,
-      startIssued: false,
-      lastError: reason,
-    });
-
-    report(
-      `Boss ${bossId || 'unknown'} is not currently fightable and will be skipped in this scan: ${reason}`,
-      'error',
-    );
-    navigateTo(BOSS_CONFIG.wavePath);
-    return next;
+  function statusVisitId(command = loadOrchestratorCommand()) {
+    return matchingPvpCommand(command)?.visitId || '';
   }
 
-  function completeCurrentBoss(state, reason = 'target') {
-    const bossId = state.targetBossId;
-    const next = patchBossCycleState(state, {
-      phase: BOSS_PHASES.returningHub,
-      targetBossId: '',
-      processedBossIds: normalizeBossIdList([...state.processedBossIds, bossId]),
-      failedBossIds: state.failedBossIds.filter((candidate) => candidate !== bossId),
-      actionKind: '',
-      actionAt: 0,
-      actionAttempts: 0,
-      startIssued: false,
-      lastError: '',
-    });
-
-    report(
-      reason === 'defeated'
-        ? `Boss ${bossId} was defeated; returning to the wave.`
-        : `Boss ${bossId} reached the 3b target; returning to the wave.`,
-    );
-    navigateTo(BOSS_CONFIG.wavePath);
-    return next;
-  }
-
-  function handleBossHubPage() {
-    const now = Date.now();
-    let state = loadBossCycleState(now);
-    if (!state?.active) return;
-
-    if (isPageHidden()) {
-      if (runtime.bossSuspendedAt === 0) runtime.bossSuspendedAt = now;
-      return;
-    }
-
-    state = renewBossCycleLease(state, now);
-    if (!state) {
-      report('Another tab owns the active boss cycle; this tab is waiting.');
-      return;
-    }
-
-    if (isBossCycleStale(state, now)) {
-      state = patchBossCycleState(
-        state,
-        {
-          phase: BOSS_PHASES.checking,
-          cycleStartedAt: now,
-          phaseUpdatedAt: now,
-          actionKind: '',
-          actionAt: 0,
-          actionAttempts: 0,
-          startIssued: false,
-          lastError: 'The boss cycle exceeded its safety window and was resumed.',
-        },
-        now,
+  function publishDrainedStatus(command) {
+    const ownVisit = matchingPvpCommand(command);
+    if (ownVisit) {
+      return publishWorkerStatus(
+        'done',
+        true,
+        'PvP is safely drained in the lobby.',
+        ownVisit.visitId,
       );
-      report('The boss cycle safety window elapsed; continuing the Wave 3 scan.', 'error');
     }
 
-    state = ensureAliveMonsterWaveFilter(state, now);
-    if (!state) return;
-
-    if (!document.querySelector(SELECTORS.bossContainer)) {
-      if (now - state.phaseUpdatedAt >= BOSS_CONFIG.actionTimeoutMs) {
-        patchBossCycleState(state, {
-          phase: BOSS_PHASES.checking,
-          phaseUpdatedAt: now,
-          actionKind: '',
-          actionAt: 0,
-          actionAttempts: 0,
-          lastError: 'The boss list did not render; Wave 3 is being reloaded.',
-        });
-        report('The boss list did not render; reloading Wave 3 instead of returning to PvP.', 'error');
-        navigateTo(BOSS_CONFIG.wavePath);
-      } else {
-        report('Waiting for the boss list to render.');
-      }
-      return;
-    }
-
-    const activeAutoSummonBossIds = getActiveAutoSummonBossIds();
-    const cards = sortedBossCards(activeAutoSummonBossIds);
-    if (now - state.phaseUpdatedAt < BOSS_CONFIG.hubSettleMs) {
-      report('Waiting briefly for all boss cards to render.');
-      return;
-    }
-
-    if (cards.length === 0) {
-      if (runtime.bossEmptySince === 0) runtime.bossEmptySince = now;
-      if (now - runtime.bossEmptySince < BOSS_CONFIG.hubEmptyWaitMs) {
-        report('Waiting for the alive boss list to finish loading.');
-        return;
-      }
-    } else {
-      runtime.bossEmptySince = 0;
-    }
-
-    const targetCard = state.targetBossId
-      ? cards.find((candidate) => String(candidate.dataset.monsterId || '') === state.targetBossId)
-      : null;
-    const targetBossFailed = Boolean(
-      state.targetBossId && state.failedBossIds.includes(state.targetBossId),
-    );
-    let card =
-      targetCard &&
-      isFightableBossCard(targetCard, activeAutoSummonBossIds) &&
-      !targetBossFailed
-        ? targetCard
-        : null;
-
-    if (state.targetBossId && !card) {
-      if (!targetCard && now - state.phaseUpdatedAt < BOSS_CONFIG.actionTimeoutMs) {
-        report(`Waiting for boss ${state.targetBossId} to appear in the wave list.`);
-        return;
-      }
-
-      state = patchBossCycleState(state, {
-        phase: BOSS_PHASES.checking,
-        targetBossId: '',
-        processedBossIds: normalizeBossIdList([...state.processedBossIds, state.targetBossId]),
-        failedBossIds: targetBossFailed
-          ? state.failedBossIds
-          : state.failedBossIds.filter((candidate) => candidate !== state.targetBossId),
-        actionKind: '',
-        actionAt: 0,
-        actionAttempts: 0,
-        startIssued: false,
-      });
-    }
-
-    if (!card) {
-      card = cards.find((candidate) => {
-        const bossId = String(candidate.dataset.monsterId || '');
-        return (
-          isFightableBossCard(candidate, activeAutoSummonBossIds) &&
-          !state.processedBossIds.includes(bossId) &&
-          !state.failedBossIds.includes(bossId)
-        );
-      });
-    }
-
-    if (!card) {
-      finishBossCycle(state);
-      return;
-    }
-
-    const bossId = String(card.dataset.monsterId || '');
-    if (state.targetBossId !== bossId) {
-      state = patchBossCycleState(state, {
-        phase: BOSS_PHASES.checking,
-        targetBossId: bossId,
-        actionKind: '',
-        actionAt: 0,
-        actionAttempts: 0,
-        startIssued: false,
-        lastError: '',
-      });
-    }
-
-    const joined = String(card.dataset.joined || '') === '1';
-    const joinControl = findJoinBossControl(card);
-    const enterControl = findEnterBattleControl(card, joined);
-    const joinConfirmedByUi =
-      (!joinControl || isDisabledControl(joinControl)) && Boolean(enterControl);
-
-    if (joined || joinConfirmedByUi) {
-      if (!enterControl) {
-        if (now - state.phaseUpdatedAt >= BOSS_CONFIG.actionTimeoutMs) {
-          abandonCurrentBoss(state, 'Enter Battle was not found. The missing HTML can be added later.');
-        } else {
-          report(`Boss ${bossId} is joined; waiting for Enter Battle.`);
-        }
-        return;
-      }
-
-      if (isDisabledControl(enterControl)) {
-        if (now - state.phaseUpdatedAt >= BOSS_CONFIG.actionTimeoutMs) {
-          abandonCurrentBoss(state, 'Enter Battle stayed disabled.');
-        } else {
-          report(`Boss ${bossId} is joined; waiting for Enter Battle to become available.`);
-        }
-        return;
-      }
-
-      if (!actionCanRun(state, 'enter', now)) return;
-      if (state.actionKind === 'enter' && state.actionAttempts >= BOSS_CONFIG.maxActionAttempts) {
-        abandonCurrentBoss(state, 'Enter Battle did not open the fight.');
-        return;
-      }
-
-      report(`Entering boss battle ${bossId}.`);
-      clickBossControl(state, enterControl, {
-        phase: BOSS_PHASES.entering,
-        kind: 'enter',
-        maxAttempts: BOSS_CONFIG.maxActionAttempts,
-        allowedPhases: [BOSS_PHASES.joining, BOSS_PHASES.entering, BOSS_PHASES.checking],
-      });
-      return;
-    }
-
-    if (!joinControl) {
-      if (now - state.phaseUpdatedAt >= BOSS_CONFIG.actionTimeoutMs) {
-        abandonCurrentBoss(state, 'Join Battle was not found.');
-      } else {
-        report(`Waiting for Join Battle on boss ${bossId}.`);
-      }
-      return;
-    }
-
-    if (isDisabledControl(joinControl)) {
-      if (now - state.phaseUpdatedAt >= BOSS_CONFIG.actionTimeoutMs) {
-        abandonCurrentBoss(state, 'Join Battle stayed disabled.');
-      } else {
-        report(`Waiting for Join Battle on boss ${bossId} to become available.`);
-      }
-      return;
-    }
-
-    // Joining sends a POST request. Never repeat it merely because a slow
-    // response has not navigated yet; wait for joined/UI confirmation.
-    if (state.actionKind === 'join') {
-      if (now - state.actionAt >= BOSS_CONFIG.actionTimeoutMs) {
-        abandonCurrentBoss(state, 'Join Battle did not complete.');
-      }
-      return;
-    }
-
-    report(`Joining boss ${bossId}.`);
-    clickBossControl(state, joinControl, {
-      phase: BOSS_PHASES.joining,
-      kind: 'join',
-      once: true,
-      allowedPhases: [BOSS_PHASES.checking, BOSS_PHASES.joining],
-    });
-  }
-
-  function dispatchBubblingEvent(element, type) {
-    const EventConstructor = window.Event || globalThis.Event;
-    if (!element?.dispatchEvent || typeof EventConstructor !== 'function') return;
-    element.dispatchEvent(new EventConstructor(type, { bubbles: true }));
-  }
-
-  function ensureBossDamageTarget(input) {
-    if (!input) return false;
-    if (normalizeText(input.value).replace(/\s/g, '') === BOSS_CONFIG.targetDamage) return true;
-
-    input.value = BOSS_CONFIG.targetDamage;
-    dispatchBubblingEvent(input, 'input');
-    dispatchBubblingEvent(input, 'change');
-    return normalizeText(input.value).replace(/\s/g, '') === BOSS_CONFIG.targetDamage;
-  }
-
-  function handleMonsterBossBattlePage() {
-    const now = Date.now();
-    let state = loadBossCycleState(now);
-    if (!state?.active) return;
-
-    if (isPageHidden()) {
-      if (runtime.bossSuspendedAt === 0) runtime.bossSuspendedAt = now;
-      return;
-    }
-
-    state = renewBossCycleLease(state, now);
-    if (!state) {
-      report('Another tab owns the active boss fight; this tab is waiting.');
-      return;
-    }
-
-    if (isBossCycleStale(state, now)) {
-      patchBossCycleState(
-        state,
-        {
-          phase: BOSS_PHASES.returningHub,
-          cycleStartedAt: now,
-          actionKind: '',
-          actionAt: 0,
-          actionAttempts: 0,
-          startIssued: false,
-          lastError: 'The boss fight exceeded its safety window and will be retried.',
-        },
-        now,
-      );
-      report('The boss fight safety window elapsed; returning to Wave 3 to retry it.', 'error');
-      navigateTo(BOSS_CONFIG.wavePath);
-      return;
-    }
-
-    if (!state.targetBossId) {
-      report('Boss target was lost; returning to the wave.', 'error');
-      navigateTo(BOSS_CONFIG.wavePath);
-      return;
-    }
-
-    const pageBossId = getBattleMonsterId();
-    if (pageBossId && pageBossId !== state.targetBossId) {
-      abandonCurrentBoss(state, `Opened monster ${pageBossId} instead of ${state.targetBossId}.`);
-      return;
-    }
-
-    if (!pageBossId) {
-      if (now - state.phaseUpdatedAt >= BOSS_CONFIG.actionTimeoutMs) {
-        abandonCurrentBoss(state, 'The battle monster ID could not be verified.');
-      } else {
-        report('The battle page is ready, but the boss ID is not verifiable yet.');
-      }
-      return;
-    }
-
-    const statusText = document.querySelector(SELECTORS.monsterAutoStatus)?.textContent || '';
-    const damageElement = document.querySelector(SELECTORS.monsterDamage);
-    const damageText = damageElement?.textContent || '';
-    const hpText = document.querySelector(SELECTORS.monsterHp)?.textContent || '';
-    const completionReason = monsterAutoBattleCompletionReason({ statusText, damageText, hpText });
-    if (completionReason) {
-      completeCurrentBoss(state, completionReason);
-      return;
-    }
-
-    // Clicking Join on the Wave overview opens battle.php, but the native
-    // battle still requires its own, separate Join the Battle action.
-    const pageJoinControl =
-      document.querySelector(SELECTORS.monsterJoin) ||
-      findTextControl(document, ['join the battle', 'join battle']);
-    if (pageJoinControl) {
-      if (isDisabledControl(pageJoinControl)) {
-        const waitStartedAt = state.actionKind === 'join-page' ? state.actionAt : state.phaseUpdatedAt;
-        if (now - waitStartedAt >= BOSS_CONFIG.actionTimeoutMs) {
-          abandonCurrentBoss(state, 'Join the Battle stayed disabled.');
-        } else {
-          report(`Waiting for boss ${state.targetBossId} to enable Join the Battle.`);
-        }
-        return;
-      }
-
-      if (state.actionKind === 'join-page') {
-        if (now - state.actionAt < BOSS_CONFIG.actionTimeoutMs) {
-          report(`Waiting for boss ${state.targetBossId} to accept the battle-page join.`);
-          return;
-        }
-
-        if (state.actionAttempts >= BOSS_CONFIG.maxActionAttempts) {
-          abandonCurrentBoss(state, 'Join the Battle did not make this boss fightable.');
-          return;
-        }
-      }
-
-      report(`Joining boss ${state.targetBossId} on the battle page.`);
-      clickBossControl(state, pageJoinControl, {
-        phase: BOSS_PHASES.joining,
-        kind: 'join-page',
-        maxAttempts: BOSS_CONFIG.maxActionAttempts,
-        allowedPhases: [BOSS_PHASES.checking, BOSS_PHASES.joining, BOSS_PHASES.entering],
-      });
-      return;
-    }
-
-    const panel = document.querySelector(SELECTORS.monsterAutoPanel);
-    const targetInput = document.querySelector(SELECTORS.monsterAutoTarget);
-    const startButton = document.querySelector(SELECTORS.monsterAutoStart);
-    const stopButton = document.querySelector(SELECTORS.monsterAutoStop);
-    const autoBattleRunning = Boolean(
-      panel && startButton && (startButton.disabled || (stopButton && !stopButton.disabled)),
-    );
-    const playerHealth = parseFraction(document.querySelector(SELECTORS.playerHp)?.textContent)?.current;
-
-    // A joined player with 0 HP has no attack buttons, so Monster Auto Battle
-    // cannot mount yet. Bootstrap that one heal through the native battle
-    // control; subsequent combat healing remains an Auto Battle setting.
-    if (damageElement && playerHealth === 0) {
-      if (autoBattleRunning) {
-        report('Player HP is 0; Monster Auto Battle is handling the configured health potion.');
-        return;
-      }
-
-      const healControl =
-        document.querySelector(SELECTORS.healPotion) ||
-        document.querySelector('.potion-use-btn[data-item="108"]');
-      if (!healControl) {
-        if (now - state.phaseUpdatedAt >= BOSS_CONFIG.actionTimeoutMs) {
-          abandonCurrentBoss(state, 'Player HP is 0 and no heal-potion control is available.');
-        } else {
-          report('Player HP is 0, but no heal-potion control is available yet.', 'error');
-        }
-        return;
-      }
-
-      if (state.actionKind === 'heal') {
-        if (now - state.actionAt < BOSS_CONFIG.actionTimeoutMs) {
-          report('Waiting for the heal potion to restore HP and reload the battle.');
-          return;
-        }
-
-        if (state.actionAttempts >= BOSS_CONFIG.maxActionAttempts) {
-          abandonCurrentBoss(state, 'The heal potion did not restore HP after several attempts.');
-          return;
-        }
-      }
-
-      if (healControl.disabled) {
-        report('The heal-potion control is still processing.');
-        return;
-      }
-
-      report(`Using a heal potion before fighting boss ${state.targetBossId}.`);
-      clickBossControl(state, healControl, {
-        phase: BOSS_PHASES.entering,
-        kind: 'heal',
-        maxAttempts: BOSS_CONFIG.maxActionAttempts,
-        allowedPhases: [BOSS_PHASES.joining, BOSS_PHASES.entering, BOSS_PHASES.attacking],
-      });
-      return;
-    }
-
-    if (!panel) {
-      if (state.phase !== BOSS_PHASES.entering) {
-        state = patchBossCycleState(state, {
-          phase: BOSS_PHASES.entering,
-          actionKind: '',
-          actionAt: 0,
-          actionAttempts: 0,
-        });
-      }
-
-      const enterControl = findEnterBattleControl(document, false);
-      if (enterControl && isDisabledControl(enterControl)) {
-        if (now - state.phaseUpdatedAt >= BOSS_CONFIG.actionTimeoutMs) {
-          abandonCurrentBoss(state, 'Enter Battle stayed disabled on the battle page.');
-        } else {
-          report(`Waiting for boss ${state.targetBossId} to enable Enter Battle.`);
-        }
-        return;
-      }
-
-      if (enterControl && actionCanRun(state, 'enter', now)) {
-        if (state.actionKind === 'enter' && state.actionAttempts >= BOSS_CONFIG.maxActionAttempts) {
-          abandonCurrentBoss(state, 'Enter Battle did not reveal the monster fight.');
-          return;
-        }
-
-        report(`Clicking Enter Battle for boss ${state.targetBossId}.`);
-        clickBossControl(state, enterControl, {
-          phase: BOSS_PHASES.entering,
-          kind: 'enter',
-          maxAttempts: BOSS_CONFIG.maxActionAttempts,
-          allowedPhases: [BOSS_PHASES.entering, BOSS_PHASES.joining],
-        });
-        return;
-      }
-
-      if (now - state.phaseUpdatedAt >= BOSS_CONFIG.actionTimeoutMs) {
-        abandonCurrentBoss(state, 'Monster Auto Battle did not appear after joining and healing.');
-      } else {
-        report('Waiting for the joined battle and Monster Auto Battle controls.');
-      }
-      return;
-    }
-
-    if (state.phase !== BOSS_PHASES.attacking) {
-      state = patchBossCycleState(state, {
-        phase: BOSS_PHASES.attacking,
-        actionKind: '',
-        actionAt: 0,
-        actionAttempts: 0,
-        startIssued: false,
-      });
-    }
-
-    if (!targetInput || !startButton) {
-      if (now - state.phaseUpdatedAt >= BOSS_CONFIG.actionTimeoutMs) {
-        abandonCurrentBoss(state, 'Monster Auto Battle did not expose its damage field and Start button.');
-      } else {
-        report('Waiting for the Monster Auto Battle controls.');
-      }
-      return;
-    }
-
-    if (!ensureBossDamageTarget(targetInput)) {
-      abandonCurrentBoss(state, 'The Monster Auto Battle damage field could not be set to 3b.');
-      return;
-    }
-
-    if (autoBattleRunning) {
-      if (!state.startIssued) {
-        patchBossCycleState(state, {
-          startIssued: true,
-          actionKind: 'start',
-          actionAt: now,
-          actionAttempts: Math.max(1, state.actionAttempts),
-        });
-      }
-      report(`Monster Auto Battle is dealing up to ${BOSS_CONFIG.targetDamage} damage.`);
-      return;
-    }
-
-    if (!actionCanRun(state, 'start', now)) {
-      report('Waiting briefly before checking or restarting Monster Auto Battle.');
-      return;
-    }
-
-    const currentDamage = parseGameNumber(damageText);
-    const damageLabel = Number.isFinite(currentDamage)
-      ? new Intl.NumberFormat('en-US').format(currentDamage)
-      : 'an unreadable damage value';
-    report(
-      state.startIssued
-        ? `Monster Auto Battle stopped at ${damageLabel}; restarting because 3b was not reached.`
-        : `Starting Monster Auto Battle with a ${BOSS_CONFIG.targetDamage} damage target.`,
-      isMonsterAutoBattleFailure(statusText) ? 'error' : 'info',
-    );
-    clickBossControl(state, startButton, {
-      phase: BOSS_PHASES.attacking,
-      kind: 'start',
-      startIssued: true,
-      allowedPhases: [BOSS_PHASES.attacking],
-      beforeClick: () => ensureBossDamageTarget(targetInput),
-    });
-  }
-
-  function handleBossRoute() {
-    if (isBossHubPage()) {
-      handleBossHubPage();
-      return true;
-    }
-
-    if (isMonsterBattlePage()) {
-      handleMonsterBossBattlePage();
-      return true;
-    }
-
-    return false;
+    return publishWorkerStatus('idle', true, 'PvP is ready for the scheduled hand-off.');
   }
 
   function isBattlePage() {
@@ -2045,6 +541,10 @@
         document.querySelector('#battleControlCard') &&
         document.querySelector('#enemyFormation'),
     );
+  }
+
+  function isPvpBattlePath() {
+    return /\/pvp_battle\.php\/?$/i.test(window.location.pathname);
   }
 
   function isBattleEnded() {
@@ -2100,58 +600,7 @@
 
   function readSoloTokenCount(root = document) {
     const tokenPill = findSoloTokenPill(root);
-
     return tokenPill ? parseInteger(tokenPill.querySelector('span')?.textContent) : null;
-  }
-
-  function ensureBossCountdownElement() {
-    const battleTokenValue = document.querySelector(SELECTORS.tokenValue);
-    const battlePanel = battleTokenValue?.closest?.('.combatTokenPanel') || null;
-    const lobbyTokenPill = battlePanel ? null : findSoloTokenPill();
-    const host = battlePanel || lobbyTokenPill;
-    if (!host) return null;
-
-    let countdown = document.getElementById?.(BOSS_COUNTDOWN_ID) || null;
-    if (!countdown) {
-      countdown = document.createElement?.('small') || null;
-      if (!countdown) return null;
-
-      countdown.id = BOSS_COUNTDOWN_ID;
-      countdown.setAttribute?.('aria-label', 'Countdown bis zur nächsten Bossprüfung');
-    }
-
-    const placement = battlePanel ? 'battle' : 'lobby';
-    if (countdown.dataset?.placement !== placement) {
-      if (countdown.dataset) countdown.dataset.placement = placement;
-      if (countdown.style) {
-        countdown.style.cssText = battlePanel
-          ? 'display:block;width:100%;margin-top:4px;font-size:11px;font-weight:700;opacity:.78;white-space:nowrap;'
-          : 'margin-left:2px;padding-left:8px;border-left:1px solid rgba(148,163,184,.38);font-size:10px;font-weight:700;opacity:.82;white-space:nowrap;';
-      }
-    }
-
-    if (countdown.parentElement !== host) {
-      const targetHint = battlePanel?.querySelector?.('#targetHint') || null;
-      if (targetHint && typeof host.insertBefore === 'function') {
-        host.insertBefore(countdown, targetHint);
-      } else {
-        host.appendChild?.(countdown);
-      }
-    }
-
-    return countdown;
-  }
-
-  function updateBossCheckCountdown(now = Date.now()) {
-    const countdown = ensureBossCountdownElement();
-    if (!countdown) return;
-
-    const tick = Math.floor(now / 1000);
-    if (runtime.bossCountdownTick === tick && countdown.textContent) return;
-    runtime.bossCountdownTick = tick;
-
-    const text = formatBossCheckCountdown(loadBossCycleState(now), now);
-    if (countdown.textContent !== text) countdown.textContent = text;
   }
 
   function getLobbySnapshot(root = document) {
@@ -2172,10 +621,21 @@
   }
 
   function clearLobbyPollTimer() {
-    if (runtime.lobbyPollTimer !== null) {
-      window.clearTimeout(runtime.lobbyPollTimer);
-      runtime.lobbyPollTimer = null;
-    }
+    if (runtime.lobbyPollTimer === null) return;
+    window.clearTimeout(runtime.lobbyPollTimer);
+    runtime.lobbyPollTimer = null;
+  }
+
+  function clearMatchmakeTimer() {
+    if (runtime.matchmakeTimer === null) return;
+    window.clearTimeout(runtime.matchmakeTimer);
+    runtime.matchmakeTimer = null;
+  }
+
+  function pauseLobbyActivity() {
+    clearLobbyPollTimer();
+    clearMatchmakeTimer();
+    runtime.lobbyAbortController?.abort();
   }
 
   function scheduleLobbyPoll(delay = CONFIG.lobbyPollIntervalMs) {
@@ -2189,6 +649,15 @@
 
   async function pollLobbyForTokens() {
     if (runtime.stopped || runtime.lobbyPollRunning || !isLobbyPage()) return;
+
+    const initialCommand = loadOrchestratorCommand();
+    if (
+      matchingRunningVisit(initialCommand) ||
+      isDrainingCommand(initialCommand) ||
+      shouldYieldToOtherTask(initialCommand)
+    ) {
+      return;
+    }
 
     runtime.lobbyPollRunning = true;
     const controller = new AbortController();
@@ -2208,59 +677,152 @@
       const html = await response.text();
       const nextDocument = new DOMParser().parseFromString(html, 'text/html');
       const snapshot = getLobbySnapshot(nextDocument);
-
       if (!snapshot.section) throw new Error('Solo ladder missing from lobby response.');
 
+      const command = loadOrchestratorCommand();
+      const visit = matchingRunningVisit(command);
+      if (isDrainingCommand(command)) {
+        publishDrainedStatus(command);
+        return;
+      }
+
+      if (shouldYieldToOtherTask(command)) {
+        publishDrainedStatus(command);
+        return;
+      }
+
       if (snapshot.canStart) {
+        publishWorkerStatus('busy', false, 'A Solo token is available; refreshing PvP.', visit?.visitId);
         report('Solo token available; refreshing the lobby.');
         window.location.reload();
         return;
       }
 
+      if (visit && snapshot.tokens === 0) {
+        publishWorkerStatus('done', true, 'No Solo tokens remain.', visit.visitId);
+        report('The scheduled PvP visit is complete; no Solo tokens remain.');
+        return;
+      }
+
+      publishWorkerStatus('idle', true, `${snapshot.tokens ?? 0} Solo token(s); waiting.`);
       report(`${snapshot.tokens ?? 0} Solo token(s); checking again in 30 seconds.`);
     } catch (error) {
       if (error?.name !== 'AbortError') {
         console.warn('[Smart Solo PvP] Lobby token check failed:', error);
+        publishWorkerStatus('error', false, 'The PvP token check failed.', statusVisitId());
+        report('Lobby token check failed; retrying in 30 seconds.', 'error');
       }
-      report('Lobby token check failed; retrying in 30 seconds.', 'error');
     } finally {
       window.clearTimeout(timeout);
       if (runtime.lobbyAbortController === controller) runtime.lobbyAbortController = null;
       runtime.lobbyPollRunning = false;
-      scheduleLobbyPoll();
+
+      const command = loadOrchestratorCommand();
+      if (
+        !matchingRunningVisit(command) &&
+        !isDrainingCommand(command) &&
+        !shouldYieldToOtherTask(command)
+      ) {
+        scheduleLobbyPoll();
+      }
     }
   }
 
   function handleLobbyPage() {
+    const command = loadOrchestratorCommand();
+    const ownCommand = matchingPvpCommand(command);
+    const visit = matchingRunningVisit(command);
     const snapshot = getLobbySnapshot();
 
     if (!snapshot.section) {
+      publishWorkerStatus('error', true, 'The Solo ladder was not found.', ownCommand?.visitId);
       report('Solo ladder was not found; waiting for the lobby.', 'error');
-      scheduleLobbyPoll();
+      if (!ownCommand && !isDrainingCommand(command) && !shouldYieldToOtherTask(command)) {
+        scheduleLobbyPoll();
+      }
       return;
     }
 
-    if (!snapshot.canStart) {
-      report(`${snapshot.tokens ?? 0} Solo token(s); waiting for the next token.`);
-      scheduleLobbyPoll();
-      return;
-    }
-
-    clearLobbyPollTimer();
-    if (snapshot.button.disabled) {
+    if (snapshot.button?.disabled) {
+      clearLobbyPollTimer();
+      publishWorkerStatus(
+        'busy',
+        false,
+        'Solo matchmaking is in progress.',
+        ownCommand?.visitId,
+      );
       report('Solo matchmaking is already running.');
       return;
     }
 
+    if (isDrainingCommand(command)) {
+      pauseLobbyActivity();
+      publishDrainedStatus(command);
+      report('PvP is idle; waiting for the orchestrator hand-off.');
+      return;
+    }
+
+    if (runtime.matchmakeTimer !== null) {
+      clearLobbyPollTimer();
+      publishWorkerStatus(
+        'busy',
+        false,
+        'Solo matchmaking is in progress.',
+        visit?.visitId,
+      );
+      report('Solo matchmaking is already running.');
+      return;
+    }
+
+    if (shouldYieldToOtherTask(command)) {
+      pauseLobbyActivity();
+      publishDrainedStatus(command);
+      report('PvP is idle; waiting for the orchestrator hand-off.');
+      return;
+    }
+
+    if (!snapshot.canStart) {
+      if (snapshot.tokens === 0) {
+        if (visit) {
+          clearLobbyPollTimer();
+          publishWorkerStatus('done', true, 'No Solo tokens remain.', visit.visitId);
+          report('The scheduled PvP visit is complete; no Solo tokens remain.');
+        } else {
+          publishWorkerStatus('idle', true, 'No Solo token is currently available.');
+          report('0 Solo token(s); waiting for the next token.');
+          scheduleLobbyPoll();
+        }
+        return;
+      }
+
+      publishWorkerStatus(
+        'error',
+        false,
+        'The Solo token count or matchmaking control is unavailable.',
+        visit?.visitId,
+      );
+      report('Solo matchmaking controls are incomplete; waiting for the lobby.', 'error');
+      if (!visit) scheduleLobbyPoll();
+      return;
+    }
+
+    clearLobbyPollTimer();
     const now = Date.now();
+    publishWorkerStatus('busy', false, 'Starting Solo matchmaking.', visit?.visitId);
     if (now - runtime.lastMatchmakeClickAt < CONFIG.matchmakeRetryMs) return;
 
     runtime.lastMatchmakeClickAt = now;
     report(`${snapshot.tokens} Solo token(s); starting a new match.`);
 
-    window.clearTimeout(runtime.matchmakeTimer);
+    clearMatchmakeTimer();
     runtime.matchmakeTimer = window.setTimeout(() => {
       runtime.matchmakeTimer = null;
+      const currentCommand = loadOrchestratorCommand();
+      if (isDrainingCommand(currentCommand) || shouldYieldToOtherTask(currentCommand)) {
+        publishDrainedStatus(currentCommand);
+        return;
+      }
+
       const current = getLobbySnapshot();
       if (current.canStart && current.button && !current.button.disabled) current.button.click();
     }, 250);
@@ -2268,12 +830,17 @@
 
   function cancelReturnToLobby() {
     if (runtime.returnToLobbyTimer === null) return;
-
     window.clearTimeout(runtime.returnToLobbyTimer);
     runtime.returnToLobbyTimer = null;
   }
 
-  function scheduleReturnToLobby() {
+  function scheduleReturnToLobby(command = loadOrchestratorCommand()) {
+    publishWorkerStatus(
+      'busy',
+      false,
+      'The PvP battle ended; returning to the PvP lobby.',
+      statusVisitId(command),
+    );
     if (runtime.returnToLobbyTimer !== null) return;
 
     report('Battle ended; returning to the PvP lobby.');
@@ -2341,7 +908,7 @@
 
   function getAllyName() {
     const slot = document.querySelector(SELECTORS.allySlot);
-    return String(slot?.dataset.username || document.querySelector('#allyBadge')?.textContent || '').trim();
+    return String(slot?.dataset?.username || document.querySelector('#allyBadge')?.textContent || '').trim();
   }
 
   function getLatestTurnStart() {
@@ -2383,7 +950,6 @@
 
   function isTargetPoisoned(target) {
     // The native renderer adds this class only for effect.key === 'poison'.
-    // Text such as "Poison Resistance" must not count as an active poison.
     return Boolean(target?.classList.contains('hasPoison'));
   }
 
@@ -2493,12 +1059,8 @@
     );
 
     if (confirmed) {
-      if (pending.prepareBridge) {
-        runtime.bridge = { targetKey: pending.targetKey };
-      }
-      if (pending.consumeBridge || pending.resetCycle) {
-        runtime.bridge = null;
-      }
+      if (pending.prepareBridge) runtime.bridge = { targetKey: pending.targetKey };
+      if (pending.consumeBridge || pending.resetCycle) runtime.bridge = null;
       runtime.pendingAction = null;
       return;
     }
@@ -2510,11 +1072,7 @@
       normalizeText(latestTurn.actor) === allyName;
 
     if (newerOwnTurn) {
-      // The click was intentionally not retried. If its log cannot be found,
-      // do not arm a Death-Mark follow-up based on an unconfirmed action.
-      if (pending.consumeBridge || pending.resetCycle) {
-        runtime.bridge = null;
-      }
+      if (pending.consumeBridge || pending.resetCycle) runtime.bridge = null;
       runtime.pendingAction = null;
     }
   }
@@ -2605,41 +1163,52 @@
     selectedSkill.button.click();
   }
 
+  function isPageHidden() {
+    return document.hidden === true || document.visibilityState === 'hidden';
+  }
+
   async function scanPage() {
-    if (runtime.scanRunning) return;
+    if (runtime.scanRunning || runtime.stopped || runtime.suspended || isPageHidden()) return;
     runtime.scanRunning = true;
 
     try {
-      if (handleBossRoute()) {
-        delete document.documentElement.dataset.veyraSmartPvp;
-        return;
-      }
-
       if (!isBattlePage()) {
         delete document.documentElement.dataset.veyraSmartPvp;
-        if (isLobbyPage()) {
-          updateBossCheckCountdown();
-          if (startBossCycleFromLobby()) return;
+        if (isPvpBattlePath()) {
+          clearLobbyPollTimer();
+          runtime.lobbyAbortController?.abort();
+          publishWorkerStatus(
+            'busy',
+            false,
+            'The Solo PvP battle page is still rendering.',
+            statusVisitId(),
+          );
+        } else if (isLobbyPage()) {
           handleLobbyPage();
+        } else {
+          publishWorkerStatus('error', true, 'This PvP page is not recognized.', statusVisitId());
         }
         return;
       }
 
-      // This marker only describes ownership of an actual battle page.
+      // This marker only describes ownership of an actual PvP battle page.
       document.documentElement.dataset.veyraSmartPvp = '1';
       clearLobbyPollTimer();
-      updateBossCheckCountdown();
+      runtime.lobbyAbortController?.abort();
 
+      const command = loadOrchestratorCommand();
+      const visitId = statusVisitId(command);
       settlePendingAction();
 
       if (isBattleEnded()) {
         runtime.bridge = null;
         runtime.pendingAction = null;
-        scheduleReturnToLobby();
+        scheduleReturnToLobby(command);
         return;
       }
 
       cancelReturnToLobby();
+      publishWorkerStatus('busy', false, 'A Solo PvP battle is in progress.', visitId);
 
       if (!ensureBattleMode()) return;
 
@@ -2649,13 +1218,14 @@
       await actOnTurn(turn);
     } catch (error) {
       console.error('[Smart Solo PvP] Scan failed:', error);
+      publishWorkerStatus('error', false, 'The PvP manager encountered an error.', statusVisitId());
     } finally {
       runtime.scanRunning = false;
     }
   }
 
   function scheduleScan() {
-    if (runtime.scanTimer !== null) return;
+    if (runtime.stopped || runtime.suspended || runtime.scanTimer !== null) return;
 
     runtime.scanTimer = window.setTimeout(() => {
       runtime.scanTimer = null;
@@ -2663,49 +1233,51 @@
     }, CONFIG.scanDebounceMs);
   }
 
-  initializeAutoFarmExclusiveActivation();
+  function handleVisibilityChange() {
+    if (isPageHidden()) {
+      runtime.suspended = true;
+      window.clearTimeout(runtime.scanTimer);
+      runtime.scanTimer = null;
+      return;
+    }
+
+    runtime.suspended = false;
+    runtime.scanRunning = false;
+    scheduleScan();
+  }
 
   runtime.observer = new MutationObserver(scheduleScan);
   runtime.observer.observe(document.documentElement, {
     childList: true,
     subtree: true,
     attributes: true,
-    attributeFilter: ['class', 'disabled', 'data-alive', 'data-dead', 'data-joined', 'data-userdmg'],
+    attributeFilter: ['class', 'disabled', 'data-alive'],
   });
 
   runtime.interval = window.setInterval(scheduleScan, CONFIG.scanIntervalMs);
   document.addEventListener?.('visibilitychange', handleVisibilityChange);
-  window.addEventListener('pageshow', (event) => {
-    if (event?.persisted) {
-      window.clearTimeout(runtime.scanTimer);
-      runtime.scanTimer = null;
-      runtime.bossActionPending = false;
-      runtime.bossNavigationPending = false;
-      refreshBossCycleAfterMobileResume();
-      runtime.bossSuspendedAt = 0;
-    }
-
+  window.addEventListener?.('pageshow', () => {
+    runtime.suspended = false;
+    runtime.scanRunning = false;
+    window.clearTimeout(runtime.scanTimer);
+    runtime.scanTimer = null;
     scheduleScan();
   });
-  window.addEventListener('pagehide', (event) => {
-    // A BFCache page is only frozen and can be restored without re-running the
-    // userscript. Keep its observers/timers registered so mobile Safari can
-    // continue immediately on pageshow.
+  window.addEventListener?.('pagehide', (event) => {
     if (event?.persisted) {
-      runtime.bossSuspendedAt = Date.now();
+      runtime.suspended = true;
+      window.clearTimeout(runtime.scanTimer);
+      runtime.scanTimer = null;
       return;
     }
 
     runtime.stopped = true;
-    document.removeEventListener?.('click', handleAutoFarmActivateClick, true);
     document.removeEventListener?.('visibilitychange', handleVisibilityChange);
-    runtime.autoFarmObserver?.disconnect();
-    cancelAutoFarmDecoration();
     runtime.observer?.disconnect();
     window.clearInterval(runtime.interval);
     window.clearTimeout(runtime.scanTimer);
     window.clearTimeout(runtime.returnToLobbyTimer);
-    window.clearTimeout(runtime.matchmakeTimer);
+    clearMatchmakeTimer();
     clearLobbyPollTimer();
     runtime.lobbyAbortController?.abort();
   });

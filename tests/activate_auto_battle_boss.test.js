@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
-const scriptPath = path.resolve(__dirname, '../activate_auto_battle_target.js');
+const scriptPath = path.resolve(__dirname, '../wave_3_boss_manager.js');
 const scriptSource = fs.readFileSync(scriptPath, 'utf8');
 const monsterAutoBattleSource = fs.readFileSync(
   path.resolve(__dirname, '../monster_auto_battle.js'),
@@ -16,8 +16,9 @@ const monsterAutoBattleSource = fs.readFileSync(
 const {
   BOSS_CONFIG,
   BOSS_PHASES,
+  COMMAND_KEY,
+  STATUS_KEY,
   createDefaultBossCycleState,
-  formatBossCheckCountdown,
   isFightableBossData,
   isMonsterAutoBattleSuccess,
 } = require(scriptPath);
@@ -163,7 +164,6 @@ function bossState(overrides = {}, now = FIXED_NOW) {
     phase: BOSS_PHASES.checking,
     cycleStartedAt: now - 1_000,
     phaseUpdatedAt: now - 1_000,
-    nextCheckAt: now - 1,
     ...overrides,
   };
 }
@@ -178,7 +178,7 @@ function readBossState(storage) {
 
 function runUserscript({
   document,
-  href = 'https://demonicscans.org/pvp.php',
+  href = 'https://demonicscans.org/active_wave.php?gate=3&wave=8',
   localStorage = createStorage(),
   sessionStorage = createStorage(),
   navigator: navigatorObject,
@@ -260,98 +260,6 @@ function runUserscript({
   return { localStorage, navigation, timers, window };
 }
 
-function createLobbyDocument(tokens = 1) {
-  const title = { textContent: 'Solo Ladder' };
-  const label = { textContent: 'Tokens:' };
-  const value = { textContent: String(tokens) };
-  const pill = {
-    children: [label, value],
-    querySelector(selector) {
-      if (selector === 'strong') return label;
-      if (selector === 'span') return value;
-      return null;
-    },
-  };
-  const section = {
-    querySelector(selector) {
-      return selector === '.section-title' ? title : null;
-    },
-    querySelectorAll(selector) {
-      return selector === '.info-pill' ? [pill] : [];
-    },
-  };
-  const matchButton = {
-    disabled: false,
-    closest() {
-      return section;
-    },
-    click() {
-      throw new Error('matchmaking must not start while the boss check is due');
-    },
-  };
-
-  const document = createDocument({
-    nodes: { '.js-matchmake[data-ladder="solo"]': matchButton },
-    nodeLists: { section: [section] },
-  });
-  pill.appendChild = (element) => {
-    element.parentElement = pill;
-    pill.children.push(element);
-    document.registerElement(element);
-  };
-  document.soloTokenPill = pill;
-  document.soloTokenValue = value;
-  return document;
-}
-
-function createRunningPvpDocument() {
-  const activeClassList = { contains: (name) => name === 'active' };
-  const inactiveClassList = { contains: () => false };
-  const nodes = {
-    '#fastEnemyBtn': {
-      disabled: false,
-      classList: activeClassList,
-      getAttribute: () => null,
-      textContent: 'Enemy Turns 1s: ON',
-    },
-    '#battleControlCard': {},
-    '#enemyFormation': {},
-    '#matchStatusBadge': { textContent: 'Battle in progress' },
-    '#rewardsModal': { classList: inactiveClassList },
-    '#allyFormation .pSlot[data-side="ally"][data-alive="1"]': { dataset: { username: 'Hero' } },
-    '#enemyFormation .pSlot[data-side="enemy"][data-alive="1"]:not(.dead)': {},
-  };
-  const document = createDocument({ nodes });
-  const targetHint = {};
-  const combatTokenPanel = {
-    children: [],
-    querySelector(selector) {
-      return selector === '#targetHint' ? targetHint : null;
-    },
-    insertBefore(element) {
-      element.parentElement = combatTokenPanel;
-      combatTokenPanel.children.push(element);
-      document.registerElement(element);
-    },
-    appendChild(element) {
-      element.parentElement = combatTokenPanel;
-      combatTokenPanel.children.push(element);
-      document.registerElement(element);
-    },
-  };
-  const tokenValue = {
-    textContent: '40',
-    closest(selector) {
-      return selector === '.combatTokenPanel' ? combatTokenPanel : null;
-    },
-  };
-  nodes['#myTokens'] = tokenValue;
-  document.combatTokenPanel = combatTokenPanel;
-  document.combatTokenValue = tokenValue;
-
-  return document;
-}
-
 test('metadata covers the Grakthar wave and monster battle routes', () => {
   assert.match(scriptSource, /^\/\/ @match\s+https:\/\/demonicscans\.org\/active_wave\.php\*$/m);
   assert.match(scriptSource, /^\/\/ @match\s+https:\/\/demonicscans\.org\/battle\.php\*$/m);
@@ -363,70 +271,201 @@ test('metadata covers the Grakthar wave and monster battle routes', () => {
   );
 });
 
-test('the first boss check is scheduled for 30 minutes after initialization', () => {
+test('a private Wave 3 run starts inactive without scheduler fields', () => {
   const state = createDefaultBossCycleState(FIXED_NOW);
 
   assert.equal(state.active, false);
-  assert.equal(state.nextCheckAt, FIXED_NOW + 30 * 60 * 1000);
+  assert.equal(state.visitId, '');
+  assert.equal('nextCheckAt' in state, false);
 });
 
-test('formats the time until the next boss check without negative countdowns', () => {
-  const waiting = createDefaultBossCycleState(FIXED_NOW);
-
-  assert.equal(formatBossCheckCountdown(waiting, FIXED_NOW), 'Bossprüfung in 30:00');
-  assert.equal(
-    formatBossCheckCountdown({ ...waiting, nextCheckAt: FIXED_NOW + 90_001 }, FIXED_NOW),
-    'Bossprüfung in 01:31',
-  );
-  assert.equal(
-    formatBossCheckCountdown({ ...waiting, nextCheckAt: FIXED_NOW - 1 }, FIXED_NOW),
-    'Bossprüfung jetzt',
-  );
-  assert.equal(
-    formatBossCheckCountdown({ ...waiting, active: true, nextCheckAt: FIXED_NOW - 1 }, FIXED_NOW),
-    'Bossprüfung läuft',
-  );
-});
-
-test('shows one boss countdown directly in the Solo token pill', () => {
-  const state = {
-    ...createDefaultBossCycleState(FIXED_NOW),
-    nextCheckAt: FIXED_NOW + 90_001,
-  };
-  const storage = storageWithBossState(state);
-  const document = createLobbyDocument(0);
-  const { timers } = runUserscript({ document, localStorage: storage });
-
-  timers.run(40);
-  const countdown = document.getElementById('tm-boss-check-countdown');
-  assert.ok(countdown);
-  assert.equal(countdown.parentElement, document.soloTokenPill);
-  assert.equal(countdown.textContent, 'Bossprüfung in 01:31');
-  assert.equal(document.soloTokenValue.textContent, '0');
-
-  timers.runInterval(200);
-  timers.run(40);
-  assert.equal(
-    document.soloTokenPill.children.filter((element) => element.id === 'tm-boss-check-countdown').length,
-    1,
-  );
-});
-
-test('shows the boss countdown inside the PvP combat token panel', () => {
-  const storage = storageWithBossState(createDefaultBossCycleState(FIXED_NOW));
-  const document = createRunningPvpDocument();
+test('a matching running command starts a private run and publishes busy status', () => {
+  const visitId = 'wave-visit-17';
+  const storage = createStorage({
+    [COMMAND_KEY]: JSON.stringify({
+      version: 1,
+      taskId: 'wave3',
+      visitId,
+      phase: 'running',
+      issuedAt: FIXED_NOW,
+    }),
+  });
+  const document = createDocument({ nodes: { '.monster-container': {} } });
   const { timers } = runUserscript({
     document,
-    href: 'https://demonicscans.org/pvp_battle.php?match_id=44',
+    href: `https://demonicscans.org/active_wave.php?gate=3&wave=8&veyra_visit=${visitId}`,
     localStorage: storage,
   });
 
   timers.run(40);
-  const countdown = document.getElementById('tm-boss-check-countdown');
-  assert.ok(countdown);
-  assert.equal(countdown.parentElement, document.combatTokenPanel);
-  assert.equal(countdown.textContent, 'Bossprüfung in 30:00');
-  assert.equal(document.combatTokenValue.textContent, '40');
+
+  const state = readBossState(storage);
+  assert.equal(state.active, true);
+  assert.equal(state.visitId, visitId);
+  const status = JSON.parse(storage.getItem(STATUS_KEY));
+  assert.equal(status.workerId, 'wave3');
+  assert.equal(status.visitId, visitId);
+  assert.equal(status.state, 'busy');
+  assert.equal(status.safeToLeave, false);
+});
+
+test('a reloaded page does not restart a visit that already published a terminal status', () => {
+  const visitId = 'already-finished-visit';
+  const storage = createStorage({
+    [COMMAND_KEY]: JSON.stringify({
+      version: 1,
+      taskId: 'wave3',
+      visitId,
+      phase: 'running',
+    }),
+    [STATUS_KEY]: JSON.stringify({
+      version: 1,
+      workerId: 'wave3',
+      visitId,
+      state: 'done',
+      safeToLeave: true,
+      updatedAt: FIXED_NOW - 500,
+      message: 'Already complete.',
+    }),
+  });
+  const document = createDocument({ nodes: { '.monster-container': {} } });
+  const { navigation, timers } = runUserscript({
+    document,
+    href: 'https://demonicscans.org/active_wave.php?gate=3&wave=8',
+    localStorage: storage,
+  });
+
+  timers.run(40);
+
+  assert.equal(readBossState(storage).active, false);
+  assert.equal(navigation.replacedWith, null);
+  const status = JSON.parse(storage.getItem(STATUS_KEY));
+  assert.equal(status.state, 'done');
+  assert.equal(status.visitId, visitId);
+});
+
+test('a foreign draining command blocks a standalone Wave 3 scan', () => {
+  const storage = createStorage({
+    [COMMAND_KEY]: JSON.stringify({
+      version: 1,
+      taskId: 'pvp',
+      visitId: 'pvp-visit-4',
+      phase: 'draining',
+    }),
+  });
+  const document = createDocument({ nodes: { '.monster-container': {} } });
+  const { navigation, timers } = runUserscript({
+    document,
+    href: 'https://demonicscans.org/active_wave.php?gate=3&wave=8',
+    localStorage: storage,
+  });
+
+  timers.run(40);
+
+  assert.equal(readBossState(storage).active, false);
+  assert.equal(navigation.replacedWith, null);
+  const status = JSON.parse(storage.getItem(STATUS_KEY));
+  assert.equal(status.state, 'idle');
+  assert.equal(status.safeToLeave, true);
+});
+
+test('a foreign running command also blocks a standalone Wave 3 scan', () => {
+  const storage = createStorage({
+    [COMMAND_KEY]: JSON.stringify({
+      version: 1,
+      taskId: 'pvp',
+      visitId: 'pvp-running-visit',
+      phase: 'running',
+    }),
+  });
+  const document = createDocument({ nodes: { '.monster-container': {} } });
+  const { navigation, timers } = runUserscript({
+    document,
+    href: 'https://demonicscans.org/active_wave.php?gate=3&wave=8',
+    localStorage: storage,
+  });
+
+  timers.run(40);
+
+  assert.equal(readBossState(storage).active, false);
+  assert.equal(navigation.replacedWith, null);
+  assert.equal(JSON.parse(storage.getItem(STATUS_KEY)).state, 'idle');
+});
+
+test('a direct Wave 3 visit performs one standalone scan without a command', () => {
+  const storage = createStorage();
+  const document = createDocument({ nodes: { '.monster-container': {} } });
+  const { timers } = runUserscript({
+    document,
+    href: 'https://demonicscans.org/active_wave.php?gate=3&wave=8',
+    localStorage: storage,
+  });
+
+  timers.run(40);
+
+  const state = readBossState(storage);
+  assert.equal(state.active, true);
+  assert.equal(state.visitId, '');
+  assert.equal(JSON.parse(storage.getItem(STATUS_KEY)).state, 'busy');
+});
+
+test('busy worker status is refreshed as a five-second heartbeat', () => {
+  let currentNow = FIXED_NOW;
+  const visitId = 'heartbeat-visit';
+  const storage = createStorage({
+    [COMMAND_KEY]: JSON.stringify({
+      version: 1,
+      taskId: 'wave3',
+      visitId,
+      phase: 'running',
+    }),
+  });
+  const document = createDocument({ nodes: { '.monster-container': {} } });
+  const { timers } = runUserscript({
+    document,
+    href: 'https://demonicscans.org/active_wave.php?gate=3&wave=8',
+    localStorage: storage,
+    now: () => currentNow,
+  });
+
+  timers.run(40);
+  assert.equal(JSON.parse(storage.getItem(STATUS_KEY)).updatedAt, FIXED_NOW);
+
+  currentNow += 5_000;
+  timers.runInterval(200);
+  timers.run(40);
+  const status = JSON.parse(storage.getItem(STATUS_KEY));
+  assert.equal(status.state, 'busy');
+  assert.equal(status.updatedAt, FIXED_NOW + 5_000);
+});
+
+test('battle.php is untouched without a private active boss target', () => {
+  let startClicks = 0;
+  const storage = createStorage();
+  const document = createDocument({
+    nodes: {
+      '#tm-monster-auto-battle': {},
+      '#mabTarget': { value: '0' },
+      '#mabStart': {
+        disabled: false,
+        click() {
+          startClicks += 1;
+        },
+      },
+      '#yourDamageValue': { textContent: '0' },
+    },
+  });
+  const { navigation, timers } = runUserscript({
+    document,
+    href: 'https://demonicscans.org/battle.php?id=812',
+    localStorage: storage,
+  });
+
+  timers.run(40);
+
+  assert.equal(startClicks, 0);
+  assert.equal(navigation.replacedWith, null);
+  assert.equal(JSON.parse(storage.getItem(STATUS_KEY)).state, 'idle');
 });
 
 test('recognizes active, alive bosses below the 3b personal-damage target', () => {
@@ -472,44 +511,6 @@ test('requires the live damage value to confirm the 3b target', () => {
     }),
     false,
   );
-});
-
-test('a due boss check leaves the PvP lobby for Grakthar Wave 3', () => {
-  const dueState = createDefaultBossCycleState(FIXED_NOW);
-  dueState.nextCheckAt = FIXED_NOW - 1;
-  const storage = storageWithBossState(dueState);
-  const document = createLobbyDocument(2);
-  const { navigation, timers } = runUserscript({ document, localStorage: storage });
-
-  timers.run(40);
-
-  assert.equal(
-    navigation.replacedWith,
-    'https://demonicscans.org/active_wave.php?gate=3&wave=8',
-  );
-  const state = readBossState(storage);
-  assert.equal(state.active, true);
-  assert.equal(state.phase, BOSS_PHASES.checking);
-});
-
-test('a due boss check never interrupts an ongoing PvP battle', () => {
-  const dueState = createDefaultBossCycleState(FIXED_NOW);
-  dueState.nextCheckAt = FIXED_NOW - 1;
-  const storage = storageWithBossState(dueState);
-  const document = createRunningPvpDocument();
-  const { navigation, timers } = runUserscript({
-    document,
-    href: 'https://demonicscans.org/pvp_battle.php?match_id=77',
-    localStorage: storage,
-  });
-
-  timers.run(40);
-
-  assert.equal(navigation.replacedWith, null);
-  assert.equal(document.documentElement.dataset.veyraSmartPvp, '1');
-  const state = readBossState(storage);
-  assert.equal(state.active, false);
-  assert.equal(state.nextCheckAt, FIXED_NOW - 1);
 });
 
 test('forces the alive-monsters filter before evaluating Wave 3 bosses', () => {
@@ -597,9 +598,15 @@ test('stops reloading when the alive-monsters filter cannot be saved', () => {
 
   assert.equal(navigation.replacedWith, null);
   const state = readBossState(storage);
-  assert.equal(state.active, true);
-  assert.equal(state.actionAttempts, BOSS_CONFIG.maxActionAttempts);
+  assert.equal(state.active, false);
   assert.match(state.lastError, /alive-monsters filter could not be saved/i);
+  const status = JSON.parse(storage.getItem(STATUS_KEY));
+  assert.equal(status.state, 'error');
+  assert.equal(status.safeToLeave, true);
+
+  timers.runInterval(200);
+  timers.run(40);
+  assert.equal(JSON.parse(storage.getItem(STATUS_KEY)).state, 'error');
 });
 
 test('joins the first active boss below 3b on the wave hub', () => {
@@ -1158,7 +1165,7 @@ test('skips a boss that already has 3b damage and selects the next fightable bos
   assert.equal(state.targetBossId, '701');
 });
 
-test('returns to PvP when every living boss already has 3b damage', () => {
+test('publishes done without cross-page navigation when every living boss already has 3b damage', () => {
   const completedCard = {
     dataset: {
       boss: '1',
@@ -1190,7 +1197,63 @@ test('returns to PvP when every living boss already has 3b damage', () => {
 
   timers.run(40);
 
-  assert.equal(navigation.replacedWith, 'https://demonicscans.org/pvp.php');
+  assert.equal(navigation.replacedWith, null);
+  assert.equal(readBossState(storage).active, false);
+  const status = JSON.parse(storage.getItem(STATUS_KEY));
+  assert.equal(status.state, 'done');
+  assert.equal(status.safeToLeave, true);
+});
+
+test('clearing a completed command does not start a second standalone scan on the same page', () => {
+  let currentNow = FIXED_NOW;
+  const visitId = 'completed-command';
+  const completedCard = {
+    dataset: {
+      boss: '1',
+      dead: '0',
+      joined: '1',
+      userdmg: '3b',
+      monsterId: '700',
+      expire: '1',
+    },
+    querySelector() {
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    },
+  };
+  const storage = createStorage({
+    [COMMAND_KEY]: JSON.stringify({
+      version: 1,
+      taskId: 'wave3',
+      visitId,
+      phase: 'running',
+    }),
+  });
+  const document = createDocument({
+    nodes: { '.monster-container': {} },
+    nodeLists: {
+      '.monster-card[data-boss][data-dead][data-monster-id]': [completedCard],
+    },
+  });
+  const { timers } = runUserscript({
+    document,
+    href: `https://demonicscans.org/active_wave.php?gate=3&wave=8&veyra_visit=${visitId}`,
+    localStorage: storage,
+    now: () => currentNow,
+  });
+
+  timers.run(40);
+  currentNow += BOSS_CONFIG.hubSettleMs;
+  timers.runInterval(200);
+  timers.run(40);
+  assert.equal(readBossState(storage).active, false);
+  assert.equal(JSON.parse(storage.getItem(STATUS_KEY)).state, 'done');
+
+  storage.removeItem(COMMAND_KEY);
+  timers.runInterval(200);
+  timers.run(40);
   assert.equal(readBossState(storage).active, false);
 });
 
@@ -1226,8 +1289,9 @@ test('skips a boss that was confirmed not fightable during the current scan', ()
 
   timers.run(40);
 
-  assert.equal(navigation.replacedWith, 'https://demonicscans.org/pvp.php');
+  assert.equal(navigation.replacedWith, null);
   assert.equal(readBossState(storage).active, false);
+  assert.equal(JSON.parse(storage.getItem(STATUS_KEY)).state, 'done');
 });
 
 test('clicks Join the Battle on battle.php after the wave-hub join', () => {
@@ -1666,6 +1730,38 @@ test('a completed 3b attack returns to the wave and records the boss', () => {
   assert.equal(state.phase, BOSS_PHASES.returningHub);
 });
 
+test('internal navigation preserves the orchestrator visit query', () => {
+  const visitId = 'wave-run-with-query';
+  const storage = storageWithBossState(
+    bossState({
+      visitId,
+      phase: BOSS_PHASES.attacking,
+      targetBossId: '812',
+      startIssued: true,
+    }),
+  );
+  const document = createDocument({
+    nodes: {
+      '#tm-monster-auto-battle': {},
+      '#mabStatus': { textContent: 'Damage target of 3b reached' },
+      '#yourDamageValue': { textContent: '3b' },
+      '#hpText': { textContent: '97b / 100b' },
+    },
+  });
+  const { navigation, timers } = runUserscript({
+    document,
+    href: `https://demonicscans.org/battle.php?id=812&veyra_visit=${visitId}`,
+    localStorage: storage,
+  });
+
+  timers.run(40);
+
+  assert.equal(
+    navigation.replacedWith,
+    `https://demonicscans.org/active_wave.php?gate=3&wave=8&veyra_visit=${visitId}`,
+  );
+});
+
 test('a known boss missing from a still-rendering wave is not marked as processed', () => {
   const storage = storageWithBossState(
     bossState({
@@ -1739,7 +1835,7 @@ test('a stale boss fight returns to Wave 3 for another attempt instead of PvP', 
   assert.equal(readBossState(storage).active, true);
 });
 
-test('an empty wave hub waits for rendering before returning to PvP', () => {
+test('an empty wave hub waits for rendering before publishing done', () => {
   let currentNow = FIXED_NOW;
   const storage = storageWithBossState(bossState());
   const document = createDocument({
@@ -1764,9 +1860,11 @@ test('an empty wave hub waits for rendering before returning to PvP', () => {
   timers.runInterval(200);
   timers.run(40);
 
-  assert.equal(navigation.replacedWith, 'https://demonicscans.org/pvp.php');
+  assert.equal(navigation.replacedWith, null);
   const state = readBossState(storage);
   assert.equal(state.active, false);
   assert.equal(state.phase, BOSS_PHASES.idle);
-  assert.equal(state.nextCheckAt, currentNow + BOSS_CONFIG.checkIntervalMs);
+  const status = JSON.parse(storage.getItem(STATUS_KEY));
+  assert.equal(status.state, 'done');
+  assert.equal(status.safeToLeave, true);
 });
