@@ -17,6 +17,7 @@ const {
   BOSS_CONFIG,
   BOSS_PHASES,
   COMMAND_KEY,
+  META_CONFIG_KEY,
   STATUS_KEY,
   createDefaultBossCycleState,
   isFightableBossData,
@@ -390,6 +391,67 @@ test('a foreign running command also blocks a standalone Wave 3 scan', () => {
   assert.equal(readBossState(storage).active, false);
   assert.equal(navigation.replacedWith, null);
   assert.equal(JSON.parse(storage.getItem(STATUS_KEY)).state, 'idle');
+});
+
+test('an expired foreign command no longer blocks a standalone Wave 3 scan', () => {
+  const storage = createStorage({
+    [COMMAND_KEY]: JSON.stringify({
+      version: 1,
+      taskId: 'pvp',
+      visitId: 'expired-pvp-visit',
+      phase: 'draining',
+      deadlineAt: FIXED_NOW - 1,
+    }),
+  });
+  const document = createDocument({ nodes: { '.monster-container': {} } });
+  const { timers } = runUserscript({ document, localStorage: storage });
+
+  timers.run(40);
+
+  assert.equal(readBossState(storage).active, true);
+  assert.equal(JSON.parse(storage.getItem(STATUS_KEY)).state, 'busy');
+});
+
+test('a new scheduler visit replaces an abandoned active run and its lease', () => {
+  const storage = storageWithBossState(
+    bossState({
+      visitId: 'old-wave-visit',
+      targetBossId: 'old-boss',
+      targetBossKey: 'skarn',
+      processedBossIds: ['old-boss'],
+      failedBossIds: ['failed-boss'],
+      ownerId: 'old-owner',
+      leaseUntil: FIXED_NOW + BOSS_CONFIG.leaseMs,
+    }),
+  );
+  storage.setItem(
+    COMMAND_KEY,
+    JSON.stringify({
+      version: 1,
+      taskId: 'wave3',
+      visitId: 'new-wave-visit',
+      phase: 'running',
+      deadlineAt: FIXED_NOW + 60_000,
+    }),
+  );
+  const document = createDocument({ nodes: { '.monster-container': {} } });
+  const { timers } = runUserscript({
+    document,
+    localStorage: storage,
+    sessionStorage: createStorage({ [BOSS_CONFIG.ownerStorageKey]: 'new-owner' }),
+  });
+
+  timers.run(40);
+
+  const state = readBossState(storage);
+  assert.equal(state.visitId, 'new-wave-visit');
+  assert.equal(state.ownerId, 'new-owner');
+  assert.equal(state.targetBossId, '');
+  assert.deepEqual(state.processedBossIds, []);
+  assert.deepEqual(state.failedBossIds, []);
+  const status = JSON.parse(storage.getItem(STATUS_KEY));
+  assert.equal(status.visitId, 'new-wave-visit');
+  assert.equal(status.state, 'busy');
 });
 
 test('a direct Wave 3 visit performs one standalone scan without a command', () => {
@@ -843,6 +905,58 @@ test('falls back to a direct Join click when navigator.locks fails', async () =>
   }
 });
 
+test('a pending mobile Web Lock cannot suppress the boss action', () => {
+  let joinClicks = 0;
+  const joinButton = {
+    disabled: false,
+    textContent: 'Join Battle',
+    getAttribute: () => null,
+    click() {
+      joinClicks += 1;
+    },
+  };
+  const card = {
+    dataset: {
+      boss: '1',
+      dead: '0',
+      joined: '0',
+      userdmg: '0',
+      monsterId: 'pending-lock-boss',
+      expire: '99',
+    },
+    querySelector() {
+      return null;
+    },
+    querySelectorAll(selector) {
+      return selector === 'button, a, input[type="button"], input[type="submit"]'
+        ? [joinButton]
+        : [];
+    },
+  };
+  const storage = storageWithBossState(bossState());
+  const document = createDocument({
+    nodes: { '.monster-container': {} },
+    nodeLists: {
+      '.monster-card[data-boss][data-dead][data-monster-id]': [card],
+    },
+  });
+  const navigatorObject = {
+    locks: {
+      request() {
+        return new Promise(() => {});
+      },
+    },
+  };
+  const { timers } = runUserscript({ document, localStorage: storage, navigator: navigatorObject });
+
+  timers.run(40);
+  assert.equal(joinClicks, 0);
+
+  timers.run(250);
+  assert.equal(joinClicks, 1);
+  assert.equal(readBossState(storage).actionKind, 'join');
+});
+
 test('a persisted pagehide followed by pageshow resumes the boss scan', () => {
   let currentNow = FIXED_NOW;
   let joinClicks = 0;
@@ -960,6 +1074,7 @@ test('a boss route takes over its active lease after mobile navigation loses ses
 
 test('joins an active auto-summon boss even when its monster card reports data-boss zero', () => {
   let joinClicks = 0;
+  let autoSummonClicks = 0;
   const joinButton = {
     textContent: 'Join Battle',
     getAttribute: () => null,
@@ -991,11 +1106,16 @@ test('joins an active auto-summon boss even when its monster card reports data-b
     getAttribute(name) {
       return name === 'href' ? 'battle.php?id=556650107' : null;
     },
+    click() {
+      autoSummonClicks += 1;
+    },
   };
+  const autoSummonName = { textContent: 'General Skarn the Radiant Bastion' };
   const autoSummonCard = {
     dataset: { alive: '1' },
     querySelector(selector) {
-      return selector.includes('battle.php?id=') ? activeBossLink : null;
+      if (selector === '.auto-summon-name') return autoSummonName;
+      return selector.includes('battle.php') ? activeBossLink : null;
     },
     querySelectorAll(selector) {
       return selector.includes('battle.php?id=') ? [activeBossLink] : [];
@@ -1021,12 +1141,81 @@ test('joins an active auto-summon boss even when its monster card reports data-b
 
   timers.run(40);
 
-  assert.equal(joinClicks, 1);
+  assert.equal(autoSummonClicks, 1);
+  assert.equal(joinClicks, 0);
   assert.equal(navigation.replacedWith, null);
   const state = readBossState(storage);
   assert.equal(state.targetBossId, '556650107');
-  assert.equal(state.phase, BOSS_PHASES.joining);
-  assert.equal(state.actionKind, 'join');
+  assert.equal(state.targetBossKey, 'skarn');
+  assert.equal(state.phase, BOSS_PHASES.entering);
+  assert.equal(state.actionKind, 'open-battle');
+});
+
+test('does not reopen an active auto-summon boss whose configured damage is already reached', () => {
+  const linkClicks = { completed: 0, pending: 0 };
+  function createLink(id, key) {
+    return {
+      href: `https://demonicscans.org/battle.php?id=${id}`,
+      getAttribute(name) {
+        return name === 'href' ? `battle.php?id=${id}` : null;
+      },
+      click() {
+        linkClicks[key] += 1;
+      },
+    };
+  }
+  function createAutoCard(link, name) {
+    return {
+      querySelector(selector) {
+        if (selector === '.auto-summon-name') return { textContent: name };
+        return selector.includes('battle.php') ? link : null;
+      },
+    };
+  }
+  function createBossCard(id, name, damage) {
+    return {
+      dataset: {
+        boss: '0',
+        dead: '0',
+        joined: '1',
+        userdmg: damage,
+        monsterId: id,
+        name,
+        expire: '99',
+      },
+      querySelector() {
+        return null;
+      },
+      querySelectorAll() {
+        return [];
+      },
+    };
+  }
+  const completedLink = createLink('skarn-id', 'completed');
+  const pendingLink = createLink('vessir-id', 'pending');
+  const completedAutoCard = createAutoCard(completedLink, 'General Skarn the Radiant Bastion');
+  const pendingAutoCard = createAutoCard(pendingLink, 'General Vessir the Sunfang Duelist');
+  const document = createDocument({
+    nodes: { '.monster-container': {} },
+    nodeLists: {
+      '.monster-card[data-boss][data-dead][data-monster-id]': [
+        createBossCard('skarn-id', 'general skarn the radiant bastion', '3b'),
+        createBossCard('vessir-id', 'general vessir the sunfang duelist', '1b'),
+      ],
+      '.auto-summon-card[data-alive="1"]': [completedAutoCard, pendingAutoCard],
+      '.auto-summon-card[data-alive="1"] a[href*="battle.php"]': [
+        completedLink,
+        pendingLink,
+      ],
+    },
+  });
+  const storage = storageWithBossState(bossState());
+  const { timers } = runUserscript({ document, localStorage: storage });
+
+  timers.run(40);
+
+  assert.deepEqual(linkClicks, { completed: 0, pending: 1 });
+  assert.equal(readBossState(storage).targetBossId, 'vessir-id');
 });
 
 test('an already joined partially damaged boss clicks Enter Battle once without joining again', () => {
@@ -1460,6 +1649,7 @@ test('uses the page heal-potion button before auto battle when the joined player
 
 test('sets the monster target to 3b before starting auto battle', () => {
   const dispatchedEvents = [];
+  const staminaEvents = [];
   const targetInput = {
     value: '100m',
     dispatchEvent(event) {
@@ -1474,6 +1664,13 @@ test('sets the monster target to 3b before starting auto battle', () => {
       valueAtStart = targetInput.value;
     },
   };
+  const staminaInput = {
+    checked: true,
+    dispatchEvent(event) {
+      staminaEvents.push(event.type);
+      return true;
+    },
+  };
   const storage = storageWithBossState(
     bossState({ phase: BOSS_PHASES.entering, targetBossId: '812' }),
   );
@@ -1481,6 +1678,7 @@ test('sets the monster target to 3b before starting auto battle', () => {
     nodes: {
       '#tm-monster-auto-battle': {},
       '#mabTarget': targetInput,
+      '#mabAutoStamina': staminaInput,
       '#mabStart': startButton,
       '#mabStatus': { textContent: 'Ready' },
       '#yourDamageValue': { textContent: '0' },
@@ -1497,10 +1695,138 @@ test('sets the monster target to 3b before starting auto battle', () => {
 
   assert.equal(targetInput.value, '3b');
   assert.deepEqual(dispatchedEvents, ['input', 'change']);
+  assert.equal(staminaInput.checked, false);
+  assert.deepEqual(staminaEvents, ['input', 'change']);
   assert.equal(valueAtStart, '3b');
   const state = readBossState(storage);
   assert.equal(state.phase, BOSS_PHASES.attacking);
   assert.equal(state.startIssued, true);
+});
+
+test('persists a per-boss damage target and enabled stamina potions into MAB', () => {
+  let liveBossLinkClicks = 0;
+  const liveBossLink = {
+    href: 'https://demonicscans.org/battle.php?id=556650107',
+    getAttribute(name) {
+      return name === 'href' ? 'battle.php?id=556650107' : null;
+    },
+    click() {
+      liveBossLinkClicks += 1;
+    },
+  };
+  const autoSummonCard = {
+    dataset: { alive: '1' },
+    querySelector(selector) {
+      if (selector === '.auto-summon-name') {
+        return { textContent: 'General Skarn the Radiant Bastion' };
+      }
+      return selector.includes('battle.php') ? liveBossLink : null;
+    },
+  };
+  const bossCard = {
+    dataset: {
+      boss: '0',
+      dead: '0',
+      joined: '0',
+      userdmg: '0',
+      monsterId: '556650107',
+      name: 'general skarn the radiant bastion',
+      expire: '99',
+    },
+    querySelector() {
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    },
+  };
+  const storage = storageWithBossState(bossState());
+  storage.setItem(
+    META_CONFIG_KEY,
+    JSON.stringify({
+      version: 1,
+      routes: {
+        wave3: {
+          settings: {
+            useStaminaPotions: true,
+            bosses: {
+              skarn: { name: 'General Skarn the Radiant Bastion', damage: '1.25b' },
+            },
+          },
+        },
+      },
+    }),
+  );
+  const hubDocument = createDocument({
+    nodes: { '.monster-container': {} },
+    nodeLists: {
+      '.monster-card[data-boss][data-dead][data-monster-id]': [bossCard],
+      '.auto-summon-card[data-alive="1"]': [autoSummonCard],
+      '.auto-summon-card[data-alive="1"] a[href*="battle.php"]': [liveBossLink],
+    },
+  });
+  const firstPage = runUserscript({ document: hubDocument, localStorage: storage });
+
+  firstPage.timers.run(40);
+
+  assert.equal(liveBossLinkClicks, 1);
+  const selectedState = readBossState(storage);
+  assert.equal(selectedState.targetBossKey, 'skarn');
+  assert.equal(selectedState.targetDamage, '1.25b');
+  assert.equal(selectedState.targetDamageValue, 1_250_000_000);
+  assert.equal(selectedState.useStaminaPotions, true);
+
+  const targetEvents = [];
+  const staminaEvents = [];
+  const targetInput = {
+    value: '3b',
+    dispatchEvent(event) {
+      targetEvents.push(event.type);
+      return true;
+    },
+  };
+  const staminaInput = {
+    checked: false,
+    dispatchEvent(event) {
+      staminaEvents.push(event.type);
+      return true;
+    },
+  };
+  let targetAtStart = '';
+  let staminaAtStart = false;
+  const battleDocument = createDocument({
+    nodes: {
+      '#tm-monster-auto-battle': {},
+      '#mabTarget': targetInput,
+      '#mabAutoStamina': staminaInput,
+      '#mabStart': {
+        disabled: false,
+        click() {
+          targetAtStart = targetInput.value;
+          staminaAtStart = staminaInput.checked;
+        },
+      },
+      '#mabStatus': { textContent: 'Ready' },
+      '#yourDamageValue': { textContent: '0' },
+      '#hpText': { textContent: '100b / 100b' },
+    },
+  });
+  const secondPage = runUserscript({
+    document: battleDocument,
+    href: 'https://demonicscans.org/battle.php?id=556650107',
+    localStorage: storage,
+    sessionStorage: createStorage({
+      [BOSS_CONFIG.ownerStorageKey]: selectedState.ownerId,
+    }),
+  });
+
+  secondPage.timers.run(40);
+
+  assert.equal(targetAtStart, '1.25b');
+  assert.equal(staminaAtStart, true);
+  assert.deepEqual(targetEvents, ['input', 'change']);
+  assert.deepEqual(staminaEvents, ['input', 'change']);
+  assert.equal(readBossState(storage).startIssued, true);
 });
 
 test('an unverified battle URL never sets 3b or starts Monster Auto Battle', () => {
@@ -1646,6 +1972,49 @@ test('a stopped issued run below 3b starts Monster Auto Battle again', () => {
     assert.equal(state.targetBossId, bossId, statusText);
     assert.equal(state.phase, BOSS_PHASES.attacking, statusText);
   }
+});
+
+test('a repeatedly invalid MAB attack setup is bounded and returns to Wave 3', () => {
+  let startClicks = 0;
+  const storage = storageWithBossState(
+    bossState({
+      phase: BOSS_PHASES.attacking,
+      targetBossId: '812',
+      startIssued: true,
+      actionKind: 'start',
+      actionAt: FIXED_NOW - BOSS_CONFIG.actionRetryMs,
+      actionAttempts: BOSS_CONFIG.maxActionAttempts,
+    }),
+  );
+  const document = createDocument({
+    nodes: {
+      '#tm-monster-auto-battle': {},
+      '#mabTarget': { value: '3b' },
+      '#mabStart': {
+        disabled: false,
+        click() {
+          startClicks += 1;
+        },
+      },
+      '#mabStatus': { textContent: 'Please select a valid Attack 1.' },
+      '#yourDamageValue': { textContent: '0' },
+      '#hpText': { textContent: '100b / 100b' },
+    },
+  });
+  const { navigation, timers } = runUserscript({
+    document,
+    href: 'https://demonicscans.org/battle.php?id=812',
+    localStorage: storage,
+  });
+
+  timers.run(40);
+
+  assert.equal(startClicks, 0);
+  assert.equal(
+    navigation.replacedWith,
+    'https://demonicscans.org/active_wave.php?gate=3&wave=8',
+  );
+  assert.deepEqual(readBossState(storage).failedBossIds, ['812']);
 });
 
 test('a stale reached-target status below 3b restarts instead of completing the boss', () => {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Wave 3 Boss Manager
 // @namespace    local.veyra.wave-3-boss-manager
-// @version      1.0.0
+// @version      1.1.0
 // @description  Checks Grakthar Wave 3 bosses and delegates each fight to Monster Auto Battle.
 // @match        https://demonicscans.org/active_wave.php*
 // @match        https://demonicscans.org/battle.php*
@@ -16,13 +16,21 @@
   'use strict';
 
   const COMMAND_KEY = 'veyra:orchestrator:command:v1';
+  const META_CONFIG_KEY = 'veyra:orchestrator:config:v1';
   const STATUS_KEY = 'veyra:worker:wave3:status:v1';
   const WORKER_ID = 'wave3';
+
+  const DEFAULT_BOSSES = Object.freeze({
+    skarn: Object.freeze({ name: 'General Skarn the Radiant Bastion', damage: '3b' }),
+    vessir: Object.freeze({ name: 'General Vessir the Sunfang Duelist', damage: '3b' }),
+    hrazz: Object.freeze({ name: 'General Hrazz the Dawnflame Oathkeeper', damage: '3b' }),
+    drakzareth: Object.freeze({ name: 'Drakzareth The Tyrant Lizard King', damage: '3b' }),
+  });
 
   const BOSS_CONFIG = Object.freeze({
     storageKey: 'veyra:wave3:run:v1',
     ownerStorageKey: 'veyra:wave3:owner:v1',
-    stateVersion: 1,
+    stateVersion: 2,
     scanIntervalMs: 200,
     scanDebounceMs: 40,
     leaseMs: 5 * 60_000,
@@ -88,6 +96,76 @@
     return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
   }
 
+  function normalizeBossName(value) {
+    return normalizeComparableText(value)
+      .replace(/[^a-z0-9]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function normalizeDamageTarget(value, fallback = BOSS_CONFIG.targetDamage) {
+    const requested = String(value ?? '')
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, '');
+    const parsed = parseGameNumber(requested);
+    if (/^[\d.,]+[kmbtq]?$/.test(requested) && Number.isFinite(parsed) && parsed > 0) {
+      return { text: requested, value: parsed };
+    }
+
+    const fallbackText = String(fallback || BOSS_CONFIG.targetDamage)
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, '');
+    const fallbackValue = parseGameNumber(fallbackText);
+    return {
+      text: fallbackText || BOSS_CONFIG.targetDamage,
+      value:
+        Number.isFinite(fallbackValue) && fallbackValue > 0
+          ? fallbackValue
+          : BOSS_CONFIG.targetDamageValue,
+    };
+  }
+
+  function bossKeyFromName(value) {
+    const name = normalizeBossName(value);
+    if (!name) return '';
+    return (
+      Object.entries(DEFAULT_BOSSES).find(([, boss]) => normalizeBossName(boss.name) === name)?.[0] ||
+      ''
+    );
+  }
+
+  function normalizeWaveSettings(value) {
+    const bosses = {};
+    for (const [key, fallback] of Object.entries(DEFAULT_BOSSES)) {
+      const configured = value?.bosses?.[key];
+      bosses[key] = {
+        name: String(configured?.name || fallback.name).trim() || fallback.name,
+        damage: normalizeDamageTarget(configured?.damage, fallback.damage).text,
+      };
+    }
+
+    return {
+      useStaminaPotions: value?.useStaminaPotions === true,
+      bosses,
+    };
+  }
+
+  function bossTargetFor(key, name, settings = normalizeWaveSettings()) {
+    const fallbackKey = bossKeyFromName(name);
+    const resolvedKey = DEFAULT_BOSSES[key] ? key : fallbackKey;
+    const configured = settings.bosses?.[resolvedKey];
+    const target = normalizeDamageTarget(configured?.damage);
+    return {
+      key: resolvedKey,
+      name: String(name || configured?.name || DEFAULT_BOSSES[resolvedKey]?.name || '').trim(),
+      damage: target.text,
+      damageValue: target.value,
+      useStaminaPotions: settings.useStaminaPotions === true,
+    };
+  }
+
   function createDefaultBossCycleState(now = Date.now()) {
     return {
       version: BOSS_CONFIG.stateVersion,
@@ -97,6 +175,11 @@
       cycleStartedAt: 0,
       phaseUpdatedAt: now,
       targetBossId: '',
+      targetBossKey: '',
+      targetBossName: '',
+      targetDamage: BOSS_CONFIG.targetDamage,
+      targetDamageValue: BOSS_CONFIG.targetDamageValue,
+      useStaminaPotions: false,
       processedBossIds: [],
       failedBossIds: [],
       ownerId: '',
@@ -136,6 +219,11 @@
       cycleStartedAt: numberOr(value.cycleStartedAt, 0),
       phaseUpdatedAt: numberOr(value.phaseUpdatedAt, now),
       targetBossId: String(value.targetBossId || ''),
+      targetBossKey: String(value.targetBossKey || ''),
+      targetBossName: String(value.targetBossName || ''),
+      targetDamage: normalizeDamageTarget(value.targetDamage).text,
+      targetDamageValue: normalizeDamageTarget(value.targetDamage).value,
+      useStaminaPotions: value.useStaminaPotions === true,
       processedBossIds: normalizeBossIdList(value.processedBossIds),
       failedBossIds: normalizeBossIdList(value.failedBossIds),
       ownerId: String(value.ownerId || ''),
@@ -167,27 +255,30 @@
     );
   }
 
-  function isFightableBossData(dataset) {
+  function isFightableBossData(dataset, targetDamageValue = BOSS_CONFIG.targetDamageValue) {
     if (!isAliveBossData(dataset)) return false;
     const joined = String(dataset.joined || '');
     const damage = parseGameNumber(dataset.userdmg);
-    return joined === '0' || !Number.isFinite(damage) || damage < BOSS_CONFIG.targetDamageValue;
+    return joined === '0' || !Number.isFinite(damage) || damage < targetDamageValue;
   }
 
-  function monsterAutoBattleCompletionReason({ statusText, damageText, hpText }) {
+  function monsterAutoBattleCompletionReason(
+    { statusText, damageText, hpText },
+    targetDamageValue = BOSS_CONFIG.targetDamageValue,
+  ) {
     const status = normalizeComparableText(statusText);
     const damage = parseGameNumber(damageText);
     const hp = String(hpText || '').trim();
 
-    if (Number.isFinite(damage) && damage >= BOSS_CONFIG.targetDamageValue) return 'target';
+    if (Number.isFinite(damage) && damage >= targetDamageValue) return 'target';
     if (/(?:^|[^\d])0(?:[.,]0+)?\s*\//.test(hp) || /monster defeated/.test(status)) {
       return 'defeated';
     }
     return null;
   }
 
-  function isMonsterAutoBattleSuccess(snapshot) {
-    return monsterAutoBattleCompletionReason(snapshot) !== null;
+  function isMonsterAutoBattleSuccess(snapshot, targetDamageValue = BOSS_CONFIG.targetDamageValue) {
+    return monsterAutoBattleCompletionReason(snapshot, targetDamageValue) !== null;
   }
 
   function isMonsterAutoBattleFailure(statusText) {
@@ -202,7 +293,11 @@
     BOSS_CONFIG,
     BOSS_PHASES,
     COMMAND_KEY,
+    DEFAULT_BOSSES,
+    META_CONFIG_KEY,
     STATUS_KEY,
+    bossKeyFromName,
+    bossTargetFor,
     createDefaultBossCycleState,
     isAliveBossData,
     isFightableBossData,
@@ -210,7 +305,9 @@
     isMonsterAutoBattleSuccess,
     isUntouchedActiveBossData,
     monsterAutoBattleCompletionReason,
+    normalizeDamageTarget,
     normalizeBossCycleState,
+    normalizeWaveSettings,
     parseGameNumber,
     parseInteger,
   });
@@ -230,6 +327,7 @@
     monsterAutoStart: '#mabStart',
     monsterAutoStop: '#mabStop',
     monsterAutoStatus: '#mabStatus',
+    monsterAutoStamina: '#mabAutoStamina',
     monsterDamage: '#yourDamageValue',
     monsterHp: '#hpText',
     monsterJoin: '#join-battle',
@@ -298,6 +396,16 @@
     };
   }
 
+  function isOrchestratorCommandExpired(command, now = Date.now()) {
+    const deadlineAt = Number(command?.deadlineAt);
+    return Number.isFinite(deadlineAt) && deadlineAt > 0 && now > deadlineAt;
+  }
+
+  function loadWaveSettings() {
+    const config = parseStoredJson(runtime.bossStorage, META_CONFIG_KEY);
+    return normalizeWaveSettings(config?.routes?.wave3?.settings);
+  }
+
   function loadPublishedWorkerStatus() {
     const value = parseStoredJson(runtime.bossStorage, STATUS_KEY);
     if (!value || typeof value !== 'object' || Number(value.version) !== 1) return null;
@@ -312,16 +420,34 @@
 
   function matchingRunningCommand() {
     const command = loadOrchestratorCommand();
-    return command?.taskId === WORKER_ID && command.phase === 'running' && command.visitId
+    return command?.taskId === WORKER_ID &&
+      command.phase === 'running' &&
+      command.visitId &&
+      !isOrchestratorCommandExpired(command)
       ? command
       : null;
+  }
+
+  function waveDrainingCommand() {
+    const command = loadOrchestratorCommand();
+    return command?.taskId === WORKER_ID &&
+      command.phase === 'draining' &&
+      command.visitId
+      ? command
+      : null;
+  }
+
+  function matchingDrainingCommand(visitId) {
+    const command = waveDrainingCommand();
+    return command?.visitId === String(visitId || '') ? command : null;
   }
 
   function hasBlockingOrchestratorCommand() {
     // A command for another worker, or a Wave 3 command that is still
     // draining, belongs to the orchestrator. It must never be mistaken for a
     // command-free manual visit during the navigation hand-off window.
-    return Boolean(loadOrchestratorCommand());
+    const command = loadOrchestratorCommand();
+    return Boolean(command && !isOrchestratorCommandExpired(command));
   }
 
   function publishWorkerStatus(state, safeToLeave, message = '', visitId = runtime.activeVisitId) {
@@ -424,12 +550,17 @@
   }
 
   function renewBossCycleLease(state, now = Date.now()) {
+    const navigationVisitId = currentUrl().searchParams.get('veyra_visit') || '';
+    const canRestoreNavigatedOwner = Boolean(
+      state?.visitId && navigationVisitId === state.visitId,
+    );
     if (
       state?.active &&
       state.ownerId &&
       state.ownerId !== runtime.bossOwnerId &&
       state.leaseUntil > now &&
       !runtime.bossOwnerRestored &&
+      canRestoreNavigatedOwner &&
       (isBossHubPage() || isMonsterBattlePage())
     ) {
       runtime.bossOwnerId = state.ownerId;
@@ -541,6 +672,32 @@
     if (!state) return null;
 
     const command = matchingRunningCommand();
+    // A previous page can leave an active private run behind when the browser
+    // is killed, the scheduler times out, or mobile navigation loses the
+    // pagehide event. A new scheduler visit is authoritative and must never
+    // inherit the old visit ID, processed bosses, target, or lease owner.
+    if (state.active && command && state.visitId !== command.visitId) {
+      runtime.bossOwnerId = getBossOwnerId();
+      runtime.bossOwnerRestored = true;
+      state = saveBossCycleState(
+        {
+          ...createDefaultBossCycleState(now),
+          active: true,
+          visitId: command.visitId,
+          phase: BOSS_PHASES.checking,
+          cycleStartedAt: now,
+          phaseUpdatedAt: now,
+          ownerId: runtime.bossOwnerId,
+          leaseUntil: now + BOSS_CONFIG.leaseMs,
+        },
+        now,
+      );
+      runtime.manualScanStarted = true;
+      runtime.activeVisitId = command.visitId;
+      publishWorkerStatus('busy', false, 'Wave 3 boss scan started.', command.visitId);
+      return state;
+    }
+
     if (state.active) {
       // Any active run consumes this page load's one-shot scan. Otherwise an
       // orchestrated run could finish, have its command cleared, and then
@@ -797,37 +954,79 @@
     }
   }
 
-  function getActiveAutoSummonBossIds() {
-    return new Set(
-      Array.from(document.querySelectorAll(SELECTORS.activeAutoSummonBossLink))
-        .map(getMonsterIdFromBattleLink)
-        .filter(Boolean),
+  function autoSummonCardForLink(link) {
+    const closest = link?.closest?.('.auto-summon-card[data-alive="1"]');
+    if (closest) return closest;
+
+    return (
+      Array.from(document.querySelectorAll('.auto-summon-card[data-alive="1"]')).find((card) => {
+        const candidate = card.querySelector?.('a[href*="battle.php"]');
+        return candidate === link || getMonsterIdFromBattleLink(candidate) === getMonsterIdFromBattleLink(link);
+      }) || null
     );
   }
 
-  function isRecognizedBossCard(card, activeAutoSummonBossIds) {
+  function getActiveAutoSummonBosses() {
+    const bosses = new Map();
+    for (const link of document.querySelectorAll(SELECTORS.activeAutoSummonBossLink)) {
+      const id = getMonsterIdFromBattleLink(link);
+      if (!id) continue;
+      const card = autoSummonCardForLink(link);
+      const name = String(
+        card?.querySelector?.('.auto-summon-name')?.textContent || link?.dataset?.bossName || '',
+      ).trim();
+      bosses.set(id, {
+        id,
+        link,
+        name,
+        key: bossKeyFromName(name),
+      });
+    }
+    return bosses;
+  }
+
+  function isRecognizedBossCard(card, activeAutoSummonBosses) {
     const bossId = String(card?.dataset?.monsterId || '').trim();
     return Boolean(
       bossId &&
-        (String(card.dataset.boss || '') === '1' || activeAutoSummonBossIds.has(bossId)),
+        (String(card.dataset.boss || '') === '1' || activeAutoSummonBosses.has(bossId)),
     );
   }
 
-  function isFightableBossCard(card, activeAutoSummonBossIds) {
-    if (!isRecognizedBossCard(card, activeAutoSummonBossIds)) return false;
+  function bossNameFromCard(card, activeAutoSummonBosses) {
+    const bossId = String(card?.dataset?.monsterId || '').trim();
+    return String(
+      card?.dataset?.name ||
+        card?.querySelector?.('h3')?.textContent ||
+        activeAutoSummonBosses.get(bossId)?.name ||
+        '',
+    ).trim();
+  }
+
+  function targetForBossCard(card, activeAutoSummonBosses, settings) {
+    const bossId = String(card?.dataset?.monsterId || '').trim();
+    const autoSummon = activeAutoSummonBosses.get(bossId);
+    const name = bossNameFromCard(card, activeAutoSummonBosses);
+    return bossTargetFor(autoSummon?.key || bossKeyFromName(name), name, settings);
+  }
+
+  function isFightableBossCard(card, activeAutoSummonBosses, settings) {
+    if (!isRecognizedBossCard(card, activeAutoSummonBosses)) return false;
     const dataset = card.dataset;
+    const target = targetForBossCard(card, activeAutoSummonBosses, settings);
     return isFightableBossData(
       String(dataset.boss || '') === '1' ? dataset : { ...dataset, boss: '1' },
+      target.damageValue,
     );
   }
 
-  function sortedBossCards(activeAutoSummonBossIds) {
+  function sortedBossCards(activeAutoSummonBosses) {
     const cards = new Set([
       ...document.querySelectorAll(SELECTORS.bossCard),
       ...document.querySelectorAll(SELECTORS.monsterCard),
     ]);
     return Array.from(cards)
-      .filter((card) => isRecognizedBossCard(card, activeAutoSummonBossIds))
+      .filter((card) => isRecognizedBossCard(card, activeAutoSummonBosses))
       .sort((left, right) => {
         const leftExpiry = finiteNumber(left.dataset.expire) ?? Number.POSITIVE_INFINITY;
         const rightExpiry = finiteNumber(right.dataset.expire) ?? Number.POSITIVE_INFINITY;
@@ -938,16 +1137,27 @@
 
     runtime.bossActionPending = true;
     let lockCallbackRan = false;
-    const performWithLock = () => {
+    const performWithLock = (lock) => {
+      if (lockCallbackRan) return;
       lockCallbackRan = true;
-      perform();
+      if (lock) {
+        perform();
+      } else {
+        // `ifAvailable` deliberately returns null while another document owns
+        // the lock. Do not bypass that owner; the next scan will retry.
+        runtime.bossActionPending = false;
+        scheduleScan();
+      }
     };
 
     let lockRequest;
     try {
       lockRequest = locks.request(
         'veyra-wave3:boss-action',
-        { mode: 'exclusive' },
+        // Never queue behind an orphaned mobile Web Lock. The private run's
+        // localStorage lease is still checked immediately before the click,
+        // so a direct fallback remains single-owner in normal operation.
+        { mode: 'exclusive', ifAvailable: true },
         performWithLock,
       );
     } catch (error) {
@@ -957,17 +1167,34 @@
       return;
     }
 
+    const lockWatchdog = window.setTimeout(() => {
+      if (!lockCallbackRan) {
+        console.warn('[Wave 3 Boss Manager] Action lock did not answer; using lease fallback.');
+        lockCallbackRan = true;
+        perform();
+        runtime.bossActionPending = false;
+        scheduleScan();
+      }
+    }, 250);
+
     void Promise.resolve(lockRequest)
       .then(
         () => {
-          if (!lockCallbackRan) performWithLock();
+          if (!lockCallbackRan) {
+            lockCallbackRan = true;
+            perform();
+          }
         },
         (error) => {
           console.warn('[Wave 3 Boss Manager] Action lock failed; using fallback:', error);
-          if (!lockCallbackRan) performWithLock();
+          if (!lockCallbackRan) {
+            lockCallbackRan = true;
+            perform();
+          }
         },
       )
       .finally(() => {
+        window.clearTimeout(lockWatchdog);
         runtime.bossActionPending = false;
         scheduleScan();
       });
@@ -978,6 +1205,11 @@
     const next = patchBossCycleState(state, {
       phase: BOSS_PHASES.returningHub,
       targetBossId: '',
+      targetBossKey: '',
+      targetBossName: '',
+      targetDamage: BOSS_CONFIG.targetDamage,
+      targetDamageValue: BOSS_CONFIG.targetDamageValue,
+      useStaminaPotions: false,
       processedBossIds: normalizeBossIdList([...state.processedBossIds, bossId]),
       failedBossIds: normalizeBossIdList([...state.failedBossIds, bossId]),
       actionKind: '',
@@ -999,6 +1231,11 @@
     const next = patchBossCycleState(state, {
       phase: BOSS_PHASES.returningHub,
       targetBossId: '',
+      targetBossKey: '',
+      targetBossName: '',
+      targetDamage: BOSS_CONFIG.targetDamage,
+      targetDamageValue: BOSS_CONFIG.targetDamageValue,
+      useStaminaPotions: false,
       processedBossIds: normalizeBossIdList([...state.processedBossIds, bossId]),
       failedBossIds: state.failedBossIds.filter((candidate) => candidate !== bossId),
       actionKind: '',
@@ -1010,7 +1247,7 @@
     report(
       reason === 'defeated'
         ? `Boss ${bossId} was defeated; returning to the wave.`
-        : `Boss ${bossId} reached the 3b target; returning to the wave.`,
+        : `Boss ${bossId} reached the ${state.targetDamage} target; returning to the wave.`,
     );
     navigateTo(BOSS_CONFIG.wavePath);
     return next;
@@ -1035,6 +1272,14 @@
     runtime.activeVisitId = state.visitId || runtime.activeVisitId;
     publishWorkerStatus('busy', false, 'Wave 3 boss scan is running.', runtime.activeVisitId);
 
+    // Draining means the scheduler wants to leave as soon as the current
+    // unsafe page transition/fight is over. Reaching the hub is the safe
+    // boundary: do not start or reopen another boss here.
+    if (matchingDrainingCommand(state.visitId)) {
+      finishBossCycle(state, 'Wave 3 stopped safely at the boss hub.');
+      return;
+    }
+
     if (isBossCycleStale(state, now)) {
       state = patchBossCycleState(
         state,
@@ -1056,7 +1301,10 @@
     state = ensureAliveMonsterWaveFilter(state, now);
     if (!state) return;
 
-    if (!document.querySelector(SELECTORS.bossContainer)) {
+    const settings = loadWaveSettings();
+    const activeAutoSummonBosses = getActiveAutoSummonBosses();
+    const bossContainer = document.querySelector(SELECTORS.bossContainer);
+    if (!bossContainer && activeAutoSummonBosses.size === 0) {
       if (now - state.phaseUpdatedAt >= BOSS_CONFIG.actionTimeoutMs) {
         patchBossCycleState(state, {
           phase: BOSS_PHASES.checking,
@@ -1074,14 +1322,13 @@
       return;
     }
 
-    const activeAutoSummonBossIds = getActiveAutoSummonBossIds();
-    const cards = sortedBossCards(activeAutoSummonBossIds);
+    const cards = sortedBossCards(activeAutoSummonBosses);
     if (now - state.phaseUpdatedAt < BOSS_CONFIG.hubSettleMs) {
       report('Waiting briefly for all boss cards to render.');
       return;
     }
 
-    if (cards.length === 0) {
+    if (cards.length === 0 && activeAutoSummonBosses.size === 0) {
       if (runtime.bossEmptySince === 0) runtime.bossEmptySince = now;
       if (now - runtime.bossEmptySince < BOSS_CONFIG.hubEmptyWaitMs) {
         report('Waiting for the alive boss list to finish loading.');
@@ -1098,11 +1345,14 @@
       state.targetBossId && state.failedBossIds.includes(state.targetBossId),
     );
     let card =
-      targetCard && isFightableBossCard(targetCard, activeAutoSummonBossIds) && !targetBossFailed
+      targetCard && isFightableBossCard(targetCard, activeAutoSummonBosses, settings) && !targetBossFailed
         ? targetCard
         : null;
+    let autoSummonBoss = state.targetBossId && !targetCard
+      ? activeAutoSummonBosses.get(state.targetBossId) || null
+      : null;
 
-    if (state.targetBossId && !card) {
+    if (state.targetBossId && !card && !autoSummonBoss) {
       if (!targetCard && now - state.phaseUpdatedAt < BOSS_CONFIG.actionTimeoutMs) {
         report(`Waiting for boss ${state.targetBossId} to appear in the wave list.`);
         return;
@@ -1110,6 +1360,11 @@
       state = patchBossCycleState(state, {
         phase: BOSS_PHASES.checking,
         targetBossId: '',
+        targetBossKey: '',
+        targetBossName: '',
+        targetDamage: BOSS_CONFIG.targetDamage,
+        targetDamageValue: BOSS_CONFIG.targetDamageValue,
+        useStaminaPotions: false,
         processedBossIds: normalizeBossIdList([...state.processedBossIds, state.targetBossId]),
         failedBossIds: targetBossFailed
           ? state.failedBossIds
@@ -1125,29 +1380,82 @@
       card = cards.find((candidate) => {
         const bossId = String(candidate.dataset.monsterId || '');
         return (
-          isFightableBossCard(candidate, activeAutoSummonBossIds) &&
+          isFightableBossCard(candidate, activeAutoSummonBosses, settings) &&
           !state.processedBossIds.includes(bossId) &&
           !state.failedBossIds.includes(bossId)
         );
       });
     }
 
-    if (!card) {
+    if (card) {
+      autoSummonBoss = activeAutoSummonBosses.get(String(card.dataset.monsterId || '')) || null;
+    } else if (!autoSummonBoss) {
+      autoSummonBoss =
+        Array.from(activeAutoSummonBosses.values()).find(
+          (candidate) =>
+            !cards.some(
+              (cardCandidate) =>
+                String(cardCandidate.dataset.monsterId || '') === candidate.id,
+            ) &&
+            !state.processedBossIds.includes(candidate.id) &&
+            !state.failedBossIds.includes(candidate.id),
+        ) || null;
+    }
+
+    if (!card && !autoSummonBoss) {
       finishBossCycle(state);
       return;
     }
 
-    const bossId = String(card.dataset.monsterId || '');
-    if (state.targetBossId !== bossId) {
+    const bossId = String(card?.dataset?.monsterId || autoSummonBoss?.id || '');
+    const bossName = card
+      ? bossNameFromCard(card, activeAutoSummonBosses)
+      : String(autoSummonBoss?.name || '');
+    const target = card
+      ? targetForBossCard(card, activeAutoSummonBosses, settings)
+      : bossTargetFor(autoSummonBoss?.key, bossName, settings);
+    if (
+      state.targetBossId !== bossId ||
+      state.targetDamage !== target.damage ||
+      state.useStaminaPotions !== target.useStaminaPotions
+    ) {
       state = patchBossCycleState(state, {
         phase: BOSS_PHASES.checking,
         targetBossId: bossId,
+        targetBossKey: target.key,
+        targetBossName: target.name,
+        targetDamage: target.damage,
+        targetDamageValue: target.damageValue,
+        useStaminaPotions: target.useStaminaPotions,
         actionKind: '',
         actionAt: 0,
         actionAttempts: 0,
         startIssued: false,
         lastError: '',
       });
+    }
+
+    // Auto-summon links are server-rendered and authoritative. The separate
+    // monster-card Join button is injected later by page JavaScript and is
+    // frequently absent or inert on mobile. Open the known live boss first;
+    // battle.php then exposes #join-battle (if needed) and finally MAB.
+    if (autoSummonBoss?.link) {
+      if (!actionCanRun(state, 'open-battle', now)) return;
+      if (
+        state.actionKind === 'open-battle' &&
+        state.actionAttempts >= BOSS_CONFIG.maxActionAttempts
+      ) {
+        abandonCurrentBoss(state, 'The live boss link did not open the battle.');
+        return;
+      }
+      report(`Opening live boss ${target.name || bossId}.`);
+      clickBossControl(state, autoSummonBoss.link, {
+        phase: BOSS_PHASES.entering,
+        kind: 'open-battle',
+        maxAttempts: BOSS_CONFIG.maxActionAttempts,
+        allowedPhases: [BOSS_PHASES.checking, BOSS_PHASES.joining, BOSS_PHASES.entering],
+      });
+      return;
     }
 
     const joined = String(card.dataset.joined || '') === '1';
@@ -1206,10 +1514,9 @@
       return;
     }
 
-    if (state.actionKind === 'join') {
-      if (now - state.actionAt >= BOSS_CONFIG.actionTimeoutMs) {
-        abandonCurrentBoss(state, 'Join Battle did not complete.');
-      }
+    if (!actionCanRun(state, 'join', now)) return;
+    if (state.actionKind === 'join' && state.actionAttempts >= BOSS_CONFIG.maxActionAttempts) {
+      abandonCurrentBoss(state, 'Join Battle did not complete after several attempts.');
       return;
     }
 
@@ -1217,7 +1524,7 @@
     clickBossControl(state, joinControl, {
       phase: BOSS_PHASES.joining,
       kind: 'join',
-      once: true,
+      maxAttempts: BOSS_CONFIG.maxActionAttempts,
       allowedPhases: [BOSS_PHASES.checking, BOSS_PHASES.joining],
     });
   }
@@ -1228,15 +1535,26 @@
     element.dispatchEvent(new EventConstructor(type, { bubbles: true }));
   }
 
-  function ensureBossDamageTarget(input) {
+  function ensureBossDamageTarget(input, targetDamage = BOSS_CONFIG.targetDamage) {
     if (!input) return false;
-    if (normalizeComparableText(input.value).replace(/\s/g, '') === BOSS_CONFIG.targetDamage) {
+    const target = normalizeDamageTarget(targetDamage);
+    if (parseGameNumber(input.value) === target.value) {
       return true;
     }
-    input.value = BOSS_CONFIG.targetDamage;
+    input.value = target.text;
     dispatchBubblingEvent(input, 'input');
     dispatchBubblingEvent(input, 'change');
-    return normalizeComparableText(input.value).replace(/\s/g, '') === BOSS_CONFIG.targetDamage;
+    return parseGameNumber(input.value) === target.value;
+  }
+
+  function ensureCheckboxValue(input, checked) {
+    if (!input) return false;
+    const desired = checked === true;
+    if (input.checked === desired) return true;
+    input.checked = desired;
+    dispatchBubblingEvent(input, 'input');
+    dispatchBubblingEvent(input, 'change');
+    return input.checked === desired;
   }
 
   function parseFraction(value) {
@@ -1310,7 +1628,10 @@
     const damageElement = document.querySelector(SELECTORS.monsterDamage);
     const damageText = damageElement?.textContent || '';
     const hpText = document.querySelector(SELECTORS.monsterHp)?.textContent || '';
-    const completionReason = monsterAutoBattleCompletionReason({ statusText, damageText, hpText });
+    const completionReason = monsterAutoBattleCompletionReason(
+      { statusText, damageText, hpText },
+      state.targetDamageValue,
+    );
     if (completionReason) {
       completeCurrentBoss(state, completionReason);
       return;
@@ -1331,7 +1652,7 @@
       }
 
       if (state.actionKind === 'join-page') {
-        if (now - state.actionAt < BOSS_CONFIG.actionTimeoutMs) {
+        if (!actionCanRun(state, 'join-page', now)) {
           report(`Waiting for boss ${state.targetBossId} to accept the battle-page join.`);
           return;
         }
@@ -1353,6 +1674,7 @@
 
     const panel = document.querySelector(SELECTORS.monsterAutoPanel);
     const targetInput = document.querySelector(SELECTORS.monsterAutoTarget);
+    const staminaInput = document.querySelector(SELECTORS.monsterAutoStamina);
     const startButton = document.querySelector(SELECTORS.monsterAutoStart);
     const stopButton = document.querySelector(SELECTORS.monsterAutoStop);
     const autoBattleRunning = Boolean(
@@ -1466,8 +1788,16 @@
       return;
     }
 
-    if (!ensureBossDamageTarget(targetInput)) {
-      abandonCurrentBoss(state, 'The Monster Auto Battle damage field could not be set to 3b.');
+    if (!ensureBossDamageTarget(targetInput, state.targetDamage)) {
+      abandonCurrentBoss(
+        state,
+        `The Monster Auto Battle damage field could not be set to ${state.targetDamage}.`,
+      );
+      return;
+    }
+
+    if (staminaInput && !ensureCheckboxValue(staminaInput, state.useStaminaPotions)) {
+      abandonCurrentBoss(state, 'The Monster Auto Battle stamina-potion option could not be set.');
       return;
     }
 
@@ -1480,12 +1810,24 @@
           actionAttempts: Math.max(1, state.actionAttempts),
         });
       }
-      report(`Monster Auto Battle is dealing up to ${BOSS_CONFIG.targetDamage} damage.`);
+      report(`Monster Auto Battle is dealing up to ${state.targetDamage} damage.`);
       return;
     }
 
     if (!actionCanRun(state, 'start', now)) {
       report('Waiting briefly before checking or restarting Monster Auto Battle.');
+      return;
+    }
+
+    if (
+      state.startIssued &&
+      state.actionKind === 'start' &&
+      state.actionAttempts >= BOSS_CONFIG.maxActionAttempts
+    ) {
+      abandonCurrentBoss(
+        state,
+        `Monster Auto Battle failed repeatedly: ${String(statusText || 'unknown error').trim()}`,
+      );
       return;
     }
 
@@ -1495,16 +1837,19 @@
       : 'an unreadable damage value';
     report(
       state.startIssued
-        ? `Monster Auto Battle stopped at ${damageLabel}; restarting because 3b was not reached.`
-        : `Starting Monster Auto Battle with a ${BOSS_CONFIG.targetDamage} damage target.`,
+        ? `Monster Auto Battle stopped at ${damageLabel}; restarting because ${state.targetDamage} was not reached.`
+        : `Starting Monster Auto Battle with a ${state.targetDamage} damage target.`,
       isMonsterAutoBattleFailure(statusText) ? 'error' : 'info',
     );
     clickBossControl(state, startButton, {
       phase: BOSS_PHASES.attacking,
       kind: 'start',
       startIssued: true,
+      maxAttempts: BOSS_CONFIG.maxActionAttempts,
       allowedPhases: [BOSS_PHASES.attacking],
-      beforeClick: () => ensureBossDamageTarget(targetInput),
+      beforeClick: () =>
+        ensureBossDamageTarget(targetInput, state.targetDamage) &&
+        (!staminaInput || ensureCheckboxValue(staminaInput, state.useStaminaPotions)),
     });
   }
 

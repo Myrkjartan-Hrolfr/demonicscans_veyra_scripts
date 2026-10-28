@@ -16,8 +16,12 @@ const {
   POLL_INTERVAL_MS,
   ROUTES,
   RUNTIME_KEY,
+  WAVE3_BOSSES,
+  chooseDueRoute,
   createDefaultConfig,
   createDefaultRuntime,
+  formatCountdown,
+  normalizeConfig,
   routeIdForUrl,
   workerStatusKey,
 } = require(scriptPath);
@@ -64,11 +68,170 @@ function createTimers() {
   };
 }
 
+function createFakeDom(documentListeners) {
+  class FakeElement {
+    constructor(tagName) {
+      this.tagName = String(tagName || '').toUpperCase();
+      this.children = [];
+      this.parentNode = null;
+      this.id = '';
+      this.className = '';
+      this.dataset = {};
+      this.attributes = new Map();
+      this.listeners = new Map();
+      this.style = {
+        removeProperty: (name) => {
+          delete this.style[name];
+        },
+      };
+      this.textContent = '';
+      this.value = '';
+      this.checked = false;
+      this.hidden = false;
+      this.type = '';
+      this.title = '';
+      this._rect = null;
+    }
+
+    get firstChild() {
+      return this.children[0] || null;
+    }
+
+    appendChild(child) {
+      child.parentNode = this;
+      this.children.push(child);
+      return child;
+    }
+
+    removeChild(child) {
+      const index = this.children.indexOf(child);
+      if (index >= 0) this.children.splice(index, 1);
+      child.parentNode = null;
+      return child;
+    }
+
+    replaceChildren(...children) {
+      for (const child of this.children) child.parentNode = null;
+      this.children = [];
+      for (const child of children) this.appendChild(child);
+    }
+
+    remove() {
+      this.parentNode?.removeChild(this);
+    }
+
+    setAttribute(name, value) {
+      this.attributes.set(String(name), String(value));
+    }
+
+    getAttribute(name) {
+      return this.attributes.get(String(name)) ?? null;
+    }
+
+    addEventListener(type, listener) {
+      const listeners = this.listeners.get(type) || [];
+      listeners.push(listener);
+      this.listeners.set(type, listeners);
+    }
+
+    dispatch(type, extra = {}) {
+      for (const listener of this.listeners.get(type) || []) {
+        listener({ type, target: this, ...extra });
+      }
+    }
+
+    click() {
+      this.dispatch('click');
+    }
+
+    getBoundingClientRect() {
+      if (this._rect) return this._rect;
+      if (this.id === 'veyra-meta-scheduler-trigger') {
+        return { left: 0, right: 42, top: 0, bottom: 40, width: 42, height: 40 };
+      }
+      return { left: 0, right: 0, top: 0, bottom: 0, width: 0, height: 0 };
+    }
+  }
+
+  const html = new FakeElement('html');
+  const head = new FakeElement('head');
+  const body = new FakeElement('body');
+  html.appendChild(head);
+  html.appendChild(body);
+
+  function findById(node, id) {
+    if (node.id === id) return node;
+    for (const child of node.children) {
+      const match = findById(child, id);
+      if (match) return match;
+    }
+    return null;
+  }
+
+  const document = {
+    body,
+    head,
+    documentElement: html,
+    activeElement: null,
+    hidden: false,
+    visibilityState: 'visible',
+    createElement(tagName) {
+      return new FakeElement(tagName);
+    },
+    getElementById(id) {
+      return findById(html, String(id));
+    },
+    addEventListener(type, listener) {
+      const listeners = documentListeners.get(type) || [];
+      listeners.push(listener);
+      documentListeners.set(type, listeners);
+    },
+  };
+
+  const siteSettings = new FakeElement('button');
+  siteSettings.id = 'openSettingsDrawerBtn';
+  siteSettings._rect = {
+    left: 900,
+    right: 942,
+    top: 700,
+    bottom: 740,
+    width: 42,
+    height: 40,
+  };
+  body.appendChild(siteSettings);
+
+  const siteConsole = new FakeElement('button');
+  siteConsole.id = 'openConsoleBtn';
+  siteConsole._rect = {
+    left: 850,
+    right: 892,
+    top: 700,
+    bottom: 740,
+    width: 42,
+    height: 40,
+  };
+  body.appendChild(siteConsole);
+
+  const quickSets = new FakeElement('button');
+  quickSets.id = 'openQuickSetDrawerBtn';
+  quickSets._rect = {
+    left: 950,
+    right: 992,
+    top: 700,
+    bottom: 740,
+    width: 42,
+    height: 40,
+  };
+  body.appendChild(quickSets);
+  return document;
+}
+
 function runScheduler({
   href = 'https://demonicscans.org/pvp.php',
   localStorage = createStorage(),
   sessionStorage = createStorage(),
   now = NOW,
+  withDom = false,
 } = {}) {
   const timers = createTimers();
   const navigation = { replacements: [] };
@@ -82,19 +245,21 @@ function runScheduler({
     }
   }
 
-  const document = {
-    body: null,
-    hidden: false,
-    visibilityState: 'visible',
-    getElementById() {
-      return null;
-    },
-    addEventListener(type, listener) {
-      const listeners = documentListeners.get(type) || [];
-      listeners.push(listener);
-      documentListeners.set(type, listeners);
-    },
-  };
+  const document = withDom
+    ? createFakeDom(documentListeners)
+    : {
+        body: null,
+        hidden: false,
+        visibilityState: 'visible',
+        getElementById() {
+          return null;
+        },
+        addEventListener(type, listener) {
+          const listeners = documentListeners.get(type) || [];
+          listeners.push(listener);
+          documentListeners.set(type, listeners);
+        },
+      };
 
   const window = {
     ...timers.api,
@@ -109,10 +274,19 @@ function runScheduler({
         navigation.replacements.push(String(nextUrl));
       },
     },
+    innerWidth: 1024,
+    innerHeight: 768,
     addEventListener(type, listener) {
       const listeners = windowListeners.get(type) || [];
       listeners.push(listener);
       windowListeners.set(type, listeners);
+    },
+    removeEventListener(type, listener) {
+      const listeners = windowListeners.get(type) || [];
+      windowListeners.set(
+        type,
+        listeners.filter((candidate) => candidate !== listener),
+      );
     },
   };
 
@@ -177,6 +351,151 @@ test('metadata covers apex and www pages without privileged grants', () => {
   assert.match(scriptSource, /^\/\/ @noframes$/m);
 });
 
+test('default config exposes route toggles and all four Wave 3 boss settings', () => {
+  const config = createDefaultConfig();
+
+  assert.equal(config.routes.pvp.enabled, true);
+  assert.equal(config.routes.wave3.enabled, true);
+  assert.equal(config.routes.wave3.settings.useStaminaPotions, false);
+  assert.deepEqual(
+    Object.keys(config.routes.wave3.settings.bosses),
+    Object.keys(WAVE3_BOSSES),
+  );
+  for (const boss of Object.values(WAVE3_BOSSES)) {
+    assert.deepEqual(config.routes.wave3.settings.bosses[boss.id], {
+      name: boss.name,
+      damage: '3b',
+    });
+  }
+});
+
+test('normalizes old configs and preserves valid Wave 3 drawer settings', () => {
+  const migrated = normalizeConfig({ version: 1, enabled: true, homeRouteId: 'pvp' });
+  assert.equal(migrated.routes.pvp.enabled, true);
+  assert.equal(migrated.routes.wave3.settings.bosses.skarn.damage, '3b');
+
+  const customized = normalizeConfig({
+    ...createDefaultConfig(),
+    routes: {
+      pvp: { enabled: false, settings: {} },
+      wave3: {
+        enabled: true,
+        settings: {
+          useStaminaPotions: true,
+          bosses: {
+            skarn: { name: 'untrusted name', damage: '4.25b' },
+            vessir: { damage: '' },
+          },
+        },
+      },
+    },
+  });
+
+  assert.equal(customized.routes.pvp.enabled, false);
+  assert.equal(customized.routes.wave3.settings.useStaminaPotions, true);
+  assert.equal(customized.routes.wave3.settings.bosses.skarn.name, WAVE3_BOSSES.skarn.name);
+  assert.equal(customized.routes.wave3.settings.bosses.skarn.damage, '4.25b');
+  assert.equal(customized.routes.wave3.settings.bosses.vessir.damage, '3b');
+
+  const invalid = normalizeConfig({
+    ...createDefaultConfig(),
+    routes: {
+      ...createDefaultConfig().routes,
+      wave3: {
+        enabled: true,
+        settings: {
+          bosses: {
+            skarn: { damage: 'abc' },
+            vessir: { damage: '0' },
+          },
+        },
+      },
+    },
+  });
+  assert.equal(invalid.routes.wave3.settings.bosses.skarn.damage, '3b');
+  assert.equal(invalid.routes.wave3.settings.bosses.vessir.damage, '3b');
+});
+
+test('disabled routes are excluded from due-route selection', () => {
+  const runtime = createDefaultRuntime(NOW);
+  runtime.nextRunAt.pvp = NOW - 2;
+  runtime.nextRunAt.wave3 = NOW - 1;
+  const config = createDefaultConfig();
+  config.routes.pvp.enabled = false;
+
+  assert.equal(chooseDueRoute(runtime, NOW, config).id, 'wave3');
+  config.routes.wave3.enabled = false;
+  assert.equal(chooseDueRoute(runtime, NOW, config), null);
+});
+
+test('countdown text is stable for due, minute and hour values', () => {
+  assert.equal(formatCountdown(NOW, NOW), 'Jetzt fällig');
+  assert.equal(formatCountdown(NOW + 65_000, NOW), 'Noch 01:05');
+  assert.equal(formatCountdown(NOW + 3_661_000, NOW), 'Noch 01:01:01');
+});
+
+test('floating trigger opens the drawer and its controls persist scheduler config', () => {
+  const runtime = createDefaultRuntime(NOW);
+  runtime.nextRunAt.pvp = NOW + ROUTES.pvp.intervalMs;
+  runtime.nextRunAt.wave3 = NOW + ROUTES.wave3.intervalMs;
+  const localStorage = configuredStorage({ runtime });
+  const harness = runScheduler({ localStorage, withDom: true });
+  const byId = (id) => harness.document.getElementById(id);
+
+  const trigger = byId('veyra-meta-scheduler-trigger');
+  const drawer = byId('veyra-meta-scheduler-drawer');
+  assert.ok(trigger);
+  assert.ok(drawer);
+  assert.equal(trigger.style.left, '900px');
+  assert.equal(trigger.style.top, '652px');
+  assert.equal(byId('veyra-meta-scheduler-toggle').textContent, 'Stop');
+
+  trigger.click();
+  assert.equal(drawer.dataset.open, 'true');
+
+  const home = byId('veyra-meta-scheduler-home');
+  home.value = 'wave3';
+  home.dispatch('change');
+  assert.equal(read(localStorage, CONFIG_KEY).homeRouteId, 'wave3');
+
+  const waveToggle = byId('veyra-meta-scheduler-route-wave3-enabled');
+  waveToggle.checked = false;
+  waveToggle.dispatch('change');
+  assert.equal(read(localStorage, CONFIG_KEY).routes.wave3.enabled, false);
+  assert.equal(byId('veyra-meta-scheduler-route-wave3-countdown').textContent, 'Inaktiv');
+
+  byId('veyra-meta-scheduler-toggle').click();
+  assert.equal(read(localStorage, CONFIG_KEY).enabled, false);
+  assert.equal(byId('veyra-meta-scheduler-toggle').textContent, 'Start');
+});
+
+test('Wave 3 subdrawer saves four damage targets and the stamina-potion option', () => {
+  const runtime = createDefaultRuntime(NOW);
+  runtime.nextRunAt.pvp = NOW + ROUTES.pvp.intervalMs;
+  runtime.nextRunAt.wave3 = NOW + ROUTES.wave3.intervalMs;
+  const localStorage = configuredStorage({ runtime });
+  const harness = runScheduler({ localStorage, withDom: true });
+  const byId = (id) => harness.document.getElementById(id);
+
+  byId('veyra-meta-scheduler-route-wave3-settings').click();
+  assert.equal(byId('veyra-meta-scheduler-drawer').dataset.view, 'settings');
+
+  for (const boss of Object.values(WAVE3_BOSSES)) {
+    assert.equal(byId(`veyra-meta-scheduler-wave3-damage-${boss.id}`).value, '3b');
+  }
+
+  const skarnDamage = byId('veyra-meta-scheduler-wave3-damage-skarn');
+  skarnDamage.value = '4b';
+  skarnDamage.dispatch('change');
+  const potions = byId('veyra-meta-scheduler-wave3-stamina-potions');
+  potions.checked = true;
+  potions.dispatch('change');
+
+  const config = read(localStorage, CONFIG_KEY);
+  assert.equal(config.routes.wave3.settings.bosses.skarn.damage, '4b');
+  assert.equal(config.routes.wave3.settings.useStaminaPotions, true);
+});
+
 test('the PvP lobby and standalone PvP battle belong to the same worker route', () => {
   assert.equal(routeIdForUrl('https://demonicscans.org/pvp.php'), 'pvp');
   assert.equal(routeIdForUrl('https://demonicscans.org/pvp_battle.php?id=7'), 'pvp');
@@ -205,6 +524,44 @@ test('a due Wave 3 visit waits for a fresh safe PvP hand-off and then navigates'
   assert.deepEqual(harness.navigation.replacements, [
     'https://demonicscans.org/active_wave.php?gate=3&wave=8',
   ]);
+});
+
+test('a disabled due route does not issue a visit command', () => {
+  const config = createDefaultConfig();
+  config.routes.wave3.enabled = false;
+  const localStorage = configuredStorage({ runtime: runtimeWithDueWave() });
+  save(localStorage, CONFIG_KEY, config);
+
+  const harness = runScheduler({ localStorage });
+
+  assert.equal(localStorage.getItem(COMMAND_KEY), null);
+  assert.equal(read(localStorage, RUNTIME_KEY).activeVisit, null);
+  assert.deepEqual(harness.navigation.replacements, []);
+});
+
+test('a disabled active route times out and returns home without a worker heartbeat', () => {
+  const runtime = createDefaultRuntime(NOW);
+  const visit = {
+    ...runningVisit('wave3', ROUTES.pvp.path),
+    deadlineAt: NOW,
+  };
+  runtime.activeVisit = visit;
+  const config = createDefaultConfig();
+  config.routes.wave3.enabled = false;
+  const localStorage = configuredStorage({ runtime });
+  save(localStorage, CONFIG_KEY, config);
+  save(localStorage, COMMAND_KEY, visit);
+
+  const harness = runScheduler({
+    href: 'https://demonicscans.org/active_wave.php?gate=3&wave=8',
+    localStorage,
+  });
+
+  const settledRuntime = read(localStorage, RUNTIME_KEY);
+  assert.equal(settledRuntime.activeVisit, null);
+  assert.equal(settledRuntime.lastResult.state, 'error');
+  assert.equal(localStorage.getItem(COMMAND_KEY), null);
+  assert.deepEqual(harness.navigation.replacements, ['https://demonicscans.org/pvp.php']);
 });
 
 test('a busy standalone PvP battle defers a due route change', () => {
