@@ -48,10 +48,12 @@ async function postForm(url, params, options = {}) {
     maxRetryAfterMs = DEFAULT_MAX_RETRY_AFTER_MS,
     headers = {},
     onRateLimit = null,
+    beforeAttempt = null,
   } = options;
 
   const body = toFormBody(params);
   for (let attempt = 0; ; attempt += 1) {
+    await beforeAttempt?.({ attempt });
     const response = await fetchImpl(url, {
       method: 'POST',
       credentials: 'same-origin',

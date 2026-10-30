@@ -2,6 +2,7 @@
 
 module.exports = [
   require('./adventurers-guild-layout'),
+  require('./auto-battle-extras'),
   require('./better-header'),
   require('./custom-navigation'),
   require('./battle-drawer-scroll'),

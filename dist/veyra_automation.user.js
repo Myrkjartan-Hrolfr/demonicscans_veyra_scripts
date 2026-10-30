@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.1.0
+// @version      0.5.0
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -238,10 +238,12 @@
         maxRetryAfterMs = DEFAULT_MAX_RETRY_AFTER_MS,
         headers = {},
         onRateLimit = null,
+        beforeAttempt = null,
       } = options;
 
       const body = toFormBody(params);
       for (let attempt = 0; ; attempt += 1) {
+        await beforeAttempt?.({ attempt });
         const response = await fetchImpl(url, {
           method: 'POST',
           credentials: 'same-origin',
@@ -588,6 +590,10 @@
         safeToLeave: value.safeToLeave === true,
         updatedAt,
         message: String(value.message || ''),
+        // Optional with done/error: when the page should be visited next
+        // (instead of the loop length) and a short reason for the menu.
+        retryAt: finiteTimestamp(value.retryAt, 0),
+        note: String(value.note || '').slice(0, 60),
       };
     }
 
@@ -802,6 +808,939 @@
       formatDuration,
       parseClockDuration,
       sleep,
+    };
+  },
+  "features/automation/adventurers-logic.js": function (module, exports, require) {
+    'use strict';
+
+    const { parseGameNumber } = require('../../core/numbers');
+
+    const WAVE_PATH = '/active_wave.php?gate=5&wave=9';
+    const DEAD_PAGE_SIZE = 200;
+
+    function normalizeName(value) {
+      return String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, ' ');
+    }
+
+    function validId(value) {
+      const text = String(value ?? '').trim();
+      return /^\d+$/.test(text) && Number(text) > 0 ? text : '';
+    }
+
+    function parseQuestRequirement(text) {
+      const source = String(text || '').replace(/\s+/g, ' ').trim();
+      const countMatch = source.match(/\b(?:kill|loot)\s+(\d+)\s+monster(?:\(s\)|s)?\b/i);
+      const targetMatch = source.match(/\bMonster\s*:\s*(.+?)\s*[·|]\s*min\s*([\d.,]+\s*[kmbtq]?)\s*(?:dmg|damage)\b/i);
+      if (!countMatch || !targetMatch) return null;
+      const count = Number.parseInt(countMatch[1], 10);
+      const minDamage = parseGameNumber(targetMatch[2].replace(/\s+/g, ''));
+      const name = String(targetMatch[1] || '').trim();
+      if (!name || !Number.isFinite(count) || count <= 0 || minDamage === null || minDamage < 0) return null;
+      return { name, normalizedName: normalizeName(name), count, minDamage };
+    }
+
+    function actionId(row, action) {
+      const pattern = new RegExp(`${action}\\s*\\(\\s*['\"]?(\\d+)`, 'i');
+      for (const element of row?.querySelectorAll?.('[onclick]') || []) {
+        const match = String(element.getAttribute?.('onclick') || '').match(pattern);
+        if (match) return { id: validId(match[1]), element };
+      }
+      return { id: '', element: null };
+    }
+
+    function progressFromText(text, fallbackTotal = 0) {
+      const match = String(text || '').match(/(\d+)\s*\/\s*(\d+)/);
+      if (!match) return { current: 0, total: fallbackTotal };
+      return {
+        current: Math.max(0, Number.parseInt(match[1], 10) || 0),
+        total: Math.max(0, Number.parseInt(match[2], 10) || fallbackTotal),
+      };
+    }
+
+    function parseQuests(root, nowMs = Date.now()) {
+      const nowSeconds = Math.floor(nowMs / 1_000);
+      const quests = [];
+      for (const row of root?.querySelectorAll?.('.quest-row') || []) {
+        const requirement = parseQuestRequirement(row.querySelector?.('.quest-req-text')?.textContent);
+        if (!requirement) continue;
+        const accept = actionId(row, 'acceptQuest');
+        const finish = actionId(row, 'finishQuest');
+        const giveUp = actionId(row, 'giveUpQuest');
+        const cooldownNode = row.querySelector?.('.quest-cooldown-timer[data-cooldown-ts]');
+        const cooldownAt = Math.max(0, Number(cooldownNode?.getAttribute?.('data-cooldown-ts') || 0) * 1_000);
+        const progress = progressFromText(row.querySelector?.('.quest-progress')?.textContent, requirement.count);
+        const activeId = finish.id || giveUp.id;
+        let state = 'unavailable';
+        if (activeId) state = 'active';
+        else if (cooldownAt > nowSeconds * 1_000) state = 'cooldown';
+        else if (accept.id) state = 'available';
+        quests.push({
+          id: activeId || accept.id,
+          title: String(row.querySelector?.('.quest-main-title')?.textContent || requirement.name).trim(),
+          requirement,
+          state,
+          cooldownAt,
+          progress,
+          finishReady: Boolean(finish.id && finish.element?.disabled !== true),
+        });
+      }
+      return quests;
+    }
+
+    function actionableQuests(quests) {
+      return (quests || []).filter((quest) => quest.state === 'active' || quest.state === 'available');
+    }
+
+    function aggregateRequirements(requirements) {
+      const merged = new Map();
+      for (const requirement of requirements || []) {
+        if (!requirement?.normalizedName) continue;
+        const current = merged.get(requirement.normalizedName);
+        if (!current) {
+          merged.set(requirement.normalizedName, { ...requirement });
+          continue;
+        }
+        current.count += requirement.count;
+        current.minDamage = Math.max(current.minDamage, requirement.minDamage);
+      }
+      return [...merged.values()];
+    }
+
+    function earliestCooldown(quests, nowMs = Date.now()) {
+      const values = (quests || [])
+        .map((quest) => Number(quest?.cooldownAt) || 0)
+        .filter((value) => value > nowMs);
+      return values.length ? Math.min(...values) : 0;
+    }
+
+    function deadMonsterFromCard(card, nowMs = Date.now()) {
+      const data = card?.dataset || {};
+      const id = validId(data.monsterId);
+      const name = normalizeName(data.name);
+      const damage = Number(String(data.userdmg ?? '').replace(/[^\d]/g, '')) || 0;
+      const expiresAt = Math.max(0, Number(data.expire || 0) * 1_000);
+      if (!id || !name || data.dead !== '1' || data.eligible !== '1') return null;
+      if (expiresAt > 0 && expiresAt <= nowMs) return null;
+      return { id, name, damage, expiresAt };
+    }
+
+    function readDeadMonsters(root, nowMs = Date.now()) {
+      const monsters = [];
+      for (const card of root?.querySelectorAll?.('.monster-card[data-dead="1"]') || []) {
+        const monster = deadMonsterFromCard(card, nowMs);
+        if (monster) monsters.push(monster);
+      }
+      return monsters;
+    }
+
+    function eligibleForRequirement(monsters, requirement) {
+      if (!requirement) return [];
+      return (monsters || []).filter(
+        (monster) => monster.name === requirement.normalizedName && monster.damage >= requirement.minDamage,
+      );
+    }
+
+    function requirementCounts(requirements, monsters) {
+      return (requirements || []).map((requirement) => ({
+        requirement,
+        count: eligibleForRequirement(monsters, requirement).length,
+      }));
+    }
+
+    function requirementsSatisfied(requirements, monsters) {
+      return requirementCounts(requirements, monsters).every(({ requirement, count }) => count >= requirement.count);
+    }
+
+    function selectedOption(select) {
+      if (!select) return null;
+      const options = [...(select.querySelectorAll?.('option') || [])];
+      return options.find((option) => String(option.value) === String(select.value)) || options.find((option) => option.selected) || null;
+    }
+
+    function readAutoFarmTargets(root) {
+      const targets = [];
+      for (const row of root?.querySelectorAll?.('.af-row[data-target-id]') || []) {
+        const select = row.querySelector?.('.afTMonster');
+        const option = selectedOption(select);
+        const targetId = validId(row.getAttribute?.('data-target-id') || row.dataset?.targetId);
+        const monsterId = validId(select?.value || option?.value);
+        const name = String(option?.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!targetId || !monsterId || !name) continue;
+        targets.push({
+          targetId,
+          monsterId,
+          name,
+          normalizedName: normalizeName(name),
+          enabled: String(row.querySelector?.('.afTEnabled')?.value ?? '0') === '1',
+          mode: String(row.querySelector?.('.afTMode')?.value ?? '0'),
+          minDamage: Math.max(0, Number(row.querySelector?.('.afTMin')?.value) || 0),
+          maxStack: Math.min(250, Math.max(1, Number(row.querySelector?.('.afTStack')?.value) || 1)),
+        });
+      }
+      return targets;
+    }
+
+    function readMonsterOptions(root) {
+      const options = new Map();
+      for (const option of root?.querySelectorAll?.('.afTMonster option, #afAddMonster option') || []) {
+        const id = validId(option.value);
+        const name = String(option.textContent || '').replace(/\s+/g, ' ').trim();
+        const key = normalizeName(name);
+        if (id && key && !options.has(key)) options.set(key, { id, name });
+      }
+      return options;
+    }
+
+    function readInputValue(root, selector, fallback = '0') {
+      const value = root?.querySelector?.(selector)?.value;
+      return value === undefined || value === null ? String(fallback) : String(value);
+    }
+
+    function readAutoFarmSettings(root) {
+      return {
+        TOTAL_MONSTERS_TO_KILL: readInputValue(root, '#afTotalToKill'),
+        HP_POTIONS_MAX_TO_USE: readInputValue(root, '#afHpMax'),
+        STAM_POT_SMALL_ITEM_MAX_TO_USE: readInputValue(root, '#afSt20Max'),
+        STAM_POT_HALF_ITEM_ID_MAX_TO_USE: readInputValue(root, '#afStHalfMax'),
+        STAM_POT_FULL_ITEM_ID_MAX_TO_USE: readInputValue(root, '#afStFullMax'),
+        STAM_POT_ADV_ITEM_MAX_TO_USE: readInputValue(root, '#afStAdvMax'),
+        STAM_POT_PRIORITY_ITEM_ID: readInputValue(root, '#afStPriority'),
+        AUTO_LOOT_TO_LEVEL: readInputValue(root, '#afAutoLootToLevel'),
+        PRC_EXP_LEFT: readInputValue(root, '#afPrcExpLeft', '100'),
+      };
+    }
+
+    function autoFarmIsActive(root) {
+      const badge = root?.querySelector?.('#afStateBadge');
+      const text = String(badge?.textContent || '').trim();
+      return /\b(?:active|running|on)\b/i.test(text) || badge?.classList?.contains?.('on') === true;
+    }
+
+    function deadPageCount(root) {
+      const text = String(root?.body?.textContent || '');
+      const pageMatch = text.match(/Dead\s+loot\s+page\s+\d+\s*\/\s*(\d+)/i);
+      if (pageMatch) return Math.max(1, Number(pageMatch[1]) || 1);
+      const pills = [...(root?.querySelectorAll?.('.unclaimed-pill') || [])];
+      const pill = pills.find((node) => /unclaimed\s+kills/i.test(node.textContent || ''));
+      const count = parseGameNumber(pill?.querySelector?.('.count')?.textContent);
+      return count && count > 0 ? Math.max(1, Math.ceil(count / DEAD_PAGE_SIZE)) : 1;
+    }
+
+    function responseSucceeded(response) {
+      const data = response?.json;
+      const status = String(data?.status || '').toLowerCase();
+      return Boolean(response?.ok && data && (data.ok === true || data.success === true || status === 'ok' || status === 'success'));
+    }
+
+    module.exports = {
+      DEAD_PAGE_SIZE,
+      WAVE_PATH,
+      actionableQuests,
+      aggregateRequirements,
+      autoFarmIsActive,
+      deadMonsterFromCard,
+      deadPageCount,
+      earliestCooldown,
+      eligibleForRequirement,
+      normalizeName,
+      parseQuestRequirement,
+      parseQuests,
+      readAutoFarmSettings,
+      readAutoFarmTargets,
+      readDeadMonsters,
+      readMonsterOptions,
+      requirementCounts,
+      requirementsSatisfied,
+      responseSucceeded,
+      validId,
+    };
+  },
+  "features/automation/adventurers-worker.js": function (module, exports, require) {
+    'use strict';
+
+    // Scheduler-owned Adventurer's Guild worker. It keeps the marked guild page
+    // visible and performs the two requested phases through same-origin requests:
+    // pre-farm every quest monster first, then accept/loot/finish quests one by
+    // one. Auto Farm is snapshotted and restored after the last quest.
+
+    const { setProtectedNames } = require('../../core/loot-guard');
+    const { COMMAND_KEY, normalizeVisit, publishWorkerStatus } = require('../../core/protocol');
+    const { createJsonStore, getStorage } = require('../../core/storage');
+    const { sleep } = require('../../core/time');
+    const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
+    const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
+    const logic = require('./adventurers-logic');
+
+    const ROUTE_ID = 'adventurers';
+    const GUILD_PATH = '/adventurers_guild.php';
+    const AUTO_FARM_PATH = '/auto_farm_actions.php';
+    const ACCEPT_PATH = '/adventurers_accept_quest.php';
+    const FINISH_PATH = '/adventurers_finish_quest.php';
+    const LOOT_PATH = '/loot.php';
+    const AUTOFARM_SNAPSHOT_KEY = 'veyra:adventurers:auto-farm-snapshot:v1';
+    const MAX_DEAD_PAGES = 20;
+    const MAX_QUEST_STEPS = 100;
+    const FARM_POLL_MS = 10_000;
+    const ACTION_DELAY_MS = 150;
+    const POTION_LIMIT = 1_000;
+
+    const TIMING = Object.freeze({
+      tickMs: 1_000,
+      heartbeatMs: 5_000,
+      drainCheckMs: 1_000,
+    });
+
+    class VisitStop extends Error {
+      constructor(kind, message, options = {}) {
+        super(message);
+        this.name = 'VisitStop';
+        this.kind = kind;
+        this.retryAt = Number(options.retryAt) || 0;
+        this.note = String(options.note || '');
+      }
+    }
+
+    function createAdventurersWorker({
+      win,
+      doc,
+      store,
+      sessionStore = null,
+      fetchDocument,
+      postForm,
+      getUserId,
+      sleepImpl = sleep,
+      now = () => Date.now(),
+      logger = console,
+    }) {
+      const runtime = {
+        stopped: false,
+        ticking: false,
+        runningVisitId: '',
+        terminal: null,
+        interval: null,
+        heartbeat: null,
+        message: '',
+        publishSignature: '',
+        publishAt: 0,
+      };
+
+      function currentUrl() {
+        try {
+          return new URL(win.location.href, win.location.origin);
+        } catch {
+          return null;
+        }
+      }
+
+      function isMarkedHub(url = currentUrl()) {
+        return Boolean(
+          url &&
+            /\/adventurers_guild\.php\/?$/i.test(url.pathname) &&
+            url.searchParams.get('veyra_route') === ROUTE_ID,
+        );
+      }
+
+      function readCommand() {
+        const command = normalizeVisit(store.read(COMMAND_KEY), () => true);
+        return command?.taskId === ROUTE_ID ? command : null;
+      }
+
+      function ownsSchedulerLease(t = now()) {
+        if (!sessionStore || sessionStore.available === false) return true;
+        const tabId = sessionStore.readRaw?.(TAB_KEY);
+        const lease = store.read(LEASE_KEY);
+        return Boolean(tabId && lease?.ownerId === tabId && Number(lease?.leaseUntil) > t);
+      }
+
+      function publish(state, safeToLeave, message, visitId = '', options = {}) {
+        const t = now();
+        const retryAt = Number(options.retryAt) || 0;
+        const note = String(options.note || '');
+        const signature = `${visitId}|${state}|${safeToLeave}|${message}|${retryAt}|${note}`;
+        if (!options.force && signature === runtime.publishSignature && t - runtime.publishAt < TIMING.heartbeatMs) {
+          return null;
+        }
+        runtime.publishSignature = signature;
+        runtime.publishAt = t;
+        runtime.message = message;
+        return publishWorkerStatus(
+          store,
+          ROUTE_ID,
+          { visitId, workerId: ROUTE_ID, state, safeToLeave, message, retryAt, note },
+          t,
+        );
+      }
+
+      function log(message, level = 'info') {
+        const method = level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'info';
+        logger?.[method]?.(`[Veyra:adventurers-worker] ${message}`);
+      }
+
+      function setWorkingMessage(visitId, message) {
+        runtime.message = message;
+        publish('working', false, message, visitId);
+        log(message);
+      }
+
+      function setTerminal(visitId, state, message, options = {}) {
+        runtime.terminal = {
+          visitId,
+          state,
+          message,
+          retryAt: Number(options.retryAt) || 0,
+          note: String(options.note || ''),
+        };
+        runtime.runningVisitId = '';
+        publish(state, true, message, visitId, { ...runtime.terminal, force: true });
+        log(message, state === 'error' ? 'warn' : 'info');
+      }
+
+      function assertCanContinue(visitId) {
+        if (runtime.stopped) throw new VisitStop('cancelled', "Adventurer's Guild worker stopped.");
+        const command = readCommand();
+        if (!command || command.visitId !== visitId) {
+          throw new VisitStop('cancelled', "The Adventurer's Guild scheduler visit changed.");
+        }
+        if (!ownsSchedulerLease()) {
+          throw new VisitStop('ownership', "Another tab owns the Adventurer's Guild scheduler visit.");
+        }
+        if (command.phase === 'draining' || now() >= command.deadlineAt) {
+          throw new VisitStop('drain', "Adventurer's Guild stopped safely at the scheduler deadline.", {
+            retryAt: now() + 60_000,
+            note: 'Quest work will resume',
+          });
+        }
+        return command;
+      }
+
+      function guardedPost(visitId, url, params, options = {}) {
+        const previousBeforeAttempt = options.beforeAttempt;
+        return postForm(url, params, {
+          ...options,
+          async beforeAttempt(details) {
+            assertCanContinue(visitId);
+            await previousBeforeAttempt?.(details);
+          },
+        });
+      }
+
+      async function waitWithGuard(visitId, durationMs) {
+        let remaining = Math.max(0, durationMs);
+        while (remaining > 0) {
+          assertCanContinue(visitId);
+          const chunk = Math.min(TIMING.drainCheckMs, remaining);
+          await sleepImpl(chunk);
+          remaining -= chunk;
+        }
+        assertCanContinue(visitId);
+      }
+
+      async function fetchFresh(visitId, path) {
+        assertCanContinue(visitId);
+        const separator = path.includes('?') ? '&' : '?';
+        return fetchDocument(`${path}${separator}_veyra_quest=${now()}`);
+      }
+
+      function responseMessage(response) {
+        return String(response?.json?.message || response?.json?.msg || response?.json?.error || response?.text || '').trim();
+      }
+
+      function requireSuccess(response, label) {
+        if (logic.responseSucceeded(response)) return response;
+        throw new Error(`${label} failed${responseMessage(response) ? `: ${responseMessage(response)}` : '.'}`);
+      }
+
+      function routeConfig() {
+        return normalizeConfig(store.read(CONFIG_KEY)).routes[ROUTE_ID];
+      }
+
+      function requirementSignature(requirements) {
+        return (requirements || [])
+          .map((requirement) => `${requirement.normalizedName}:${requirement.count}:${requirement.minDamage}`)
+          .sort()
+          .join('|');
+      }
+
+      function makeTargetPayload(target, patch = {}) {
+        return {
+          TARGET_ID: target.targetId,
+          MONSTER_ID: target.monsterId,
+          IS_ENABLED: patch.enabled ?? (target.enabled ? 1 : 0),
+          DAMAGE_OR_CAP: patch.mode ?? target.mode,
+          MIN_DAMAGE: patch.minDamage ?? target.minDamage,
+          MAX_STACK_PER_HIT: patch.maxStack ?? target.maxStack,
+        };
+      }
+
+      function potionSettings(base) {
+        const selected = routeConfig()?.potions || { stamina: [], heal: [] };
+        const stamina = new Set((selected.stamina || []).map(Number));
+        const heal = new Set((selected.heal || []).map(Number));
+        const priority = [30, 251, 35, 359].find((itemId) => stamina.has(itemId)) || 0;
+        return {
+          ...base,
+          TOTAL_MONSTERS_TO_KILL: '0',
+          HP_POTIONS_MAX_TO_USE: heal.has(108) ? String(POTION_LIMIT) : '0',
+          STAM_POT_SMALL_ITEM_MAX_TO_USE: stamina.has(30) ? String(POTION_LIMIT) : '0',
+          STAM_POT_HALF_ITEM_ID_MAX_TO_USE: stamina.has(251) ? String(POTION_LIMIT) : '0',
+          STAM_POT_FULL_ITEM_ID_MAX_TO_USE: stamina.has(35) ? String(POTION_LIMIT) : '0',
+          STAM_POT_ADV_ITEM_MAX_TO_USE: stamina.has(359) ? String(POTION_LIMIT) : '0',
+          STAM_POT_PRIORITY_ITEM_ID: String(priority),
+          AUTO_LOOT_TO_LEVEL: '0',
+        };
+      }
+
+      function snapshotFromDocument(waveDoc, requirements) {
+        return {
+          version: 1,
+          capturedAt: now(),
+          active: logic.autoFarmIsActive(waveDoc),
+          settings: logic.readAutoFarmSettings(waveDoc),
+          targets: logic.readAutoFarmTargets(waveDoc),
+          questNames: requirements.map((requirement) => requirement.normalizedName),
+          configuredFor: '',
+        };
+      }
+
+      async function configureAutoFarm(visitId, requirements, waveDoc) {
+        let snapshot = store.read(AUTOFARM_SNAPSHOT_KEY);
+        if (!snapshot?.version || !Array.isArray(snapshot.targets)) {
+          snapshot = snapshotFromDocument(waveDoc, requirements);
+          store.write(AUTOFARM_SNAPSHOT_KEY, snapshot);
+        }
+
+        requireSuccess(await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: 0 }), 'Pausing Auto Farm');
+        await waitWithGuard(visitId, ACTION_DELAY_MS);
+
+        const requiredByName = new Map(requirements.map((requirement) => [requirement.normalizedName, requirement]));
+        const targets = logic.readAutoFarmTargets(waveDoc);
+        const options = logic.readMonsterOptions(waveDoc);
+        const found = new Set();
+
+        for (const target of targets) {
+          const requirement = requiredByName.get(target.normalizedName);
+          if (requirement) found.add(target.normalizedName);
+          const desired = requirement
+            ? { enabled: 1, mode: '1', minDamage: requirement.minDamage, maxStack: 50 }
+            : target.enabled
+              ? { enabled: 0 }
+              : null;
+          if (!desired) continue;
+          requireSuccess(
+            await guardedPost(visitId, AUTO_FARM_PATH, { action: 'update_target', ...makeTargetPayload(target, desired) }),
+            `Updating Auto Farm target ${target.name}`,
+          );
+          await waitWithGuard(visitId, ACTION_DELAY_MS);
+        }
+
+        for (const requirement of requirements) {
+          if (found.has(requirement.normalizedName)) continue;
+          const option = options.get(requirement.normalizedName);
+          if (!option) throw new Error(`Auto Farm does not offer the quest monster "${requirement.name}".`);
+          requireSuccess(
+            await guardedPost(visitId, AUTO_FARM_PATH, {
+              action: 'add_target',
+              MONSTER_ID: option.id,
+              DAMAGE_OR_CAP: 1,
+              MIN_DAMAGE: requirement.minDamage,
+              IS_ENABLED: 1,
+              MAX_STACK_PER_HIT: 50,
+            }),
+            `Adding Auto Farm target ${requirement.name}`,
+          );
+          await waitWithGuard(visitId, ACTION_DELAY_MS);
+        }
+
+        requireSuccess(
+          await guardedPost(visitId, AUTO_FARM_PATH, {
+            action: 'save_settings',
+            ...potionSettings(logic.readAutoFarmSettings(waveDoc)),
+          }),
+          'Saving Auto Farm quest settings',
+        );
+        requireSuccess(await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: 1 }), 'Starting Auto Farm');
+
+        snapshot.configuredFor = requirementSignature(requirements);
+        snapshot.questNames = [...new Set([...(snapshot.questNames || []), ...requirements.map((item) => item.normalizedName)])];
+        store.write(AUTOFARM_SNAPSHOT_KEY, snapshot);
+      }
+
+      async function pauseOwnedAutoFarm(visitId) {
+        if (!store.read(AUTOFARM_SNAPSHOT_KEY)) return;
+        requireSuccess(await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: 0 }), 'Pausing quest Auto Farm');
+      }
+
+      // A draining command forbids ordinary mutations, but leaving the game's
+      // server-side Auto Farm running would not be a safe withdrawal. This one
+      // cleanup mutation is allowed only for the same visit while this tab still
+      // owns the scheduler lease. The snapshot stays in place for a later resume.
+      async function pauseAutoFarmForDrain(command) {
+        if (!store.read(AUTOFARM_SNAPSHOT_KEY)) return;
+        try {
+          const response = await postForm(AUTO_FARM_PATH, { action: 'toggle', enabled: 0 }, {
+            maxRetries: 1,
+            beforeAttempt() {
+              const current = readCommand();
+              if (!current || current.visitId !== command.visitId || !ownsSchedulerLease()) {
+                throw new VisitStop('ownership', 'The quest Auto Farm cleanup no longer owns this visit.');
+              }
+            },
+          });
+          if (!logic.responseSucceeded(response)) {
+            log(`Could not pause Auto Farm during withdrawal: ${responseMessage(response) || 'unknown response'}`, 'warn');
+          }
+        } catch (error) {
+          log(`Could not pause Auto Farm during withdrawal: ${error?.message || error}`, 'warn');
+        }
+      }
+
+      async function restoreAutoFarm(visitId) {
+        const snapshot = store.read(AUTOFARM_SNAPSHOT_KEY);
+        if (!snapshot?.version || !Array.isArray(snapshot.targets)) return;
+        setWorkingMessage(visitId, 'Restoring the previous Auto Farm configuration.');
+        requireSuccess(await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: 0 }), 'Pausing Auto Farm');
+        const currentDoc = await fetchFresh(visitId, logic.WAVE_PATH);
+        const originalIds = new Set(snapshot.targets.map((target) => String(target.targetId)));
+        const questNames = new Set(snapshot.questNames || []);
+
+        for (const target of logic.readAutoFarmTargets(currentDoc)) {
+          const original = snapshot.targets.find((saved) => String(saved.targetId) === String(target.targetId));
+          if (original) {
+            requireSuccess(
+              await guardedPost(visitId, AUTO_FARM_PATH, {
+                action: 'update_target',
+                ...makeTargetPayload(original),
+              }),
+              `Restoring Auto Farm target ${original.name}`,
+            );
+          } else if (!originalIds.has(String(target.targetId)) && questNames.has(target.normalizedName)) {
+            requireSuccess(
+              await guardedPost(visitId, AUTO_FARM_PATH, {
+                action: 'update_target',
+                ...makeTargetPayload(target, { enabled: 0 }),
+              }),
+              `Disabling temporary Auto Farm target ${target.name}`,
+            );
+          } else {
+            continue;
+          }
+          await waitWithGuard(visitId, ACTION_DELAY_MS);
+        }
+
+        requireSuccess(
+          await guardedPost(visitId, AUTO_FARM_PATH, { action: 'save_settings', ...snapshot.settings }),
+          'Restoring Auto Farm settings',
+        );
+        requireSuccess(
+          await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: snapshot.active ? 1 : 0 }),
+          'Restoring Auto Farm state',
+        );
+        store.remove(AUTOFARM_SNAPSHOT_KEY);
+      }
+
+      async function readDeadPool(visitId, requirements) {
+        const first = await fetchFresh(visitId, logic.WAVE_PATH);
+        const documents = [first];
+        let totalPages = Math.min(MAX_DEAD_PAGES, logic.deadPageCount(first));
+        let lastCount = (first.querySelectorAll?.('.monster-card[data-dead="1"]') || []).length;
+        if (totalPages === 1 && lastCount >= logic.DEAD_PAGE_SIZE) totalPages = MAX_DEAD_PAGES;
+
+        const seenIds = new Set();
+        const monsters = [];
+        function collect(source) {
+          let added = 0;
+          for (const monster of logic.readDeadMonsters(source, now())) {
+            if (seenIds.has(monster.id)) continue;
+            seenIds.add(monster.id);
+            monsters.push(monster);
+            added += 1;
+          }
+          return added;
+        }
+        collect(first);
+
+        for (let page = 2; page <= totalPages; page += 1) {
+          if (logic.requirementsSatisfied(requirements, monsters)) break;
+          await waitWithGuard(visitId, ACTION_DELAY_MS);
+          const pageDoc = await fetchFresh(visitId, `${logic.WAVE_PATH}&dead_page=${page}`);
+          documents.push(pageDoc);
+          const cards = (pageDoc.querySelectorAll?.('.monster-card[data-dead="1"]') || []).length;
+          const added = collect(pageDoc);
+          if (added === 0 || (totalPages === MAX_DEAD_PAGES && cards < logic.DEAD_PAGE_SIZE)) break;
+          lastCount = cards;
+        }
+        void lastCount;
+        return { monsters, waveDoc: first, documents };
+      }
+
+      function countsMessage(requirements, monsters) {
+        return logic
+          .requirementCounts(requirements, monsters)
+          .map(({ requirement, count }) => `${requirement.name} ${Math.min(count, requirement.count)}/${requirement.count}`)
+          .join(', ');
+      }
+
+      async function ensurePrefarmed(visitId, requirements) {
+        let pool = await readDeadPool(visitId, requirements);
+        if (logic.requirementsSatisfied(requirements, pool.monsters)) {
+          await pauseOwnedAutoFarm(visitId);
+          return pool;
+        }
+
+        setWorkingMessage(visitId, `Preparing Auto Farm: ${countsMessage(requirements, pool.monsters)}.`);
+        await configureAutoFarm(visitId, requirements, pool.waveDoc);
+
+        while (true) {
+          await waitWithGuard(visitId, FARM_POLL_MS);
+          pool = await readDeadPool(visitId, requirements);
+          if (logic.requirementsSatisfied(requirements, pool.monsters)) {
+            await pauseOwnedAutoFarm(visitId);
+            setWorkingMessage(visitId, 'Every quest monster has been pre-farmed; starting quest turn-ins.');
+            return pool;
+          }
+          setWorkingMessage(visitId, `Pre-farming quest monsters: ${countsMessage(requirements, pool.monsters)}.`);
+        }
+      }
+
+      async function acceptQuest(visitId, quest) {
+        setWorkingMessage(visitId, `Accepting quest: ${quest.title}.`);
+        requireSuccess(
+          await guardedPost(visitId, ACCEPT_PATH, { quest_id: quest.id }),
+          `Accepting quest ${quest.title}`,
+        );
+        await waitWithGuard(visitId, 500);
+      }
+
+      async function finishQuest(visitId, quest) {
+        setWorkingMessage(visitId, `Turning in quest: ${quest.title}.`);
+        requireSuccess(
+          await guardedPost(visitId, FINISH_PATH, { quest_id: quest.id }),
+          `Turning in quest ${quest.title}`,
+        );
+        await waitWithGuard(visitId, 500);
+      }
+
+      async function lootForQuest(visitId, quest, userId) {
+        let current = quest;
+        let needed = Math.max(0, current.requirement.count - current.progress.current);
+        const pool = await readDeadPool(visitId, [current.requirement]);
+        const candidates = logic.eligibleForRequirement(pool.monsters, current.requirement);
+        let successes = 0;
+
+        for (const monster of candidates) {
+          if (needed <= 0 || current.finishReady) break;
+          setWorkingMessage(
+            visitId,
+            `Looting ${current.requirement.name} for ${current.title} (${current.progress.current}/${current.requirement.count}).`,
+          );
+          const response = await guardedPost(visitId, LOOT_PATH, { monster_id: monster.id, user_id: userId });
+          if (logic.responseSucceeded(response)) successes += 1;
+          await waitWithGuard(visitId, ACTION_DELAY_MS);
+
+          const guildDoc = await fetchFresh(visitId, GUILD_PATH);
+          const quests = logic.parseQuests(guildDoc, now());
+          const fresh = quests.find((candidate) => candidate.state === 'active' && candidate.id === current.id);
+          if (!fresh) {
+            const completed = quests.find((candidate) => candidate.id === current.id && candidate.state === 'cooldown');
+            if (completed) return;
+            continue;
+          }
+          current = fresh;
+          needed = Math.max(0, current.requirement.count - current.progress.current);
+          if (!current.progress.current && successes > 0) needed = Math.max(0, current.requirement.count - successes);
+        }
+
+        const guildDoc = await fetchFresh(visitId, GUILD_PATH);
+        const fresh = logic.parseQuests(guildDoc, now()).find((candidate) => candidate.state === 'active' && candidate.id === quest.id);
+        if (fresh?.finishReady || (fresh && fresh.progress.current >= fresh.requirement.count)) return;
+        throw new VisitStop('retry', `More eligible ${quest.requirement.name} monsters are needed for ${quest.title}.`, {
+          retryAt: now() + 60_000,
+          note: 'Pre-farming more quest monsters',
+        });
+      }
+
+      async function processQuests(visitId) {
+        const rawUserId = await getUserId?.();
+        const userId = logic.validId(rawUserId);
+        if (!userId) throw new Error('The current user ID could not be determined for quest looting.');
+
+        for (let step = 0; step < MAX_QUEST_STEPS; step += 1) {
+          const guildDoc = await fetchFresh(visitId, GUILD_PATH);
+          const quests = logic.parseQuests(guildDoc, now());
+          const actionable = logic.actionableQuests(quests);
+          setProtectedNames(store, actionable.map((quest) => quest.requirement.name));
+          const active = actionable.find((quest) => quest.state === 'active');
+
+          if (active) {
+            if (active.finishReady || active.progress.current >= active.requirement.count) {
+              await finishQuest(visitId, active);
+            } else {
+              await lootForQuest(visitId, active, userId);
+            }
+            continue;
+          }
+
+          const available = actionable.find((quest) => quest.state === 'available' && quest.id);
+          if (available) {
+            await acceptQuest(visitId, available);
+            continue;
+          }
+
+          return { quests, earliestCooldown: logic.earliestCooldown(quests, now()) };
+        }
+        throw new Error('Quest processing exceeded its safe step limit.');
+      }
+
+      async function runVisit(visitId) {
+        const guildDoc = await fetchFresh(visitId, GUILD_PATH);
+        const quests = logic.parseQuests(guildDoc, now());
+        const actionable = logic.actionableQuests(quests);
+
+        if (!actionable.length) {
+          await restoreAutoFarm(visitId);
+          setProtectedNames(store, []);
+          return { quests, earliestCooldown: logic.earliestCooldown(quests, now()) };
+        }
+
+        const requirements = logic.aggregateRequirements(actionable.map((quest) => quest.requirement));
+        setProtectedNames(store, requirements.map((requirement) => requirement.name));
+        setWorkingMessage(visitId, `Checking ${requirements.length} quest monster target(s) before accepting a quest.`);
+        await ensurePrefarmed(visitId, requirements);
+        const result = await processQuests(visitId);
+        await restoreAutoFarm(visitId);
+        setProtectedNames(store, []);
+        return result;
+      }
+
+      async function tick() {
+        if (runtime.stopped || runtime.ticking || !isMarkedHub()) return;
+        const command = readCommand();
+        if (!command) {
+          publish('idle', true, "Adventurer's Guild worker is idle.");
+          return;
+        }
+        if (runtime.terminal?.visitId === command.visitId) {
+          publish(runtime.terminal.state, true, runtime.terminal.message, command.visitId, runtime.terminal);
+          return;
+        }
+        if (command.phase === 'draining') {
+          await pauseAutoFarmForDrain(command);
+          setTerminal(command.visitId, 'done', "Adventurer's Guild stopped safely before starting.", {
+            retryAt: now() + 60_000,
+            note: 'Quest work will resume',
+          });
+          return;
+        }
+        if (!ownsSchedulerLease()) return;
+
+        runtime.ticking = true;
+        runtime.runningVisitId = command.visitId;
+        runtime.terminal = null;
+        setWorkingMessage(command.visitId, "Adventurer's Guild visit started.");
+        try {
+          const result = await runVisit(command.visitId);
+          const retryAt = Number(result.earliestCooldown) || 0;
+          setTerminal(
+            command.visitId,
+            'done',
+            retryAt
+              ? "All available Adventurer's Guild quests are complete."
+              : "No available Adventurer's Guild quests remain.",
+            { retryAt, note: retryAt ? 'Next quest cooldown' : '' },
+          );
+        } catch (error) {
+          if (error instanceof VisitStop) {
+            if (error.kind === 'ownership' || error.kind === 'cancelled') return;
+            if (error.kind === 'drain') await pauseAutoFarmForDrain(command);
+            setTerminal(command.visitId, 'done', error.message, error);
+          } else {
+            setTerminal(command.visitId, 'error', `Adventurer's Guild failed safely: ${error?.message || error}`);
+          }
+        } finally {
+          runtime.ticking = false;
+          if (!runtime.terminal) runtime.runningVisitId = '';
+        }
+      }
+
+      function heartbeat() {
+        if (!runtime.runningVisitId || runtime.terminal || !ownsSchedulerLease()) return;
+        publish('working', false, runtime.message || "Adventurer's Guild is working.", runtime.runningVisitId, {
+          force: true,
+        });
+      }
+
+      function onVisibilityChange() {
+        if (doc.hidden !== true && doc.visibilityState !== 'hidden') void tick();
+      }
+
+      function onPageShow() {
+        void tick();
+      }
+
+      function onPageHide(event) {
+        if (!event?.persisted) stop();
+      }
+
+      function start() {
+        runtime.interval = win.setInterval?.(() => void tick(), TIMING.tickMs) ?? null;
+        runtime.heartbeat = win.setInterval?.(heartbeat, TIMING.heartbeatMs) ?? null;
+        doc.addEventListener?.('visibilitychange', onVisibilityChange);
+        win.addEventListener?.('pageshow', onPageShow);
+        win.addEventListener?.('pagehide', onPageHide);
+        void tick();
+      }
+
+      function stop() {
+        runtime.stopped = true;
+        if (runtime.interval !== null) win.clearInterval?.(runtime.interval);
+        if (runtime.heartbeat !== null) win.clearInterval?.(runtime.heartbeat);
+        runtime.interval = null;
+        runtime.heartbeat = null;
+        doc.removeEventListener?.('visibilitychange', onVisibilityChange);
+        win.removeEventListener?.('pageshow', onPageShow);
+        win.removeEventListener?.('pagehide', onPageHide);
+      }
+
+      return { heartbeat, onPageHide, onPageShow, onVisibilityChange, runtime, start, stop, tick };
+    }
+
+    const adventurersWorkerFeature = Object.freeze({
+      id: 'adventurers-worker',
+      group: 'Automation',
+      settings: [],
+      matches(url) {
+        return /\/adventurers_guild\.php\/?$/i.test(url.pathname);
+      },
+      run(ctx) {
+        const worker = createAdventurersWorker({
+          win: ctx.win,
+          doc: ctx.doc,
+          store: ctx.store,
+          sessionStore: createJsonStore(getStorage('sessionStorage', ctx.win), '[Veyra]'),
+          fetchDocument: ctx.fetchDocument,
+          postForm: ctx.postForm,
+          getUserId: ctx.getUserId,
+        });
+        worker.start();
+        return worker;
+      },
+    });
+
+    module.exports = {
+      ACCEPT_PATH,
+      AUTOFARM_SNAPSHOT_KEY,
+      AUTO_FARM_PATH,
+      FINISH_PATH,
+      GUILD_PATH,
+      LOOT_PATH,
+      ROUTE_ID,
+      TIMING,
+      VisitStop,
+      adventurersWorkerFeature,
+      createAdventurersWorker,
     };
   },
   "features/automation/boss-dom.js": function (module, exports, require) {
@@ -2372,12 +3311,3850 @@
       createBossWorker,
     };
   },
+  "features/automation/crucible-logic.js": function (module, exports, require) {
+    'use strict';
+
+    // Pure parsing and planning helpers for the Polyhedral Crucible. Keeping all
+    // page-specific assumptions here lets the scheduler worker fail closed when a
+    // game layout or API response changes.
+
+    const { parseClockDuration } = require('../../core/time');
+    const crucibleRoute = require('../../routes/crucible');
+    const dungeonLogic = require('./shadowbridge-logic');
+
+    const CRUCIBLE_NAME = 'The Polyhedral Crucible';
+    const ACTIONABLE_STATUSES = new Set(['available', 'in_progress']);
+    const NODE_TYPE_ORDER = Object.freeze({ pve: 0, army: 1, pvp: 2 });
+
+    function text(element) {
+      return String(element?.textContent ?? '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    function all(root, selector) {
+      try {
+        return Array.from(root?.querySelectorAll?.(selector) || []);
+      } catch {
+        return [];
+      }
+    }
+
+    function firstAll(root, selectors) {
+      for (const selector of selectors) {
+        const result = all(root, selector);
+        if (result.length > 0) return result;
+      }
+      return [];
+    }
+
+    function attr(element, name) {
+      try {
+        return element?.getAttribute?.(name) ?? null;
+      } catch {
+        return null;
+      }
+    }
+
+    function resolveUrl(href, baseUrl = 'https://demonicscans.org/') {
+      const value = String(href || '').trim();
+      if (!value || /^javascript:/i.test(value)) return null;
+      try {
+        return new URL(value, baseUrl);
+      } catch {
+        return null;
+      }
+    }
+
+    function normalized(value) {
+      return dungeonLogic.normalizeMonsterName(value);
+    }
+
+    function namedDungeonCard(link, wantedName) {
+      let candidate = link?.parentElement || null;
+      for (let depth = 0; candidate && depth < 10; depth += 1) {
+        const enterLinks = all(candidate, 'a[href*="guild_dungeon_enter.php"]');
+        // The live page uses unclassed, inline-styled cards. The surrounding
+        // `.panel` contains every open dungeon, so accept only the smallest named
+        // ancestor that contains at most this one Enter link.
+        if (normalized(text(candidate)).includes(wantedName) && enterLinks.length <= 1) return candidate;
+        candidate = candidate.parentElement || null;
+      }
+      return null;
+    }
+
+    function parseHubEntry(doc, baseUrl = 'https://demonicscans.org/guild_dungeon.php') {
+      const wanted = normalized(CRUCIBLE_NAME);
+      for (const link of all(doc, 'a[href*="guild_dungeon_enter.php"]')) {
+        const card = namedDungeonCard(link, wanted);
+        if (!card) continue;
+        const url = resolveUrl(attr(link, 'href'), baseUrl);
+        const instanceId = url?.searchParams.get('id') || url?.searchParams.get('instance_id') || '';
+        if (url && /^\d+$/.test(instanceId)) return { instanceId, url: url.href };
+      }
+      return null;
+    }
+
+    function scriptTexts(doc) {
+      return all(doc, 'script').map((script) => String(script?.textContent ?? script?.innerHTML ?? ''));
+    }
+
+    function assignmentStart(source, name) {
+      if (!/^[A-Za-z_$][\w$]*$/.test(String(name || ''))) return -1;
+      const pattern = new RegExp(`\\b(?:const|let|var)\\s+${name}\\s*=\\s*`, 'g');
+      const match = pattern.exec(source);
+      return match ? pattern.lastIndex : -1;
+    }
+
+    function balancedJsonSlice(source, start) {
+      let index = start;
+      while (/\s/.test(source[index] || '')) index += 1;
+      const opening = source[index];
+      if (opening !== '{' && opening !== '[') return '';
+      const closing = opening === '{' ? '}' : ']';
+      let depth = 0;
+      let quote = '';
+      let escaped = false;
+      for (let cursor = index; cursor < source.length; cursor += 1) {
+        const character = source[cursor];
+        if (quote) {
+          if (escaped) escaped = false;
+          else if (character === '\\') escaped = true;
+          else if (character === quote) quote = '';
+          continue;
+        }
+        if (character === '"' || character === "'") {
+          quote = character;
+          continue;
+        }
+        if (character === opening) depth += 1;
+        else if (character === closing) {
+          depth -= 1;
+          if (depth === 0) return source.slice(index, cursor + 1);
+        }
+      }
+      return '';
+    }
+
+    function extractAssignedJson(doc, name) {
+      for (const source of scriptTexts(doc)) {
+        const start = assignmentStart(source, name);
+        if (start < 0) continue;
+        const slice = balancedJsonSlice(source, start);
+        if (!slice) continue;
+        try {
+          const value = JSON.parse(slice);
+          if (value && typeof value === 'object') return value;
+        } catch {
+          // A malformed or non-JSON assignment is not safe to execute or coerce.
+        }
+      }
+      return null;
+    }
+
+    function extractAssignedNumber(doc, name) {
+      for (const source of scriptTexts(doc)) {
+        const start = assignmentStart(source, name);
+        if (start < 0) continue;
+        const match = source.slice(start).match(/^\s*(\d+)/);
+        if (match) return match[1];
+      }
+      return '';
+    }
+
+    function normalizeNode(raw) {
+      const id = String(raw?.id ?? '').trim();
+      const key = String(raw?.key || '').trim();
+      const type = String(raw?.type || '').trim().toLowerCase();
+      const status = String(raw?.status || '').trim().toLowerCase();
+      if (!/^\d+$/.test(id) || !key || !type || !status) return null;
+      return {
+        id,
+        key,
+        name: String(raw?.name || key).trim(),
+        faceKey: String(raw?.face_key || '').trim().toLowerCase(),
+        type,
+        status,
+        linkedLocationId: String(raw?.linked_location_id || '').trim(),
+        stateMeta: raw?.state_meta && typeof raw.state_meta === 'object' ? raw.state_meta : {},
+      };
+    }
+
+    function parseCubePage(doc, pageUrl = '') {
+      const page = resolveUrl(pageUrl);
+      const state = extractAssignedJson(doc, 'STATE');
+      const instanceId =
+        extractAssignedNumber(doc, 'INSTANCE_ID') ||
+        page?.searchParams.get('instance_id') ||
+        page?.searchParams.get('id') ||
+        '';
+      const nodes = Array.isArray(state?.nodes) ? state.nodes.map(normalizeNode).filter(Boolean) : [];
+      return { instanceId, nodes, state };
+    }
+
+    function actionableNodes(cube, type = '') {
+      const wantedType = String(type || '').toLowerCase();
+      return (cube?.nodes || [])
+        .filter((node) => ACTIONABLE_STATUSES.has(node.status) && (!wantedType || node.type === wantedType))
+        .sort((left, right) => {
+          const leftType = NODE_TYPE_ORDER[left.type] ?? 99;
+          const rightType = NODE_TYPE_ORDER[right.type] ?? 99;
+          return leftType - rightType || Number(left.id) - Number(right.id);
+        });
+    }
+
+    function nodeForLocationId(locationId) {
+      const value = String(locationId || '');
+      return crucibleRoute.CRUCIBLE_PVE_NODES.find((node) => node.locationId === value) || null;
+    }
+
+    function discoverPveMonsters(node, monsters) {
+      if (!node || !Array.isArray(monsters)) return [];
+      const discoveries = [];
+      const seen = new Set();
+      for (const monster of monsters) {
+        const name = String(monster?.name || '').replace(/\s+/g, ' ').trim();
+        const id = crucibleRoute.targetIdForMonster(node.id, name);
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        discoveries.push({ id, nodeId: node.id, name });
+      }
+      return discoveries;
+    }
+
+    function parsePvpLobby(doc, pageUrl = '') {
+      const warning = text(doc?.querySelector?.('.warn'));
+      const waitMs = parseClockDuration(warning);
+      const matches = [];
+      for (const card of firstAll(doc, ['.grid > .match', '.match'])) {
+        const meta = text(card.querySelector?.('.meta'));
+        const match = meta.match(/Match\s*#\s*(\d+)\s*\/\s*Slots\s*(\d+)\s*\/\s*(\d+)/i);
+        if (!match) continue;
+        const slots = firstAll(card, ['.slots .slot', '.slot']).map((slot, index) => {
+          const name = text(slot.querySelector?.('.name'));
+          const own = /your slot/i.test(text(slot.querySelector?.('.selfMark')));
+          return { index: index + 1, occupied: Boolean(name), own, name };
+        });
+        const badges = all(card, '.badge').map((badge) => normalized(text(badge)).replace(/\s+/g, '-'));
+        const status = badges.find((badge) => ['open', 'live', 'cleared', 'lost'].includes(badge)) || '';
+        const link = card.querySelector?.('a[href*="pvp_style_battle.php"]');
+        const url = resolveUrl(attr(link, 'href'), pageUrl);
+        matches.push({
+          matchNo: Number(match[1]),
+          occupied: Number(match[2]),
+          capacity: Number(match[3]),
+          status,
+          slots,
+          ownSlot: slots.find((slot) => slot.own) || null,
+          url: url?.href || '',
+        });
+      }
+      return { warning, waitMs, matches };
+    }
+
+    function choosePvpAction(lobby) {
+      const matches = Array.isArray(lobby?.matches) ? lobby.matches : [];
+      const existing = matches.find((match) => match.ownSlot && ['open', 'live', 'cleared'].includes(match.status));
+      if (existing) return { kind: 'existing', match: existing };
+      if (Number.isFinite(lobby?.waitMs) && lobby.waitMs > 0) {
+        return { kind: 'wait', waitMs: lobby.waitMs, warning: lobby.warning || '' };
+      }
+      const open = matches
+        .filter((match) => match.status === 'open' && match.occupied < match.capacity && match.slots.some((slot) => !slot.occupied))
+        .sort((left, right) => right.occupied - left.occupied || left.matchNo - right.matchNo)[0];
+      if (!open) return { kind: 'unavailable' };
+      return {
+        kind: 'claim',
+        match: open,
+        slotIndex: open.slots.find((slot) => !slot.occupied)?.index || 0,
+      };
+    }
+
+    function cleanInteger(value) {
+      const result = String(value ?? '').trim();
+      return /^\d+$/.test(result) && Number(result) > 0 ? result : '';
+    }
+
+    function buildPvpClaimPayload({ instanceId, nodeId, matchNo, slotIndex } = {}) {
+      const instance = cleanInteger(instanceId);
+      const node = cleanInteger(nodeId);
+      const match = cleanInteger(matchNo);
+      const slot = cleanInteger(slotIndex);
+      if (!instance || !node || !match || !slot || Number(slot) > 5) return null;
+      return {
+        source: 'cube',
+        action: 'pick_slot',
+        instance_id: instance,
+        node_id: node,
+        match_no: match,
+        slot_index: slot,
+      };
+    }
+
+    function buildCubeNodeEnterPayload({ instanceId, nodeId, faceKey } = {}) {
+      const instance = cleanInteger(instanceId);
+      const node = cleanInteger(nodeId);
+      const face = String(faceKey || '').trim().toLowerCase();
+      if (!instance || !node || !/^[a-z_]+$/.test(face)) return null;
+      return { action: 'enter_node', instance_id: instance, node_id: node, face_key: face };
+    }
+
+    function wrappedJson(response) {
+      if (response && Object.prototype.hasOwnProperty.call(response, 'json')) {
+        return response.json && typeof response.json === 'object' ? response.json : null;
+      }
+      if (response && typeof response === 'object') return response;
+      return null;
+    }
+
+    function responseMessage(response) {
+      const json = wrappedJson(response);
+      return String(json?.message || json?.error || response?.text || '').trim();
+    }
+
+    function parsePvpClaimResponse(response) {
+      const json = wrappedJson(response);
+      const declared = json?.ok === true || json?.success === true || /success|claimed|joined/i.test(responseMessage(response));
+      const transportOk = response?.ok === undefined ? true : response.ok === true;
+      return { ok: Boolean(transportOk && declared), message: responseMessage(response) };
+    }
+
+    function parseCubeNodeEnterResponse(response, expected = {}, baseUrl = 'https://demonicscans.org/') {
+      const json = wrappedJson(response);
+      const transportOk = response?.ok === undefined ? true : response.ok === true;
+      const base = resolveUrl(baseUrl);
+      const redirect = resolveUrl(json?.redirect, baseUrl);
+      const instanceId = redirect?.searchParams.get('instance_id') || '';
+      const locationId = redirect?.searchParams.get('location_id') || '';
+      const ok = Boolean(
+        transportOk &&
+          json?.ok === true &&
+          base &&
+          redirect &&
+          redirect.origin === base.origin &&
+          /\/guild_dungeon_location\.php\/?$/i.test(redirect.pathname) &&
+          instanceId === String(expected.instanceId || '') &&
+          locationId === String(expected.locationId || ''),
+      );
+      return { ok, redirect: ok ? redirect.href : '', message: responseMessage(response) };
+    }
+
+    function parsePvpState(response) {
+      const json = wrappedJson(response);
+      const transportOk = response?.ok === undefined ? true : response.ok === true;
+      if (!transportOk || !json || json.ok !== true) {
+        return { ok: false, error: responseMessage(response) || 'PvP state response was invalid.' };
+      }
+      const roomStatus = String(json.room_status || '').toLowerCase();
+      const ended = json.match?.ended === true || ['cleared', 'lost'].includes(roomStatus);
+      const winnerSide = String(json.match?.winner_side || '').toLowerCase();
+      return {
+        ok: true,
+        ended,
+        won: ended && (winnerSide === 'ally' || roomStatus === 'cleared'),
+        roomStatus,
+        winnerSide,
+        roomJoined: json.room_joined === true,
+        raw: json,
+      };
+    }
+
+    function normalizeFight(raw) {
+      const matchNo = Number(raw?.match_no);
+      if (!Number.isInteger(matchNo) || matchNo <= 0) return null;
+      return {
+        matchNo,
+        battleId: Number(raw?.battle_id) || 0,
+        status: String(raw?.status || 'open').toLowerCase(),
+        winnerSide: String(raw?.winner_side || '').toUpperCase(),
+      };
+    }
+
+    function parseArmyNodePage(doc) {
+      let fights = extractAssignedJson(doc, 'fightCards');
+      if (!Array.isArray(fights)) {
+        fights = firstAll(doc, ['.fight[data-match-no]', '.fight']).map((card) => ({
+          match_no: attr(card, 'data-match-no'),
+          status: text(card.querySelector?.('.badge')),
+          battle_id: 0,
+        }));
+      }
+      const activeMatchNo = Number(extractAssignedNumber(doc, 'activeMatchNo')) || 0;
+      return {
+        activeMatchNo,
+        fights: fights.map(normalizeFight).filter(Boolean).sort((left, right) => left.matchNo - right.matchNo),
+      };
+    }
+
+    function chooseArmyFight(page) {
+      const fights = Array.isArray(page?.fights) ? page.fights : [];
+      if (Number(page?.activeMatchNo) > 0) {
+        const current = fights.find((fight) => fight.matchNo === Number(page.activeMatchNo) && fight.status !== 'cleared');
+        if (current) return current;
+      }
+      return (
+        fights.find((fight) => fight.status === 'active') ||
+        fights.find((fight) => fight.status === 'failed') ||
+        fights.find((fight) => fight.status === 'open') ||
+        null
+      );
+    }
+
+    function buildArmyEnterPayload({ instanceId, nodeId, matchNo } = {}) {
+      const instance = cleanInteger(instanceId);
+      const node = cleanInteger(nodeId);
+      const match = cleanInteger(matchNo);
+      if (!instance || !node || !match) return null;
+      return { action: 'enter_fight', instance_id: instance, node_id: node, match_no: match };
+    }
+
+    function parseArmyEnterResponse(response, baseUrl = 'https://demonicscans.org/') {
+      const json = wrappedJson(response);
+      const transportOk = response?.ok === undefined ? true : response.ok === true;
+      const base = resolveUrl(baseUrl);
+      const redirect = resolveUrl(json?.redirect, baseUrl);
+      const ok = Boolean(
+        transportOk &&
+          json?.ok === true &&
+          base &&
+          redirect &&
+          redirect.origin === base.origin &&
+          /\/shadow_army_live_battle\.php\/?$/i.test(redirect.pathname),
+      );
+      return { ok, redirect: ok ? redirect.href : '', message: responseMessage(response) };
+    }
+
+    function parseArmyLivePage(doc) {
+      const state = extractAssignedJson(doc, 'initialState');
+      const battleId = extractAssignedNumber(doc, 'battleId') || cleanInteger(state?.battle?.id);
+      return { battleId, state: state && typeof state === 'object' ? state : null };
+    }
+
+    function parseArmyActionResponse(response) {
+      const json = wrappedJson(response);
+      const transportOk = response?.ok === undefined ? true : response.ok === true;
+      const state = json?.state;
+      return {
+        ok: Boolean(transportOk && json?.ok === true && state && typeof state === 'object'),
+        state: state && typeof state === 'object' ? state : null,
+        message: responseMessage(response),
+      };
+    }
+
+    function parseOwnedArmyShadows(doc) {
+      const units = extractAssignedJson(doc, 'specialUnits');
+      if (!units || Array.isArray(units) || typeof units !== 'object') return [];
+      const shadows = [];
+      const seen = new Set();
+      for (const unit of Object.values(units)) {
+        const id = String(unit?.shadow_id ?? '').trim();
+        const name = String(unit?.title || '').replace(/\s+/g, ' ').trim();
+        if (!/^\d+$/.test(id) || Number(id) <= 0 || !name || seen.has(id)) continue;
+        seen.add(id);
+        shadows.push({ id, name });
+      }
+      return shadows.sort((left, right) => left.name.localeCompare(right.name));
+    }
+
+    function buildArmyLivePayload(action, fields = {}) {
+      const battleId = cleanInteger(fields.battleId);
+      if (!battleId || !['get_state', 'join_battle', 'assign_target', 'retreat_captain'].includes(action)) return null;
+      const payload = { action, battle_id: battleId };
+      if (action === 'assign_target') {
+        const attacker = cleanInteger(fields.attackerId);
+        const defender = cleanInteger(fields.defenderId);
+        if (!attacker || !defender) return null;
+        payload.attacker_captain_unit_id = attacker;
+        payload.defender_captain_unit_id = defender;
+      }
+      if (action === 'retreat_captain') {
+        const captain = cleanInteger(fields.captainId);
+        if (!captain) return null;
+        payload.captain_unit_id = captain;
+      }
+      return payload;
+    }
+
+    function livingCaptain(captain) {
+      return Boolean(
+        captain &&
+          !captain.is_dead &&
+          Number(captain.squad_current_health) > 0 &&
+          cleanInteger(captain.id),
+      );
+    }
+
+    function armySummary(state) {
+      const captains = Array.isArray(state?.captains) ? state.captains : [];
+      const engagements = Array.isArray(state?.engagements) ? state.engagements : [];
+      return {
+        active: String(state?.battle?.status || '').toUpperCase() === 'ACTIVE',
+        winnerSide: String(state?.battle?.winner_side || '').toUpperCase(),
+        viewer: state?.viewer && typeof state.viewer === 'object' ? state.viewer : {},
+        own: captains.filter((captain) => captain.side === 'ALLY' && captain.is_mine === true),
+        livingOwn: captains.filter(
+          (captain) => captain.side === 'ALLY' && captain.is_mine === true && livingCaptain(captain) && !captain.retreat_requested,
+        ),
+        enemies: captains.filter((captain) => captain.side === 'ENEMY'),
+        livingEnemies: captains.filter((captain) => captain.side === 'ENEMY' && livingCaptain(captain)),
+        engagements,
+      };
+    }
+
+    function planArmyActions(state, mode, selectedShadowIds = null) {
+      const summary = armySummary(state);
+      if (!summary.active) return { done: true, reason: 'ended', commands: [], summary };
+      if (summary.viewer.has_roster === false) {
+        return { done: false, error: 'No saved Shadow Army formation is available.', commands: [], summary };
+      }
+      if (summary.own.length === 0) {
+        if (summary.viewer.can_join === true) return { done: false, commands: [{ action: 'join' }], summary };
+        return { done: false, wait: true, commands: [], summary };
+      }
+      const selected = Array.isArray(selectedShadowIds)
+        ? new Set(selectedShadowIds.map((id) => String(id)))
+        : null;
+      if (selected && selected.size === 0) {
+        return { done: false, error: 'No Shadow is selected for the Crucible Army formation.', commands: [], summary };
+      }
+      const selectedOwn = selected
+        ? summary.own.filter((captain) => selected.has(String(captain.source_shadow_id ?? '')))
+        : summary.own;
+      const selectedLivingOwn = selected
+        ? summary.livingOwn.filter((captain) => selected.has(String(captain.source_shadow_id ?? '')))
+        : summary.livingOwn;
+      if (selected && selectedOwn.length === 0) {
+        return {
+          done: false,
+          error: 'None of the selected Shadows is present in the saved game formation.',
+          commands: [],
+          summary,
+        };
+      }
+      if (summary.livingEnemies.length === 0) return { done: false, wait: true, commands: [], summary };
+      if (selectedLivingOwn.length === 0) {
+        return { done: true, reason: 'all-own-dead', commands: [], summary };
+      }
+
+      const engagedAttackers = new Set(
+        summary.engagements.map((engagement) => Number(engagement?.attacker_captain_unit_id)).filter(Number.isFinite),
+      );
+      const available = selectedLivingOwn.filter((captain) => !engagedAttackers.has(Number(captain.id)));
+      if (available.length === 0) return { done: false, wait: true, commands: [], summary };
+      if (mode === 'minimal') {
+        return {
+          done: false,
+          commands: [
+            {
+              action: 'assign',
+              attackerId: Number(available[0].id),
+              defenderId: Number(summary.livingEnemies[0].id),
+            },
+          ],
+          summary,
+        };
+      }
+      if (mode !== 'kill') return { done: false, error: `Unsupported Army mode: ${String(mode || '')}.`, commands: [], summary };
+      return {
+        done: false,
+        commands: available.map((captain, index) => ({
+          action: 'assign',
+          attackerId: Number(captain.id),
+          defenderId: Number(summary.livingEnemies[index % summary.livingEnemies.length].id),
+        })),
+        summary,
+      };
+    }
+
+    function captainHealth(state, captainId) {
+      const captain = (state?.captains || []).find((candidate) => Number(candidate?.id) === Number(captainId));
+      return captain ? Number(captain.squad_current_health) : null;
+    }
+
+    function captainTurns(state, captainId) {
+      const captain = (state?.captains || []).find((candidate) => Number(candidate?.id) === Number(captainId));
+      return captain ? Number(captain.turns_acted) : null;
+    }
+
+    function hasVerifiedArmyHit(beforeState, afterState, attackerId, defenderId) {
+      const turnsBefore = captainTurns(beforeState, attackerId);
+      const turnsAfter = captainTurns(afterState, attackerId);
+      if (!Number.isFinite(turnsBefore) || !Number.isFinite(turnsAfter) || turnsAfter <= turnsBefore) return false;
+
+      const healthBefore = captainHealth(beforeState, defenderId);
+      const healthAfter = captainHealth(afterState, defenderId);
+      if (!Number.isFinite(healthBefore)) return false;
+      if (healthAfter === null) return true;
+      return Number.isFinite(healthAfter) && healthAfter < healthBefore;
+    }
+
+    function parseArmyHealAvailability(doc) {
+      for (const form of all(doc, 'form')) {
+        const input = form.querySelector?.('input[name="action"][value="heal_all_units"]');
+        if (!input) continue;
+        const button = form.querySelector?.('button[type="submit"], button');
+        const disabled = Boolean(button?.disabled || attr(button, 'disabled') !== null);
+        return { found: true, available: Boolean(button && !disabled) };
+      }
+      return { found: false, available: false };
+    }
+
+    module.exports = {
+      ACTIONABLE_STATUSES,
+      CRUCIBLE_NAME,
+      actionableNodes,
+      armySummary,
+      buildArmyEnterPayload,
+      buildArmyLivePayload,
+      buildCubeNodeEnterPayload,
+      buildPvpClaimPayload,
+      chooseArmyFight,
+      choosePvpAction,
+      discoverPveMonsters,
+      extractAssignedJson,
+      extractAssignedNumber,
+      hasVerifiedArmyHit,
+      nodeForLocationId,
+      parseArmyActionResponse,
+      parseArmyEnterResponse,
+      parseArmyHealAvailability,
+      parseArmyLivePage,
+      parseArmyNodePage,
+      parseOwnedArmyShadows,
+      parseCubeNodeEnterResponse,
+      parseCubePage,
+      parseHubEntry,
+      parsePvpClaimResponse,
+      parsePvpLobby,
+      parsePvpState,
+      planArmyActions,
+      resolveUrl,
+    };
+  },
+  "features/automation/crucible-worker.js": function (module, exports, require) {
+    'use strict';
+
+    // Scheduler-owned Polyhedral Crucible worker. The marked guild-dungeon hub
+    // remains visible while the worker reads and acts on PvE, PvP and Army pages
+    // sequentially. Every mutation is guarded by the current visit id and lease.
+
+    const { parseFraction, parseGameNumber } = require('../../core/numbers');
+    const { COMMAND_KEY, normalizeVisit, publishWorkerStatus } = require('../../core/protocol');
+    const { pickPotion, readPotionInventory, usePotion } = require('../../core/potions');
+    const { createJsonStore, getStorage } = require('../../core/storage');
+    const { sleep } = require('../../core/time');
+    const crucibleRoute = require('../../routes/crucible');
+    const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
+    const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
+    const { staminaCost, staminaMultiplier } = require('../shared/asterion');
+    const logic = require('./crucible-logic');
+    const dungeonLogic = require('./shadowbridge-logic');
+
+    const ROUTE_ID = 'crucible';
+    const JOIN_URL = '/dungeon_join_battle.php';
+    const DAMAGE_URL = '/damage.php';
+    const DASHBOARD_URL = '/game_dash.php';
+    const CUBE_ACTION_URL = '/guild_dungeon_cube_action.php';
+    const PVP_ACTION_URL = '/pvp_style_action.php';
+    const PVP_STATE_URL = '/pvp_style_state.php';
+    const ARMY_ACTION_URL = '/guild_dungeon_cube_army_action.php';
+    const ARMY_LIVE_URL = '/shadow_army_live_battle.php';
+    const SHADOW_ARMY_URL = '/shadow_army.php';
+    const MINIMAL_ARMY_CONTRIBUTIONS_KEY = 'veyra:crucible:minimal-army-contributions:v1';
+
+    const TIMING = Object.freeze({
+      tickMs: 1_000,
+      heartbeatMs: 5_000,
+      pvpPollMs: 2_500,
+      armyPollMs: 1_500,
+      regularRecheckMs: 5 * 60_000,
+      refreshBattleEvery: 20,
+      maxAttacksPerMonster: 10_000,
+      maxVisitPasses: 16,
+      maxArmyPolls: 2_400,
+      minimalHitPolls: 30,
+      lowHpFraction: 0.1,
+    });
+
+    class VisitStop extends Error {
+      constructor(kind, message, options = {}) {
+        super(message);
+        this.name = 'VisitStop';
+        this.kind = kind;
+        this.retryAt = Number(options.retryAt) || 0;
+        this.note = String(options.note || '');
+      }
+    }
+
+    function readStamina(root) {
+      const raw = String(root?.querySelector?.('#stamina_span')?.textContent || '').trim();
+      const fraction = parseFraction(raw);
+      if (fraction) return fraction.current;
+      const match = raw.match(/[\d,.]+\s*[kmbtq]?/i);
+      return match ? parseGameNumber(match[0].replace(/\s+/g, '')) : null;
+    }
+
+    function responseText(response) {
+      return String(response?.json?.message || response?.json?.error || response?.text || '').trim();
+    }
+
+    function retryDelayFromMessage(message, fallback) {
+      const milliseconds = String(message || '').match(/(?:wait|cooldown)[^\d]{0,20}(\d+)\s*ms/i);
+      if (milliseconds) return Math.min(30_000, Math.max(fallback, Number(milliseconds[1])));
+      const seconds = String(message || '').match(/(?:wait|cooldown)[^\d]{0,20}(\d+(?:\.\d+)?)\s*s/i);
+      if (seconds) return Math.min(30_000, Math.max(fallback, Math.ceil(Number(seconds[1]) * 1_000)));
+      return null;
+    }
+
+    function createCrucibleWorker({
+      win,
+      doc,
+      store,
+      sessionStore = null,
+      fetchDocument,
+      fetchJson = null,
+      postForm,
+      getUserId,
+      asterionMultiplier = 1,
+      sleepImpl = sleep,
+      now = () => Date.now(),
+      logger = console,
+    }) {
+      const runtime = {
+        stopped: false,
+        ticking: false,
+        runningVisitId: '',
+        terminal: null,
+        interval: null,
+        heartbeat: null,
+        message: '',
+        publishSignature: '',
+        publishAt: 0,
+        processedPve: new Set(),
+        processedPvp: new Set(),
+        attacks: 0,
+        targets: 0,
+        armyActions: 0,
+      };
+
+      function currentUrl() {
+        try {
+          return new URL(win.location.href, win.location.origin);
+        } catch {
+          return null;
+        }
+      }
+
+      function isMarkedHub(url = currentUrl()) {
+        return Boolean(
+          url &&
+            /\/guild_dungeon\.php\/?$/i.test(url.pathname) &&
+            url.searchParams.get('veyra_route') === ROUTE_ID,
+        );
+      }
+
+      function readCommand() {
+        const command = normalizeVisit(store.read(COMMAND_KEY), () => true);
+        return command?.taskId === ROUTE_ID ? command : null;
+      }
+
+      function ownsSchedulerLease(t = now()) {
+        if (!sessionStore || sessionStore.available === false) return true;
+        const tabId = sessionStore.readRaw?.(TAB_KEY);
+        const lease = store.read(LEASE_KEY);
+        return Boolean(
+          tabId &&
+            lease?.ownerId === tabId &&
+            Number.isFinite(Number(lease?.leaseUntil)) &&
+            Number(lease.leaseUntil) > t,
+        );
+      }
+
+      function publish(state, safeToLeave, message, visitId = '', options = {}) {
+        const t = now();
+        const retryAt = Number(options.retryAt) || 0;
+        const note = String(options.note || '');
+        const signature = `${visitId}|${state}|${safeToLeave}|${message}|${retryAt}|${note}`;
+        if (!options.force && signature === runtime.publishSignature && t - runtime.publishAt < TIMING.heartbeatMs) {
+          return null;
+        }
+        runtime.publishSignature = signature;
+        runtime.publishAt = t;
+        runtime.message = message;
+        return publishWorkerStatus(
+          store,
+          ROUTE_ID,
+          { visitId, workerId: ROUTE_ID, state, safeToLeave, message, retryAt, note },
+          t,
+        );
+      }
+
+      function log(message, level = 'info') {
+        const method = level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'info';
+        logger?.[method]?.(`[Veyra:crucible-worker] ${message}`);
+      }
+
+      function setWorkingMessage(visitId, message) {
+        runtime.message = message;
+        publish('working', false, message, visitId);
+        log(message);
+      }
+
+      function setTerminal(visitId, state, message, options = {}) {
+        runtime.terminal = {
+          visitId,
+          state,
+          message,
+          retryAt: Number(options.retryAt) || 0,
+          note: String(options.note || ''),
+        };
+        runtime.runningVisitId = '';
+        publish(state, true, message, visitId, { ...runtime.terminal, force: true });
+        log(message, state === 'error' ? 'warn' : 'info');
+      }
+
+      function assertCanMutate(visitId) {
+        if (runtime.stopped) throw new VisitStop('cancelled', 'Crucible worker stopped.');
+        const command = readCommand();
+        if (!command || command.visitId !== visitId) {
+          throw new VisitStop('cancelled', 'The Crucible scheduler visit changed.');
+        }
+        if (!ownsSchedulerLease()) {
+          throw new VisitStop('ownership', 'Another tab owns the Crucible scheduler visit.');
+        }
+        if (command.phase === 'draining' || now() >= command.deadlineAt) {
+          throw new VisitStop('drain', 'Crucible stopped safely at the scheduler deadline.');
+        }
+        return command;
+      }
+
+      function guardedPostForm(visitId, url, params, options = {}) {
+        const previousBeforeAttempt = options.beforeAttempt;
+        return postForm(url, params, {
+          ...options,
+          async beforeAttempt(details) {
+            assertCanMutate(visitId);
+            await previousBeforeAttempt?.(details);
+          },
+        });
+      }
+
+      function routeConfig() {
+        return normalizeConfig(store.read(CONFIG_KEY)).routes[ROUTE_ID];
+      }
+
+      function minimalArmyContribution(battleId) {
+        const wanted = String(battleId || '');
+        const records = store.read(MINIMAL_ARMY_CONTRIBUTIONS_KEY)?.records;
+        if (!Array.isArray(records)) return null;
+        return records.find((record) => String(record?.battleId || '') === wanted) || null;
+      }
+
+      function rememberMinimalArmyContribution(visitId, battleId, captainId) {
+        assertCanMutate(visitId);
+        const current = store.read(MINIMAL_ARMY_CONTRIBUTIONS_KEY);
+        const records = Array.isArray(current?.records) ? current.records : [];
+        const next = records
+          .filter((record) => String(record?.battleId || '') !== String(battleId))
+          .slice(-99);
+        next.push({
+          battleId: String(battleId),
+          captainId: String(captainId),
+          verifiedAt: now(),
+        });
+        store.write(MINIMAL_ARMY_CONTRIBUTIONS_KEY, { records: next });
+      }
+
+      async function requestJson(url) {
+        if (fetchJson) return fetchJson(url);
+        const response = await win.fetch(url, { credentials: 'same-origin', cache: 'no-store' });
+        const raw = await response.text();
+        let json = null;
+        try {
+          json = JSON.parse(raw);
+        } catch {
+          // The semantic parser will reject HTML/login/error pages.
+        }
+        return { ok: response.ok, status: response.status, text: raw, json };
+      }
+
+      async function readDashboard(visitId) {
+        assertCanMutate(visitId);
+        return fetchDocument(DASHBOARD_URL);
+      }
+
+      function createResourceManager(visitId, route, initialDoc) {
+        let currentStamina = readStamina(initialDoc);
+        let inventory = readPotionInventory(initialDoc);
+
+        async function refresh() {
+          const sourceDoc = await readDashboard(visitId);
+          currentStamina = readStamina(sourceDoc);
+          inventory = readPotionInventory(sourceDoc);
+          return sourceDoc;
+        }
+
+        async function ensureInventory() {
+          if (inventory.length === 0) await refresh();
+          return inventory;
+        }
+
+        async function consumePotion(entry, label) {
+          assertCanMutate(visitId);
+          setWorkingMessage(visitId, `Using ${entry.name || label}.`);
+          const result = await usePotion(entry, {
+            post: (url, params, options) => guardedPostForm(visitId, url, params, options),
+          });
+          if (!result.ok) {
+            throw new VisitStop('resource', `${label} could not be used: ${result.message || 'unknown response'}`);
+          }
+          const saved = inventory.find((candidate) => candidate.invId === entry.invId);
+          if (saved) saved.quantity = Math.max(0, saved.quantity - 1);
+          return result;
+        }
+
+        async function ensureStamina(required, forceRefresh = false) {
+          if (forceRefresh || currentStamina === null) await refresh();
+          if (currentStamina === null || currentStamina >= required) return true;
+          await ensureInventory();
+          if (currentStamina === null || currentStamina >= required) return true;
+          const potion = pickPotion(inventory, route.potions.stamina);
+          if (!potion) {
+            throw new VisitStop(
+              'resource',
+              `Only ${currentStamina} stamina remains and no selected stamina potion is available.`,
+            );
+          }
+          await consumePotion(potion, 'The selected stamina potion');
+          await refresh();
+          if (currentStamina !== null && currentStamina < required) {
+            throw new VisitStop('resource', `Stamina is still below the required ${required} after using a potion.`);
+          }
+          return true;
+        }
+
+        async function ensureHealth(snapshot) {
+          if (!Number.isFinite(snapshot.playerHp) || !Number.isFinite(snapshot.playerMaxHp) || snapshot.playerMaxHp <= 0) {
+            return true;
+          }
+          if (snapshot.playerHp <= 0) throw new VisitStop('resource', 'Player HP reached zero; Crucible PvE stopped.');
+          if (snapshot.playerHp / snapshot.playerMaxHp > TIMING.lowHpFraction) return true;
+          await ensureInventory();
+          const potion = pickPotion(inventory, route.potions.heal);
+          if (!potion) {
+            throw new VisitStop(
+              'resource',
+              `Player HP is at or below ${Math.round(TIMING.lowHpFraction * 100)}% and no selected healing potion is available.`,
+            );
+          }
+          await consumePotion(potion, 'The selected healing potion');
+          snapshot.playerHp = snapshot.playerMaxHp;
+          return true;
+        }
+
+        function spendStamina(amount) {
+          if (currentStamina !== null) currentStamina = Math.max(0, currentStamina - amount);
+        }
+
+        return { ensureHealth, ensureStamina, spendStamina };
+      }
+
+      async function fetchBattle(target, userId) {
+        const battleDoc = await fetchDocument(target.url);
+        return {
+          doc: battleDoc,
+          snapshot: dungeonLogic.parseBattleSnapshot(battleDoc, {
+            userId,
+            monsterId: target.monsterId,
+            instanceId: target.instanceId,
+            url: target.url,
+          }),
+        };
+      }
+
+      async function joinPveIfNeeded(visitId, target, userId, battle) {
+        if (battle.snapshot.joined === true) return battle;
+        if (battle.snapshot.joined !== false) {
+          throw new Error(`Could not determine whether ${target.name || 'the PvE monster'} is joined.`);
+        }
+        const payload = dungeonLogic.buildJoinPayload({
+          instanceId: target.instanceId,
+          monsterId: target.monsterId,
+          userId,
+        });
+        if (!payload) throw new Error('Could not build a safe Crucible PvE join request.');
+        assertCanMutate(visitId);
+        setWorkingMessage(visitId, `Joining ${target.name || 'Crucible PvE monster'}.`);
+        const response = await guardedPostForm(visitId, JOIN_URL, payload);
+        const joined = dungeonLogic.parseJoinResponse(response);
+        if (!joined.ok) throw new Error(`Joining ${target.name || 'the monster'} failed: ${joined.message || 'unknown response'}`);
+        const refreshed = await fetchBattle(target, userId);
+        if (refreshed.snapshot.joined !== true) {
+          throw new Error(`The battle page did not confirm that ${target.name || 'the monster'} was joined.`);
+        }
+        return refreshed;
+      }
+
+      function resolvePveTarget(target, snapshot) {
+        return dungeonLogic.resolveDamageTarget({
+          mode: target.target.mode,
+          damage: target.target.damage,
+          allowMaxExp: true,
+          snapshot,
+        });
+      }
+
+      async function attackPveMonster(visitId, route, target, userId) {
+        assertCanMutate(visitId);
+        let battle = await fetchBattle(target, userId);
+        if (battle.snapshot.dead) return { reason: 'dead', attacks: 0 };
+        battle = await joinPveIfNeeded(visitId, target, userId, battle);
+        let decision = resolvePveTarget(target, battle.snapshot);
+        if (!decision.ok) throw new Error(`${target.name || 'Crucible PvE target'}: ${decision.error}`);
+        if (decision.done) return { reason: 'target', attacks: 0 };
+
+        const skill = dungeonLogic.skillForId(route.settings.skill);
+        const payload = dungeonLogic.buildDamagePayload({
+          instanceId: target.instanceId,
+          monsterId: target.monsterId,
+          skillId: route.settings.skill,
+        });
+        if (!skill || !payload) throw new Error('The selected Crucible PvE skill is invalid.');
+        const effectiveStaminaCost = staminaCost(skill.cost, asterionMultiplier);
+        const resources = createResourceManager(visitId, route, battle.doc);
+        let ownDamage = battle.snapshot.ownDamage;
+        let attempts = 0;
+        let cooldownRetries = 0;
+
+        while (attempts < TIMING.maxAttacksPerMonster) {
+          assertCanMutate(visitId);
+          if (!decision.untilDead && Number.isFinite(ownDamage) && ownDamage >= decision.targetDamage) {
+            return { reason: 'target', attacks: attempts };
+          }
+          await resources.ensureHealth(battle.snapshot);
+          await resources.ensureStamina(effectiveStaminaCost);
+          assertCanMutate(visitId);
+
+          setWorkingMessage(
+            visitId,
+            `Attacking ${target.name || 'Crucible monster'} (${attempts + 1}${
+              decision.untilDead ? ', until defeated' : `, ${Math.max(0, decision.targetDamage - ownDamage)} damage remaining`
+            }).`,
+          );
+          const response = await guardedPostForm(visitId, DAMAGE_URL, payload, {
+            onRateLimit({ waitMs }) {
+              setWorkingMessage(visitId, `Crucible PvE rate limit: waiting ${Math.ceil(waitMs / 1_000)} seconds.`);
+            },
+          });
+          const result = dungeonLogic.parseAttackResponse(response);
+          if (!result.ok) {
+            if (/not enough stamina|insufficient stamina/i.test(result.message)) {
+              await resources.ensureStamina(effectiveStaminaCost, true);
+              continue;
+            }
+            const retryMs = retryDelayFromMessage(result.message, route.settings.attackCooldownMs);
+            if (retryMs !== null && cooldownRetries < 5) {
+              cooldownRetries += 1;
+              await sleepImpl(retryMs);
+              continue;
+            }
+            throw new Error(`Attack on ${target.name || 'the monster'} failed: ${result.message || `HTTP ${response?.status || '?'}`}`);
+          }
+          if (!result.dead && result.damage <= 0) {
+            throw new Error(`Attack on ${target.name || 'the monster'} returned no verifiable damage.`);
+          }
+          cooldownRetries = 0;
+          attempts += 1;
+          runtime.attacks += 1;
+          resources.spendStamina(effectiveStaminaCost);
+          if (Number.isFinite(ownDamage)) ownDamage += result.damage;
+          if (Number.isFinite(result.playerHp)) battle.snapshot.playerHp = result.playerHp;
+          if (result.dead) return { reason: 'dead', attacks: attempts };
+          if (!decision.untilDead && Number.isFinite(ownDamage) && ownDamage >= decision.targetDamage) {
+            return { reason: 'target', attacks: attempts };
+          }
+
+          if (attempts % TIMING.refreshBattleEvery === 0 || result.currentHp === null) {
+            battle = await fetchBattle(target, userId);
+            if (battle.snapshot.dead) return { reason: 'dead', attacks: attempts };
+            decision = resolvePveTarget(target, battle.snapshot);
+            if (!decision.ok) throw new Error(`${target.name || 'Crucible PvE target'}: ${decision.error}`);
+            ownDamage = battle.snapshot.ownDamage;
+            if (decision.done) return { reason: 'target', attacks: attempts };
+          }
+          await sleepImpl(route.settings.attackCooldownMs);
+        }
+        throw new Error(`${target.name || 'Crucible PvE target'} exceeded the per-monster attack safety limit.`);
+      }
+
+      function saveDiscoveries(discoveries) {
+        const config = normalizeConfig(store.read(CONFIG_KEY));
+        const merged = crucibleRoute.mergeDiscoveredMonsters(config.routes[ROUTE_ID].settings, discoveries);
+        if (!merged.changed) return config.routes[ROUTE_ID].settings;
+        config.routes[ROUTE_ID].settings = merged.settings;
+        store.write(CONFIG_KEY, normalizeConfig(config));
+        return merged.settings;
+      }
+
+      function saveShadowDiscoveries(discoveries) {
+        const config = normalizeConfig(store.read(CONFIG_KEY));
+        const merged = crucibleRoute.mergeDiscoveredShadows(config.routes[ROUTE_ID].settings, discoveries);
+        if (!merged.changed) return config.routes[ROUTE_ID].settings;
+        config.routes[ROUTE_ID].settings = merged.settings;
+        store.write(CONFIG_KEY, normalizeConfig(config));
+        return merged.settings;
+      }
+
+      async function processPveNode(visitId, route, cube, node, userId) {
+        const definition = logic.nodeForLocationId(node.linkedLocationId);
+        if (!definition) throw new Error(`${node.name || node.key} has an unknown Crucible PvE location.`);
+        const enterPayload = logic.buildCubeNodeEnterPayload({
+          instanceId: cube.instanceId,
+          nodeId: node.id,
+          faceKey: node.faceKey,
+        });
+        if (!enterPayload) throw new Error(`Could not build a safe ${node.name || node.key} node-entry request.`);
+        setWorkingMessage(visitId, `Scanning ${definition.faceName} · ${node.name}.`);
+        const enterResponse = await guardedPostForm(visitId, CUBE_ACTION_URL, enterPayload);
+        const entered = logic.parseCubeNodeEnterResponse(
+          enterResponse,
+          { instanceId: cube.instanceId, locationId: node.linkedLocationId },
+          win.location.origin,
+        );
+        if (!entered.ok) throw new Error(`Entering ${node.name || node.key} failed: ${entered.message || 'invalid redirect'}`);
+        const locationDoc = await fetchDocument(entered.redirect);
+        const monsters = dungeonLogic.parseLocationPage(locationDoc, entered.redirect);
+        const discoveries = logic.discoverPveMonsters(definition, monsters);
+        assertCanMutate(visitId);
+        route.settings = saveDiscoveries(discoveries);
+        let processed = 0;
+
+        for (const monster of monsters) {
+          assertCanMutate(visitId);
+          const key = `${monster.instanceId || cube.instanceId}:${monster.monsterId}`;
+          if (monster.dead || runtime.processedPve.has(key)) continue;
+          const selected = crucibleRoute.settingsForMonster(route.settings, definition.id, monster.name);
+          if (!selected.target?.enabled) continue;
+          const target = {
+            ...monster,
+            instanceId: monster.instanceId || cube.instanceId,
+            key,
+            target: selected.target,
+          };
+          const result = await attackPveMonster(visitId, route, target, userId);
+          runtime.processedPve.add(key);
+          runtime.targets += 1;
+          processed += 1;
+          setWorkingMessage(
+            visitId,
+            `${monster.name || 'Crucible monster'} ${
+              result.reason === 'dead' ? 'is defeated' : 'reached its configured damage target'
+            }; checking the next target.`,
+          );
+        }
+        return processed;
+      }
+
+      function pvpLobbyUrl(instanceId, nodeId) {
+        const url = new URL('/pvp_style_node.php', win.location.origin);
+        url.searchParams.set('source', 'cube');
+        url.searchParams.set('instance_id', instanceId);
+        url.searchParams.set('node_id', nodeId);
+        return url.href;
+      }
+
+      function pvpStateUrl(instanceId, nodeId, matchNo) {
+        const url = new URL(PVP_STATE_URL, win.location.origin);
+        url.searchParams.set('source', 'cube');
+        url.searchParams.set('since_log_id', '0');
+        url.searchParams.set('instance_id', instanceId);
+        url.searchParams.set('node_id', nodeId);
+        url.searchParams.set('match_no', String(matchNo));
+        return url.href;
+      }
+
+      function cappedRecheck(waitMs = TIMING.regularRecheckMs) {
+        const delay = Number.isFinite(Number(waitMs)) && Number(waitMs) > 0
+          ? Math.min(Number(waitMs), TIMING.regularRecheckMs)
+          : TIMING.regularRecheckMs;
+        return now() + Math.max(1_000, delay);
+      }
+
+      async function monitorPvpMatch(visitId, cube, node, matchNo) {
+        let polls = 0;
+        while (true) {
+          assertCanMutate(visitId);
+          const response = await requestJson(pvpStateUrl(cube.instanceId, node.id, matchNo));
+          const state = logic.parsePvpState(response);
+          if (!state.ok) throw new Error(`PvP match #${matchNo} state failed: ${state.error}`);
+          if (state.ended) {
+            runtime.processedPvp.add(node.key);
+            return { progressed: true, message: `PvP match #${matchNo} ${state.won ? 'was won' : 'ended'}.` };
+          }
+          if (state.roomStatus !== 'live') {
+            return {
+              waitUntil: cappedRecheck(),
+              note: `${node.name} waiting for players`,
+              message: `PvP match #${matchNo} is still open; checking the Crucible again soon.`,
+            };
+          }
+          polls += 1;
+          setWorkingMessage(visitId, `Watching live ${node.name} match #${matchNo} (${polls}).`);
+          await sleepImpl(TIMING.pvpPollMs);
+        }
+      }
+
+      async function processPvpNode(visitId, cube, node) {
+        const lobbyUrl = pvpLobbyUrl(cube.instanceId, node.id);
+        setWorkingMessage(visitId, `Checking ${node.name} PvP slots.`);
+        let lobbyDoc = await fetchDocument(lobbyUrl);
+        let lobby = logic.parsePvpLobby(lobbyDoc, lobbyUrl);
+        let action = logic.choosePvpAction(lobby);
+
+        if (action.kind === 'existing') {
+          return monitorPvpMatch(visitId, cube, node, action.match.matchNo);
+        }
+        if (action.kind === 'wait') {
+          return {
+            waitUntil: cappedRecheck(action.waitMs),
+            note: `${node.name} binding active`,
+            message: `${node.name} is bound for ${Math.ceil(action.waitMs / 1_000)} more seconds; checking node progress regularly.`,
+          };
+        }
+        if (action.kind === 'unavailable') {
+          return {
+            waitUntil: cappedRecheck(),
+            note: `${node.name} has no free slot`,
+            message: `${node.name} has no open slot; checking again soon.`,
+          };
+        }
+
+        const payload = logic.buildPvpClaimPayload({
+          instanceId: cube.instanceId,
+          nodeId: node.id,
+          matchNo: action.match.matchNo,
+          slotIndex: action.slotIndex,
+        });
+        if (!payload) throw new Error(`Could not build a safe ${node.name} slot request.`);
+        assertCanMutate(visitId);
+        setWorkingMessage(visitId, `Claiming slot ${action.slotIndex} in ${node.name} match #${action.match.matchNo}.`);
+        const response = await guardedPostForm(visitId, PVP_ACTION_URL, payload);
+        const claimed = logic.parsePvpClaimResponse(response);
+        if (!claimed.ok) throw new Error(`Claiming the PvP slot failed: ${claimed.message || 'unknown response'}`);
+
+        // Require the lobby to confirm our slot before waiting on the match.
+        lobbyDoc = await fetchDocument(lobbyUrl);
+        lobby = logic.parsePvpLobby(lobbyDoc, lobbyUrl);
+        action = logic.choosePvpAction(lobby);
+        if (action.kind !== 'existing' || action.match.matchNo !== Number(payload.match_no)) {
+          throw new Error('The PvP lobby did not confirm the claimed slot.');
+        }
+        return monitorPvpMatch(visitId, cube, node, action.match.matchNo);
+      }
+
+      async function healArmyIfAvailable(visitId, route) {
+        assertCanMutate(visitId);
+        const armyDoc = await fetchDocument(SHADOW_ARMY_URL);
+        const shadows = logic.parseOwnedArmyShadows(armyDoc);
+        if (shadows.length > 0) {
+          assertCanMutate(visitId);
+          route.settings = saveShadowDiscoveries(shadows);
+        }
+        const availability = logic.parseArmyHealAvailability(armyDoc);
+        if (!availability.found) throw new Error('The Shadow Army heal-all control could not be found.');
+        if (!availability.available) return false;
+        setWorkingMessage(visitId, 'Healing all ready Shadow Army units before joining.');
+        assertCanMutate(visitId);
+        const response = await guardedPostForm(visitId, SHADOW_ARMY_URL, { action: 'heal_all_units' });
+        if (!response?.ok) {
+          throw new Error(`Healing the Shadow Army failed: ${responseText(response) || `HTTP ${response?.status || '?'}`}`);
+        }
+        const verifiedDoc = await fetchDocument(SHADOW_ARMY_URL);
+        const verified = logic.parseArmyHealAvailability(verifiedDoc);
+        if (!verified.found || verified.available) {
+          throw new Error('The Shadow Army page did not confirm that ready units were healed.');
+        }
+        return true;
+      }
+
+      async function armyStateAction(visitId, action, fields) {
+        const payload = logic.buildArmyLivePayload(action, fields);
+        if (!payload) throw new Error(`Could not build a safe Army ${action} request.`);
+        assertCanMutate(visitId);
+        const response = await guardedPostForm(visitId, ARMY_LIVE_URL, payload);
+        const result = logic.parseArmyActionResponse(response);
+        if (!result.ok) {
+          throw new Error(`Army ${action} failed: ${result.message || `HTTP ${response?.status || '?'}`}`);
+        }
+        runtime.armyActions += action === 'get_state' ? 0 : 1;
+        return result.state;
+      }
+
+      async function joinArmyIfNeeded(visitId, battleId, state) {
+        let summary = logic.armySummary(state);
+        if (summary.own.length > 0) return state;
+        if (summary.viewer.has_roster === false) throw new Error('No saved Shadow Army formation is available.');
+        if (summary.viewer.can_join !== true) {
+          // A captain that already retreated may no longer be present in the
+          // captain array while the player remains committed to this fight. That
+          // is a waiting state, not evidence that a second join is safe.
+          return null;
+        }
+        setWorkingMessage(visitId, 'Joining the live fight with the saved Shadow Army formation.');
+        state = await armyStateAction(visitId, 'join_battle', { battleId });
+        summary = logic.armySummary(state);
+        if (summary.own.length === 0) throw new Error('The Army battle did not confirm our formation after joining.');
+        return state;
+      }
+
+      async function applySelectedArmyFormation(visitId, battleId, state, selectedShadowIds) {
+        const selected = new Set((selectedShadowIds || []).map(String));
+        if (selected.size === 0) throw new Error('Select at least one Shadow for the Crucible Army formation.');
+        let summary = logic.armySummary(state);
+        const selectedOwn = summary.own.filter((captain) => selected.has(String(captain.source_shadow_id ?? '')));
+        if (summary.own.length > 0 && selectedOwn.length === 0) {
+          throw new Error('None of the selected Shadows is present in the saved game formation.');
+        }
+        for (const captain of summary.livingOwn) {
+          if (selected.has(String(captain.source_shadow_id ?? ''))) continue;
+          setWorkingMessage(visitId, `Retreating unselected Shadow ${captain.display_name || captain.id}.`);
+          state = await armyStateAction(visitId, 'retreat_captain', {
+            battleId,
+            captainId: captain.id,
+          });
+          summary = logic.armySummary(state);
+          if (!summary.active) break;
+        }
+        return state;
+      }
+
+      async function runMinimalArmy(visitId, node, battleId, initialState, selectedShadowIds) {
+        let state = initialState;
+        const previous = minimalArmyContribution(battleId);
+        if (previous) {
+          const summary = logic.armySummary(state);
+          const captain = summary.own.find((candidate) => Number(candidate?.id) === Number(previous.captainId));
+          if (summary.active && captain && !captain.is_dead && captain.retreat_requested !== true) {
+            setWorkingMessage(visitId, `Finishing the verified minimal-contribution retreat in ${node.name}.`);
+            state = await armyStateAction(visitId, 'retreat_captain', {
+              battleId,
+              captainId: previous.captainId,
+            });
+          }
+          return {
+            waitUntil: cappedRecheck(),
+            note: `${node.name} contribution complete`,
+            message: `${node.name} already has a verified personal contribution; checking for the next fight soon.`,
+          };
+        }
+        const plan = logic.planArmyActions(state, 'minimal', selectedShadowIds);
+        if (plan.error) throw new Error(plan.error);
+        if (plan.done) return { progressed: plan.reason === 'ended', message: `${node.name} Army fight ${plan.reason}.` };
+        const command = plan.commands.find((candidate) => candidate.action === 'assign');
+        if (!command) {
+          return {
+            waitUntil: cappedRecheck(),
+            note: `${node.name} Army fight active`,
+            message: `${node.name} has no free personal captain to assign yet.`,
+          };
+        }
+
+        const before = state;
+        setWorkingMessage(visitId, `Assigning one captain in ${node.name} for the minimal contribution.`);
+        state = await armyStateAction(visitId, 'assign_target', {
+          battleId,
+          attackerId: command.attackerId,
+          defenderId: command.defenderId,
+        });
+        let verified = logic.hasVerifiedArmyHit(before, state, command.attackerId, command.defenderId);
+        for (let poll = 0; !verified && poll < TIMING.minimalHitPolls; poll += 1) {
+          assertCanMutate(visitId);
+          if (!logic.armySummary(state).active) break;
+          await sleepImpl(TIMING.armyPollMs);
+          state = await armyStateAction(visitId, 'get_state', { battleId });
+          verified = logic.hasVerifiedArmyHit(before, state, command.attackerId, command.defenderId);
+        }
+
+        const stillActive = logic.armySummary(state).active;
+        if (!verified) {
+          if (!stillActive) {
+            return {
+              progressed: true,
+              message: `${node.name} ended before a personal hit could be verified.`,
+            };
+          }
+          throw new Error(`${node.name} did not show a verifiable personal hit; the captain remains assigned.`);
+        }
+        rememberMinimalArmyContribution(visitId, battleId, command.attackerId);
+        if (stillActive) {
+          setWorkingMessage(visitId, `Retreating the minimal-contribution captain from ${node.name}.`);
+          state = await armyStateAction(visitId, 'retreat_captain', {
+            battleId,
+            captainId: command.attackerId,
+          });
+        }
+        return {
+          waitUntil: cappedRecheck(),
+          note: `${node.name} contribution complete`,
+          message: `${node.name} received the minimal contribution; checking for the next fight soon.`,
+        };
+      }
+
+      async function runKillArmy(visitId, node, battleId, initialState, selectedShadowIds) {
+        let state = initialState;
+        for (let poll = 0; poll < TIMING.maxArmyPolls; poll += 1) {
+          assertCanMutate(visitId);
+          const plan = logic.planArmyActions(state, 'kill', selectedShadowIds);
+          if (plan.error) throw new Error(plan.error);
+          if (plan.done) {
+            if (plan.reason === 'ended') {
+              return { progressed: true, message: `${node.name} Army fight ended.` };
+            }
+            return {
+              waitUntil: cappedRecheck(),
+              note: `${node.name} formation defeated`,
+              message: `All personal captains in ${node.name} are down; checking healing and fight state soon.`,
+            };
+          }
+
+          const assignments = plan.commands.filter((command) => command.action === 'assign');
+          if (assignments.length > 0) {
+            for (const command of assignments) {
+              assertCanMutate(visitId);
+              if (!logic.armySummary(state).active) break;
+              setWorkingMessage(
+                visitId,
+                `Assigning captain ${command.attackerId} to enemy ${command.defenderId} in ${node.name}.`,
+              );
+              state = await armyStateAction(visitId, 'assign_target', {
+                battleId,
+                attackerId: command.attackerId,
+                defenderId: command.defenderId,
+              });
+            }
+          } else {
+            setWorkingMessage(visitId, `Waiting for the active ${node.name} Army engagements.`);
+          }
+          await sleepImpl(TIMING.armyPollMs);
+          state = await armyStateAction(visitId, 'get_state', { battleId });
+        }
+        throw new Error(`${node.name} exceeded the Army battle polling safety limit.`);
+      }
+
+      async function processArmyNode(visitId, route, cube, node) {
+        const pageUrl = new URL('/guild_dungeon_cube_army_enter.php', win.location.origin);
+        pageUrl.searchParams.set('instance_id', cube.instanceId);
+        pageUrl.searchParams.set('node_id', node.id);
+        setWorkingMessage(visitId, `Checking Army fights in ${node.name}.`);
+        const pageDoc = await fetchDocument(pageUrl.href);
+        const page = logic.parseArmyNodePage(pageDoc);
+        const fight = logic.chooseArmyFight(page);
+        if (!fight) return { progressed: false, message: `${node.name} has no actionable Army fight.` };
+
+        await healArmyIfAvailable(visitId, route);
+        if (route.settings.army.selectedShadowIds.length === 0) {
+          throw new Error('Select at least one Shadow for the Crucible Army formation.');
+        }
+        const payload = logic.buildArmyEnterPayload({
+          instanceId: cube.instanceId,
+          nodeId: node.id,
+          matchNo: fight.matchNo,
+        });
+        if (!payload) throw new Error(`Could not build a safe ${node.name} Army entry request.`);
+        assertCanMutate(visitId);
+        setWorkingMessage(visitId, `Entering ${node.name} Army fight #${fight.matchNo}.`);
+        const response = await guardedPostForm(visitId, ARMY_ACTION_URL, payload);
+        const entered = logic.parseArmyEnterResponse(response, win.location.origin);
+        if (!entered.ok) throw new Error(`Entering the Army fight failed: ${entered.message || 'invalid redirect'}`);
+        const liveDoc = await fetchDocument(entered.redirect);
+        const live = logic.parseArmyLivePage(liveDoc);
+        if (!live.battleId || !live.state) throw new Error('The live Army battle state could not be read safely.');
+        if (!logic.armySummary(live.state).active) {
+          return { progressed: true, message: `${node.name} Army fight already ended.` };
+        }
+        if (route.settings.army.mode === 'minimal' && minimalArmyContribution(live.battleId)) {
+          return runMinimalArmy(
+            visitId,
+            node,
+            live.battleId,
+            live.state,
+            route.settings.army.selectedShadowIds,
+          );
+        }
+        let state = await joinArmyIfNeeded(visitId, live.battleId, live.state);
+        if (!state) {
+          return {
+            waitUntil: cappedRecheck(),
+            note: `${node.name} Army commitment active`,
+            message: `${node.name} is active but the formation cannot safely join again; checking its state soon.`,
+          };
+        }
+        state = await applySelectedArmyFormation(
+          visitId,
+          live.battleId,
+          state,
+          route.settings.army.selectedShadowIds,
+        );
+        if (route.settings.army.mode === 'minimal') {
+          return runMinimalArmy(visitId, node, live.battleId, state, route.settings.army.selectedShadowIds);
+        }
+        return runKillArmy(visitId, node, live.battleId, state, route.settings.army.selectedShadowIds);
+      }
+
+      async function loadCube(visitId, url) {
+        assertCanMutate(visitId);
+        const cubeDoc = await fetchDocument(url);
+        const cube = logic.parseCubePage(cubeDoc, url);
+        if (!/^\d+$/.test(cube.instanceId)) throw new Error('The Crucible instance id could not be read.');
+        if (cube.nodes.length === 0) throw new Error('The Crucible STATE nodes could not be read.');
+        return cube;
+      }
+
+      function waitResult(results) {
+        const waits = results.filter((result) => Number(result?.waitUntil) > now());
+        if (waits.length === 0) return null;
+        waits.sort((left, right) => left.waitUntil - right.waitUntil);
+        return waits[0];
+      }
+
+      async function executeVisit(command) {
+        const visitId = command.visitId;
+        let route = routeConfig();
+        if (!route.settings.pveEnabled && !route.settings.pvp.enabled && !route.settings.army.enabled) {
+          setTerminal(visitId, 'done', 'Crucible has no enabled automation section.');
+          return;
+        }
+
+        setWorkingMessage(visitId, 'Looking for the active Polyhedral Crucible instance.');
+        const entry = logic.parseHubEntry(doc, currentUrl()?.href);
+        if (!entry) throw new Error('The Polyhedral Crucible entry was not found on the guild-dungeon page.');
+        let cubeUrl = entry.url;
+        let userId = '';
+
+        for (let pass = 0; pass < TIMING.maxVisitPasses; pass += 1) {
+          assertCanMutate(visitId);
+          const cube = await loadCube(visitId, cubeUrl);
+          cubeUrl = new URL(`/guild_dungeon_cube.php?instance_id=${encodeURIComponent(cube.instanceId)}`, win.location.origin).href;
+          route = routeConfig();
+          let progressed = false;
+          const waiting = [];
+
+          if (route.settings.pveEnabled) {
+            const pveNodes = [
+              ...logic.actionableNodes(cube, 'pve'),
+              ...logic.actionableNodes(cube, 'boss'),
+            ];
+            if (pveNodes.length > 0 && !userId) {
+              userId = String(await getUserId() || '');
+              if (!userId) throw new Error('The player id could not be determined for Crucible PvE.');
+            }
+            for (const node of pveNodes) {
+              const count = await processPveNode(visitId, route, cube, node, userId);
+              progressed = count > 0 || progressed;
+            }
+            if (progressed) continue;
+          }
+
+          if (route.settings.army.enabled) {
+            for (const node of logic.actionableNodes(cube, 'army')) {
+              const result = await processArmyNode(visitId, route, cube, node);
+              if (result.progressed) {
+                progressed = true;
+                break;
+              }
+              if (result.waitUntil) waiting.push(result);
+            }
+            if (progressed) continue;
+          }
+
+          if (route.settings.pvp.enabled) {
+            for (const node of logic.actionableNodes(cube, 'pvp')) {
+              if (runtime.processedPvp.has(node.key)) continue;
+              const result = await processPvpNode(visitId, cube, node);
+              if (result.progressed) {
+                progressed = true;
+                break;
+              }
+              if (result.waitUntil) waiting.push(result);
+            }
+            if (progressed) continue;
+          }
+
+          const next = waitResult(waiting);
+          if (next) {
+            setTerminal(
+              visitId,
+              'done',
+              `${next.message} Completed ${runtime.targets} PvE target(s), ${runtime.attacks} PvE attack(s) and ${runtime.armyActions} Army action(s).`,
+              { retryAt: next.waitUntil, note: next.note },
+            );
+            return;
+          }
+
+          setTerminal(
+            visitId,
+            'done',
+            `Crucible pass finished ${runtime.targets} PvE target(s), ${runtime.attacks} PvE attack(s) and ${runtime.armyActions} Army action(s).`,
+          );
+          return;
+        }
+        throw new Error('Crucible did not settle after repeated node-state rescans.');
+      }
+
+      async function tick() {
+        if (runtime.stopped || runtime.ticking || !isMarkedHub()) return;
+        const command = readCommand();
+        if (!command) {
+          if (!runtime.runningVisitId) publish('idle', true, 'Crucible is idle on the dungeon page.');
+          return;
+        }
+        if (!ownsSchedulerLease()) return;
+        if (runtime.terminal?.visitId === command.visitId) {
+          publish(runtime.terminal.state, true, runtime.terminal.message, command.visitId, runtime.terminal);
+          return;
+        }
+        if (command.phase === 'draining' || now() >= command.deadlineAt) {
+          setTerminal(command.visitId, 'done', 'Crucible stopped safely before starting another action.');
+          return;
+        }
+
+        runtime.ticking = true;
+        runtime.runningVisitId = command.visitId;
+        runtime.terminal = null;
+        runtime.processedPve = new Set();
+        runtime.processedPvp = new Set();
+        runtime.attacks = 0;
+        runtime.targets = 0;
+        runtime.armyActions = 0;
+        try {
+          await executeVisit(command);
+        } catch (error) {
+          if (error instanceof VisitStop) {
+            if (error.kind === 'ownership' || error.kind === 'cancelled') return;
+            setTerminal(command.visitId, 'done', error.message, { retryAt: error.retryAt, note: error.note });
+          } else {
+            setTerminal(command.visitId, 'error', `Crucible failed safely: ${error?.message || error}`);
+          }
+        } finally {
+          runtime.ticking = false;
+          if (!runtime.terminal) runtime.runningVisitId = '';
+        }
+      }
+
+      function heartbeat() {
+        if (!runtime.runningVisitId || runtime.terminal || !ownsSchedulerLease()) return;
+        publish('working', false, runtime.message || 'Crucible is working.', runtime.runningVisitId, { force: true });
+      }
+
+      function onVisibilityChange() {
+        if (doc.hidden !== true && doc.visibilityState !== 'hidden') void tick();
+      }
+
+      function onPageShow() {
+        void tick();
+      }
+
+      function onPageHide(event) {
+        if (!event?.persisted) stop();
+      }
+
+      function start() {
+        runtime.interval = win.setInterval?.(() => void tick(), TIMING.tickMs) ?? null;
+        runtime.heartbeat = win.setInterval?.(heartbeat, TIMING.heartbeatMs) ?? null;
+        doc.addEventListener?.('visibilitychange', onVisibilityChange);
+        win.addEventListener?.('pageshow', onPageShow);
+        win.addEventListener?.('pagehide', onPageHide);
+        void tick();
+      }
+
+      function stop() {
+        runtime.stopped = true;
+        if (runtime.interval !== null) win.clearInterval?.(runtime.interval);
+        if (runtime.heartbeat !== null) win.clearInterval?.(runtime.heartbeat);
+        runtime.interval = null;
+        runtime.heartbeat = null;
+        doc.removeEventListener?.('visibilitychange', onVisibilityChange);
+        win.removeEventListener?.('pageshow', onPageShow);
+        win.removeEventListener?.('pagehide', onPageHide);
+      }
+
+      return { heartbeat, onPageHide, onPageShow, onVisibilityChange, runtime, start, stop, tick };
+    }
+
+    const crucibleWorkerFeature = Object.freeze({
+      id: 'crucible-worker',
+      group: 'Automation',
+      settings: [],
+      matches(url) {
+        return /\/guild_dungeon\.php\/?$/i.test(url.pathname);
+      },
+      run(ctx) {
+        let multiplier = 1;
+        try {
+          multiplier = staminaMultiplier(ctx);
+        } catch {
+          // The optional shared setting is unavailable only in isolated tests.
+        }
+        const worker = createCrucibleWorker({
+          win: ctx.win,
+          doc: ctx.doc,
+          store: ctx.store,
+          sessionStore: createJsonStore(getStorage('sessionStorage', ctx.win), '[Veyra]'),
+          fetchDocument: ctx.fetchDocument,
+          postForm: ctx.postForm,
+          getUserId: ctx.getUserId,
+          asterionMultiplier: multiplier,
+        });
+        worker.start();
+        return worker;
+      },
+    });
+
+    module.exports = {
+      ARMY_ACTION_URL,
+      ARMY_LIVE_URL,
+      CUBE_ACTION_URL,
+      DAMAGE_URL,
+      DASHBOARD_URL,
+      JOIN_URL,
+      MINIMAL_ARMY_CONTRIBUTIONS_KEY,
+      PVP_ACTION_URL,
+      PVP_STATE_URL,
+      ROUTE_ID,
+      SHADOW_ARMY_URL,
+      TIMING,
+      VisitStop,
+      createCrucibleWorker,
+      crucibleWorkerFeature,
+      readStamina,
+    };
+  },
   "features/automation/index.js": function (module, exports, require) {
     'use strict';
 
+    const { adventurersWorkerFeature } = require('./adventurers-worker');
     const { bossWorkerFeature } = require('./boss-worker');
+    const { crucibleWorkerFeature } = require('./crucible-worker');
+    const { pvpWorkerFeature } = require('./pvp-worker');
+    const { shadowbridgeWorkerFeature } = require('./shadowbridge-worker');
 
-    module.exports = [bossWorkerFeature];
+    module.exports = [
+      bossWorkerFeature,
+      pvpWorkerFeature,
+      adventurersWorkerFeature,
+      shadowbridgeWorkerFeature,
+      crucibleWorkerFeature,
+    ];
+  },
+  "features/automation/pvp-logic.js": function (module, exports, require) {
+    'use strict';
+
+    // Pure Solo PvP helpers. The attack planner is the tested strategy from the
+    // former activate_auto_battle_target.js userscript, kept independent from DOM
+    // and scheduler state so it can be verified without a browser.
+
+    const SKILL_KEYS = Object.freeze({
+      slash: 'slash',
+      powerSlash: 'powerSlash',
+      venomRend: 'venomRend',
+      deathMark: 'deathMark',
+      finalWish: 'finalWish',
+    });
+
+    const SKILL_IDS = Object.freeze({
+      [SKILL_KEYS.slash]: '0',
+      [SKILL_KEYS.powerSlash]: '-1',
+      [SKILL_KEYS.venomRend]: 'adv:18',
+      [SKILL_KEYS.deathMark]: 'adv:19',
+      [SKILL_KEYS.finalWish]: 'adv:20',
+    });
+
+    const SKILL_NAMES = Object.freeze({
+      [SKILL_KEYS.slash]: 'Slash',
+      [SKILL_KEYS.powerSlash]: 'Power Slash',
+      [SKILL_KEYS.venomRend]: 'Venom Rend',
+      [SKILL_KEYS.deathMark]: 'Death Mark',
+      [SKILL_KEYS.finalWish]: 'Final Wish',
+    });
+
+    const COMBAT_DEFAULTS = Object.freeze({
+      slashTokenGain: 3,
+      resourceGainPerAction: 25,
+      finalWishCost: 15,
+      resourceMaximum: 100,
+    });
+
+    function finiteNumber(value) {
+      if (value === null || value === undefined || String(value).trim() === '') return null;
+      const number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    }
+
+    function parseInteger(value) {
+      const match = String(value ?? '').match(/-?\d[\d.,\s]*/);
+      if (!match) return null;
+      const number = Number.parseInt(match[0].replace(/\D/g, ''), 10);
+      if (!Number.isFinite(number)) return null;
+      return match[0].trim().startsWith('-') ? -number : number;
+    }
+
+    function parseFraction(value) {
+      const match = String(value ?? '').match(/(\d[\d.,\s]*)\s*\/\s*(\d[\d.,\s]*)/);
+      if (!match) return null;
+      const current = parseInteger(match[1]);
+      const maximum = parseInteger(match[2]);
+      return current === null || maximum === null ? null : { current, maximum };
+    }
+
+    function normalizeText(value) {
+      return String(value || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+    }
+
+    function roundsUntilFinalWish({
+      tokens,
+      resource,
+      finalCost = COMBAT_DEFAULTS.finalWishCost,
+      resourceMaximum = COMBAT_DEFAULTS.resourceMaximum,
+      slashTokenGain = COMBAT_DEFAULTS.slashTokenGain,
+      resourceGainPerAction = COMBAT_DEFAULTS.resourceGainPerAction,
+    }) {
+      const tokenValue = finiteNumber(tokens);
+      const resourceValue = finiteNumber(resource);
+      const cost = finiteNumber(finalCost);
+      const maximum = finiteNumber(resourceMaximum);
+      if (
+        tokenValue === null ||
+        resourceValue === null ||
+        cost === null ||
+        maximum === null ||
+        slashTokenGain <= 0 ||
+        resourceGainPerAction <= 0
+      ) {
+        return Number.POSITIVE_INFINITY;
+      }
+
+      const tokenRounds = Math.ceil(Math.max(0, cost - tokenValue) / slashTokenGain);
+      const resourceRounds = Math.ceil(Math.max(0, maximum - resourceValue) / resourceGainPerAction);
+      return Math.max(tokenRounds, resourceRounds);
+    }
+
+    function canSpendWithoutDelayingFinal({
+      tokens,
+      skillCost,
+      rounds,
+      finalCost = COMBAT_DEFAULTS.finalWishCost,
+      slashTokenGain = COMBAT_DEFAULTS.slashTokenGain,
+    }) {
+      const tokenValue = finiteNumber(tokens);
+      const cost = finiteNumber(skillCost);
+      if (tokenValue === null || cost === null || !Number.isFinite(rounds) || rounds < 1) return false;
+      const remainingSlashActions = Math.max(0, Math.floor(rounds) - 1);
+      return tokenValue - cost + remainingSlashActions * slashTokenGain >= finalCost;
+    }
+
+    function canUseSkill(skill, snapshot) {
+      if (!skill?.available) return false;
+      const cost = finiteNumber(skill.cost);
+      const resourceCost = finiteNumber(skill.resourceCost);
+      if (cost === null || resourceCost === null || cost < 0 || resourceCost < 0) return false;
+      if (snapshot.tokens < cost || snapshot.resource < resourceCost) return false;
+      return !skill.requiresFullResource || snapshot.resource >= snapshot.resourceMaximum;
+    }
+
+    function makeDecision(skillKey, reason, rounds, options = {}) {
+      return {
+        skillKey,
+        reason,
+        roundsUntilFinalWish: rounds,
+        prepareBridge: options.prepareBridge === true,
+        consumeBridge: options.consumeBridge === true,
+        resetCycle: options.resetCycle === true,
+      };
+    }
+
+    function chooseAttackPlan(input) {
+      const tokens = finiteNumber(input?.tokens);
+      const resource = finiteNumber(input?.resource);
+      const resourceMaximum = finiteNumber(input?.resourceMaximum) ?? COMBAT_DEFAULTS.resourceMaximum;
+      const skills = input?.skills || {};
+      const bridgePending = input?.bridgePending === true;
+      const enemyPoisoned = input?.enemyPoisoned === true;
+      const slash = skills[SKILL_KEYS.slash];
+      const finalWish = skills[SKILL_KEYS.finalWish];
+      const finalCost = finiteNumber(finalWish?.cost) ?? COMBAT_DEFAULTS.finalWishCost;
+
+      if (tokens === null || resource === null) {
+        return makeDecision(null, 'Battle values are unavailable.', Number.POSITIVE_INFINITY, {
+          consumeBridge: bridgePending,
+        });
+      }
+
+      const snapshot = { tokens, resource, resourceMaximum };
+      const rounds = roundsUntilFinalWish({ tokens, resource, finalCost, resourceMaximum });
+      if (rounds === 0 && canUseSkill(finalWish, snapshot)) {
+        return makeDecision(SKILL_KEYS.finalWish, 'Final Wish is ready now.', rounds, {
+          consumeBridge: bridgePending,
+          resetCycle: true,
+        });
+      }
+
+      if (!slash?.available) {
+        return makeDecision(null, 'Slash is unavailable.', rounds, { consumeBridge: bridgePending });
+      }
+
+      if (tokens < finalCost) {
+        return makeDecision(SKILL_KEYS.slash, `Only ${tokens} token(s): build with Slash.`, rounds, {
+          consumeBridge: bridgePending,
+        });
+      }
+
+      if (bridgePending) {
+        const followUpKey = enemyPoisoned ? SKILL_KEYS.venomRend : SKILL_KEYS.powerSlash;
+        const followUp = skills[followUpKey];
+        const followUpName = SKILL_NAMES[followUpKey];
+        if (
+          rounds === 1 &&
+          canUseSkill(followUp, snapshot) &&
+          canSpendWithoutDelayingFinal({ tokens, skillCost: followUp.cost, rounds, finalCost })
+        ) {
+          return makeDecision(
+            followUpKey,
+            enemyPoisoned
+              ? `${followUpName}: Death Mark is prepared and the enemy is poisoned.`
+              : `${followUpName}: Death Mark is prepared and the enemy is not poisoned.`,
+            rounds,
+            { consumeBridge: true },
+          );
+        }
+        return makeDecision(
+          SKILL_KEYS.slash,
+          `${followUpName} would delay Final Wish or is unavailable; use Slash.`,
+          rounds,
+          { consumeBridge: true },
+        );
+      }
+
+      const deathMark = skills[SKILL_KEYS.deathMark];
+      if (
+        (rounds === 1 || rounds === 2) &&
+        canUseSkill(deathMark, snapshot) &&
+        canSpendWithoutDelayingFinal({ tokens, skillCost: deathMark.cost, rounds, finalCost })
+      ) {
+        return makeDecision(
+          SKILL_KEYS.deathMark,
+          `Death Mark prepares Final Wish ${rounds === 1 ? 'next turn' : 'in two turns'}.`,
+          rounds,
+          { prepareBridge: rounds === 2 },
+        );
+      }
+
+      return makeDecision(
+        SKILL_KEYS.slash,
+        Number.isFinite(rounds)
+          ? `Build for Final Wish (${rounds} preparation turn(s) remaining).`
+          : 'Could not calculate Final Wish safely; use Slash.',
+        rounds,
+      );
+    }
+
+    function isConfirmedSkillUse(logText, actorName, skillName) {
+      const text = normalizeText(logText);
+      const actor = normalizeText(actorName);
+      const skill = normalizeText(skillName);
+      if (!text || !actor || !skill) return false;
+      const prefix = `${actor} used ${skill}`;
+      if (!text.startsWith(prefix)) return false;
+      const boundary = text.charAt(prefix.length);
+      return boundary === '' || /[\s.,!?:;()-]/.test(boundary);
+    }
+
+    function isFinishedBattleState({ statusText, rewardsVisible, allyAlive, enemyAlive }) {
+      const status = normalizeText(statusText);
+      if (/victory|defeat|draw|battle ended|match ended|finished/.test(status) || rewardsVisible) {
+        return true;
+      }
+      if (/battle in progress|match in progress/.test(status)) return false;
+      return allyAlive === false || enemyAlive === false;
+    }
+
+    module.exports = {
+      COMBAT_DEFAULTS,
+      SKILL_IDS,
+      SKILL_KEYS,
+      SKILL_NAMES,
+      canSpendWithoutDelayingFinal,
+      canUseSkill,
+      chooseAttackPlan,
+      finiteNumber,
+      isConfirmedSkillUse,
+      isFinishedBattleState,
+      normalizeText,
+      parseFraction,
+      parseInteger,
+      roundsUntilFinalWish,
+    };
+  },
+  "features/automation/pvp-worker.js": function (module, exports, require) {
+    'use strict';
+
+    // Scheduler-owned Solo PvP worker. It consumes every available Solo token,
+    // returns to the lobby after each match, and reports a safe terminal status
+    // only from the lobby. Combat can use the game's Auto Play or the deliberate
+    // skill planner ported from activate_auto_battle_target.js.
+
+    const {
+      COMMAND_KEY,
+      normalizeVisit,
+      publishWorkerStatus,
+    } = require('../../core/protocol');
+    const { createJsonStore, getStorage } = require('../../core/storage');
+    const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
+    const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
+    const logic = require('./pvp-logic');
+
+    const ROUTE_ID = 'pvp';
+    const LOBBY_PATH = '/pvp.php';
+
+    const MODES = Object.freeze({
+      autoplay: 'autoplay',
+      skillPlanner: 'skill-planner',
+    });
+
+    const TIMING = Object.freeze({
+      tickMs: 200,
+      heartbeatMs: 5_000,
+      modeRetryMs: 1_000,
+      matchmakeRetryMs: 15_000,
+      returnToLobbyMs: 3_000,
+      renderGraceMs: 10_000,
+      initialAutoPlayDelayMs: 1_500,
+      skillWaitMs: 1_000,
+      targetWaitMs: 1_000,
+    });
+
+    const SELECTORS = Object.freeze({
+      soloMatchButton: '.js-matchmake[data-ladder="solo"]',
+      section: 'section',
+      sectionTitle: '.section-title',
+      infoPill: '.info-pill',
+      autoPlayButton: '#autoPlayBtn',
+      fastEnemyButton: '#fastEnemyBtn',
+      viewerMode: '#viewerModeBadge',
+      matchStatus: '#matchStatusBadge',
+      rewardsModal: '#rewardsModal',
+      battleControl: '#battleControlCard',
+      attackButton: '#attackBtn',
+      allyFormation: '#allyFormation',
+      enemyFormation: '#enemyFormation',
+      allySlot: '#allyFormation .pSlot[data-side="ally"][data-alive="1"]',
+      enemySlot: '#enemyFormation .pSlot[data-side="enemy"][data-alive="1"]:not(.dead)',
+      defeatedAllySlot:
+        '#allyFormation .pSlot[data-side="ally"][data-key]:not([data-key=""])[data-alive="0"], ' +
+        '#allyFormation .pSlot[data-side="ally"][data-key]:not([data-key=""]).dead',
+      defeatedEnemySlot:
+        '#enemyFormation .pSlot[data-side="enemy"][data-key]:not([data-key=""])[data-alive="0"], ' +
+        '#enemyFormation .pSlot[data-side="enemy"][data-key]:not([data-key=""]).dead',
+      tokenValue: '#myTokens',
+      resourceValue: '#advancedResourceValue',
+      nativeSkillModal: '#skillsModal',
+      nativeSkillGrid: '#skillsGrid',
+      logLines: '#logBox .logLine[data-log-id]',
+    });
+
+    function queryAll(root, selector) {
+      return Array.from(root?.querySelectorAll?.(selector) || []);
+    }
+
+    function findSoloSection(root) {
+      const button = root?.querySelector?.(SELECTORS.soloMatchButton);
+      if (button?.closest) {
+        const section = button.closest(SELECTORS.section);
+        if (section) return section;
+      }
+      return (
+        queryAll(root, SELECTORS.section).find((section) => {
+          const title = logic.normalizeText(section.querySelector?.(SELECTORS.sectionTitle)?.textContent);
+          return title.includes('solo') && title.includes('ladder');
+        }) || null
+      );
+    }
+
+    function readSoloTokenCount(root) {
+      const section = findSoloSection(root);
+      if (!section) return null;
+      const pill =
+        queryAll(section, SELECTORS.infoPill).find((candidate) =>
+          logic.normalizeText(candidate.querySelector?.('strong')?.textContent).startsWith('tokens'),
+        ) || null;
+      return pill ? logic.parseInteger(pill.querySelector?.('span')?.textContent) : null;
+    }
+
+    function getLobbySnapshot(root) {
+      const section = findSoloSection(root);
+      const button = root?.querySelector?.(SELECTORS.soloMatchButton) || null;
+      const tokens = readSoloTokenCount(root);
+      return {
+        section,
+        button,
+        tokens,
+        canStart: Boolean(button) && Number.isFinite(tokens) && tokens > 0,
+      };
+    }
+
+    function classContains(element, name) {
+      return element?.classList?.contains?.(name) === true;
+    }
+
+    function isAutoPlayActive(root) {
+      const button = root?.querySelector?.(SELECTORS.autoPlayButton);
+      const viewerMode = logic.normalizeText(root?.querySelector?.(SELECTORS.viewerMode)?.textContent);
+      const buttonText = logic.normalizeText(button?.textContent);
+      return Boolean(
+        classContains(button, 'active') ||
+          button?.getAttribute?.('aria-pressed') === 'true' ||
+          buttonText.includes('auto play on') ||
+          viewerMode.includes('auto play enabled')
+      );
+    }
+
+    function isFastEnemyActive(root) {
+      const button = root?.querySelector?.(SELECTORS.fastEnemyButton);
+      const viewerMode = logic.normalizeText(root?.querySelector?.(SELECTORS.viewerMode)?.textContent);
+      const buttonText = logic.normalizeText(button?.textContent);
+      return Boolean(
+        classContains(button, 'active') ||
+          button?.getAttribute?.('aria-pressed') === 'true' ||
+          buttonText.includes('enemy turns 1s on') ||
+          viewerMode.includes('enemy turns set to 1s')
+      );
+    }
+
+    function aliveState(root, formationSelector, livingSelector, defeatedSelector) {
+      if (!root?.querySelector?.(formationSelector)) return null;
+      if (root.querySelector(livingSelector)) return true;
+      return root.querySelector(defeatedSelector) ? false : null;
+    }
+
+    function isBattleEnded(root) {
+      return logic.isFinishedBattleState({
+        statusText: root?.querySelector?.(SELECTORS.matchStatus)?.textContent,
+        rewardsVisible: classContains(root?.querySelector?.(SELECTORS.rewardsModal), 'show'),
+        allyAlive: aliveState(
+          root,
+          SELECTORS.allyFormation,
+          SELECTORS.allySlot,
+          SELECTORS.defeatedAllySlot,
+        ),
+        enemyAlive: aliveState(
+          root,
+          SELECTORS.enemyFormation,
+          SELECTORS.enemySlot,
+          SELECTORS.defeatedEnemySlot,
+        ),
+      });
+    }
+
+    function isBattleUiReady(root) {
+      return Boolean(
+        root?.querySelector?.(SELECTORS.battleControl) &&
+          root.querySelector(SELECTORS.enemyFormation) &&
+          root.querySelector(SELECTORS.autoPlayButton) &&
+          root.querySelector(SELECTORS.fastEnemyButton)
+      );
+    }
+
+    function normalizedMode(value) {
+      return value === MODES.skillPlanner ? MODES.skillPlanner : MODES.autoplay;
+    }
+
+    function createPvpWorker({
+      win,
+      doc,
+      store,
+      sessionStore = null,
+      now = () => Date.now(),
+      logger = console,
+    }) {
+      const runtime = {
+        interval: null,
+        ticking: false,
+        stopped: false,
+        navigating: false,
+        startedAt: now(),
+        incompleteLobbyAt: 0,
+        lastMatchmakeAt: 0,
+        lastModeClickAt: 0,
+        battleSeenAt: 0,
+        returnTimer: null,
+        publishSignature: '',
+        publishAt: 0,
+        logSignature: '',
+        handledTurnKey: '',
+        bridge: null,
+        pendingAction: null,
+      };
+
+      function log(message, level = 'info') {
+        const signature = `${level}:${message}`;
+        if (runtime.logSignature === signature) return;
+        runtime.logSignature = signature;
+        const method = level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'info';
+        logger?.[method]?.(`[Veyra:pvp-worker] ${message}`);
+      }
+
+      function currentUrl() {
+        try {
+          return new URL(win.location.href, win.location.origin);
+        } catch {
+          return null;
+        }
+      }
+
+      function isLobbyUrl(url = currentUrl()) {
+        return Boolean(url && /\/pvp\.php\/?$/i.test(url.pathname));
+      }
+
+      function isBattleUrl(url = currentUrl()) {
+        return Boolean(url && /\/pvp_battle\.php\/?$/i.test(url.pathname));
+      }
+
+      function readCommand() {
+        return normalizeVisit(store.read(COMMAND_KEY), () => true);
+      }
+
+      function ownCommand(command = readCommand()) {
+        return command?.taskId === ROUTE_ID ? command : null;
+      }
+
+      // The scheduler already elects one tab through a localStorage lease. Reuse
+      // that ownership here so a second open PvP tab cannot spend the same token
+      // or submit a second skill. If sessionStorage is unavailable, retain the
+      // scheduler's existing best-effort behaviour instead of disabling PvP.
+      function ownsSchedulerLease(t = now()) {
+        if (!sessionStore || sessionStore.available === false) return true;
+        const tabId = sessionStore.readRaw?.(TAB_KEY);
+        const lease = store.read(LEASE_KEY);
+        return Boolean(
+          tabId &&
+            lease?.ownerId === tabId &&
+            Number.isFinite(Number(lease?.leaseUntil)) &&
+            Number(lease.leaseUntil) > t
+        );
+      }
+
+      function visitIsDraining(command, t = now()) {
+        return Boolean(command && (command.phase === 'draining' || t >= command.deadlineAt));
+      }
+
+      function readMode() {
+        const saved = normalizeConfig(store.read(CONFIG_KEY)).routes[ROUTE_ID]?.settings?.mode;
+        return normalizedMode(saved);
+      }
+
+      function publish(state, safeToLeave, message, visitId = '') {
+        const t = now();
+        const signature = `${visitId}|${state}|${safeToLeave}|${message}`;
+        if (signature === runtime.publishSignature && t - runtime.publishAt < TIMING.heartbeatMs) return null;
+        runtime.publishSignature = signature;
+        runtime.publishAt = t;
+        return publishWorkerStatus(
+          store,
+          ROUTE_ID,
+          { visitId, workerId: ROUTE_ID, state, safeToLeave, message },
+          t,
+        );
+      }
+
+      function setLifecycleMarker(active, smart = false) {
+        const dataset = doc?.documentElement?.dataset;
+        if (!dataset) return;
+        if (active) dataset.veyraSmartPvpLifecycle = '1';
+        else delete dataset.veyraSmartPvpLifecycle;
+        if (active && smart) dataset.veyraSmartPvp = '1';
+        else delete dataset.veyraSmartPvp;
+      }
+
+      function navigateToLobby() {
+        if (runtime.navigating) return false;
+        runtime.navigating = true;
+        win.location.replace(new URL(LOBBY_PATH, win.location.origin).href);
+        return true;
+      }
+
+      function clearReturnTimer() {
+        if (runtime.returnTimer === null) return;
+        win.clearTimeout?.(runtime.returnTimer);
+        runtime.returnTimer = null;
+      }
+
+      function scheduleLobbyReturn(command) {
+        publish('busy', false, 'The Solo PvP battle ended; returning to the lobby.', command.visitId);
+        if (runtime.returnTimer !== null) return;
+        runtime.returnTimer = win.setTimeout?.(() => {
+          runtime.returnTimer = null;
+          if (!isBattleEnded(doc)) return;
+          navigateToLobby();
+        }, TIMING.returnToLobbyMs);
+      }
+
+      function handleLobby(command, t) {
+        clearReturnTimer();
+        runtime.battleSeenAt = 0;
+        runtime.handledTurnKey = '';
+        runtime.bridge = null;
+        runtime.pendingAction = null;
+
+        if (!command) {
+          setLifecycleMarker(false);
+          publish('idle', true, 'PvP is idle in the lobby.');
+          return;
+        }
+
+        setLifecycleMarker(true, readMode() === MODES.skillPlanner);
+        if (visitIsDraining(command, t)) {
+          publish('done', true, 'PvP stopped safely in the lobby.', command.visitId);
+          return;
+        }
+
+        const snapshot = getLobbySnapshot(doc);
+        if (!snapshot.section) {
+          if (t - runtime.startedAt < TIMING.renderGraceMs) {
+            publish('busy', false, 'Waiting for the Solo PvP lobby to render.', command.visitId);
+          } else {
+            publish('error', true, 'The Solo ladder was not found.', command.visitId);
+          }
+          return;
+        }
+
+        if (snapshot.tokens === 0) {
+          runtime.incompleteLobbyAt = 0;
+          publish('done', true, 'No Solo tokens remain.', command.visitId);
+          return;
+        }
+
+        if (!snapshot.button || snapshot.tokens === null) {
+          if (!runtime.incompleteLobbyAt) runtime.incompleteLobbyAt = t;
+          if (t - runtime.incompleteLobbyAt < TIMING.renderGraceMs) {
+            publish('busy', false, 'Waiting for Solo token and matchmaking controls.', command.visitId);
+          } else {
+            publish('error', true, 'Solo matchmaking controls are incomplete.', command.visitId);
+          }
+          return;
+        }
+        runtime.incompleteLobbyAt = 0;
+
+        if (snapshot.button.disabled) {
+          publish('busy', false, 'Solo matchmaking is in progress.', command.visitId);
+          return;
+        }
+
+        publish('busy', false, `Starting Solo matchmaking with ${snapshot.tokens} token(s).`, command.visitId);
+        if (!snapshot.canStart || t - runtime.lastMatchmakeAt < TIMING.matchmakeRetryMs) return;
+        runtime.lastMatchmakeAt = t;
+        snapshot.button.click?.();
+      }
+
+      function modeControlReady(mode, t) {
+        const autoButton = doc.querySelector?.(SELECTORS.autoPlayButton);
+        if (mode === MODES.autoplay) {
+          if (isAutoPlayActive(doc)) return true;
+          if (runtime.battleSeenAt === 0) runtime.battleSeenAt = t;
+          if (
+            t - runtime.battleSeenAt < TIMING.initialAutoPlayDelayMs ||
+            !autoButton ||
+            autoButton.disabled
+          ) {
+            return false;
+          }
+          if (t - runtime.lastModeClickAt >= TIMING.modeRetryMs) {
+            runtime.lastModeClickAt = t;
+            log('Enabling the game Auto Play mode.');
+            autoButton.click?.();
+          }
+          return false;
+        }
+
+        if (isAutoPlayActive(doc)) {
+          if (autoButton && !autoButton.disabled && t - runtime.lastModeClickAt >= TIMING.modeRetryMs) {
+            runtime.lastModeClickAt = t;
+            log('Disabling Auto Play for the skill planner.');
+            autoButton.click?.();
+          }
+          return false;
+        }
+
+        if (!isFastEnemyActive(doc)) {
+          const fastButton = doc.querySelector?.(SELECTORS.fastEnemyButton);
+          if (fastButton && !fastButton.disabled && t - runtime.lastModeClickAt >= TIMING.modeRetryMs) {
+            runtime.lastModeClickAt = t;
+            log('Enabling one-second enemy turns.');
+            fastButton.click?.();
+          }
+          return false;
+        }
+        return true;
+      }
+
+      function getAllyName() {
+        const slot = doc.querySelector?.(SELECTORS.allySlot);
+        return String(slot?.dataset?.username || doc.querySelector?.('#allyBadge')?.textContent || '').trim();
+      }
+
+      function getLatestTurnStart() {
+        const lines = queryAll(doc, SELECTORS.logLines);
+        for (let index = lines.length - 1; index >= 0; index -= 1) {
+          const line = lines[index];
+          const text = String(line.querySelector?.('.logText')?.textContent || '').trim();
+          const match = text.match(/^(.+?)\s+takes the turn\.?$/i);
+          if (match) {
+            return {
+              key: String(line.dataset?.logId || ''),
+              numericId: logic.parseInteger(line.dataset?.logId),
+              actor: match[1].trim(),
+            };
+          }
+        }
+        return null;
+      }
+
+      function isOwnActionableTurn(turn) {
+        const allyName = getAllyName();
+        const attackButton = doc.querySelector?.(SELECTORS.attackButton);
+        return Boolean(
+          turn?.key &&
+            allyName &&
+            logic.normalizeText(turn.actor) === logic.normalizeText(allyName) &&
+            attackButton &&
+            !attackButton.disabled
+        );
+      }
+
+      function skillKeyFromButton(button) {
+        const id = String(button?.dataset?.skillId || '');
+        const byId = Object.entries(logic.SKILL_IDS).find(([, skillId]) => skillId === id);
+        if (byId) return byId[0];
+        const name = logic.normalizeText(button?.querySelector?.('.skillName')?.textContent || button?.textContent);
+        return (
+          Object.keys(logic.SKILL_NAMES).find(
+            (key) => logic.normalizeText(logic.SKILL_NAMES[key]) === name,
+          ) || null
+        );
+      }
+
+      function readSkills() {
+        const skills = {};
+        const grid = doc.querySelector?.(SELECTORS.nativeSkillGrid);
+        for (const button of queryAll(grid, 'button.skillCard[data-skill-id]')) {
+          const key = skillKeyFromButton(button);
+          if (!key) continue;
+          const cost = logic.parseInteger(button.dataset?.cost);
+          const resourceCost = logic.parseInteger(button.dataset?.resourceCost);
+          const metadataValid = cost !== null && resourceCost !== null && cost >= 0 && resourceCost >= 0;
+          skills[key] = {
+            key,
+            name: String(button.querySelector?.('.skillName')?.textContent || logic.SKILL_NAMES[key]).trim(),
+            cost,
+            resourceCost,
+            requiresFullResource: button.dataset?.requiresFullResource === '1',
+            available: !button.disabled && metadataValid,
+            button,
+          };
+        }
+        return skills;
+      }
+
+      function readBattleSnapshot(target) {
+        const resource = logic.parseFraction(doc.querySelector?.(SELECTORS.resourceValue)?.textContent);
+        return {
+          tokens: logic.parseInteger(doc.querySelector?.(SELECTORS.tokenValue)?.textContent),
+          resource: resource?.current ?? null,
+          resourceMaximum: resource?.maximum ?? logic.COMBAT_DEFAULTS.resourceMaximum,
+          enemyPoisoned: classContains(target, 'hasPoison'),
+          bridgePending: Boolean(runtime.bridge && runtime.bridge.targetKey === target?.dataset?.key),
+          skills: readSkills(),
+        };
+      }
+
+      function getLogTextsAfter(logId) {
+        const numericId = logic.finiteNumber(logId);
+        if (numericId === null) return [];
+        return queryAll(doc, SELECTORS.logLines)
+          .filter((line) => {
+            const currentId = logic.parseInteger(line.dataset?.logId);
+            return currentId !== null && currentId > numericId;
+          })
+          .map((line) => String(line.querySelector?.('.logText')?.textContent || '').trim());
+      }
+
+      function settlePendingAction() {
+        const pending = runtime.pendingAction;
+        if (!pending) return;
+        const confirmed = getLogTextsAfter(pending.turnNumericId).some((text) =>
+          logic.isConfirmedSkillUse(text, pending.allyName, pending.skillName),
+        );
+        if (confirmed) {
+          if (pending.prepareBridge) runtime.bridge = { targetKey: pending.targetKey };
+          if (pending.consumeBridge || pending.resetCycle) runtime.bridge = null;
+          runtime.pendingAction = null;
+          return;
+        }
+
+        const latestTurn = getLatestTurnStart();
+        if (
+          latestTurn?.key &&
+          latestTurn.key !== pending.turnKey &&
+          logic.normalizeText(latestTurn.actor) === logic.normalizeText(pending.allyName)
+        ) {
+          if (pending.consumeBridge || pending.resetCycle) runtime.bridge = null;
+          runtime.pendingAction = null;
+        }
+      }
+
+      function waitFor(predicate, timeoutMs) {
+        return new Promise((resolve) => {
+          const startedAt = now();
+          const check = () => {
+            const result = predicate();
+            if (result || now() - startedAt >= timeoutMs || runtime.stopped || runtime.navigating) {
+              resolve(result || null);
+              return;
+            }
+            win.setTimeout?.(check, 40);
+          };
+          check();
+        });
+      }
+
+      async function actOnTurn(turn) {
+        let target = doc.querySelector?.(SELECTORS.enemySlot);
+        if (!target) return;
+        const modal = doc.querySelector?.(SELECTORS.nativeSkillModal);
+        if (!classContains(target, 'targeted')) target.click?.();
+        else if (modal && !classContains(modal, 'show')) doc.querySelector?.(SELECTORS.attackButton)?.click?.();
+
+        const grid = await waitFor(() => {
+          const nextModal = doc.querySelector?.(SELECTORS.nativeSkillModal);
+          const nextGrid = doc.querySelector?.(SELECTORS.nativeSkillGrid);
+          return classContains(nextModal, 'show') && nextGrid?.querySelector?.('button.skillCard[data-skill-id]')
+            ? nextGrid
+            : null;
+        }, TIMING.skillWaitMs);
+        if (!grid) return;
+
+        const currentTurn = getLatestTurnStart();
+        target = doc.querySelector?.(SELECTORS.enemySlot);
+        if (!currentTurn || currentTurn.key !== turn.key || !target || isAutoPlayActive(doc)) return;
+        if (!classContains(target, 'targeted')) {
+          target.click?.();
+          await waitFor(
+            () => classContains(doc.querySelector?.(SELECTORS.enemySlot), 'targeted'),
+            TIMING.targetWaitMs,
+          );
+        }
+
+        const stableTurn = getLatestTurnStart();
+        const stableTarget = doc.querySelector?.(SELECTORS.enemySlot);
+        if (
+          !stableTurn ||
+          stableTurn.key !== turn.key ||
+          !isOwnActionableTurn(stableTurn) ||
+          !classContains(stableTarget, 'targeted') ||
+          !classContains(doc.querySelector?.(SELECTORS.nativeSkillModal), 'show') ||
+          isAutoPlayActive(doc) ||
+          !isFastEnemyActive(doc)
+        ) {
+          return;
+        }
+
+        const snapshot = readBattleSnapshot(stableTarget);
+        const decision = logic.chooseAttackPlan(snapshot);
+        const selected = decision.skillKey ? snapshot.skills[decision.skillKey] : null;
+        if (!selected || !logic.canUseSkill(selected, snapshot) || selected.button?.isConnected === false) {
+          log(decision.reason, 'warn');
+          return;
+        }
+
+        runtime.handledTurnKey = turn.key;
+        runtime.pendingAction = {
+          turnKey: turn.key,
+          turnNumericId: turn.numericId,
+          allyName: getAllyName(),
+          skillName: selected.name,
+          targetKey: stableTarget.dataset?.key || '',
+          prepareBridge: decision.prepareBridge,
+          consumeBridge: decision.consumeBridge,
+          resetCycle: decision.resetCycle,
+        };
+        log(
+          `${selected.name} | Tokens ${snapshot.tokens}, Energy ${snapshot.resource}/${snapshot.resourceMaximum} | ${decision.reason}`,
+        );
+        selected.button.click?.();
+      }
+
+      async function handleBattle(command, t) {
+        const ended = isBattleEnded(doc);
+        const ready = isBattleUiReady(doc);
+        if (!command) {
+          setLifecycleMarker(false);
+          if (!ended && !ready && t - runtime.startedAt >= TIMING.renderGraceMs) {
+            publish('error', true, 'The manual PvP battle page did not render.');
+            return;
+          }
+          publish(
+            ended ? 'idle' : 'busy',
+            ended,
+            ended ? 'The manual PvP battle has ended.' : 'A manual PvP battle is in progress.',
+          );
+          return;
+        }
+
+        const mode = readMode();
+        setLifecycleMarker(true, mode === MODES.skillPlanner);
+        if (ended) {
+          runtime.bridge = null;
+          runtime.pendingAction = null;
+          scheduleLobbyReturn(command);
+          return;
+        }
+
+        if (!ready) {
+          if (t - runtime.startedAt < TIMING.renderGraceMs) {
+            publish('busy', false, 'Waiting for the Solo PvP battle to render.', command.visitId);
+          } else {
+            publish('error', true, 'The Solo PvP battle page did not render.', command.visitId);
+          }
+          return;
+        }
+
+        clearReturnTimer();
+        publish(
+          'busy',
+          false,
+          visitIsDraining(command, t)
+            ? 'Finishing the current Solo PvP battle before stopping.'
+            : `Solo PvP battle is running (${mode === MODES.autoplay ? 'Game Auto Play' : 'skill planner'}).`,
+          command.visitId,
+        );
+
+        if (!modeControlReady(mode, t) || mode !== MODES.skillPlanner) return;
+        settlePendingAction();
+        const turn = getLatestTurnStart();
+        if (!isOwnActionableTurn(turn) || runtime.handledTurnKey === turn.key) return;
+        await actOnTurn(turn);
+      }
+
+      async function tick() {
+        if (runtime.stopped || runtime.ticking || runtime.navigating) return;
+        runtime.ticking = true;
+        try {
+          const url = currentUrl();
+          const command = ownCommand();
+          const t = now();
+          if (command && !ownsSchedulerLease(t)) {
+            setLifecycleMarker(false);
+            return;
+          }
+          if (isLobbyUrl(url)) handleLobby(command, t);
+          else if (isBattleUrl(url)) await handleBattle(command, t);
+        } catch (error) {
+          const command = ownCommand();
+          log(`PvP worker error: ${error?.message || error}`, 'error');
+          publish('error', isLobbyUrl(), `PvP worker failed: ${error?.message || error}`, command?.visitId);
+        } finally {
+          runtime.ticking = false;
+        }
+      }
+
+      function onVisibilityChange() {
+        if (doc.hidden !== true && doc.visibilityState !== 'hidden') void tick();
+      }
+
+      function onPageShow() {
+        runtime.navigating = false;
+        runtime.ticking = false;
+        void tick();
+      }
+
+      function onPageHide(event) {
+        if (!event?.persisted) stop();
+      }
+
+      function start() {
+        runtime.interval = win.setInterval?.(() => void tick(), TIMING.tickMs) ?? null;
+        doc.addEventListener?.('visibilitychange', onVisibilityChange);
+        win.addEventListener?.('pageshow', onPageShow);
+        win.addEventListener?.('pagehide', onPageHide);
+        void tick();
+      }
+
+      function stop() {
+        runtime.stopped = true;
+        if (runtime.interval !== null) win.clearInterval?.(runtime.interval);
+        runtime.interval = null;
+        clearReturnTimer();
+        doc.removeEventListener?.('visibilitychange', onVisibilityChange);
+        win.removeEventListener?.('pageshow', onPageShow);
+        win.removeEventListener?.('pagehide', onPageHide);
+      }
+
+      return {
+        runtime,
+        start,
+        stop,
+        tick,
+        onPageShow,
+        onPageHide,
+        onVisibilityChange,
+      };
+    }
+
+    const pvpWorkerFeature = Object.freeze({
+      id: 'pvp-worker',
+      group: 'Automation',
+      settings: [],
+      matches(url) {
+        return /\/(?:pvp|pvp_battle)\.php\/?$/i.test(url.pathname);
+      },
+      run(ctx) {
+        const worker = createPvpWorker({
+          win: ctx.win,
+          doc: ctx.doc,
+          store: ctx.store,
+          sessionStore: createJsonStore(getStorage('sessionStorage', ctx.win), '[Veyra]'),
+        });
+        worker.start();
+        return worker;
+      },
+    });
+
+    module.exports = {
+      LOBBY_PATH,
+      MODES,
+      ROUTE_ID,
+      SELECTORS,
+      TIMING,
+      createPvpWorker,
+      findSoloSection,
+      getLobbySnapshot,
+      isAutoPlayActive,
+      isBattleEnded,
+      isBattleUiReady,
+      isFastEnemyActive,
+      normalizedMode,
+      pvpWorkerFeature,
+      readSoloTokenCount,
+    };
+  },
+  "features/automation/shadowbridge-logic.js": function (module, exports, require) {
+    'use strict';
+
+    // Pure parsing and decision helpers for Shadowbridge Warrens.  The worker is
+    // intentionally kept separate: this module never navigates, stores state or
+    // submits a request, which makes every safety decision testable in Node.
+
+    const { parseFraction, parseGameNumber } = require('../../core/numbers');
+    const participation = require('../dungeon/participation-helpers');
+    const shadowbridgeRoute = require('../../routes/shadowbridge');
+
+    const SHADOWBRIDGE_NAME = 'Shadowbridge Warrens';
+    const SHADOWBRIDGE_MONSTERS = shadowbridgeRoute.SHADOWBRIDGE_MONSTERS;
+    const SHADOWBRIDGE_SKILLS = shadowbridgeRoute.SHADOWBRIDGE_SKILLS;
+
+    const MONSTER_ID_BY_NAME = new Map(
+      SHADOWBRIDGE_MONSTERS.map((monster) => [normalizeMonsterName(monster.name), monster.id]),
+    );
+    const SKILL_BY_ID = new Map(SHADOWBRIDGE_SKILLS.map((skill) => [String(skill.id), skill]));
+
+    function text(element) {
+      return String(element?.textContent ?? '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    function all(root, selector) {
+      try {
+        return Array.from(root?.querySelectorAll?.(selector) || []);
+      } catch {
+        return [];
+      }
+    }
+
+    function attr(element, name) {
+      try {
+        return element?.getAttribute?.(name) ?? null;
+      } catch {
+        return null;
+      }
+    }
+
+    function hasClass(element, name) {
+      return element?.classList?.contains?.(name) === true;
+    }
+
+    function resolveUrl(href, baseUrl = 'https://demonicscans.org/') {
+      const value = String(href || '').trim();
+      if (!value || /^javascript:/i.test(value)) return null;
+      try {
+        return new URL(value, baseUrl);
+      } catch {
+        return null;
+      }
+    }
+
+    function queryParam(href, name, baseUrl) {
+      return resolveUrl(href, baseUrl)?.searchParams.get(name) || '';
+    }
+
+    function normalizeMonsterName(value) {
+      return String(value ?? '')
+        .normalize?.('NFKD')
+        ?.replace(/[\u0300-\u036f]/g, '')
+        .replace(/[’‘`]/g, "'")
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase() || '';
+    }
+
+    function monsterIdForName(value) {
+      return MONSTER_ID_BY_NAME.get(normalizeMonsterName(value)) || '';
+    }
+
+    function parseLooseAmount(value) {
+      const match = String(value ?? '').match(/(\d[\d,.]*(?:\s*[kmbtq])?)/i);
+      return match ? parseGameNumber(match[1].replace(/\s+/g, '')) : null;
+    }
+
+    function parsePageFraction(value) {
+      const match = String(value ?? '').match(/([\d,.]+\s*[kmbtq]?)\s*\/\s*([\d,.]+\s*[kmbtq]?)/i);
+      if (!match) return null;
+      return parseFraction(`${match[1]} / ${match[2]}`);
+    }
+
+    function namedDungeonCard(link, wantedName) {
+      let candidate = link?.parentElement || null;
+      for (let depth = 0; candidate && depth < 10; depth += 1) {
+        const enterLinks = all(candidate, 'a[href*="guild_dungeon_enter.php"]');
+        // The live Open Dungeons cards have no class. Their shared `.panel`
+        // contains every dungeon and must never be used to associate a link with
+        // a name, otherwise the first card wins for every worker.
+        if (normalizeMonsterName(text(candidate)).includes(wantedName) && enterLinks.length <= 1) {
+          return candidate;
+        }
+        candidate = candidate.parentElement || null;
+      }
+      return null;
+    }
+
+    // Finds the dynamic instance entry.  A hub can contain several dungeons, so
+    // an enter link is accepted only when its surrounding card names Shadowbridge.
+    function parseHubEntry(doc, baseUrl = 'https://demonicscans.org/guild_dungeon.php') {
+      const wanted = normalizeMonsterName(SHADOWBRIDGE_NAME);
+      for (const link of all(doc, 'a[href*="guild_dungeon_enter.php"]')) {
+        const card = namedDungeonCard(link, wanted);
+        if (!card) continue;
+        const url = resolveUrl(attr(link, 'href'), baseUrl);
+        const instanceId = url?.searchParams.get('id') || url?.searchParams.get('instance_id') || '';
+        if (!url || !/^\d+$/.test(instanceId)) continue;
+        return { instanceId, url: url.href };
+      }
+
+      // Some layouts put the dungeon name and the button in a common card but
+      // render the link outside the generic anchor list returned by test doubles.
+      for (const card of all(doc, '.dungeon-card, .guild-dungeon-card, .card')) {
+        if (!normalizeMonsterName(text(card)).includes(wanted)) continue;
+        const link = card.querySelector?.('a[href*="guild_dungeon_enter.php"]');
+        const url = resolveUrl(attr(link, 'href'), baseUrl);
+        const instanceId = url?.searchParams.get('id') || url?.searchParams.get('instance_id') || '';
+        if (url && /^\d+$/.test(instanceId)) return { instanceId, url: url.href };
+      }
+      return null;
+    }
+
+    function instanceIdFromPage(doc, pageUrl = '') {
+      const url = resolveUrl(pageUrl);
+      const fromQuery = url?.searchParams.get('id') || url?.searchParams.get('instance_id') || '';
+      if (/^\d+$/.test(fromQuery)) return fromQuery;
+      const titleMatch = `${text(doc?.querySelector?.('title'))} ${text(doc?.querySelector?.('h1'))} ${text(doc?.body)}`
+        .match(/instance\s*#\s*(\d+)/i);
+      if (titleMatch) return titleMatch[1];
+      for (const link of all(doc, 'a[href*="guild_dungeon_location.php"]')) {
+        const candidate = queryParam(attr(link, 'href'), 'instance_id', pageUrl);
+        if (/^\d+$/.test(candidate)) return candidate;
+      }
+      return '';
+    }
+
+    function locationLabel(link) {
+      return (
+        text(link?.querySelector?.('.label')) ||
+        String(attr(link, 'title') || '').trim() ||
+        String(attr(link, 'aria-label') || '').trim() ||
+        text(link)
+      );
+    }
+
+    function isBossLabel(value) {
+      return /\bboss\b/i.test(String(value || ''));
+    }
+
+    function parseInstancePage(doc, pageUrl = '') {
+      const instanceId = instanceIdFromPage(doc, pageUrl);
+      const locations = [];
+      const seen = new Set();
+      let bossLocked = false;
+
+      const links = [
+        ...all(doc, 'a[href*="guild_dungeon_location.php"]'),
+        ...all(doc, 'a.pin.locked'),
+      ];
+      for (const link of links) {
+        const label = locationLabel(link);
+        const href = attr(link, 'href') || '';
+        const locked = hasClass(link, 'locked') || /^\s*javascript:/i.test(href) || !href;
+        if (locked) {
+          if (isBossLabel(label) || normalizeMonsterName(text(link)).includes('boss')) bossLocked = true;
+          continue;
+        }
+        const url = resolveUrl(href, pageUrl);
+        const locationId = url?.searchParams.get('location_id') || '';
+        const linkInstanceId = url?.searchParams.get('instance_id') || instanceId;
+        if (!url || !/^\d+$/.test(locationId)) continue;
+        if (instanceId && linkInstanceId && linkInstanceId !== instanceId) continue;
+        const key = `${linkInstanceId}:${locationId}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        locations.push({
+          id: locationId,
+          instanceId: linkInstanceId,
+          url: url.href,
+          label,
+          isBoss: isBossLabel(label),
+        });
+      }
+      return { instanceId, locations, bossLocked };
+    }
+
+    function directText(element) {
+      try {
+        return Array.from(element?.childNodes || [])
+          .filter((node) => node?.nodeType === 3)
+          .map((node) => String(node.textContent || '').trim())
+          .filter(Boolean)
+          .join(' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+      } catch {
+        return '';
+      }
+    }
+
+    function monsterNameFromCard(card) {
+      const named =
+        card?.querySelector?.('.monster-name, .name') ||
+        card?.querySelector?.('.monster-name') ||
+        card?.querySelector?.('.name') ||
+        null;
+      if (named) return text(named);
+
+      const heading =
+        card?.querySelector?.('[style*="font-weight:700"]') ||
+        card?.querySelector?.('[style*="font-weight: 700"]') ||
+        null;
+      // On live dungeon pages the join-status pill is a child of this heading.
+      // Read only its direct text node so "not joined" never becomes part of the
+      // persisted monster identity.
+      const directName = directText(heading);
+      if (directName) return directName;
+      const headingText = text(heading).replace(/^(?:(?:not\s+)?joined|dead|defeated)\s+/i, '');
+      return headingText || String(attr(card?.querySelector?.('img[alt]'), 'alt') || '').trim();
+    }
+
+    function parseLocationPage(doc, pageUrl = '') {
+      const page = resolveUrl(pageUrl);
+      const pageInstanceId = page?.searchParams.get('instance_id') || '';
+      const locationId = page?.searchParams.get('location_id') || '';
+      const monsters = [];
+      for (const card of all(doc, '.mon')) {
+        const link =
+          card.querySelector?.('a[href*="battle.php"]') ||
+          card.querySelector?.('a[href*="dgmid"]') ||
+          null;
+        const url = resolveUrl(attr(link, 'href'), pageUrl);
+        const monsterId = url?.searchParams.get('dgmid') || '';
+        if (!url || !monsterId) continue;
+        const name = monsterNameFromCard(card);
+        const pillText = normalizeMonsterName(all(card, '.pill').map(text).join(' '));
+        const dead =
+          hasClass(card, 'dead') ||
+          attr(card, 'data-dead') === '1' ||
+          /\bdead\b|\bdefeated\b/.test(pillText);
+        const joinedAttr = attr(card, 'data-joined');
+        const joined =
+          joinedAttr === '1' ||
+          joinedAttr === 'true' ||
+          (/\bjoined\b/.test(pillText) && !/\bnot joined\b/.test(pillText));
+        monsters.push({
+          monsterId: String(monsterId),
+          name,
+          monsterTypeId: monsterIdForName(name),
+          instanceId: url.searchParams.get('instance_id') || pageInstanceId,
+          locationId,
+          url: url.href,
+          dead,
+          joined,
+        });
+      }
+      return monsters;
+    }
+
+    function statBlock(doc, wantedLabel) {
+      const wanted = normalizeMonsterName(wantedLabel).replace(/\s+/g, '');
+      return (
+        all(doc, '.stat-block').find((block) => {
+          const label = normalizeMonsterName(text(block.querySelector?.('.label'))).replace(/\s+/g, '');
+          return label === wanted;
+        }) || null
+      );
+    }
+
+    function parseHpFraction(doc, selector) {
+      return parsePageFraction(text(doc?.querySelector?.(selector)));
+    }
+
+    function parseExpCapFraction(doc) {
+      const block = statBlock(doc, 'EXP Cap');
+      const match = text(block).match(/(\d+(?:[.,]\d+)?)\s*%/);
+      if (!match) return null;
+      const percent = Number(match[1].replace(',', '.'));
+      return Number.isFinite(percent) && percent > 0 ? percent / 100 : null;
+    }
+
+    function parseBattleSnapshot(doc, options = {}) {
+      const info = participation.parseBattleInfo(doc);
+      const hp =
+        parseHpFraction(doc, '#hpText') ||
+        parseHpFraction(doc, '.monster-hp .stat-value') ||
+        null;
+      const playerHp = parseHpFraction(doc, '#pHpText');
+      const maxHp = hp?.max ?? info.maxHp ?? null;
+      const expCapFraction = parseExpCapFraction(doc);
+      const expCapDamage =
+        info.expCapDamage ??
+        (expCapFraction !== null && Number.isFinite(maxHp) ? Math.ceil(expCapFraction * maxHp) : null);
+      const userId = String(options.userId ?? '').trim();
+      const ownRow = userId ? info.leaderboard.find((entry) => String(entry.pid) === userId) : null;
+      const joinButton = doc?.querySelector?.('#join-battle') || null;
+      const actionsCard = doc?.querySelector?.('.battle-actions-card') || null;
+      const actionsText = normalizeMonsterName(text(actionsCard));
+      const joined = ownRow
+        ? true
+        : joinButton
+          ? false
+          : /\balready joined\b|\byou joined\b|\bjoined battle\b/.test(actionsText) || actionsCard
+            ? true
+            : null;
+      const bodyState = normalizeMonsterName(
+        `${text(doc?.querySelector?.('.battle-actions-card'))} ${text(doc?.querySelector?.('#hpText'))}`,
+      );
+      const dead = hp?.current === 0 || /\bmonster (?:is )?dead\b|\bdefeated\b|\bbattle ended\b/.test(bodyState);
+      const page = resolveUrl(options.url || '');
+
+      return {
+        monsterId: String(options.monsterId || page?.searchParams.get('dgmid') || ''),
+        instanceId: String(options.instanceId || page?.searchParams.get('instance_id') || ''),
+        joined,
+        dead,
+        currentHp: hp?.current ?? null,
+        maxHp,
+        playerHp: playerHp?.current ?? null,
+        playerMaxHp: playerHp?.max ?? null,
+        ownDamage: ownRow ? ownRow.damage : null,
+        ownDamageKnown: Boolean(ownRow),
+        lootRequirement: info.lootRequirement,
+        expCapDamage,
+        expCapFraction,
+        leaderboard: info.leaderboard,
+      };
+    }
+
+    function positiveAmount(value) {
+      const parsed = typeof value === 'number' ? value : parseGameNumber(value);
+      return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : null;
+    }
+
+    // Resolves a personal damage goal.  Kill mode deliberately has no numeric
+    // goal: concurrent players may reduce HP, so the worker must continue until a
+    // fresh battle page or attack response says the monster is dead.
+    function resolveDamageTarget({ mode, damage, isBoss = false, allowMaxExp = isBoss, snapshot } = {}) {
+      if (!snapshot || typeof snapshot !== 'object') {
+        return { ok: false, error: 'Battle data is unavailable.' };
+      }
+      if (snapshot.dead) return { ok: true, done: true, untilDead: mode === 'kill', targetDamage: null, remaining: 0 };
+
+      if (mode === 'kill') {
+        return { ok: true, done: false, untilDead: true, targetDamage: null, remaining: null };
+      }
+
+      let targetDamage = null;
+      if (mode === 'max-loot') targetDamage = positiveAmount(snapshot.lootRequirement);
+      else if (mode === 'max-exp' && allowMaxExp) targetDamage = positiveAmount(snapshot.expCapDamage);
+      else if (mode === 'custom') targetDamage = positiveAmount(damage);
+      else return { ok: false, error: `Unsupported Shadowbridge damage mode: ${String(mode || '')}.` };
+
+      if (targetDamage === null) {
+        const label = mode === 'max-loot' ? 'loot requirement' : mode === 'max-exp' ? 'EXP cap' : 'custom damage';
+        return { ok: false, error: `The ${label} could not be read safely.` };
+      }
+      if (!snapshot.ownDamageKnown || !Number.isFinite(snapshot.ownDamage)) {
+        return { ok: false, error: 'Your current damage is missing from the battle leaderboard.' };
+      }
+      const remaining = Math.max(0, targetDamage - snapshot.ownDamage);
+      return {
+        ok: true,
+        done: remaining === 0,
+        untilDead: false,
+        targetDamage,
+        remaining,
+      };
+    }
+
+    function cleanIdentifier(value) {
+      const result = String(value ?? '').trim();
+      return result && /^[\w:-]+$/.test(result) ? result : '';
+    }
+
+    function buildJoinPayload({ instanceId, monsterId, userId } = {}) {
+      const instance = cleanIdentifier(instanceId);
+      const monster = cleanIdentifier(monsterId);
+      const user = cleanIdentifier(userId);
+      if (!instance || !monster || !user) return null;
+      return { instance_id: instance, dgmid: monster, user_id: user };
+    }
+
+    function skillForId(skillId) {
+      return SKILL_BY_ID.get(String(skillId)) || null;
+    }
+
+    function buildDamagePayload({ instanceId, monsterId, skillId } = {}) {
+      const instance = cleanIdentifier(instanceId);
+      const monster = cleanIdentifier(monsterId);
+      const skill = skillForId(skillId);
+      if (!instance || !monster || !skill) return null;
+      return {
+        instance_id: instance,
+        dgmid: monster,
+        skill_id: String(skill.id),
+        // F21: always send the base cost.  Asterion affects the game's display
+        // and stamina checks, never this damage.php parameter.
+        stamina_cost: skill.cost,
+      };
+    }
+
+    function responseMessage(response) {
+      const json = response?.json;
+      return String(json?.message ?? json?.msg ?? response?.text ?? '').trim();
+    }
+
+    function parseJoinResponse(response) {
+      const message = responseMessage(response);
+      const normalized = normalizeMonsterName(message);
+      const json = response?.json;
+      const declaredFailure = json?.success === false || /^(?:error|failed|failure)$/i.test(String(json?.status || ''));
+      const alreadyJoined = /already (?:joined|in (?:this )?battle)/i.test(message);
+      const declaredSuccess =
+        json?.success === true ||
+        /^(?:ok|success)$/i.test(String(json?.status || '')) ||
+        /successfully joined|joined (?:the )?battle/.test(normalized) ||
+        alreadyJoined;
+      return {
+        ok: Boolean(response?.ok && !declaredFailure && declaredSuccess),
+        alreadyJoined,
+        message,
+      };
+    }
+
+    function parseAttackResponse(response) {
+      const json = response?.json;
+      const message = responseMessage(response);
+      const normalized = normalizeMonsterName(message);
+      const directDamage =
+        positiveAmount(json?.damage) ??
+        positiveAmount(json?.damage_dealt) ??
+        positiveAmount(json?.dealt) ??
+        null;
+      const strongMatch = message.match(/<strong[^>]*>\s*([\d,.]+\s*[kmbtq]?)\s*<\/strong>/i);
+      const textMatch = message.match(/(?:deal(?:t)?|damage(?:d)?)\D{0,24}([\d,.]+\s*[kmbtq]?)/i);
+      const damage = directDamage ?? positiveAmount(strongMatch?.[1]) ?? positiveAmount(textMatch?.[1]) ?? 0;
+      const dead = Boolean(
+        json?.monster_dead === true ||
+          json?.dead === true ||
+          Number(json?.hp?.value) === 0 ||
+          /\bmonster (?:is )?dead\b|\bdefeated\b|\bslain\b|\bkilled\b|no longer alive/.test(normalized),
+      );
+      const declaredFailure = json?.success === false || /^(?:error|failed|failure)$/i.test(String(json?.status || ''));
+      const declaredSuccess =
+        json?.success === true ||
+        /^(?:ok|success)$/i.test(String(json?.status || '')) ||
+        damage > 0 ||
+        dead;
+      const currentHp = Number.isFinite(Number(json?.hp?.value)) ? Number(json.hp.value) : null;
+      const maxHp = Number.isFinite(Number(json?.hp?.max)) ? Number(json.hp.max) : null;
+      const playerHp = Number.isFinite(Number(json?.retaliation?.user_hp_after))
+        ? Number(json.retaliation.user_hp_after)
+        : null;
+      return {
+        ok: Boolean(response?.ok && !declaredFailure && declaredSuccess),
+        damage,
+        dead,
+        currentHp,
+        maxHp,
+        playerHp,
+        message,
+      };
+    }
+
+    module.exports = {
+      SHADOWBRIDGE_MONSTERS,
+      SHADOWBRIDGE_NAME,
+      SHADOWBRIDGE_SKILLS,
+      buildDamagePayload,
+      buildJoinPayload,
+      instanceIdFromPage,
+      monsterIdForName,
+      normalizeMonsterName,
+      parseAttackResponse,
+      parseBattleSnapshot,
+      parseHubEntry,
+      parseInstancePage,
+      parseJoinResponse,
+      parseLocationPage,
+      resolveDamageTarget,
+      skillForId,
+    };
+  },
+  "features/automation/shadowbridge-worker.js": function (module, exports, require) {
+    'use strict';
+
+    // Scheduler-owned Shadowbridge worker.  The visible tab stays on the marked
+    // guild-dungeon hub while instance, location and battle pages are read one at
+    // a time.  Mutating requests are made only for the current scheduler visit and
+    // only by the tab that owns the scheduler lease.
+
+    const { parseFraction, parseGameNumber } = require('../../core/numbers');
+    const { COMMAND_KEY, normalizeVisit, publishWorkerStatus } = require('../../core/protocol');
+    const { pickPotion, readPotionInventory, usePotion } = require('../../core/potions');
+    const { createJsonStore, getStorage } = require('../../core/storage');
+    const { sleep } = require('../../core/time');
+    const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
+    const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
+    const { staminaCost, staminaMultiplier } = require('../shared/asterion');
+    const logic = require('./shadowbridge-logic');
+
+    const ROUTE_ID = 'shadowbridge';
+    const JOIN_URL = '/dungeon_join_battle.php';
+    const DAMAGE_URL = '/damage.php';
+    const DASHBOARD_URL = '/game_dash.php';
+
+    const TIMING = Object.freeze({
+      tickMs: 1_000,
+      heartbeatMs: 5_000,
+      refreshBattleEvery: 20,
+      maxAttacksPerMonster: 10_000,
+      maxScanPasses: 8,
+      lowHpFraction: 0.1,
+    });
+
+    class VisitStop extends Error {
+      constructor(kind, message) {
+        super(message);
+        this.name = 'VisitStop';
+        this.kind = kind;
+      }
+    }
+
+    function readStamina(root) {
+      const raw = String(root?.querySelector?.('#stamina_span')?.textContent || '').trim();
+      const fraction = parseFraction(raw);
+      if (fraction) return fraction.current;
+      const match = raw.match(/[\d,.]+\s*[kmbtq]?/i);
+      return match ? parseGameNumber(match[0].replace(/\s+/g, '')) : null;
+    }
+
+    function attackPlan(scans, settings, processed = new Set()) {
+      const regular = [];
+      const bosses = [];
+      let sequence = 0;
+      for (const scan of scans || []) {
+        for (const monster of scan.monsters || []) {
+          const key = `${monster.instanceId || scan.location.instanceId}:${monster.monsterId}`;
+          const candidate = { ...monster, key, location: scan.location, sequence: sequence++ };
+          if (monster.dead || processed.has(key)) continue;
+          if (scan.location.isBoss) {
+            if (settings.bossRoom.enabled) bosses.push({ ...candidate, target: settings.bossRoom, isBoss: true });
+            continue;
+          }
+          const target = settings.monsters[monster.monsterTypeId];
+          if (target?.enabled) regular.push({ ...candidate, target, isBoss: false });
+        }
+      }
+
+      const order = new Map(settings.order.map((id, index) => [id, index]));
+      regular.sort((left, right) => {
+        const leftOrder = order.get(left.monsterTypeId) ?? Number.MAX_SAFE_INTEGER;
+        const rightOrder = order.get(right.monsterTypeId) ?? Number.MAX_SAFE_INTEGER;
+        return leftOrder - rightOrder || left.sequence - right.sequence;
+      });
+      bosses.sort((left, right) => left.sequence - right.sequence);
+      return [...regular, ...bosses];
+    }
+
+    function createShadowbridgeWorker({
+      win,
+      doc,
+      store,
+      sessionStore = null,
+      fetchDocument,
+      postForm,
+      getUserId,
+      asterionMultiplier = 1,
+      sleepImpl = sleep,
+      now = () => Date.now(),
+      logger = console,
+    }) {
+      const runtime = {
+        stopped: false,
+        ticking: false,
+        runningVisitId: '',
+        terminal: null,
+        interval: null,
+        heartbeat: null,
+        message: '',
+        publishSignature: '',
+        publishAt: 0,
+        processed: new Set(),
+        attacks: 0,
+        targets: 0,
+      };
+
+      function currentUrl() {
+        try {
+          return new URL(win.location.href, win.location.origin);
+        } catch {
+          return null;
+        }
+      }
+
+      function isMarkedHub(url = currentUrl()) {
+        return Boolean(
+          url &&
+            /\/guild_dungeon\.php\/?$/i.test(url.pathname) &&
+            url.searchParams.get('veyra_route') === ROUTE_ID,
+        );
+      }
+
+      function readCommand() {
+        const command = normalizeVisit(store.read(COMMAND_KEY), () => true);
+        return command?.taskId === ROUTE_ID ? command : null;
+      }
+
+      function ownsSchedulerLease(t = now()) {
+        if (!sessionStore || sessionStore.available === false) return true;
+        const tabId = sessionStore.readRaw?.(TAB_KEY);
+        const lease = store.read(LEASE_KEY);
+        return Boolean(
+          tabId &&
+            lease?.ownerId === tabId &&
+            Number.isFinite(Number(lease?.leaseUntil)) &&
+            Number(lease.leaseUntil) > t,
+        );
+      }
+
+      function publish(state, safeToLeave, message, visitId = '', force = false) {
+        const t = now();
+        const signature = `${visitId}|${state}|${safeToLeave}|${message}`;
+        if (!force && signature === runtime.publishSignature && t - runtime.publishAt < TIMING.heartbeatMs) {
+          return null;
+        }
+        runtime.publishSignature = signature;
+        runtime.publishAt = t;
+        runtime.message = message;
+        return publishWorkerStatus(
+          store,
+          ROUTE_ID,
+          { visitId, workerId: ROUTE_ID, state, safeToLeave, message },
+          t,
+        );
+      }
+
+      function log(message, level = 'info') {
+        const method = level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'info';
+        logger?.[method]?.(`[Veyra:shadowbridge-worker] ${message}`);
+      }
+
+      function setWorkingMessage(visitId, message) {
+        runtime.message = message;
+        publish('working', false, message, visitId);
+        log(message);
+      }
+
+      function setTerminal(visitId, state, message) {
+        runtime.terminal = { visitId, state, message };
+        runtime.runningVisitId = '';
+        publish(state, true, message, visitId, true);
+        log(message, state === 'error' ? 'warn' : 'info');
+      }
+
+      function assertCanMutate(visitId) {
+        if (runtime.stopped) throw new VisitStop('cancelled', 'Shadowbridge worker stopped.');
+        const command = readCommand();
+        if (!command || command.visitId !== visitId) {
+          throw new VisitStop('cancelled', 'The Shadowbridge scheduler visit changed.');
+        }
+        if (!ownsSchedulerLease()) {
+          throw new VisitStop('ownership', 'Another tab owns the Shadowbridge scheduler visit.');
+        }
+        if (command.phase === 'draining' || now() >= command.deadlineAt) {
+          throw new VisitStop('drain', 'Shadowbridge stopped safely at the scheduler deadline.');
+        }
+        return command;
+      }
+
+      function guardedPostForm(visitId, url, params, options = {}) {
+        const previousBeforeAttempt = options.beforeAttempt;
+        return postForm(url, params, {
+          ...options,
+          async beforeAttempt(details) {
+            assertCanMutate(visitId);
+            await previousBeforeAttempt?.(details);
+          },
+        });
+      }
+
+      function routeConfig() {
+        return normalizeConfig(store.read(CONFIG_KEY)).routes[ROUTE_ID];
+      }
+
+      async function readDashboard(visitId) {
+        assertCanMutate(visitId);
+        return fetchDocument(DASHBOARD_URL);
+      }
+
+      function createResourceManager(visitId, route, initialDoc) {
+        let sourceDoc = initialDoc;
+        let currentStamina = readStamina(initialDoc);
+        let inventory = readPotionInventory(initialDoc);
+
+        async function refresh() {
+          sourceDoc = await readDashboard(visitId);
+          currentStamina = readStamina(sourceDoc);
+          inventory = readPotionInventory(sourceDoc);
+          return sourceDoc;
+        }
+
+        async function ensureInventory() {
+          if (inventory.length === 0) await refresh();
+          return inventory;
+        }
+
+        async function consumePotion(entry, label) {
+          assertCanMutate(visitId);
+          setWorkingMessage(visitId, `Using ${entry.name || label}.`);
+          const result = await usePotion(entry, {
+            post: (url, params, options) => guardedPostForm(visitId, url, params, options),
+          });
+          if (!result.ok) throw new VisitStop('resource', `${label} could not be used: ${result.message || 'unknown response'}`);
+          const saved = inventory.find((candidate) => candidate.invId === entry.invId);
+          if (saved) saved.quantity = Math.max(0, saved.quantity - 1);
+          return result;
+        }
+
+        async function ensureStamina(required, forceRefresh = false) {
+          if (forceRefresh || currentStamina === null) await refresh();
+          // If the dashboard layout does not expose stamina, let damage.php make
+          // the authoritative decision.  An insufficient-stamina response comes
+          // back through the force-refresh path below.
+          if (currentStamina === null || currentStamina >= required) return true;
+          await ensureInventory();
+          if (currentStamina === null || currentStamina >= required) return true;
+          const potion = pickPotion(inventory, route.potions.stamina);
+          if (!potion) {
+            throw new VisitStop('resource', `Only ${currentStamina} stamina remains and no selected stamina potion is available.`);
+          }
+          await consumePotion(potion, 'The selected stamina potion');
+          await refresh();
+          if (currentStamina !== null && currentStamina < required) {
+            throw new VisitStop('resource', `Stamina is still below the required ${required} after using a potion.`);
+          }
+          return true;
+        }
+
+        async function ensureHealth(snapshot) {
+          if (!Number.isFinite(snapshot.playerHp) || !Number.isFinite(snapshot.playerMaxHp) || snapshot.playerMaxHp <= 0) {
+            return true;
+          }
+          if (snapshot.playerHp <= 0) throw new VisitStop('resource', 'Player HP reached zero; Shadowbridge stopped.');
+          if (snapshot.playerHp / snapshot.playerMaxHp > TIMING.lowHpFraction) return true;
+          await ensureInventory();
+          const potion = pickPotion(inventory, route.potions.heal);
+          if (!potion) {
+            throw new VisitStop(
+              'resource',
+              `Player HP is at or below ${Math.round(TIMING.lowHpFraction * 100)}% and no selected healing potion is available.`,
+            );
+          }
+          await consumePotion(potion, 'The selected healing potion');
+          snapshot.playerHp = snapshot.playerMaxHp;
+          return true;
+        }
+
+        function spendStamina(amount) {
+          if (currentStamina !== null) currentStamina = Math.max(0, currentStamina - amount);
+        }
+
+        return { ensureHealth, ensureStamina, refresh, spendStamina };
+      }
+
+      async function fetchBattle(target, userId) {
+        const battleDoc = await fetchDocument(target.url);
+        return {
+          doc: battleDoc,
+          snapshot: logic.parseBattleSnapshot(battleDoc, {
+            userId,
+            monsterId: target.monsterId,
+            instanceId: target.instanceId,
+            url: target.url,
+          }),
+        };
+      }
+
+      function resolveTarget(target, snapshot) {
+        return logic.resolveDamageTarget({
+          mode: target.target.mode,
+          damage: target.target.damage,
+          isBoss: target.isBoss,
+          snapshot,
+        });
+      }
+
+      async function joinIfNeeded(visitId, target, userId, battle) {
+        if (battle.snapshot.joined === true) return battle;
+        if (battle.snapshot.joined !== false) {
+          throw new Error(`Could not determine whether ${target.name || 'the monster'} is joined.`);
+        }
+        const payload = logic.buildJoinPayload({
+          instanceId: target.instanceId,
+          monsterId: target.monsterId,
+          userId,
+        });
+        if (!payload) throw new Error('Could not build a safe Shadowbridge join request.');
+        assertCanMutate(visitId);
+        setWorkingMessage(visitId, `Joining ${target.name || 'Shadowbridge monster'}.`);
+        const response = await guardedPostForm(visitId, JOIN_URL, payload);
+        const joined = logic.parseJoinResponse(response);
+        if (!joined.ok) throw new Error(`Joining ${target.name || 'the monster'} failed: ${joined.message || 'unknown response'}`);
+        const refreshed = await fetchBattle(target, userId);
+        if (refreshed.snapshot.joined !== true) {
+          throw new Error(`The battle page did not confirm that ${target.name || 'the monster'} was joined.`);
+        }
+        return refreshed;
+      }
+
+      function retryDelayFromMessage(message, fallback) {
+        const milliseconds = String(message || '').match(/(?:wait|cooldown)[^\d]{0,20}(\d+)\s*ms/i);
+        if (milliseconds) return Math.min(30_000, Math.max(fallback, Number(milliseconds[1])));
+        const seconds = String(message || '').match(/(?:wait|cooldown)[^\d]{0,20}(\d+(?:\.\d+)?)\s*s/i);
+        if (seconds) return Math.min(30_000, Math.max(fallback, Math.ceil(Number(seconds[1]) * 1_000)));
+        return null;
+      }
+
+      async function attackMonster(visitId, route, target, userId) {
+        assertCanMutate(visitId);
+        let battle = await fetchBattle(target, userId);
+        if (battle.snapshot.dead) return { reason: 'dead', attacks: 0 };
+        battle = await joinIfNeeded(visitId, target, userId, battle);
+
+        let decision = resolveTarget(target, battle.snapshot);
+        if (!decision.ok) throw new Error(`${target.name || 'Shadowbridge target'}: ${decision.error}`);
+        if (decision.done) return { reason: 'target', attacks: 0 };
+
+        const skill = logic.skillForId(route.settings.skill);
+        const payload = logic.buildDamagePayload({
+          instanceId: target.instanceId,
+          monsterId: target.monsterId,
+          skillId: route.settings.skill,
+        });
+        if (!skill || !payload) throw new Error('The selected Shadowbridge skill is invalid.');
+        const effectiveStaminaCost = staminaCost(skill.cost, asterionMultiplier);
+        const resources = createResourceManager(visitId, route, battle.doc);
+        let ownDamage = battle.snapshot.ownDamage;
+        let attempts = 0;
+        let cooldownRetries = 0;
+
+        while (attempts < TIMING.maxAttacksPerMonster) {
+          assertCanMutate(visitId);
+          if (!decision.untilDead && Number.isFinite(ownDamage) && ownDamage >= decision.targetDamage) {
+            return { reason: 'target', attacks: attempts };
+          }
+          await resources.ensureHealth(battle.snapshot);
+          await resources.ensureStamina(effectiveStaminaCost);
+          assertCanMutate(visitId);
+
+          setWorkingMessage(
+            visitId,
+            `Attacking ${target.name || 'Shadowbridge boss'} (${attempts + 1}${
+              decision.untilDead ? ', until defeated' : `, ${Math.max(0, decision.targetDamage - ownDamage)} damage remaining`
+            }).`,
+          );
+          const response = await guardedPostForm(visitId, DAMAGE_URL, payload, {
+            onRateLimit({ waitMs }) {
+              setWorkingMessage(visitId, `Shadowbridge rate limit: waiting ${Math.ceil(waitMs / 1_000)} seconds.`);
+            },
+          });
+          const result = logic.parseAttackResponse(response);
+          if (!result.ok) {
+            if (/not enough stamina|insufficient stamina/i.test(result.message)) {
+              await resources.ensureStamina(effectiveStaminaCost, true);
+              continue;
+            }
+            const retryMs = retryDelayFromMessage(result.message, route.settings.attackCooldownMs);
+            if (retryMs !== null && cooldownRetries < 5) {
+              cooldownRetries += 1;
+              await sleepImpl(retryMs);
+              continue;
+            }
+            throw new Error(`Attack on ${target.name || 'the monster'} failed: ${result.message || `HTTP ${response?.status || '?'}`}`);
+          }
+          if (!result.dead && result.damage <= 0) {
+            throw new Error(`Attack on ${target.name || 'the monster'} returned no verifiable damage.`);
+          }
+          cooldownRetries = 0;
+          attempts += 1;
+          runtime.attacks += 1;
+          resources.spendStamina(effectiveStaminaCost);
+          if (Number.isFinite(ownDamage)) ownDamage += result.damage;
+          if (Number.isFinite(result.playerHp)) battle.snapshot.playerHp = result.playerHp;
+          if (result.dead) return { reason: 'dead', attacks: attempts };
+          if (!decision.untilDead && Number.isFinite(ownDamage) && ownDamage >= decision.targetDamage) {
+            return { reason: 'target', attacks: attempts };
+          }
+
+          if (attempts % TIMING.refreshBattleEvery === 0 || result.currentHp === null) {
+            battle = await fetchBattle(target, userId);
+            if (battle.snapshot.dead) return { reason: 'dead', attacks: attempts };
+            decision = resolveTarget(target, battle.snapshot);
+            if (!decision.ok) throw new Error(`${target.name || 'Shadowbridge target'}: ${decision.error}`);
+            ownDamage = battle.snapshot.ownDamage;
+            if (decision.done) return { reason: 'target', attacks: attempts };
+          }
+          await sleepImpl(route.settings.attackCooldownMs);
+        }
+        throw new Error(`${target.name || 'Shadowbridge target'} exceeded the per-monster attack safety limit.`);
+      }
+
+      async function scanLocations(visitId, instance) {
+        const scans = [];
+        for (const location of instance.locations) {
+          assertCanMutate(visitId);
+          setWorkingMessage(visitId, `Scanning ${location.label || `Shadowbridge location ${location.id}`}.`);
+          const locationDoc = await fetchDocument(location.url);
+          scans.push({
+            location,
+            monsters: logic.parseLocationPage(locationDoc, location.url),
+          });
+        }
+        return scans;
+      }
+
+      async function loadInstance(visitId, url) {
+        assertCanMutate(visitId);
+        const instanceDoc = await fetchDocument(url);
+        const instance = logic.parseInstancePage(instanceDoc, url);
+        if (!instance.instanceId) throw new Error('The Shadowbridge instance id could not be read.');
+        if (instance.locations.length === 0) {
+          throw new Error('No unlocked Shadowbridge locations were found on the instance page.');
+        }
+        return instance;
+      }
+
+      async function executeVisit(command) {
+        const visitId = command.visitId;
+        const route = routeConfig();
+        const enabledNormal = Object.values(route.settings.monsters).some((target) => target.enabled);
+        if (!enabledNormal && !route.settings.bossRoom.enabled) {
+          setTerminal(visitId, 'done', 'Shadowbridge has no enabled targets.');
+          return;
+        }
+
+        setWorkingMessage(visitId, 'Looking for the active Shadowbridge Warrens instance.');
+        const entry = logic.parseHubEntry(doc, currentUrl()?.href);
+        if (!entry) throw new Error('The Shadowbridge Warrens entry was not found on the guild-dungeon page.');
+        const userId = await getUserId();
+        if (!userId) throw new Error('The player id could not be determined for Shadowbridge.');
+
+        let instanceUrl = entry.url;
+        for (let pass = 0; pass < TIMING.maxScanPasses; pass += 1) {
+          assertCanMutate(visitId);
+          const instance = await loadInstance(visitId, instanceUrl);
+          instanceUrl = new URL(`/guild_dungeon_instance.php?id=${encodeURIComponent(instance.instanceId)}`, win.location.origin).href;
+          const scans = await scanLocations(visitId, instance);
+          const plan = attackPlan(scans, route.settings, runtime.processed);
+          if (plan.length === 0) {
+            const bossNote = route.settings.bossRoom.enabled && instance.bossLocked ? ' The Boss Room is still locked.' : '';
+            setTerminal(
+              visitId,
+              'done',
+              `Shadowbridge finished ${runtime.targets} target(s) with ${runtime.attacks} attack(s).${bossNote}`,
+            );
+            return;
+          }
+
+          for (const target of plan) {
+            assertCanMutate(visitId);
+            const result = await attackMonster(visitId, route, target, String(userId));
+            runtime.processed.add(target.key);
+            runtime.targets += 1;
+            setWorkingMessage(
+              visitId,
+              `${target.name || 'Shadowbridge boss'} ${
+                result.reason === 'dead' ? 'is defeated' : 'reached its configured damage target'
+              }; checking the next target.`,
+            );
+          }
+
+          // Re-read the instance after each complete plan: killing the last normal
+          // monster can unlock a dynamically linked Boss Room.
+        }
+        throw new Error('Shadowbridge did not settle after repeated instance rescans.');
+      }
+
+      async function tick() {
+        if (runtime.stopped || runtime.ticking || !isMarkedHub()) return;
+        const command = readCommand();
+        if (!command) {
+          if (!runtime.runningVisitId) publish('idle', true, 'Shadowbridge is idle on the dungeon page.');
+          return;
+        }
+        if (!ownsSchedulerLease()) return;
+        if (runtime.terminal?.visitId === command.visitId) {
+          publish(runtime.terminal.state, true, runtime.terminal.message, command.visitId);
+          return;
+        }
+        if (command.phase === 'draining' || now() >= command.deadlineAt) {
+          setTerminal(command.visitId, 'done', 'Shadowbridge stopped safely before starting another action.');
+          return;
+        }
+
+        runtime.ticking = true;
+        runtime.runningVisitId = command.visitId;
+        runtime.terminal = null;
+        runtime.processed = new Set();
+        runtime.attacks = 0;
+        runtime.targets = 0;
+        try {
+          await executeVisit(command);
+        } catch (error) {
+          if (error instanceof VisitStop) {
+            if (error.kind === 'ownership' || error.kind === 'cancelled') return;
+            setTerminal(command.visitId, 'done', error.message);
+          } else {
+            setTerminal(command.visitId, 'error', `Shadowbridge failed safely: ${error?.message || error}`);
+          }
+        } finally {
+          runtime.ticking = false;
+          if (!runtime.terminal) runtime.runningVisitId = '';
+        }
+      }
+
+      function heartbeat() {
+        if (!runtime.runningVisitId || runtime.terminal || !ownsSchedulerLease()) return;
+        publish(
+          'working',
+          false,
+          runtime.message || 'Shadowbridge is working.',
+          runtime.runningVisitId,
+          true,
+        );
+      }
+
+      function onVisibilityChange() {
+        if (doc.hidden !== true && doc.visibilityState !== 'hidden') void tick();
+      }
+
+      function onPageShow() {
+        void tick();
+      }
+
+      function onPageHide(event) {
+        if (!event?.persisted) stop();
+      }
+
+      function start() {
+        runtime.interval = win.setInterval?.(() => void tick(), TIMING.tickMs) ?? null;
+        runtime.heartbeat = win.setInterval?.(heartbeat, TIMING.heartbeatMs) ?? null;
+        doc.addEventListener?.('visibilitychange', onVisibilityChange);
+        win.addEventListener?.('pageshow', onPageShow);
+        win.addEventListener?.('pagehide', onPageHide);
+        void tick();
+      }
+
+      function stop() {
+        runtime.stopped = true;
+        if (runtime.interval !== null) win.clearInterval?.(runtime.interval);
+        if (runtime.heartbeat !== null) win.clearInterval?.(runtime.heartbeat);
+        runtime.interval = null;
+        runtime.heartbeat = null;
+        doc.removeEventListener?.('visibilitychange', onVisibilityChange);
+        win.removeEventListener?.('pageshow', onPageShow);
+        win.removeEventListener?.('pagehide', onPageHide);
+      }
+
+      return { heartbeat, onPageHide, onPageShow, onVisibilityChange, runtime, start, stop, tick };
+    }
+
+    const shadowbridgeWorkerFeature = Object.freeze({
+      id: 'shadowbridge-worker',
+      group: 'Automation',
+      settings: [],
+      matches(url) {
+        return /\/guild_dungeon\.php\/?$/i.test(url.pathname);
+      },
+      run(ctx) {
+        let multiplier = 1;
+        try {
+          multiplier = staminaMultiplier(ctx);
+        } catch {
+          // The optional shared setting is unavailable only in isolated tests.
+        }
+        const worker = createShadowbridgeWorker({
+          win: ctx.win,
+          doc: ctx.doc,
+          store: ctx.store,
+          sessionStore: createJsonStore(getStorage('sessionStorage', ctx.win), '[Veyra]'),
+          fetchDocument: ctx.fetchDocument,
+          postForm: ctx.postForm,
+          getUserId: ctx.getUserId,
+          asterionMultiplier: multiplier,
+        });
+        worker.start();
+        return worker;
+      },
+    });
+
+    module.exports = {
+      DAMAGE_URL,
+      DASHBOARD_URL,
+      JOIN_URL,
+      ROUTE_ID,
+      TIMING,
+      VisitStop,
+      attackPlan,
+      createShadowbridgeWorker,
+      readStamina,
+      shadowbridgeWorkerFeature,
+    };
   },
   "features/battle/index.js": function (module, exports, require) {
     'use strict';
@@ -5402,7 +10179,7 @@
           pid,
           name: text(link) || `#${pid}`,
           avatar: attr(row.querySelector?.('.lb-avatar'), 'src') || '',
-          damage: parseGameNumber(text(row.querySelector?.('.lb-dmg')).replace(/[^\d,]/g, '')) ?? 0,
+          damage: parseAmount(text(row.querySelector?.('.lb-dmg'))) ?? 0,
         });
       }
       return rows;
@@ -6139,6 +10916,3650 @@
         if (value === null || ctx.setting(ASTERION_VALUE.key) === value) return;
         ctx.setSetting(ASTERION_VALUE.key, value);
         ctx.log(`Asterion multiplier set to ${value}.`);
+      },
+    });
+  },
+  "features/general/auto-battle-extras.js": function (module, exports, require) {
+    'use strict';
+
+    module.exports = Object.freeze({
+      id: 'auto-battle-extras',
+      group: 'Castle event',
+      settings: [],
+
+      matches(url) {
+        return /\/occurrence_castle\.php\/?$/i.test(url.pathname);
+      },
+
+      run(ctx) {
+        const win = ctx.win;
+        if (!win || win.__veyraAutoBattleExtrasLoaded) return;
+        win.__veyraAutoBattleExtrasLoaded = true;
+        const window = win;
+        const document = ctx.doc;
+        (function () {
+            'use strict';
+
+            const AutoBattleExtras = (function createAutoBattleExtrasCore() {
+                const STORAGE_PREFIX = 'tmAutoBattleExtras:';
+                const AUTO_RESTART_KEY = STORAGE_PREFIX + 'autoBattleRestart:v1';
+                const modules = [];
+
+                let root = null;
+                let content = null;
+                let globalStatus = null;
+                let observer = null;
+                let scanTimer = null;
+                let started = false;
+
+                function clone(value) {
+                    return JSON.parse(JSON.stringify(value));
+                }
+
+                function isPlainObject(value) {
+                    return !!value && typeof value === 'object' && !Array.isArray(value);
+                }
+
+                function mergeDefaults(defaults, saved) {
+                    const base = clone(defaults || {});
+
+                    if (!isPlainObject(saved)) return base;
+
+                    for (const [key, value] of Object.entries(saved)) {
+                        if (isPlainObject(base[key]) && isPlainObject(value)) {
+                            base[key] = {
+                                ...base[key],
+                                ...value
+                            };
+                        } else {
+                            base[key] = value;
+                        }
+                    }
+
+                    return base;
+                }
+
+                function storageKey(moduleId) {
+                    return STORAGE_PREFIX + moduleId + ':v1';
+                }
+
+                function readState(moduleId, defaults) {
+                    try {
+                        const saved = JSON.parse(localStorage.getItem(storageKey(moduleId)) || '{}');
+                        return mergeDefaults(defaults, saved);
+                    } catch {
+                        return clone(defaults || {});
+                    }
+                }
+
+                function saveState(moduleId, state) {
+                    localStorage.setItem(storageKey(moduleId), JSON.stringify(state || {}));
+                }
+
+                function normalizeText(value) {
+                    return String(value || '')
+                        .replace(/\s+/g, ' ')
+                        .trim();
+                }
+
+                function normalizePowerName(value) {
+                    return normalizeText(value)
+                        .replace(/\s*\((common|rare|epic|legendary)\)\s*$/i, '')
+                        .trim();
+                }
+
+                function powerNameKey(value) {
+                    return normalizePowerName(value).toLowerCase();
+                }
+
+                function uniquePowerNames(names) {
+                    const map = new Map();
+
+                    for (const raw of names || []) {
+                        const clean = normalizePowerName(raw);
+                        if (!clean) continue;
+
+                        const key = powerNameKey(clean);
+                        if (!map.has(key)) map.set(key, clean);
+                    }
+
+                    return Array.from(map.values());
+                }
+
+                function makePowerNameSet(names) {
+                    return new Set(uniquePowerNames(names).map(powerNameKey));
+                }
+
+                function parseNumberText(value) {
+                    const digits = String(value || '').replace(/[^\d]/g, '');
+                    return digits ? Number(digits) : NaN;
+                }
+
+                function getPlayerStatusText() {
+                    return normalizeText(document.querySelector('#playerStatusText')?.textContent || 'None');
+                }
+
+                function getPlayerHpPercent() {
+                    const autoPanel = document.querySelector('#autoBattlePanel');
+
+                    const fromDataset = Number(autoPanel?.dataset?.playerHpPercent);
+                    if (Number.isFinite(fromDataset)) return Math.max(0, Math.min(100, fromDataset));
+
+                    const hpFill = document.querySelector('#playerHpFill');
+                    const widthText = hpFill?.style?.width || '';
+                    const widthMatch = widthText.match(/([\d.]+)\s*%/);
+
+                    if (widthMatch) {
+                        const width = Number(widthMatch[1]);
+                        if (Number.isFinite(width)) return Math.max(0, Math.min(100, width));
+                    }
+
+                    const hpText = normalizeText(document.querySelector('#playerHpText')?.textContent || '');
+                    const hpMatch = hpText.match(/(.+?)\s*\/\s*(.+)/);
+
+                    if (hpMatch) {
+                        const current = parseNumberText(hpMatch[1]);
+                        const max = parseNumberText(hpMatch[2]);
+
+                        if (Number.isFinite(current) && Number.isFinite(max) && max > 0) {
+                            return Math.max(0, Math.min(100, (current / max) * 100));
+                        }
+                    }
+
+                    return 100;
+                }
+
+                function readAutoBattleRestartRequest() {
+                    try {
+                        return JSON.parse(localStorage.getItem(AUTO_RESTART_KEY) || '{}');
+                    } catch {
+                        return {};
+                    }
+                }
+
+                function requestAutoBattleRestart(reason) {
+                    localStorage.setItem(AUTO_RESTART_KEY, JSON.stringify({
+                        requested: true,
+                        reason: reason || 'module action',
+                        requestedAt: Date.now()
+                    }));
+                }
+
+                function clearAutoBattleRestartRequest() {
+                    localStorage.removeItem(AUTO_RESTART_KEY);
+                }
+
+                function shouldAutoBattleRestart() {
+                    const request = readAutoBattleRestartRequest();
+
+                    if (!request.requested) return false;
+
+                    const age = Date.now() - Number(request.requestedAt || 0);
+
+                    if (age > 120000) {
+                        clearAutoBattleRestartRequest();
+                        return false;
+                    }
+
+                    return true;
+                }
+
+                function isNativeAutoBattleActive() {
+                    const autoPanel = document.querySelector('#autoBattlePanel');
+                    const storageKey = autoPanel?.dataset?.storageKey;
+
+                    if (!storageKey) return false;
+
+                    try {
+                        const state = JSON.parse(localStorage.getItem(storageKey) || '{}');
+                        return !!state.active;
+                    } catch {
+                        return false;
+                    }
+                }
+
+                function hasBattleForAutoStart() {
+                    const autoPanel = document.querySelector('#autoBattlePanel');
+
+                    if (autoPanel?.dataset?.hasBattle === '1') return true;
+
+                    return !!(
+                        document.querySelector('.monster-card') &&
+                        document.querySelector('form.js-attack-form')
+                    );
+                }
+
+                function tryStartNativeAutoBattle(reason) {
+                    if (!shouldAutoBattleRestart()) return false;
+
+                    if (isNativeAutoBattleActive()) {
+                        clearAutoBattleRestartRequest();
+                        return false;
+                    }
+
+                    if (!hasBattleForAutoStart()) return false;
+
+                    const startButton = document.querySelector('#autoStartBtn');
+
+                    if (!startButton) return false;
+                    if (startButton.disabled) return false;
+
+                    clearAutoBattleRestartRequest();
+
+                    setGlobalStatus('Restarting native Auto Battle' + (reason ? ': ' + reason : '') + '.');
+
+                    window.setTimeout(() => {
+                        startButton.click();
+                    }, 250);
+
+                    return true;
+                }
+
+                function submitForm(form, options = {}) {
+                    if (!form) return;
+
+                    const restartAutoBattle = options.restartAutoBattle !== false;
+
+                    if (restartAutoBattle) {
+                        requestAutoBattleRestart(options.restartReason || form.dataset.itemName || 'module action');
+                    }
+
+                    const button = form.querySelector('button, input[type="submit"]');
+
+                    if (typeof form.requestSubmit === 'function') {
+                        form.requestSubmit(button || undefined);
+                    } else if (button) {
+                        button.click();
+                    } else {
+                        form.submit();
+                    }
+                }
+
+                function createCheckbox(checked, onChange) {
+                    const input = document.createElement('input');
+                    input.type = 'checkbox';
+                    input.checked = !!checked;
+                    input.addEventListener('change', () => onChange(input.checked));
+                    return input;
+                }
+
+                function createNumberInput(value, min, max, onChange) {
+                    const input = document.createElement('input');
+                    input.type = 'number';
+                    input.min = String(min);
+                    input.max = String(max);
+                    input.value = String(value);
+                    input.style.width = '70px';
+
+                    input.addEventListener('change', () => {
+                        const parsed = Number(input.value);
+                        const clean = Number.isFinite(parsed)
+                            ? Math.max(min, Math.min(max, Math.round(parsed)))
+                            : value;
+
+                        input.value = String(clean);
+                        onChange(clean);
+                    });
+
+                    return input;
+                }
+
+                function createPrioritySelect(value, maxPriority, onChange) {
+                    const select = document.createElement('select');
+
+                    for (let number = 1; number <= maxPriority; number += 1) {
+                        const option = document.createElement('option');
+                        option.value = String(number);
+                        option.textContent = String(number);
+                        select.appendChild(option);
+                    }
+
+                    select.value = String(value || 1);
+                    select.addEventListener('change', () => {
+                        onChange(Number(select.value));
+                        scheduleScan(100);
+                    });
+
+                    return select;
+                }
+
+                function setModuleStatus(moduleId, text) {
+                    const el = document.querySelector('#tmModuleStatus_' + moduleId);
+                    if (el) el.textContent = text || '';
+                }
+
+                function setGlobalStatus(text) {
+                    if (globalStatus) globalStatus.textContent = text || '';
+                }
+
+                function getMountPoint() {
+                    return (
+                        document.querySelector('#autoBattlePanel') ||
+                        document.querySelector('.castle-event-card') ||
+                        document.querySelector('.card') ||
+                        document.body
+                    );
+                }
+
+                function ensureRoot() {
+                    if (root && document.documentElement.contains(root)) return;
+
+                    const mount = getMountPoint();
+
+                    root = document.createElement('section');
+                    root.id = 'tmAutoBattleExtrasRoot';
+                    root.style.marginTop = '12px';
+                    root.style.padding = '12px';
+                    root.style.border = '1px solid rgba(255,255,255,0.25)';
+                    root.style.borderRadius = '12px';
+                    root.style.display = 'block';
+
+                    const title = document.createElement('h2');
+                    title.textContent = 'Tampermonkey Auto Battle Extras';
+                    title.style.marginTop = '0';
+
+                    const hint = document.createElement('div');
+                    hint.textContent = 'Modular addon panel for power choices, castle events, and future automation modules.';
+                    hint.style.fontSize = '12px';
+                    hint.style.opacity = '0.8';
+                    hint.style.marginBottom = '12px';
+
+                    content = document.createElement('div');
+                    content.id = 'tmAutoBattleExtrasContent';
+
+                    globalStatus = document.createElement('div');
+                    globalStatus.id = 'tmAutoBattleExtrasGlobalStatus';
+                    globalStatus.style.marginTop = '10px';
+                    globalStatus.style.fontSize = '12px';
+                    globalStatus.style.opacity = '0.85';
+
+                    root.appendChild(title);
+                    root.appendChild(hint);
+                    root.appendChild(content);
+                    root.appendChild(globalStatus);
+
+                    mount.appendChild(root);
+                }
+
+                function createModulePanel(module) {
+                    if (!content) return null;
+
+                    let panel = document.querySelector('#tmModule_' + module.id);
+                    if (panel) return panel;
+
+                    panel = document.createElement('section');
+                    panel.id = 'tmModule_' + module.id;
+                    panel.style.marginTop = '12px';
+                    panel.style.padding = '10px';
+                    panel.style.border = '1px solid rgba(255,255,255,0.18)';
+                    panel.style.borderRadius = '10px';
+
+                    const title = document.createElement('h3');
+                    title.textContent = module.title || module.id;
+                    title.style.marginTop = '0';
+
+                    const body = document.createElement('div');
+                    body.id = 'tmModuleBody_' + module.id;
+
+                    const status = document.createElement('div');
+                    status.id = 'tmModuleStatus_' + module.id;
+                    status.style.marginTop = '8px';
+                    status.style.fontSize = '12px';
+                    status.style.opacity = '0.85';
+
+                    panel.appendChild(title);
+                    panel.appendChild(body);
+                    panel.appendChild(status);
+
+                    content.appendChild(panel);
+
+                    return body;
+                }
+
+                function renderModules() {
+                    ensureRoot();
+
+                    for (const module of modules) {
+                        if (module.rendered) continue;
+
+                        const body = createModulePanel(module);
+                        if (!body) continue;
+
+                        try {
+                            module.render?.(body, api);
+                            module.rendered = true;
+                        } catch (error) {
+                            console.error('[AutoBattleExtras] Render failed:', module.id, error);
+                            setModuleStatus(module.id, 'Render error: ' + (error.message || error));
+                        }
+                    }
+                }
+
+                function scanModules() {
+                    renderModules();
+
+                    for (const module of modules) {
+                        try {
+                            module.scan?.(api);
+                        } catch (error) {
+                            console.error('[AutoBattleExtras] Scan failed:', module.id, error);
+                            setModuleStatus(module.id, 'Scan error: ' + (error.message || error));
+                        }
+                    }
+                }
+
+                function scheduleScan(delay) {
+                    if (scanTimer) clearTimeout(scanTimer);
+
+                    scanTimer = window.setTimeout(() => {
+                        scanTimer = null;
+                        scanModules();
+                    }, Number(delay) || 200);
+                }
+
+                function startObserver() {
+                    if (observer) return;
+
+                    observer = new MutationObserver(() => {
+                        scheduleScan(200);
+                    });
+
+                    observer.observe(document.documentElement, {
+                        childList: true,
+                        subtree: true,
+                        characterData: true
+                    });
+                }
+
+                function registerModule(module) {
+                    if (!module || !module.id) {
+                        throw new Error('Module requires an id.');
+                    }
+
+                    modules.push({
+                        ...module,
+                        rendered: false
+                    });
+
+                    if (started) {
+                        renderModules();
+                        scheduleScan(100);
+                    }
+                }
+
+                function start() {
+                    if (started) return;
+
+                    started = true;
+                    renderModules();
+                    startObserver();
+                    scheduleScan(150);
+
+                    setGlobalStatus('Auto Battle Extras loaded.');
+                }
+
+                const api = {
+                    readState,
+                    saveState,
+                    normalizeText,
+                    normalizePowerName,
+                    powerNameKey,
+                    uniquePowerNames,
+                    makePowerNameSet,
+                    parseNumberText,
+                    getPlayerStatusText,
+                    getPlayerHpPercent,
+                    submitForm,
+                    requestAutoBattleRestart,
+                    clearAutoBattleRestartRequest,
+                    shouldAutoBattleRestart,
+                    tryStartNativeAutoBattle,
+                    createCheckbox,
+                    createNumberInput,
+                    createPrioritySelect,
+                    setModuleStatus,
+                    setGlobalStatus,
+                    scheduleScan
+                };
+
+                return {
+                    registerModule,
+                    start,
+                    api
+                };
+            })();
+
+            window.AutoBattleExtras = AutoBattleExtras;
+
+            AutoBattleExtras.registerModule({
+                id: 'autoBattleResume',
+                title: 'Auto Battle Resume',
+
+                defaults: {
+                    enabled: true
+                },
+
+                read(api) {
+                    return api.readState(this.id, this.defaults);
+                },
+
+                write(api, state) {
+                    api.saveState(this.id, {
+                        ...this.defaults,
+                        ...state
+                    });
+                },
+
+                render(panel, api) {
+                    const state = this.read(api);
+
+                    const enabledLabel = document.createElement('label');
+                    enabledLabel.style.display = 'flex';
+                    enabledLabel.style.gap = '8px';
+                    enabledLabel.style.alignItems = 'center';
+                    enabledLabel.style.marginBottom = '10px';
+
+                    const enabledCheckbox = api.createCheckbox(state.enabled, (checked) => {
+                        const latest = this.read(api);
+                        latest.enabled = checked;
+                        this.write(api, latest);
+
+                        api.setModuleStatus(this.id, checked ? 'Auto Battle Resume enabled.' : 'Auto Battle Resume paused.');
+                        api.scheduleScan(100);
+                    });
+
+                    enabledLabel.appendChild(enabledCheckbox);
+                    enabledLabel.appendChild(document.createTextNode('Restart native Auto Battle after module actions'));
+
+                    const hint = document.createElement('div');
+                    hint.style.fontSize = '12px';
+                    hint.style.opacity = '0.8';
+                    hint.textContent = 'When another module buys, uses, chooses, or resolves something, this module clicks Start Auto again once a battle is available.';
+
+                    const scanButton = document.createElement('button');
+                    scanButton.type = 'button';
+                    scanButton.textContent = 'Check now';
+                    scanButton.style.marginTop = '10px';
+
+                    scanButton.addEventListener('click', () => {
+                        const didStart = this.scan(api);
+
+                        if (!didStart) {
+                            api.setModuleStatus(this.id, 'No pending Auto Battle restart or Start Auto is not available yet.');
+                        }
+                    });
+
+                    panel.appendChild(enabledLabel);
+                    panel.appendChild(hint);
+                    panel.appendChild(scanButton);
+                },
+
+                scan(api) {
+                    const state = this.read(api);
+                    if (!state.enabled) return false;
+
+                    if (!api.shouldAutoBattleRestart()) return false;
+
+                    const didStart = api.tryStartNativeAutoBattle('after module action');
+
+                    if (didStart) {
+                        api.setModuleStatus(this.id, 'Native Auto Battle restarted.');
+                        return true;
+                    }
+
+                    api.setModuleStatus(this.id, 'Waiting until Start Auto is available.');
+                    return false;
+                }
+            });
+
+            AutoBattleExtras.registerModule({
+                id: 'statusPotionAutoUse',
+                title: 'Status Potion Auto Use',
+
+                defaults: {
+                    enabled: false,
+
+                    useForStatuses: {
+                        burned: true,
+                        frozen: true,
+                        poisoned: true
+                    },
+
+                    onlyDuringBattle: true,
+                    submitDelay: 50
+                },
+
+                isUsingPotion: false,
+                attackFetchGuardInstalled: false,
+                fastScanInterval: null,
+
+                read(api) {
+                    const state = api.readState(this.id, this.defaults);
+
+                    return {
+                        ...this.defaults,
+                        ...state,
+                        useForStatuses: {
+                            ...this.defaults.useForStatuses,
+                            ...(state.useForStatuses || {})
+                        }
+                    };
+                },
+
+                write(api, state) {
+                    api.saveState(this.id, {
+                        ...this.defaults,
+                        ...state,
+                        useForStatuses: {
+                            ...this.defaults.useForStatuses,
+                            ...(state.useForStatuses || {})
+                        }
+                    });
+                },
+
+                getStatusPotionForm(api) {
+                    const direct = Array.from(document.querySelectorAll('form[data-item-name]')).find((form) => {
+                        return api.normalizeText(form.dataset.itemName).toLowerCase() === 'status potion';
+                    });
+
+                    if (direct) return direct;
+
+                    const items = Array.from(document.querySelectorAll('.item'));
+
+                    for (const item of items) {
+                        const title = api.normalizeText(item.querySelector('.item-title')?.textContent || '');
+
+                        if (title.toLowerCase() !== 'status potion') continue;
+
+                        const form = item.querySelector('form');
+                        if (form) return form;
+                    }
+
+                    return null;
+                },
+
+                getStatusPotionCount(api) {
+                    const items = Array.from(document.querySelectorAll('.item'));
+
+                    for (const item of items) {
+                        const title = api.normalizeText(item.querySelector('.item-title')?.textContent || '');
+
+                        if (title.toLowerCase() !== 'status potion') continue;
+
+                        const meta = api.normalizeText(item.querySelector('.item-meta')?.textContent || '');
+                        const match = meta.match(/x\s*(\d+)/i);
+
+                        if (match) return Number(match[1]);
+                    }
+
+                    return this.getStatusPotionForm(api) ? 1 : 0;
+                },
+
+                hasActiveBattle() {
+                    const autoPanel = document.querySelector('#autoBattlePanel');
+
+                    if (autoPanel?.dataset?.hasBattle === '1') return true;
+
+                    return !!(
+                        document.querySelector('.monster-card') &&
+                        document.querySelector('form.js-attack-form')
+                    );
+                },
+
+                getMatchedStatus(api, state) {
+                    const statusText = api.getPlayerStatusText().toLowerCase();
+
+                    const statusMap = {
+                        burned: ['burned', 'burn'],
+                        frozen: ['frozen', 'freeze'],
+                        poisoned: ['poisoned', 'poison']
+                    };
+
+                    for (const [statusKey, aliases] of Object.entries(statusMap)) {
+                        if (!state.useForStatuses[statusKey]) continue;
+
+                        const matches = aliases.some((alias) => statusText.includes(alias));
+                        if (matches) return statusKey;
+                    }
+
+                    return '';
+                },
+
+                shouldUseStatusPotion(api) {
+                    const state = this.read(api);
+                    if (!state.enabled) return false;
+                    if (this.isUsingPotion) return false;
+
+                    if (state.onlyDuringBattle && !this.hasActiveBattle()) return false;
+
+                    const matchedStatus = this.getMatchedStatus(api, state);
+                    if (!matchedStatus) return false;
+
+                    const form = this.getStatusPotionForm(api);
+                    if (!form) {
+                        api.setModuleStatus(this.id, 'Status matched, but no Status Potion form was found.');
+                        return false;
+                    }
+
+                    return true;
+                },
+
+                useStatusPotion(api, reason) {
+                    if (this.isUsingPotion) return false;
+
+                    const state = this.read(api);
+                    const matchedStatus = this.getMatchedStatus(api, state);
+                    const form = this.getStatusPotionForm(api);
+
+                    if (!matchedStatus || !form) return false;
+
+                    this.isUsingPotion = true;
+
+                    const count = this.getStatusPotionCount(api);
+
+                    api.setModuleStatus(
+                        this.id,
+                        'Using Status Potion automatically for ' +
+                        matchedStatus +
+                        (count ? ' | available: x' + count : '') +
+                        (reason ? ' | reason: ' + reason : '')
+                    );
+
+                    window.setTimeout(() => {
+                        api.submitForm(form);
+                    }, Number(state.submitDelay) || 50);
+
+                    return true;
+                },
+
+                isAttackRequest(args) {
+                    const input = args[0];
+                    const init = args[1] || {};
+
+                    const method = String(init.method || '').toUpperCase();
+                    if (method !== 'POST') return false;
+
+                    const body = init.body;
+                    if (!(body instanceof FormData)) return false;
+
+                    const action = body.get('action');
+                    const attackType = body.get('attack_type');
+
+                    return action === 'attack' && ['slash', 'magic'].includes(String(attackType));
+                },
+
+                installAttackFetchGuard(api) {
+                    if (this.attackFetchGuardInstalled) return;
+
+                    this.attackFetchGuardInstalled = true;
+
+                    const module = this;
+                    const originalFetch = window.fetch;
+
+                    window.fetch = function guardedFetch(...args) {
+                        try {
+                            if (module.isAttackRequest(args) && module.shouldUseStatusPotion(api)) {
+                                const didUsePotion = module.useStatusPotion(api, 'before attack');
+
+                                if (didUsePotion) {
+                                    // Keep the native attack request pending.
+                                    // The Status Potion form submit should navigate/reload the page.
+                                    // This avoids letting the native Auto Battle treat the blocked attack as an error.
+                                    return new Promise(() => { });
+                                }
+                            }
+                        } catch (error) {
+                            console.error('[AutoBattleExtras] Status Potion attack guard failed:', error);
+                        }
+
+                        return originalFetch.apply(this, args);
+                    };
+                },
+
+                installManualSubmitGuard(api) {
+                    if (this.manualSubmitGuardInstalled) return;
+
+                    this.manualSubmitGuardInstalled = true;
+
+                    document.addEventListener(
+                        'submit',
+                        (event) => {
+                            const form = event.target;
+
+                            if (!(form instanceof HTMLFormElement)) return;
+                            if (!form.matches('form.js-attack-form')) return;
+                            if (!this.shouldUseStatusPotion(api)) return;
+
+                            const didUsePotion = this.useStatusPotion(api, 'before manual attack');
+
+                            if (didUsePotion) {
+                                event.preventDefault();
+                                event.stopImmediatePropagation();
+                            }
+                        },
+                        true
+                    );
+                },
+
+                startFastScan(api) {
+                    if (this.fastScanInterval) return;
+
+                    this.fastScanInterval = window.setInterval(() => {
+                        const state = this.read(api);
+                        if (!state.enabled) return;
+                        if (!this.shouldUseStatusPotion(api)) return;
+
+                        this.useStatusPotion(api, 'status scan');
+                    }, 250);
+                },
+
+                render(panel, api) {
+                    const state = this.read(api);
+
+                    this.installAttackFetchGuard(api);
+                    this.installManualSubmitGuard(api);
+                    this.startFastScan(api);
+
+                    const enabledLabel = document.createElement('label');
+                    enabledLabel.style.display = 'flex';
+                    enabledLabel.style.gap = '8px';
+                    enabledLabel.style.alignItems = 'center';
+                    enabledLabel.style.marginBottom = '10px';
+
+                    const enabledCheckbox = api.createCheckbox(state.enabled, (checked) => {
+                        const latest = this.read(api);
+                        latest.enabled = checked;
+                        this.write(api, latest);
+
+                        api.setModuleStatus(this.id, checked ? 'Status Potion Auto Use enabled.' : 'Status Potion Auto Use paused.');
+                        api.scheduleScan(50);
+                    });
+
+                    enabledLabel.appendChild(enabledCheckbox);
+                    enabledLabel.appendChild(document.createTextNode('Automatically use Status Potion'));
+
+                    const statusGrid = document.createElement('div');
+                    statusGrid.style.display = 'grid';
+                    statusGrid.style.gridTemplateColumns = 'repeat(3, minmax(120px, 1fr))';
+                    statusGrid.style.gap = '8px';
+                    statusGrid.style.marginBottom = '10px';
+
+                    const statusOptions = [
+                        ['burned', 'Burned'],
+                        ['frozen', 'Frozen'],
+                        ['poisoned', 'Poisoned']
+                    ];
+
+                    for (const [key, labelText] of statusOptions) {
+                        const label = document.createElement('label');
+                        label.style.display = 'flex';
+                        label.style.gap = '6px';
+                        label.style.alignItems = 'center';
+
+                        const checkbox = api.createCheckbox(state.useForStatuses[key], (checked) => {
+                            const latest = this.read(api);
+                            latest.useForStatuses[key] = checked;
+                            this.write(api, latest);
+
+                            api.setModuleStatus(this.id, labelText + (checked ? ' enabled.' : ' disabled.'));
+                            api.scheduleScan(50);
+                        });
+
+                        label.appendChild(checkbox);
+                        label.appendChild(document.createTextNode(labelText));
+                        statusGrid.appendChild(label);
+                    }
+
+                    const battleOnlyLabel = document.createElement('label');
+                    battleOnlyLabel.style.display = 'flex';
+                    battleOnlyLabel.style.gap = '8px';
+                    battleOnlyLabel.style.alignItems = 'center';
+                    battleOnlyLabel.style.marginBottom = '10px';
+
+                    const battleOnlyCheckbox = api.createCheckbox(state.onlyDuringBattle, (checked) => {
+                        const latest = this.read(api);
+                        latest.onlyDuringBattle = checked;
+                        this.write(api, latest);
+
+                        api.setModuleStatus(this.id, checked ? 'Only during battle enabled.' : 'Only during battle disabled.');
+                        api.scheduleScan(50);
+                    });
+
+                    battleOnlyLabel.appendChild(battleOnlyCheckbox);
+                    battleOnlyLabel.appendChild(document.createTextNode('Only use during active battle'));
+
+                    const hint = document.createElement('div');
+                    hint.style.fontSize = '12px';
+                    hint.style.opacity = '0.8';
+                    hint.style.marginBottom = '8px';
+                    hint.textContent = 'The module checks status continuously and also guards Slash/Magic attack requests before they are sent.';
+
+                    const scanButton = document.createElement('button');
+                    scanButton.type = 'button';
+                    scanButton.textContent = 'Check now';
+
+                    scanButton.addEventListener('click', () => {
+                        const didUse = this.scan(api);
+
+                        if (!didUse) {
+                            const status = api.getPlayerStatusText();
+                            const count = this.getStatusPotionCount(api);
+
+                            api.setModuleStatus(
+                                this.id,
+                                'No Status Potion used. Current status: ' + status + ' | available: x' + count
+                            );
+                        }
+                    });
+
+                    panel.appendChild(enabledLabel);
+                    panel.appendChild(statusGrid);
+                    panel.appendChild(battleOnlyLabel);
+                    panel.appendChild(hint);
+                    panel.appendChild(scanButton);
+                },
+
+                scan(api) {
+                    const state = this.read(api);
+                    if (!state.enabled) return false;
+
+                    if (!this.shouldUseStatusPotion(api)) return false;
+
+                    return this.useStatusPotion(api, 'module scan');
+                }
+            });
+
+            AutoBattleExtras.registerModule({
+                id: 'powerWishlist',
+                title: 'Power Target List',
+
+                defaults: {
+                    enabled: true,
+
+                    selectedPowerSlots: [
+                        '', '', '', '', '',
+                        '', '', '', '', ''
+                    ],
+
+                    autoSkipUnusablePowerRewards: true,
+                    submitDelay: 650
+                },
+
+                isChoosing: false,
+
+                allPowerNames: [
+                    'Arcane Surge',
+                    'Ashen Wand',
+                    'Blood Alchemy',
+                    'Blood Frenzy',
+                    'Crimson Vitality',
+                    'Execution Rhythm',
+                    'Frozen Blood',
+                    'Glass Fang',
+                    'Iron Veil',
+                    'Mana Leech',
+                    'Raven Eye',
+                    'Serrated Vein',
+                    'Stun',
+                    'Thorns of the Crypt',
+                    'Vampiric Edge',
+                    'Venom Script',
+                    'Witchfire Core'
+                ],
+
+                rarityRank: {
+                    common: 1,
+                    epic: 2,
+                    legendary: 3
+                },
+
+                read(api) {
+                    const state = api.readState(this.id, this.defaults);
+
+                    let selectedPowerSlots = Array.isArray(state.selectedPowerSlots)
+                        ? state.selectedPowerSlots
+                        : [];
+
+                    selectedPowerSlots = selectedPowerSlots
+                        .slice(0, 10)
+                        .map((name) => this.isKnownPower(api, name) ? api.normalizePowerName(name) : '');
+
+                    while (selectedPowerSlots.length < 10) {
+                        selectedPowerSlots.push('');
+                    }
+
+                    return {
+                        ...this.defaults,
+                        ...state,
+                        selectedPowerSlots,
+                        autoSkipUnusablePowerRewards: state.autoSkipUnusablePowerRewards !== false
+                    };
+                },
+
+                write(api, state) {
+                    const selectedPowerSlots = Array.isArray(state.selectedPowerSlots)
+                        ? state.selectedPowerSlots
+                        : [];
+
+                    api.saveState(this.id, {
+                        ...this.defaults,
+                        ...state,
+                        selectedPowerSlots: selectedPowerSlots
+                            .slice(0, 10)
+                            .map((name) => this.isKnownPower(api, name) ? api.normalizePowerName(name) : '')
+                    });
+                },
+
+                isKnownPower(api, name) {
+                    const key = api.powerNameKey(name);
+                    return this.allPowerNames.some((powerName) => api.powerNameKey(powerName) === key);
+                },
+
+                getSelectedPowerNames(api, state) {
+                    // Dropdown order is priority order. Duplicate selections are collapsed.
+                    return api.uniquePowerNames(
+                        (state.selectedPowerSlots || [])
+                            .map((name) => api.normalizePowerName(name))
+                            .filter(Boolean)
+                    );
+                },
+
+                getSelectedPowerSet(api, state) {
+                    return api.makePowerNameSet(this.getSelectedPowerNames(api, state));
+                },
+
+                getRarityRank(rarity) {
+                    return this.rarityRank[String(rarity || '').toLowerCase()] || 0;
+                },
+
+                getRarityFromElement(element) {
+                    if (!element) return '';
+
+                    const text = String(element.textContent || '').toLowerCase();
+                    const classText = String(element.className || '').toLowerCase();
+                    const dataRarity = String(element.dataset?.rarity || '').toLowerCase();
+
+                    for (const rarity of ['legendary', 'epic', 'common']) {
+                        if (dataRarity === rarity) return rarity;
+                        if (classText.includes(rarity)) return rarity;
+                        if (text.includes('(' + rarity + ')')) return rarity;
+                    }
+
+                    return '';
+                },
+
+                parseMaxStacks(text) {
+                    const clean = String(text || '');
+
+                    // Examples:
+                    // "Stacks: 0 / 3"
+                    // "Slot 2 / 3"
+                    const match = clean.match(/(?:stacks?|slot)\s*:?\s*\d+\s*\/\s*(\d+)/i);
+
+                    if (match) {
+                        const max = Number(match[1]);
+                        if (Number.isFinite(max) && max > 0) return max;
+                    }
+
+                    return 1;
+                },
+
+                getCurrentPowerStacks(api) {
+                    return Array.from(document.querySelectorAll('.power-list .power')).map((powerElement) => {
+                        const nameElement = powerElement.querySelector('.power-slot-head strong');
+                        const badgeElement = powerElement.querySelector('.power-slot-badge');
+
+                        const name = api.normalizePowerName(nameElement?.textContent || '');
+                        const rarity = this.getRarityFromElement(nameElement);
+                        const maxStacks = this.parseMaxStacks(badgeElement?.textContent || '');
+
+                        return {
+                            name,
+                            key: api.powerNameKey(name),
+                            rarity,
+                            rarityRank: this.getRarityRank(rarity),
+                            maxStacks
+                        };
+                    }).filter((power) => power.name);
+                },
+
+                getCurrentStacksForPower(api, powerName) {
+                    const key = api.powerNameKey(powerName);
+
+                    return this.getCurrentPowerStacks(api).filter((power) => {
+                        return power.key === key;
+                    });
+                },
+
+                getKnownMaxStacks(api, powerName, offeredMaxStacks) {
+                    const currentStacks = this.getCurrentStacksForPower(api, powerName);
+
+                    const currentMax = currentStacks.reduce((max, stack) => {
+                        return Math.max(max, Number(stack.maxStacks) || 1);
+                    }, 1);
+
+                    return Math.max(1, Number(offeredMaxStacks) || 1, currentMax);
+                },
+
+                getPowerChoiceForms(api) {
+                    return Array.from(document.querySelectorAll('form.power-choice-card')).map((form) => {
+                        const titleElement = form.querySelector('h3');
+                        const stackMetaElement = form.querySelector('.power-stack-meta');
+
+                        const name = api.normalizePowerName(titleElement ? titleElement.textContent : '');
+
+                        const rarity =
+                            String(form.dataset.rarity || '').toLowerCase() ||
+                            this.getRarityFromElement(titleElement);
+
+                        const stackMetaText = api.normalizeText(stackMetaElement?.textContent || '');
+                        const maxStacks = this.parseMaxStacks(stackMetaText);
+
+                        return {
+                            form,
+                            name,
+                            key: api.powerNameKey(name),
+                            rarity,
+                            rarityRank: this.getRarityRank(rarity),
+                            maxStacks,
+                            stackMetaText
+                        };
+                    }).filter((choice) => choice.name);
+                },
+
+                getSkipPowerForm() {
+                    return document.querySelector('#skipPowerForm') || null;
+                },
+
+                parseReplacementOption(api, option) {
+                    const text = option ? option.textContent || '' : '';
+
+                    // Example:
+                    // Remove 1 stack from Blood Frenzy (common) x3
+                    const match = text.match(/from\s+(.+?)\s+\((common|epic|legendary)\)\s*x?\d*/i);
+
+                    if (match) {
+                        const name = api.normalizePowerName(match[1]);
+                        const rarity = String(match[2] || '').toLowerCase();
+
+                        return {
+                            option,
+                            value: option.value,
+                            name,
+                            key: api.powerNameKey(name),
+                            rarity,
+                            rarityRank: this.getRarityRank(rarity),
+                            text: api.normalizeText(text)
+                        };
+                    }
+
+                    const fallbackName = api.normalizePowerName(text);
+
+                    return {
+                        option,
+                        value: option?.value || '',
+                        name: fallbackName,
+                        key: api.powerNameKey(fallbackName),
+                        rarity: '',
+                        rarityRank: 0,
+                        text: api.normalizeText(text)
+                    };
+                },
+
+                getReplacementOptions(api, form) {
+                    const select = form.querySelector('select[name="replace_id"]');
+                    if (!select) return [];
+
+                    return Array.from(select.options).map((option) => {
+                        return this.parseReplacementOption(api, option);
+                    }).filter((info) => info.value);
+                },
+
+                applyReplacementOption(form, replacementInfo) {
+                    const select = form.querySelector('select[name="replace_id"]');
+
+                    if (!select || !replacementInfo) return false;
+
+                    select.value = replacementInfo.value;
+                    select.dispatchEvent(new Event('change', { bubbles: true }));
+
+                    return true;
+                },
+
+                findLowestLowerSamePowerReplacement(api, choice) {
+                    const replacementOptions = this.getReplacementOptions(api, choice.form);
+
+                    return replacementOptions
+                        .filter((option) => {
+                            return (
+                                option.key === choice.key &&
+                                option.rarityRank > 0 &&
+                                option.rarityRank < choice.rarityRank
+                            );
+                        })
+                        .sort((a, b) => {
+                            // Replace the lowest rarity first:
+                            // common before epic.
+                            return a.rarityRank - b.rarityRank;
+                        })[0] || null;
+                },
+
+                findUnselectedReplacement(api, choice, state) {
+                    const selectedSet = this.getSelectedPowerSet(api, state);
+                    const replacementOptions = this.getReplacementOptions(api, choice.form);
+
+                    return replacementOptions
+                        .filter((option) => {
+                            if (!option.key) return false;
+
+                            // Target powers are protected from being replaced by a different power.
+                            // Same-power upgrades are handled separately.
+                            if (selectedSet.has(option.key)) return false;
+
+                            return true;
+                        })
+                        .sort((a, b) => {
+                            // Prefer replacing low rarity non-target powers first.
+                            if (a.rarityRank !== b.rarityRank) return a.rarityRank - b.rarityRank;
+                            return a.name.localeCompare(b.name);
+                        })[0] || null;
+                },
+
+                analyzeChoice(api, choice, state) {
+                    const selectedSet = this.getSelectedPowerSet(api, state);
+
+                    if (!selectedSet.has(choice.key)) {
+                        return {
+                            usable: false,
+                            reason: 'not selected'
+                        };
+                    }
+
+                    const currentStacks = this.getCurrentStacksForPower(api, choice.name);
+                    const maxStacks = this.getKnownMaxStacks(api, choice.name, choice.maxStacks);
+                    const hasReplaceSelect = !!choice.form.querySelector('select[name="replace_id"]');
+
+                    const lowerSamePowerReplacement = hasReplaceSelect
+                        ? this.findLowestLowerSamePowerReplacement(api, choice)
+                        : null;
+
+                    // Case 1:
+                    // Stack is not full yet.
+                    // Take the power, regardless of rarity.
+                    // Example:
+                    // Blood Frenzy common 0/3 -> take common.
+                    // Blood Frenzy epic 1/3 -> take epic as an additional stack.
+                    if (currentStacks.length < maxStacks) {
+                        if (!hasReplaceSelect) {
+                            return {
+                                usable: true,
+                                action: 'add-stack',
+                                replacement: null,
+                                reason:
+                                    'adding stack ' +
+                                    (currentStacks.length + 1) +
+                                    ' / ' +
+                                    maxStacks +
+                                    ' for ' +
+                                    choice.name +
+                                    ' (' +
+                                    choice.rarity +
+                                    ')'
+                            };
+                        }
+
+                        // If the global power list is full, adding a stack needs a replacement.
+                        // Prefer replacing a non-target power, because that truly adds this target stack.
+                        const unselectedReplacement = this.findUnselectedReplacement(api, choice, state);
+
+                        if (unselectedReplacement) {
+                            return {
+                                usable: true,
+                                action: 'add-stack-with-replacement',
+                                replacement: unselectedReplacement,
+                                reason:
+                                    'adding stack ' +
+                                    (currentStacks.length + 1) +
+                                    ' / ' +
+                                    maxStacks +
+                                    ' for ' +
+                                    choice.name +
+                                    ' (' +
+                                    choice.rarity +
+                                    ') by replacing non-target power ' +
+                                    unselectedReplacement.name
+                            };
+                        }
+
+                        // If there is no non-target replacement, a higher rarity same-power replacement
+                        // is still useful, even though it does not increase the stack count.
+                        if (lowerSamePowerReplacement) {
+                            return {
+                                usable: true,
+                                action: 'upgrade-while-not-full',
+                                replacement: lowerSamePowerReplacement,
+                                reason:
+                                    'upgrading existing ' +
+                                    choice.name +
+                                    ' stack from ' +
+                                    lowerSamePowerReplacement.rarity +
+                                    ' to ' +
+                                    choice.rarity +
+                                    ' because no safe free slot replacement is available'
+                            };
+                        }
+
+                        return {
+                            usable: false,
+                            reason:
+                                choice.name +
+                                ' stack is not full, but no safe replacement is available'
+                        };
+                    }
+
+                    // Case 2:
+                    // Stack is full.
+                    // Only take the offered power if it upgrades a lower rarity stack of the same power.
+                    // Example:
+                    // Blood Frenzy common x3, offered Blood Frenzy epic -> replace one common.
+                    if (currentStacks.length >= maxStacks) {
+                        if (lowerSamePowerReplacement) {
+                            return {
+                                usable: true,
+                                action: 'upgrade-full-stack',
+                                replacement: lowerSamePowerReplacement,
+                                reason:
+                                    'full stack upgrade for ' +
+                                    choice.name +
+                                    ': replacing ' +
+                                    lowerSamePowerReplacement.rarity +
+                                    ' with ' +
+                                    choice.rarity
+                            };
+                        }
+
+                        return {
+                            usable: false,
+                            reason:
+                                choice.name +
+                                ' stack is full and no lower rarity same-power stack can be upgraded'
+                        };
+                    }
+
+                    return {
+                        usable: false,
+                        reason: 'not useful'
+                    };
+                },
+
+                findBestChoice(api, state) {
+                    const selectedPowerNames = this.getSelectedPowerNames(api, state);
+                    const choices = this.getPowerChoiceForms(api);
+
+                    // Dropdown order is priority order.
+                    for (const selectedName of selectedPowerNames) {
+                        const selectedKey = api.powerNameKey(selectedName);
+
+                        const matchingChoices = choices
+                            .filter((choice) => choice.key === selectedKey)
+                            .sort((a, b) => {
+                                // If the same selected power appears more than once, prefer higher rarity.
+                                return b.rarityRank - a.rarityRank;
+                            });
+
+                        for (const choice of matchingChoices) {
+                            const analysis = this.analyzeChoice(api, choice, state);
+
+                            if (analysis.usable) {
+                                return {
+                                    choice,
+                                    analysis
+                                };
+                            }
+                        }
+                    }
+
+                    return null;
+                },
+
+                render(panel, api) {
+                    const state = this.read(api);
+
+                    const enabledLabel = document.createElement('label');
+                    enabledLabel.style.display = 'flex';
+                    enabledLabel.style.gap = '8px';
+                    enabledLabel.style.alignItems = 'center';
+                    enabledLabel.style.marginBottom = '10px';
+
+                    const enabledCheckbox = api.createCheckbox(state.enabled, (checked) => {
+                        const latest = this.read(api);
+                        latest.enabled = checked;
+                        this.write(api, latest);
+
+                        api.setModuleStatus(this.id, checked ? 'Power Target List enabled.' : 'Power Target List paused.');
+                        api.scheduleScan(100);
+                    });
+
+                    enabledLabel.appendChild(enabledCheckbox);
+                    enabledLabel.appendChild(document.createTextNode('Auto collect selected powers'));
+
+                    const skipLabel = document.createElement('label');
+                    skipLabel.style.display = 'flex';
+                    skipLabel.style.gap = '8px';
+                    skipLabel.style.alignItems = 'center';
+                    skipLabel.style.marginBottom = '10px';
+
+                    const skipCheckbox = api.createCheckbox(state.autoSkipUnusablePowerRewards, (checked) => {
+                        const latest = this.read(api);
+                        latest.autoSkipUnusablePowerRewards = checked;
+                        this.write(api, latest);
+
+                        api.setModuleStatus(
+                            this.id,
+                            checked
+                                ? 'Auto-skip unusable power rewards enabled.'
+                                : 'Auto-skip unusable power rewards disabled.'
+                        );
+
+                        api.scheduleScan(100);
+                    });
+
+                    skipLabel.appendChild(skipCheckbox);
+                    skipLabel.appendChild(document.createTextNode('Skip reward if no useful selected power is available'));
+
+                    const grid = document.createElement('div');
+                    grid.style.display = 'grid';
+                    grid.style.gridTemplateColumns = 'repeat(2, minmax(220px, 1fr))';
+                    grid.style.gap = '8px';
+                    grid.style.marginBottom = '10px';
+
+                    for (let index = 0; index < 10; index += 1) {
+                        const row = document.createElement('label');
+                        row.style.display = 'grid';
+                        row.style.gridTemplateColumns = '80px 1fr';
+                        row.style.gap = '6px';
+                        row.style.alignItems = 'center';
+
+                        const label = document.createElement('span');
+                        label.textContent = 'Target ' + (index + 1);
+
+                        const select = document.createElement('select');
+
+                        const emptyOption = document.createElement('option');
+                        emptyOption.value = '';
+                        emptyOption.textContent = 'None';
+                        select.appendChild(emptyOption);
+
+                        for (const powerName of this.allPowerNames) {
+                            const option = document.createElement('option');
+                            option.value = powerName;
+                            option.textContent = powerName;
+                            select.appendChild(option);
+                        }
+
+                        select.value = state.selectedPowerSlots[index] || '';
+
+                        select.addEventListener('change', () => {
+                            const latest = this.read(api);
+                            latest.selectedPowerSlots[index] = select.value;
+                            this.write(api, latest);
+
+                            api.setModuleStatus(
+                                this.id,
+                                'Target ' + (index + 1) + ' set to: ' + (select.value || 'None') + '.'
+                            );
+
+                            api.scheduleScan(100);
+                        });
+
+                        row.appendChild(label);
+                        row.appendChild(select);
+                        grid.appendChild(row);
+                    }
+
+                    const hint = document.createElement('div');
+                    hint.style.fontSize = '12px';
+                    hint.style.opacity = '0.8';
+                    hint.style.marginBottom = '8px';
+                    hint.textContent =
+                        'Dropdown order is priority order. Selected powers are collected until their stack cap is full. If a stack is full, only higher rarity versions of the same power are taken. Rarity order: common < epic < legendary.';
+
+                    const scanButton = document.createElement('button');
+                    scanButton.type = 'button';
+                    scanButton.textContent = 'Check now';
+
+                    scanButton.addEventListener('click', () => {
+                        const didChoose = this.scan(api);
+
+                        if (!didChoose) {
+                            api.setModuleStatus(this.id, 'No useful selected power found.');
+                        }
+                    });
+
+                    panel.appendChild(enabledLabel);
+                    panel.appendChild(skipLabel);
+                    panel.appendChild(grid);
+                    panel.appendChild(hint);
+                    panel.appendChild(scanButton);
+                },
+
+                scan(api) {
+                    if (this.isChoosing) return false;
+
+                    const state = this.read(api);
+                    if (!state.enabled) return false;
+
+                    const choices = this.getPowerChoiceForms(api);
+                    if (!choices.length) return false;
+
+                    const best = this.findBestChoice(api, state);
+
+                    if (best) {
+                        const { choice, analysis } = best;
+
+                        if (analysis.replacement) {
+                            this.applyReplacementOption(choice.form, analysis.replacement);
+                        }
+
+                        this.isChoosing = true;
+
+                        api.setModuleStatus(
+                            this.id,
+                            'Choosing automatically: ' +
+                            choice.name +
+                            ' (' +
+                            choice.rarity +
+                            ') | ' +
+                            analysis.reason
+                        );
+
+                        window.setTimeout(() => {
+                            api.submitForm(choice.form, {
+                                restartAutoBattle: true,
+                                restartReason: 'Power Target List'
+                            });
+                        }, Number(state.submitDelay) || 650);
+
+                        return true;
+                    }
+
+                    if (state.autoSkipUnusablePowerRewards) {
+                        const skipForm = this.getSkipPowerForm();
+
+                        if (!skipForm) {
+                            api.setModuleStatus(this.id, 'No useful selected power found, but Skip Power form was not found.');
+                            return false;
+                        }
+
+                        this.isChoosing = true;
+
+                        api.setModuleStatus(this.id, 'No useful selected power available. Skipping power reward automatically.');
+
+                        window.setTimeout(() => {
+                            api.submitForm(skipForm, {
+                                restartAutoBattle: true,
+                                restartReason: 'Power Target List skip'
+                            });
+                        }, Number(state.submitDelay) || 650);
+
+                        return true;
+                    }
+
+                    api.setModuleStatus(this.id, 'No useful selected power available. Waiting because auto-skip is disabled.');
+                    return false;
+                }
+            });
+
+            AutoBattleExtras.registerModule({
+                id: 'shrineEventPicker',
+                title: 'Shrine Event Picker',
+
+                defaults: {
+                    enabled: true,
+
+                    priorities: {
+                        cleanse: 1,
+                        heal: 2,
+                        bless: 3
+                    },
+
+                    cleanseEnabled: true,
+                    healEnabled: true,
+                    blessEnabled: true,
+
+                    healThreshold: 50,
+
+                    ignoredStatuses: [
+                        'none',
+                        'no status',
+                        'normal',
+                        'clean',
+                        'healthy',
+                        'blessed',
+                        'bless'
+                    ],
+
+                    submitDelay: 450
+                },
+
+                isResolving: false,
+
+                read(api) {
+                    const state = api.readState(this.id, this.defaults);
+
+                    return {
+                        ...this.defaults,
+                        ...state,
+                        priorities: {
+                            ...this.defaults.priorities,
+                            ...(state.priorities || {})
+                        },
+                        ignoredStatuses: Array.isArray(state.ignoredStatuses)
+                            ? state.ignoredStatuses
+                            : this.defaults.ignoredStatuses
+                    };
+                },
+
+                write(api, state) {
+                    api.saveState(this.id, {
+                        ...this.defaults,
+                        ...state,
+                        priorities: {
+                            ...this.defaults.priorities,
+                            ...(state.priorities || {})
+                        }
+                    });
+                },
+
+                getEventCard(api) {
+                    const cards = Array.from(document.querySelectorAll('.castle-event-card'));
+
+                    return cards.find((card) => {
+                        const title = api.normalizeText(card.querySelector('.event-title')?.textContent);
+                        return title === 'Shrine of the Last Guest';
+                    }) || null;
+                },
+
+                getEventForm(api, choice) {
+                    const card = this.getEventCard(api);
+                    if (!card) return null;
+
+                    return Array.from(card.querySelectorAll('form.event-option-form')).find((form) => {
+                        const input = form.querySelector('input[name="choice"]');
+                        return input && input.value === choice;
+                    }) || null;
+                },
+
+                hasBadStatus(api, state) {
+                    const status = api.getPlayerStatusText();
+                    const key = api.normalizeText(status).toLowerCase();
+
+                    if (!key) return false;
+
+                    const ignored = new Set(
+                        (state.ignoredStatuses || [])
+                            .map((item) => api.normalizeText(item).toLowerCase())
+                            .filter(Boolean)
+                    );
+
+                    return !ignored.has(key);
+                },
+
+                getAvailableChoices(api) {
+                    return {
+                        heal: !!this.getEventForm(api, 'heal'),
+                        cleanse: !!this.getEventForm(api, 'cleanse'),
+                        bless: !!this.getEventForm(api, 'bless')
+                    };
+                },
+
+                buildDecisionList(api, state) {
+                    const hpPercent = api.getPlayerHpPercent();
+                    const badStatus = this.hasBadStatus(api, state);
+                    const available = this.getAvailableChoices(api);
+
+                    const candidates = [
+                        {
+                            choice: 'cleanse',
+                            label: 'Cleanse Bad Status',
+                            priority: Number(state.priorities.cleanse) || 1,
+                            enabled: !!state.cleanseEnabled,
+                            available: available.cleanse,
+                            condition: badStatus,
+                            reason: 'status is: ' + api.getPlayerStatusText()
+                        },
+                        {
+                            choice: 'heal',
+                            label: 'Drink From The Chalice',
+                            priority: Number(state.priorities.heal) || 2,
+                            enabled: !!state.healEnabled,
+                            available: available.heal,
+                            condition: hpPercent <= Number(state.healThreshold || 50),
+                            reason: 'HP is ' + Math.round(hpPercent) + '%'
+                        },
+                        {
+                            choice: 'bless',
+                            label: 'Bless Next Hit',
+                            priority: Number(state.priorities.bless) || 3,
+                            enabled: !!state.blessEnabled,
+                            available: available.bless,
+                            condition: true,
+                            reason: 'fallback'
+                        }
+                    ];
+
+                    return candidates
+                        .filter((item) => item.enabled && item.available && item.condition)
+                        .sort((a, b) => {
+                            if (a.priority !== b.priority) return a.priority - b.priority;
+                            return ['cleanse', 'heal', 'bless'].indexOf(a.choice) - ['cleanse', 'heal', 'bless'].indexOf(b.choice);
+                        });
+                },
+
+                render(panel, api) {
+                    const state = this.read(api);
+
+                    const enabledLabel = document.createElement('label');
+                    enabledLabel.style.display = 'flex';
+                    enabledLabel.style.gap = '8px';
+                    enabledLabel.style.alignItems = 'center';
+                    enabledLabel.style.marginBottom = '10px';
+
+                    const enabledCheckbox = api.createCheckbox(state.enabled, (checked) => {
+                        const latest = this.read(api);
+                        latest.enabled = checked;
+                        this.write(api, latest);
+
+                        api.setModuleStatus(this.id, checked ? 'Shrine Event Picker enabled.' : 'Shrine Event Picker paused.');
+                        api.scheduleScan(100);
+                    });
+
+                    enabledLabel.appendChild(enabledCheckbox);
+                    enabledLabel.appendChild(document.createTextNode('Automatically resolve Shrine of the Last Guest'));
+
+                    const table = document.createElement('div');
+                    table.style.display = 'grid';
+                    table.style.gridTemplateColumns = '90px 90px 1fr';
+                    table.style.gap = '6px 10px';
+                    table.style.alignItems = 'center';
+
+                    const addRow = (choice, label, enabledKey, extraBuilder) => {
+                        const latest = this.read(api);
+
+                        const enabled = api.createCheckbox(latest[enabledKey], (checked) => {
+                            const stateNow = this.read(api);
+                            stateNow[enabledKey] = checked;
+                            this.write(api, stateNow);
+                            api.scheduleScan(100);
+                        });
+
+                        const priority = api.createPrioritySelect(latest.priorities[choice], 3, (value) => {
+                            const stateNow = this.read(api);
+                            stateNow.priorities[choice] = value;
+                            this.write(api, stateNow);
+                        });
+
+                        const left = document.createElement('label');
+                        left.style.display = 'flex';
+                        left.style.gap = '5px';
+                        left.style.alignItems = 'center';
+                        left.appendChild(enabled);
+                        left.appendChild(document.createTextNode(label));
+
+                        const middle = document.createElement('div');
+                        middle.appendChild(document.createTextNode('Priority '));
+                        middle.appendChild(priority);
+
+                        const right = document.createElement('div');
+                        right.appendChild(extraBuilder());
+
+                        table.appendChild(left);
+                        table.appendChild(middle);
+                        table.appendChild(right);
+                    };
+
+                    addRow('cleanse', 'Cleanse', 'cleanseEnabled', () => {
+                        const span = document.createElement('span');
+                        span.textContent = 'if status is not ignored';
+                        return span;
+                    });
+
+                    addRow('heal', 'Chalice', 'healEnabled', () => {
+                        const wrapper = document.createElement('span');
+                        wrapper.appendChild(document.createTextNode('if HP ≤ '));
+
+                        const input = api.createNumberInput(state.healThreshold, 1, 99, (value) => {
+                            const latest = this.read(api);
+                            latest.healThreshold = value;
+                            this.write(api, latest);
+                            api.scheduleScan(100);
+                        });
+
+                        wrapper.appendChild(input);
+                        wrapper.appendChild(document.createTextNode('%'));
+
+                        return wrapper;
+                    });
+
+                    addRow('bless', 'Bless', 'blessEnabled', () => {
+                        const span = document.createElement('span');
+                        span.textContent = 'always valid fallback';
+                        return span;
+                    });
+
+                    const ignoredLabel = document.createElement('label');
+                    ignoredLabel.style.display = 'block';
+                    ignoredLabel.style.marginTop = '12px';
+
+                    const ignoredText = document.createElement('div');
+                    ignoredText.textContent = 'Ignored status values, comma-separated:';
+                    ignoredText.style.fontSize = '12px';
+                    ignoredText.style.opacity = '0.85';
+
+                    const ignoredInput = document.createElement('input');
+                    ignoredInput.type = 'text';
+                    ignoredInput.value = state.ignoredStatuses.join(', ');
+                    ignoredInput.style.width = '100%';
+
+                    ignoredInput.addEventListener('change', () => {
+                        const latest = this.read(api);
+
+                        latest.ignoredStatuses = ignoredInput.value
+                            .split(',')
+                            .map((item) => api.normalizeText(item))
+                            .filter(Boolean);
+
+                        this.write(api, latest);
+                        api.scheduleScan(100);
+                    });
+
+                    ignoredLabel.appendChild(ignoredText);
+                    ignoredLabel.appendChild(ignoredInput);
+
+                    const scanButton = document.createElement('button');
+                    scanButton.type = 'button';
+                    scanButton.textContent = 'Check now';
+                    scanButton.style.marginTop = '10px';
+
+                    scanButton.addEventListener('click', () => {
+                        const didResolve = this.scan(api);
+
+                        if (!didResolve) {
+                            const hp = Math.round(api.getPlayerHpPercent());
+                            const status = api.getPlayerStatusText();
+                            api.setModuleStatus(this.id, 'Nothing selected. Current HP: ' + hp + '%, status: ' + status);
+                        }
+                    });
+
+                    panel.appendChild(enabledLabel);
+                    panel.appendChild(table);
+                    panel.appendChild(ignoredLabel);
+                    panel.appendChild(scanButton);
+                },
+
+                scan(api) {
+                    if (this.isResolving) return false;
+
+                    const state = this.read(api);
+                    if (!state.enabled) return false;
+
+                    const card = this.getEventCard(api);
+                    if (!card) return false;
+
+                    const decisions = this.buildDecisionList(api, state);
+                    const winner = decisions[0];
+
+                    if (!winner) {
+                        api.setModuleStatus(this.id, 'Shrine found, but no option matches the current conditions.');
+                        return false;
+                    }
+
+                    const form = this.getEventForm(api, winner.choice);
+                    if (!form) {
+                        api.setModuleStatus(this.id, 'Shrine found, but form is missing for choice: ' + winner.choice);
+                        return false;
+                    }
+
+                    this.isResolving = true;
+
+                    api.setModuleStatus(this.id, 'Choosing automatically: ' + winner.label + ' because ' + winner.reason);
+
+                    window.setTimeout(() => {
+                        api.submitForm(form);
+                    }, Number(state.submitDelay) || 450);
+
+                    return true;
+                }
+            });
+
+            AutoBattleExtras.registerModule({
+                id: 'portraitTrialPicker',
+                title: 'Portrait Trial Picker',
+
+                defaults: {
+                    enabled: true,
+
+                    // Visible answer number: 1 to 4.
+                    // The game internally uses choice values 0 to 3.
+                    defaultAnswer: 1,
+
+                    submitDelay: 450
+                },
+
+                isResolving: false,
+
+                read(api) {
+                    const state = api.readState(this.id, this.defaults);
+
+                    const answer = Number(state.defaultAnswer);
+                    const cleanAnswer = Number.isFinite(answer)
+                        ? Math.max(1, Math.min(4, Math.round(answer)))
+                        : 1;
+
+                    return {
+                        ...this.defaults,
+                        ...state,
+                        defaultAnswer: cleanAnswer
+                    };
+                },
+
+                write(api, state) {
+                    api.saveState(this.id, {
+                        ...this.defaults,
+                        ...state
+                    });
+                },
+
+                getEventCard(api) {
+                    const cards = Array.from(document.querySelectorAll('.castle-event-card'));
+
+                    return cards.find((card) => {
+                        const title = api.normalizeText(card.querySelector('.event-title')?.textContent);
+                        return title === 'Portrait Trial';
+                    }) || null;
+                },
+
+                getQuestionText(api) {
+                    const card = this.getEventCard(api);
+                    if (!card) return '';
+
+                    return api.normalizeText(card.querySelector('.event-options strong')?.textContent || '');
+                },
+
+                getAnswerForms(api) {
+                    const card = this.getEventCard(api);
+                    if (!card) return [];
+
+                    return Array.from(card.querySelectorAll('form.event-option-form')).map((form, index) => {
+                        const choiceInput = form.querySelector('input[name="choice"]');
+                        const button = form.querySelector('button');
+
+                        return {
+                            form,
+                            index,
+                            choiceValue: choiceInput ? choiceInput.value : String(index),
+                            label: api.normalizeText(button?.textContent || '')
+                        };
+                    });
+                },
+
+                getSelectedAnswer(api, state) {
+                    const answers = this.getAnswerForms(api);
+                    const wantedIndex = Math.max(0, Math.min(3, Number(state.defaultAnswer) - 1));
+
+                    return answers[wantedIndex] || null;
+                },
+
+                render(panel, api) {
+                    const state = this.read(api);
+
+                    const enabledLabel = document.createElement('label');
+                    enabledLabel.style.display = 'flex';
+                    enabledLabel.style.gap = '8px';
+                    enabledLabel.style.alignItems = 'center';
+                    enabledLabel.style.marginBottom = '10px';
+
+                    const enabledCheckbox = api.createCheckbox(state.enabled, (checked) => {
+                        const latest = this.read(api);
+                        latest.enabled = checked;
+                        this.write(api, latest);
+
+                        api.setModuleStatus(this.id, checked ? 'Portrait Trial Picker enabled.' : 'Portrait Trial Picker paused.');
+                        api.scheduleScan(100);
+                    });
+
+                    enabledLabel.appendChild(enabledCheckbox);
+                    enabledLabel.appendChild(document.createTextNode('Automatically answer Portrait Trial'));
+
+                    const row = document.createElement('div');
+                    row.style.display = 'flex';
+                    row.style.gap = '8px';
+                    row.style.alignItems = 'center';
+                    row.style.flexWrap = 'wrap';
+
+                    const label = document.createElement('span');
+                    label.textContent = 'Default answer:';
+
+                    const select = document.createElement('select');
+
+                    for (const answerNumber of [1, 2, 3, 4]) {
+                        const option = document.createElement('option');
+                        option.value = String(answerNumber);
+                        option.textContent = String(answerNumber);
+                        select.appendChild(option);
+                    }
+
+                    select.value = String(state.defaultAnswer);
+
+                    select.addEventListener('change', () => {
+                        const latest = this.read(api);
+                        latest.defaultAnswer = Number(select.value);
+                        this.write(api, latest);
+
+                        api.setModuleStatus(this.id, 'Default answer set to option ' + select.value + '.');
+                        api.scheduleScan(100);
+                    });
+
+                    const hint = document.createElement('span');
+                    hint.style.fontSize = '12px';
+                    hint.style.opacity = '0.8';
+                    hint.textContent = 'Option 1 = top answer, option 4 = bottom answer.';
+
+                    row.appendChild(label);
+                    row.appendChild(select);
+                    row.appendChild(hint);
+
+                    const scanButton = document.createElement('button');
+                    scanButton.type = 'button';
+                    scanButton.textContent = 'Check now';
+                    scanButton.style.marginTop = '10px';
+
+                    scanButton.addEventListener('click', () => {
+                        const didResolve = this.scan(api);
+
+                        if (!didResolve) {
+                            api.setModuleStatus(this.id, 'No Portrait Trial found or module is paused.');
+                        }
+                    });
+
+                    panel.appendChild(enabledLabel);
+                    panel.appendChild(row);
+                    panel.appendChild(scanButton);
+                },
+
+                scan(api) {
+                    if (this.isResolving) return false;
+
+                    const state = this.read(api);
+                    if (!state.enabled) return false;
+
+                    const card = this.getEventCard(api);
+                    if (!card) return false;
+
+                    const selected = this.getSelectedAnswer(api, state);
+
+                    if (!selected || !selected.form) {
+                        api.setModuleStatus(this.id, 'Portrait Trial found, but answer option ' + state.defaultAnswer + ' was not found.');
+                        return false;
+                    }
+
+                    this.isResolving = true;
+
+                    const question = this.getQuestionText(api);
+                    const answerText = selected.label || 'Option ' + state.defaultAnswer;
+
+                    api.setModuleStatus(
+                        this.id,
+                        'Answering Portrait Trial with option ' + state.defaultAnswer + ': ' + answerText + (question ? ' | Question: ' + question : '')
+                    );
+
+                    window.setTimeout(() => {
+                        api.submitForm(selected.form);
+                    }, Number(state.submitDelay) || 450);
+
+                    return true;
+                }
+            });
+
+            AutoBattleExtras.registerModule({
+                id: 'hungryMerchantPicker',
+                title: 'Hungry Merchant Picker',
+
+                defaults: {
+                    enabled: true,
+
+                    buyOffers: {
+                        first: false,
+                        second: false,
+                        third: false,
+                        fourth: false
+                    },
+
+                    autoContinueAfterBuying: true,
+                    submitDelay: 450
+                },
+
+                isResolving: false,
+
+                read(api) {
+                    const state = api.readState(this.id, this.defaults);
+
+                    return {
+                        ...this.defaults,
+                        ...state,
+                        buyOffers: {
+                            ...this.defaults.buyOffers,
+                            ...(state.buyOffers || {})
+                        }
+                    };
+                },
+
+                write(api, state) {
+                    api.saveState(this.id, {
+                        ...this.defaults,
+                        ...state,
+                        buyOffers: {
+                            ...this.defaults.buyOffers,
+                            ...(state.buyOffers || {})
+                        }
+                    });
+                },
+
+                getEventCard(api) {
+                    const cards = Array.from(document.querySelectorAll('.castle-event-card'));
+
+                    return cards.find((card) => {
+                        const title = api.normalizeText(card.querySelector('.event-title')?.textContent);
+                        return title === 'The Hungry Merchant';
+                    }) || null;
+                },
+
+                getOfferForms(api) {
+                    const card = this.getEventCard(api);
+                    if (!card) return [];
+
+                    return Array.from(card.querySelectorAll('.merchant-offers form.merchant-offer')).map((form, index) => {
+                        const name = api.normalizeText(form.querySelector('strong')?.textContent || '');
+                        const rarity =
+                            form.querySelector('strong')?.className ||
+                            String(form.dataset.rarity || '');
+
+                        const choiceInput = form.querySelector('input[name="choice"]');
+                        const logs = Array.from(form.querySelectorAll('.log')).map((el) => api.normalizeText(el.textContent));
+                        const costLog = logs.find((text) => /cost:/i.test(text)) || '';
+
+                        return {
+                            form,
+                            index,
+                            positionKey: ['first', 'second', 'third', 'fourth'][index] || String(index),
+                            choiceValue: choiceInput ? choiceInput.value : '',
+                            name,
+                            rarity,
+                            costLog
+                        };
+                    }).filter((offer) => offer.choiceValue);
+                },
+
+                getContinueForm(api) {
+                    const card = this.getEventCard(api);
+                    if (!card) return null;
+
+                    return Array.from(card.querySelectorAll('form.event-option-form')).find((form) => {
+                        const input = form.querySelector('input[name="choice"]');
+                        return input && input.value === 'leave';
+                    }) || null;
+                },
+
+                getProgressStorageKey() {
+                    return 'tmAutoBattleExtras:' + this.id + ':progress:v2';
+                },
+
+                readProgress() {
+                    try {
+                        return JSON.parse(localStorage.getItem(this.getProgressStorageKey()) || '{}');
+                    } catch {
+                        return {};
+                    }
+                },
+
+                writeProgress(progress) {
+                    localStorage.setItem(this.getProgressStorageKey(), JSON.stringify(progress || {}));
+                },
+
+                clearProgress() {
+                    localStorage.removeItem(this.getProgressStorageKey());
+                },
+
+                buildInitialTargetChoices(api, state) {
+                    const offers = this.getOfferForms(api);
+
+                    return offers
+                        .filter((offer) => !!state.buyOffers[offer.positionKey])
+                        .map((offer) => ({
+                            positionKey: offer.positionKey,
+                            choiceValue: offer.choiceValue,
+                            name: offer.name,
+                            costLog: offer.costLog
+                        }));
+                },
+
+                ensureProgressForCurrentMerchant(api, state) {
+                    const card = this.getEventCard(api);
+
+                    if (!card) {
+                        this.clearProgress();
+                        return {
+                            targetChoices: [],
+                            boughtChoiceValues: {}
+                        };
+                    }
+
+                    const progress = this.readProgress();
+
+                    if (Array.isArray(progress.targetChoices)) {
+                        return {
+                            targetChoices: progress.targetChoices,
+                            boughtChoiceValues: progress.boughtChoiceValues || {}
+                        };
+                    }
+
+                    const targetChoices = this.buildInitialTargetChoices(api, state);
+
+                    const nextProgress = {
+                        createdAt: Date.now(),
+                        targetChoices,
+                        boughtChoiceValues: {}
+                    };
+
+                    this.writeProgress(nextProgress);
+
+                    return nextProgress;
+                },
+
+                getNextTargetOffer(api, progress) {
+                    const currentOffers = this.getOfferForms(api);
+
+                    for (const target of progress.targetChoices || []) {
+                        if (progress.boughtChoiceValues?.[target.choiceValue]) continue;
+
+                        const currentOffer = currentOffers.find((offer) => {
+                            return offer.choiceValue === target.choiceValue;
+                        });
+
+                        if (currentOffer) {
+                            return {
+                                ...currentOffer,
+                                originalPositionKey: target.positionKey,
+                                originalName: target.name,
+                                originalCostLog: target.costLog
+                            };
+                        }
+
+                        progress.boughtChoiceValues = {
+                            ...(progress.boughtChoiceValues || {}),
+                            [target.choiceValue]: true
+                        };
+
+                        this.writeProgress(progress);
+                    }
+
+                    return null;
+                },
+
+                markOfferAsBought(api, offer) {
+                    const progress = this.readProgress();
+
+                    const next = {
+                        ...progress,
+                        boughtChoiceValues: {
+                            ...(progress.boughtChoiceValues || {}),
+                            [offer.choiceValue]: true
+                        }
+                    };
+
+                    this.writeProgress(next);
+                },
+
+                render(panel, api) {
+                    const state = this.read(api);
+
+                    const enabledLabel = document.createElement('label');
+                    enabledLabel.style.display = 'flex';
+                    enabledLabel.style.gap = '8px';
+                    enabledLabel.style.alignItems = 'center';
+                    enabledLabel.style.marginBottom = '10px';
+
+                    const enabledCheckbox = api.createCheckbox(state.enabled, (checked) => {
+                        const latest = this.read(api);
+                        latest.enabled = checked;
+                        this.write(api, latest);
+
+                        api.setModuleStatus(this.id, checked ? 'Hungry Merchant Picker enabled.' : 'Hungry Merchant Picker paused.');
+                        api.scheduleScan(100);
+                    });
+
+                    enabledLabel.appendChild(enabledCheckbox);
+                    enabledLabel.appendChild(document.createTextNode('Automatically handle The Hungry Merchant'));
+
+                    const offerGrid = document.createElement('div');
+                    offerGrid.style.display = 'grid';
+                    offerGrid.style.gridTemplateColumns = 'repeat(2, minmax(160px, 1fr))';
+                    offerGrid.style.gap = '8px';
+                    offerGrid.style.marginBottom = '10px';
+
+                    const offerLabels = [
+                        ['first', 'Buy first offer'],
+                        ['second', 'Buy second offer'],
+                        ['third', 'Buy third offer'],
+                        ['fourth', 'Buy fourth offer']
+                    ];
+
+                    for (const [key, labelText] of offerLabels) {
+                        const label = document.createElement('label');
+                        label.style.display = 'flex';
+                        label.style.gap = '6px';
+                        label.style.alignItems = 'center';
+
+                        const checkbox = api.createCheckbox(state.buyOffers[key], (checked) => {
+                            const latest = this.read(api);
+                            latest.buyOffers[key] = checked;
+                            this.write(api, latest);
+
+                            this.clearProgress();
+
+                            api.setModuleStatus(this.id, labelText + (checked ? ' enabled.' : ' disabled.'));
+                            api.scheduleScan(100);
+                        });
+
+                        label.appendChild(checkbox);
+                        label.appendChild(document.createTextNode(labelText));
+                        offerGrid.appendChild(label);
+                    }
+
+                    const continueLabel = document.createElement('label');
+                    continueLabel.style.display = 'flex';
+                    continueLabel.style.gap = '8px';
+                    continueLabel.style.alignItems = 'center';
+                    continueLabel.style.marginBottom = '10px';
+
+                    const continueCheckbox = api.createCheckbox(state.autoContinueAfterBuying, (checked) => {
+                        const latest = this.read(api);
+                        latest.autoContinueAfterBuying = checked;
+                        this.write(api, latest);
+
+                        api.setModuleStatus(this.id, checked ? 'Auto-continue enabled.' : 'Auto-continue disabled.');
+                        api.scheduleScan(100);
+                    });
+
+                    continueLabel.appendChild(continueCheckbox);
+                    continueLabel.appendChild(document.createTextNode('Continue automatically after selected purchases'));
+
+                    const hint = document.createElement('div');
+                    hint.style.fontSize = '12px';
+                    hint.style.opacity = '0.8';
+                    hint.style.marginBottom = '8px';
+                    hint.textContent = 'Selected offer positions are captured when the merchant first appears. The module then buys those exact offers, even if the list changes after a purchase.';
+
+                    const resetButton = document.createElement('button');
+                    resetButton.type = 'button';
+                    resetButton.textContent = 'Reset merchant progress';
+                    resetButton.style.marginRight = '8px';
+
+                    resetButton.addEventListener('click', () => {
+                        this.clearProgress();
+                        api.setModuleStatus(this.id, 'Merchant progress reset.');
+                        api.scheduleScan(100);
+                    });
+
+                    const scanButton = document.createElement('button');
+                    scanButton.type = 'button';
+                    scanButton.textContent = 'Check now';
+
+                    scanButton.addEventListener('click', () => {
+                        const didResolve = this.scan(api);
+
+                        if (!didResolve) {
+                            api.setModuleStatus(this.id, 'No Hungry Merchant event found or nothing to do.');
+                        }
+                    });
+
+                    panel.appendChild(enabledLabel);
+                    panel.appendChild(offerGrid);
+                    panel.appendChild(continueLabel);
+                    panel.appendChild(hint);
+                    panel.appendChild(resetButton);
+                    panel.appendChild(scanButton);
+                },
+
+                scan(api) {
+                    if (this.isResolving) return false;
+
+                    const state = this.read(api);
+                    if (!state.enabled) return false;
+
+                    const card = this.getEventCard(api);
+
+                    if (!card) {
+                        this.clearProgress();
+                        return false;
+                    }
+
+                    const progress = this.ensureProgressForCurrentMerchant(api, state);
+                    const nextOffer = this.getNextTargetOffer(api, progress);
+
+                    if (nextOffer) {
+                        this.isResolving = true;
+                        this.markOfferAsBought(api, nextOffer);
+
+                        api.setModuleStatus(
+                            this.id,
+                            'Buying automatically: ' +
+                            (nextOffer.originalPositionKey || nextOffer.positionKey || 'selected') +
+                            ' offer' +
+                            (nextOffer.name ? ' | ' + nextOffer.name : '') +
+                            (nextOffer.costLog ? ' | ' + nextOffer.costLog : '')
+                        );
+
+                        window.setTimeout(() => {
+                            api.submitForm(nextOffer.form, {
+                                restartAutoBattle: true,
+                                restartReason: 'Hungry Merchant'
+                            });
+                        }, Number(state.submitDelay) || 450);
+
+                        return true;
+                    }
+
+                    if (state.autoContinueAfterBuying) {
+                        const continueForm = this.getContinueForm(api);
+
+                        if (!continueForm) {
+                            api.setModuleStatus(this.id, 'All selected offers handled, but Continue form was not found.');
+                            return false;
+                        }
+
+                        this.isResolving = true;
+
+                        api.setModuleStatus(this.id, 'All selected offers handled. Continuing automatically.');
+
+                        window.setTimeout(() => {
+                            this.clearProgress();
+
+                            api.submitForm(continueForm, {
+                                restartAutoBattle: true,
+                                restartReason: 'Hungry Merchant'
+                            });
+                        }, Number(state.submitDelay) || 450);
+
+                        return true;
+                    }
+
+                    api.setModuleStatus(this.id, 'All selected offers handled. Auto-continue is disabled.');
+                    return false;
+                }
+            });
+
+            AutoBattleExtras.registerModule({
+                id: 'cursedMirrorPicker',
+                title: 'Cursed Mirror Picker',
+
+                defaults: {
+                    enabled: true,
+
+                    // Options: 'fight' or 'leave'
+                    eventDecision: 'fight',
+
+                    // Options: 'manual' or 'auto'
+                    fightMode: 'auto',
+
+                    submitDelay: 450
+                },
+
+                isResolving: false,
+
+                read(api) {
+                    const state = api.readState(this.id, this.defaults);
+
+                    const eventDecision = ['fight', 'leave'].includes(state.eventDecision)
+                        ? state.eventDecision
+                        : 'fight';
+
+                    const fightMode = ['manual', 'auto'].includes(state.fightMode)
+                        ? state.fightMode
+                        : 'auto';
+
+                    return {
+                        ...this.defaults,
+                        ...state,
+                        eventDecision,
+                        fightMode
+                    };
+                },
+
+                write(api, state) {
+                    api.saveState(this.id, {
+                        ...this.defaults,
+                        ...state
+                    });
+                },
+
+                getEventCard(api) {
+                    const cards = Array.from(document.querySelectorAll('.castle-event-card'));
+
+                    return cards.find((card) => {
+                        const title = api.normalizeText(card.querySelector('.event-title')?.textContent);
+                        return title === 'Cursed Mirror';
+                    }) || null;
+                },
+
+                getEventForm(api, choice) {
+                    const card = this.getEventCard(api);
+                    if (!card) return null;
+
+                    return Array.from(card.querySelectorAll('form.event-option-form')).find((form) => {
+                        const input = form.querySelector('input[name="choice"]');
+                        return input && input.value === choice;
+                    }) || null;
+                },
+
+                getMirrorMonsterCard(api) {
+                    const cards = Array.from(document.querySelectorAll('.monster-card'));
+
+                    return cards.find((card) => {
+                        const monsterText = api.normalizeText(card.querySelector('.monster')?.textContent || '');
+                        const imageSrc = String(card.querySelector('img.monster-art')?.getAttribute('src') || '');
+
+                        return (
+                            monsterText.includes('Mirrorbound Doppelganger') ||
+                            imageSrc.includes('cursed_mirror_doppelganger')
+                        );
+                    }) || null;
+                },
+
+                getMirrorFightSignature(api) {
+                    const card = this.getMirrorMonsterCard(api);
+                    if (!card) return '';
+
+                    const monsterText = api.normalizeText(card.querySelector('.monster')?.textContent || '');
+                    const monsterHp = api.normalizeText(document.querySelector('#monsterHpText')?.textContent || '');
+                    const floor = api.normalizeText(document.querySelector('#battleFloorText')?.textContent || '');
+                    const encounter = api.normalizeText(document.querySelector('#battleEncounterText')?.textContent || '');
+
+                    return [monsterText, monsterHp, floor, encounter].join('|');
+                },
+
+                getProgressStorageKey() {
+                    return 'tmAutoBattleExtras:' + this.id + ':progress:v1';
+                },
+
+                readProgress() {
+                    try {
+                        return JSON.parse(localStorage.getItem(this.getProgressStorageKey()) || '{}');
+                    } catch {
+                        return {};
+                    }
+                },
+
+                writeProgress(progress) {
+                    localStorage.setItem(this.getProgressStorageKey(), JSON.stringify(progress || {}));
+                },
+
+                getNativeAutoBattleState() {
+                    const autoPanel = document.querySelector('#autoBattlePanel');
+                    const storageKey = autoPanel?.dataset?.storageKey;
+
+                    if (!storageKey) return {};
+
+                    try {
+                        return JSON.parse(localStorage.getItem(storageKey) || '{}');
+                    } catch {
+                        return {};
+                    }
+                },
+
+                startNativeAutoBattle(api) {
+                    const autoPanel = document.querySelector('#autoBattlePanel');
+                    const startButton = document.querySelector('#autoStartBtn');
+
+                    if (!autoPanel) {
+                        api.setModuleStatus(this.id, 'Mirror fight detected, but Auto Battle panel was not found.');
+                        return false;
+                    }
+
+                    if (!startButton) {
+                        api.setModuleStatus(this.id, 'Mirror fight detected, but Start Auto button was not found.');
+                        return false;
+                    }
+
+                    const nativeAutoState = this.getNativeAutoBattleState();
+
+                    if (nativeAutoState.active) {
+                        api.setModuleStatus(this.id, 'Mirror fight detected. Native Auto Battle is already active.');
+                        return false;
+                    }
+
+                    if (startButton.disabled) {
+                        api.setModuleStatus(this.id, 'Mirror fight detected, but Start Auto button is disabled.');
+                        return false;
+                    }
+
+                    const signature = this.getMirrorFightSignature(api);
+                    const progress = this.readProgress();
+
+                    if (progress.startedAutoForSignature === signature) {
+                        api.setModuleStatus(this.id, 'Mirror fight detected. Auto Battle was already started for this fight.');
+                        return false;
+                    }
+
+                    this.writeProgress({
+                        ...progress,
+                        startedAutoForSignature: signature
+                    });
+
+                    api.setModuleStatus(this.id, 'Mirror fight detected. Starting native Auto Battle.');
+
+                    window.setTimeout(() => {
+                        startButton.click();
+                    }, Number(this.read(api).submitDelay) || 450);
+
+                    return true;
+                },
+
+                render(panel, api) {
+                    const state = this.read(api);
+
+                    const enabledLabel = document.createElement('label');
+                    enabledLabel.style.display = 'flex';
+                    enabledLabel.style.gap = '8px';
+                    enabledLabel.style.alignItems = 'center';
+                    enabledLabel.style.marginBottom = '10px';
+
+                    const enabledCheckbox = api.createCheckbox(state.enabled, (checked) => {
+                        const latest = this.read(api);
+                        latest.enabled = checked;
+                        this.write(api, latest);
+
+                        api.setModuleStatus(this.id, checked ? 'Cursed Mirror Picker enabled.' : 'Cursed Mirror Picker paused.');
+                        api.scheduleScan(100);
+                    });
+
+                    enabledLabel.appendChild(enabledCheckbox);
+                    enabledLabel.appendChild(document.createTextNode('Automatically handle Cursed Mirror'));
+
+                    const decisionRow = document.createElement('div');
+                    decisionRow.style.display = 'flex';
+                    decisionRow.style.gap = '8px';
+                    decisionRow.style.alignItems = 'center';
+                    decisionRow.style.flexWrap = 'wrap';
+                    decisionRow.style.marginBottom = '8px';
+
+                    const decisionLabel = document.createElement('span');
+                    decisionLabel.textContent = 'Event decision:';
+
+                    const decisionSelect = document.createElement('select');
+
+                    const fightOption = document.createElement('option');
+                    fightOption.value = 'fight';
+                    fightOption.textContent = 'Fight Your Reflection';
+
+                    const leaveOption = document.createElement('option');
+                    leaveOption.value = 'leave';
+                    leaveOption.textContent = 'Walk Away';
+
+                    decisionSelect.appendChild(fightOption);
+                    decisionSelect.appendChild(leaveOption);
+                    decisionSelect.value = state.eventDecision;
+
+                    decisionSelect.addEventListener('change', () => {
+                        const latest = this.read(api);
+                        latest.eventDecision = decisionSelect.value;
+                        this.write(api, latest);
+
+                        api.setModuleStatus(this.id, 'Event decision set to: ' + decisionSelect.options[decisionSelect.selectedIndex].textContent + '.');
+                        api.scheduleScan(100);
+                    });
+
+                    decisionRow.appendChild(decisionLabel);
+                    decisionRow.appendChild(decisionSelect);
+
+                    const fightModeRow = document.createElement('div');
+                    fightModeRow.style.display = 'flex';
+                    fightModeRow.style.gap = '8px';
+                    fightModeRow.style.alignItems = 'center';
+                    fightModeRow.style.flexWrap = 'wrap';
+                    fightModeRow.style.marginBottom = '8px';
+
+                    const fightModeLabel = document.createElement('span');
+                    fightModeLabel.textContent = 'Fight mode:';
+
+                    const fightModeSelect = document.createElement('select');
+
+                    const manualOption = document.createElement('option');
+                    manualOption.value = 'manual';
+                    manualOption.textContent = 'Manual fight';
+
+                    const autoOption = document.createElement('option');
+                    autoOption.value = 'auto';
+                    autoOption.textContent = 'Start Auto Battle';
+
+                    fightModeSelect.appendChild(manualOption);
+                    fightModeSelect.appendChild(autoOption);
+                    fightModeSelect.value = state.fightMode;
+
+                    fightModeSelect.addEventListener('change', () => {
+                        const latest = this.read(api);
+                        latest.fightMode = fightModeSelect.value;
+                        this.write(api, latest);
+
+                        api.setModuleStatus(this.id, 'Fight mode set to: ' + fightModeSelect.options[fightModeSelect.selectedIndex].textContent + '.');
+                        api.scheduleScan(100);
+                    });
+
+                    fightModeRow.appendChild(fightModeLabel);
+                    fightModeRow.appendChild(fightModeSelect);
+
+                    const hint = document.createElement('div');
+                    hint.style.fontSize = '12px';
+                    hint.style.opacity = '0.8';
+                    hint.style.marginBottom = '8px';
+                    hint.textContent = 'If Fight + Start Auto Battle is selected, the module starts the mirror fight and then clicks the native Start Auto button.';
+
+                    const scanButton = document.createElement('button');
+                    scanButton.type = 'button';
+                    scanButton.textContent = 'Check now';
+
+                    scanButton.addEventListener('click', () => {
+                        const didResolve = this.scan(api);
+
+                        if (!didResolve) {
+                            api.setModuleStatus(this.id, 'No Cursed Mirror event or mirror fight action available.');
+                        }
+                    });
+
+                    panel.appendChild(enabledLabel);
+                    panel.appendChild(decisionRow);
+                    panel.appendChild(fightModeRow);
+                    panel.appendChild(hint);
+                    panel.appendChild(scanButton);
+                },
+
+                scan(api) {
+                    if (this.isResolving) return false;
+
+                    const state = this.read(api);
+                    if (!state.enabled) return false;
+
+                    const eventCard = this.getEventCard(api);
+
+                    if (eventCard) {
+                        const form = this.getEventForm(api, state.eventDecision);
+
+                        if (!form) {
+                            api.setModuleStatus(this.id, 'Cursed Mirror found, but selected form was not found: ' + state.eventDecision);
+                            return false;
+                        }
+
+                        this.isResolving = true;
+
+                        const label = state.eventDecision === 'fight'
+                            ? 'Fight Your Reflection'
+                            : 'Walk Away';
+
+                        api.setModuleStatus(this.id, 'Choosing automatically: ' + label + '.');
+
+                        window.setTimeout(() => {
+                            api.submitForm(form, {
+                                restartAutoBattle: state.eventDecision !== 'fight' || state.fightMode === 'auto',
+                                restartReason: 'Cursed Mirror'
+                            });
+                        }, Number(state.submitDelay) || 450);
+
+                        return true;
+                    }
+
+                    if (state.eventDecision === 'fight' && state.fightMode === 'auto') {
+                        const mirrorMonsterCard = this.getMirrorMonsterCard(api);
+
+                        if (mirrorMonsterCard) {
+                            return this.startNativeAutoBattle(api);
+                        }
+                    }
+
+                    return false;
+                }
+            });
+
+            AutoBattleExtras.registerModule({
+                id: 'whisperingDoorPicker',
+                title: 'Whispering Door Picker',
+
+                defaults: {
+                    enabled: true,
+
+                    // Options: 'black', 'crimson', 'silver'
+                    doorChoice: 'silver',
+
+                    submitDelay: 450
+                },
+
+                isResolving: false,
+
+                read(api) {
+                    const state = api.readState(this.id, this.defaults);
+
+                    const doorChoice = ['black', 'crimson', 'silver'].includes(state.doorChoice)
+                        ? state.doorChoice
+                        : 'silver';
+
+                    return {
+                        ...this.defaults,
+                        ...state,
+                        doorChoice
+                    };
+                },
+
+                write(api, state) {
+                    api.saveState(this.id, {
+                        ...this.defaults,
+                        ...state
+                    });
+                },
+
+                getEventCard(api) {
+                    const cards = Array.from(document.querySelectorAll('.castle-event-card'));
+
+                    return cards.find((card) => {
+                        const title = api.normalizeText(card.querySelector('.event-title')?.textContent);
+                        return title === 'Whispering Door';
+                    }) || null;
+                },
+
+                getEventForm(api, choice) {
+                    const card = this.getEventCard(api);
+                    if (!card) return null;
+
+                    return Array.from(card.querySelectorAll('form.event-option-form')).find((form) => {
+                        const input = form.querySelector('input[name="choice"]');
+                        return input && input.value === choice;
+                    }) || null;
+                },
+
+                render(panel, api) {
+                    const state = this.read(api);
+
+                    const enabledLabel = document.createElement('label');
+                    enabledLabel.style.display = 'flex';
+                    enabledLabel.style.gap = '8px';
+                    enabledLabel.style.alignItems = 'center';
+                    enabledLabel.style.marginBottom = '10px';
+
+                    const enabledCheckbox = api.createCheckbox(state.enabled, (checked) => {
+                        const latest = this.read(api);
+                        latest.enabled = checked;
+                        this.write(api, latest);
+
+                        api.setModuleStatus(this.id, checked ? 'Whispering Door Picker enabled.' : 'Whispering Door Picker paused.');
+                        api.scheduleScan(100);
+                    });
+
+                    enabledLabel.appendChild(enabledCheckbox);
+                    enabledLabel.appendChild(document.createTextNode('Automatically handle Whispering Door'));
+
+                    const row = document.createElement('div');
+                    row.style.display = 'flex';
+                    row.style.gap = '8px';
+                    row.style.alignItems = 'center';
+                    row.style.flexWrap = 'wrap';
+                    row.style.marginBottom = '8px';
+
+                    const label = document.createElement('span');
+                    label.textContent = 'Door choice:';
+
+                    const select = document.createElement('select');
+
+                    const options = [
+                        ['black', 'Black Door'],
+                        ['crimson', 'Crimson Door'],
+                        ['silver', 'Silver Door']
+                    ];
+
+                    for (const [value, text] of options) {
+                        const option = document.createElement('option');
+                        option.value = value;
+                        option.textContent = text;
+                        select.appendChild(option);
+                    }
+
+                    select.value = state.doorChoice;
+
+                    select.addEventListener('change', () => {
+                        const latest = this.read(api);
+                        latest.doorChoice = select.value;
+                        this.write(api, latest);
+
+                        api.setModuleStatus(
+                            this.id,
+                            'Door choice set to: ' + select.options[select.selectedIndex].textContent + '.'
+                        );
+
+                        api.scheduleScan(100);
+                    });
+
+                    row.appendChild(label);
+                    row.appendChild(select);
+
+                    const hint = document.createElement('div');
+                    hint.style.fontSize = '12px';
+                    hint.style.opacity = '0.8';
+                    hint.style.marginBottom = '8px';
+                    hint.textContent = 'Default is Silver Door. The selected door will be chosen automatically when the event appears.';
+
+                    const scanButton = document.createElement('button');
+                    scanButton.type = 'button';
+                    scanButton.textContent = 'Check now';
+
+                    scanButton.addEventListener('click', () => {
+                        const didResolve = this.scan(api);
+
+                        if (!didResolve) {
+                            api.setModuleStatus(this.id, 'No Whispering Door event found or module is paused.');
+                        }
+                    });
+
+                    panel.appendChild(enabledLabel);
+                    panel.appendChild(row);
+                    panel.appendChild(hint);
+                    panel.appendChild(scanButton);
+                },
+
+                scan(api) {
+                    if (this.isResolving) return false;
+
+                    const state = this.read(api);
+                    if (!state.enabled) return false;
+
+                    const card = this.getEventCard(api);
+                    if (!card) return false;
+
+                    const form = this.getEventForm(api, state.doorChoice);
+
+                    if (!form) {
+                        api.setModuleStatus(this.id, 'Whispering Door found, but selected door was not found: ' + state.doorChoice);
+                        return false;
+                    }
+
+                    this.isResolving = true;
+
+                    const doorLabel = {
+                        black: 'Black Door',
+                        crimson: 'Crimson Door',
+                        silver: 'Silver Door'
+                    }[state.doorChoice] || state.doorChoice;
+
+                    api.setModuleStatus(this.id, 'Choosing automatically: ' + doorLabel + '.');
+
+                    window.setTimeout(() => {
+                        api.submitForm(form);
+                    }, Number(state.submitDelay) || 450);
+
+                    return true;
+                }
+            });
+
+            AutoBattleExtras.registerModule({
+                id: 'smallBloodPotionAutoUse',
+                title: 'Small Blood Potion Auto Use',
+
+                defaults: {
+                    enabled: false,
+                    onlyDuringBattle: true,
+                    resetLastDamageOnKill: true,
+                    submitDelay: 50
+                },
+
+                isUsingPotion: false,
+                fetchHookInstalled: false,
+                manualSubmitGuardInstalled: false,
+                fastScanInterval: null,
+                lastSeenMessageText: '',
+                lastSeenRunLogText: '',
+
+                read(api) {
+                    const state = api.readState(this.id, this.defaults);
+
+                    return {
+                        ...this.defaults,
+                        ...state,
+                        onlyDuringBattle: state.onlyDuringBattle !== false,
+                        resetLastDamageOnKill: state.resetLastDamageOnKill !== false
+                    };
+                },
+
+                write(api, state) {
+                    api.saveState(this.id, {
+                        ...this.defaults,
+                        ...state
+                    });
+                },
+
+                getDamageStorageKey() {
+                    return 'tmAutoBattleExtras:' + this.id + ':lastMonsterDamage:v2';
+                },
+
+                readLastMonsterDamage() {
+                    try {
+                        const data = JSON.parse(localStorage.getItem(this.getDamageStorageKey()) || '{}');
+
+                        return {
+                            damage: Number(data.damage) || 0,
+                            source: data.source || '',
+                            text: data.text || '',
+                            updatedAt: Number(data.updatedAt) || 0
+                        };
+                    } catch {
+                        return {
+                            damage: 0,
+                            source: '',
+                            text: '',
+                            updatedAt: 0
+                        };
+                    }
+                },
+
+                writeLastMonsterDamage(damage, source, text) {
+                    const cleanDamage = Number(damage);
+
+                    if (!Number.isFinite(cleanDamage) || cleanDamage <= 0) return false;
+
+                    localStorage.setItem(this.getDamageStorageKey(), JSON.stringify({
+                        damage: Math.round(cleanDamage),
+                        source: source || 'unknown',
+                        text: String(text || '').slice(0, 300),
+                        updatedAt: Date.now()
+                    }));
+
+                    return true;
+                },
+
+                clearLastMonsterDamage(reason) {
+                    localStorage.setItem(this.getDamageStorageKey(), JSON.stringify({
+                        damage: 0,
+                        source: reason || 'reset',
+                        text: '',
+                        updatedAt: Date.now()
+                    }));
+                },
+
+                parseNumber(value) {
+                    const clean = String(value || '').replace(/[^\d]/g, '');
+                    return clean ? Number(clean) : NaN;
+                },
+
+                getCurrentHp(api) {
+                    const hpText = api.normalizeText(document.querySelector('#playerHpText')?.textContent || '');
+                    const match = hpText.match(/(.+?)\s*\/\s*(.+)/);
+
+                    if (!match) return NaN;
+
+                    return this.parseNumber(match[1]);
+                },
+
+                hasActiveBattle() {
+                    const autoPanel = document.querySelector('#autoBattlePanel');
+
+                    if (autoPanel?.dataset?.hasBattle === '1') return true;
+
+                    return !!(
+                        document.querySelector('.monster-card') &&
+                        document.querySelector('form.js-attack-form')
+                    );
+                },
+
+                getSmallBloodPotionForm(api) {
+                    const direct = Array.from(document.querySelectorAll('form[data-item-name]')).find((form) => {
+                        return api.normalizeText(form.dataset.itemName).toLowerCase() === 'small blood potion';
+                    });
+
+                    if (direct) return direct;
+
+                    const items = Array.from(document.querySelectorAll('.item'));
+
+                    for (const item of items) {
+                        const title = api.normalizeText(item.querySelector('.item-title')?.textContent || '');
+
+                        if (title.toLowerCase() !== 'small blood potion') continue;
+
+                        const form = item.querySelector('form');
+                        if (form) return form;
+                    }
+
+                    return null;
+                },
+
+                getSmallBloodPotionCount(api) {
+                    const items = Array.from(document.querySelectorAll('.item'));
+
+                    for (const item of items) {
+                        const title = api.normalizeText(item.querySelector('.item-title')?.textContent || '');
+
+                        if (title.toLowerCase() !== 'small blood potion') continue;
+
+                        const meta = api.normalizeText(item.querySelector('.item-meta')?.textContent || '');
+                        const match = meta.match(/x\s*(\d+)/i);
+
+                        if (match) return Number(match[1]);
+                    }
+
+                    return this.getSmallBloodPotionForm(api) ? 1 : 0;
+                },
+
+                textContainsKill(text) {
+                    const raw = String(text || '');
+
+                    return (
+                        /\[kill\]/i.test(raw) ||
+                        /\bkilled\b/i.test(raw) ||
+                        /\bmonster\s+(?:was\s+)?killed\b/i.test(raw) ||
+                        /\bdefeated\b/i.test(raw)
+                    );
+                },
+
+                extractMonsterDamageFromText(text) {
+                    const raw = String(text || '');
+
+                    if (!raw.trim()) return 0;
+
+                    // Important:
+                    // The message can contain your damage and the monster retaliation in the same text:
+                    // "You dealt 218 damage. The monster retaliated for 8."
+                    // We only extract the monster retaliation damage.
+
+                    const patterns = [
+                        // ajaxMessage example:
+                        // "The monster retaliated for 8."
+                        /\bmonster\s+retaliated\s+for\s+([\d,.]+)/i,
+                        /\bmonster\b.*?\bretaliated\b.*?\bfor\s+([\d,.]+)/i,
+                        /\bmonster\b.*?\bretaliates\b.*?\bfor\s+([\d,.]+)/i,
+
+                        // Recent Run Log example:
+                        // "[attack] Dealt 218 damage. Retaliation dealt 8."
+                        /\bretaliation\s+dealt\s+([\d,.]+)/i,
+                        /\bretaliation\b.*?\bdealt\b.*?([\d,.]+)/i,
+
+                        // Other possible variants:
+                        /\byou\s+(?:take|took|suffer|suffered|receive|received)\s+([\d,.]+)\s+damage\b/i,
+                        /\b(?:monster|enemy|foe|it|doppelganger|reflection)\b.*?\b(?:deals?|hits?|strikes?|attacks?|counterattacks?)\b.*?([\d,.]+)\s+damage\b/i,
+                        /\b(?:deals?|hits?|strikes?)\s+you\s+for\s+([\d,.]+)/i,
+                        /\b(?:counterattack|counter attack|counter-hit|counter hit)\b.*?([\d,.]+)\s+damage\b/i,
+                        /\b([\d,.]+)\s+damage\s+to\s+you\b/i
+                    ];
+
+                    for (const pattern of patterns) {
+                        const match = raw.match(pattern);
+                        if (!match) continue;
+
+                        const damage = this.parseNumber(match[1]);
+                        if (Number.isFinite(damage) && damage > 0) return damage;
+                    }
+
+                    return 0;
+                },
+
+                extractMonsterDamageFromObject(value, path) {
+                    if (!value) return 0;
+
+                    if (typeof value === 'string') {
+                        return this.extractMonsterDamageFromText(value);
+                    }
+
+                    if (typeof value === 'number') {
+                        const pathText = String(path || '').toLowerCase();
+
+                        const likelyDamageKey =
+                            pathText.includes('monster_damage') ||
+                            pathText.includes('counter_damage') ||
+                            pathText.includes('counterattack_damage') ||
+                            pathText.includes('retaliation_damage') ||
+                            pathText.includes('damage_taken') ||
+                            pathText.includes('taken_damage') ||
+                            pathText.includes('incoming_damage') ||
+                            pathText.includes('player_damage_taken');
+
+                        return likelyDamageKey && value > 0 ? value : 0;
+                    }
+
+                    if (Array.isArray(value)) {
+                        for (let index = 0; index < value.length; index += 1) {
+                            const damage = this.extractMonsterDamageFromObject(value[index], path + '[' + index + ']');
+                            if (damage > 0) return damage;
+                        }
+
+                        return 0;
+                    }
+
+                    if (typeof value === 'object') {
+                        const preferredKeys = [
+                            'monster_damage',
+                            'counter_damage',
+                            'counterattack_damage',
+                            'retaliation_damage',
+                            'damage_taken',
+                            'taken_damage',
+                            'incoming_damage',
+                            'player_damage_taken',
+                            'message',
+                            'log',
+                            'text',
+                            'description'
+                        ];
+
+                        for (const key of preferredKeys) {
+                            if (!(key in value)) continue;
+
+                            const damage = this.extractMonsterDamageFromObject(value[key], path ? path + '.' + key : key);
+                            if (damage > 0) return damage;
+                        }
+
+                        for (const [key, child] of Object.entries(value)) {
+                            const damage = this.extractMonsterDamageFromObject(child, path ? path + '.' + key : key);
+                            if (damage > 0) return damage;
+                        }
+                    }
+
+                    return 0;
+                },
+
+                rememberDamageFromText(api, text, source) {
+                    const state = this.read(api);
+
+                    if (state.resetLastDamageOnKill && this.textContainsKill(text)) {
+                        this.clearLastMonsterDamage('kill detected in ' + (source || 'text'));
+                        api.setModuleStatus(this.id, 'Last monster damage reset because a kill was detected.');
+                        return true;
+                    }
+
+                    const damage = this.extractMonsterDamageFromText(text);
+
+                    if (damage > 0) {
+                        this.writeLastMonsterDamage(damage, source || 'text', text);
+                        api.setModuleStatus(this.id, 'Last monster damage recorded: ' + damage + '.');
+                        return true;
+                    }
+
+                    return false;
+                },
+
+                rememberDamageFromResponse(api, data) {
+                    const state = this.read(api);
+
+                    const text =
+                        typeof data?.message === 'string'
+                            ? data.message
+                            : JSON.stringify(data).slice(0, 300);
+
+                    if (state.resetLastDamageOnKill && this.textContainsKill(text)) {
+                        this.clearLastMonsterDamage('kill detected in attack response');
+                        api.setModuleStatus(this.id, 'Last monster damage reset because a kill was detected.');
+                        return true;
+                    }
+
+                    const damage = this.extractMonsterDamageFromObject(data, '');
+
+                    if (damage > 0) {
+                        this.writeLastMonsterDamage(damage, 'attack response', text);
+                        api.setModuleStatus(this.id, 'Last monster damage recorded: ' + damage + '.');
+                        return true;
+                    }
+
+                    return false;
+                },
+
+                scanRunLogForDamageOrKill(api) {
+                    const cards = Array.from(document.querySelectorAll('.card'));
+                    const recentRunLogCard = cards.find((card) => {
+                        const title = api.normalizeText(card.querySelector('h2')?.textContent || '');
+                        return title === 'Recent Run Log';
+                    });
+
+                    if (!recentRunLogCard) return false;
+
+                    const firstLog = recentRunLogCard.querySelector('.log');
+                    const text = api.normalizeText(firstLog?.textContent || '');
+
+                    if (!text || text === this.lastSeenRunLogText) return false;
+
+                    this.lastSeenRunLogText = text;
+
+                    return this.rememberDamageFromText(api, text, 'recent run log');
+                },
+
+                shouldUsePotion(api) {
+                    const state = this.read(api);
+
+                    if (!state.enabled) return false;
+                    if (this.isUsingPotion) return false;
+
+                    if (state.onlyDuringBattle && !this.hasActiveBattle()) return false;
+
+                    const form = this.getSmallBloodPotionForm(api);
+                    if (!form) return false;
+
+                    const currentHp = this.getCurrentHp(api);
+                    if (!Number.isFinite(currentHp) || currentHp <= 0) return false;
+
+                    const last = this.readLastMonsterDamage();
+                    if (!Number.isFinite(last.damage) || last.damage <= 0) return false;
+
+                    // Survival rule:
+                    // If the next hit repeats the last monster damage, HP <= damage means death risk.
+                    return currentHp <= last.damage;
+                },
+
+                usePotion(api, reason) {
+                    if (this.isUsingPotion) return false;
+
+                    const form = this.getSmallBloodPotionForm(api);
+                    if (!form) return false;
+
+                    const currentHp = this.getCurrentHp(api);
+                    const last = this.readLastMonsterDamage();
+                    const count = this.getSmallBloodPotionCount(api);
+
+                    this.isUsingPotion = true;
+
+                    api.setModuleStatus(
+                        this.id,
+                        'Using Small Blood Potion automatically. Current HP: ' +
+                        currentHp +
+                        ' | last monster damage: ' +
+                        last.damage +
+                        (count ? ' | available: x' + count : '') +
+                        (reason ? ' | reason: ' + reason : '')
+                    );
+
+                    window.setTimeout(() => {
+                        api.submitForm(form, {
+                            restartAutoBattle: true,
+                            restartReason: 'Small Blood Potion Auto Use'
+                        });
+                    }, Number(this.read(api).submitDelay) || 50);
+
+                    return true;
+                },
+
+                isAttackRequest(args) {
+                    const init = args[1] || {};
+                    const method = String(init.method || '').toUpperCase();
+
+                    if (method !== 'POST') return false;
+
+                    const body = init.body;
+                    if (!(body instanceof FormData)) return false;
+
+                    const action = body.get('action');
+                    const attackType = body.get('attack_type');
+
+                    return action === 'attack' && ['slash', 'magic'].includes(String(attackType));
+                },
+
+                installFetchHook(api) {
+                    if (this.fetchHookInstalled) return;
+
+                    this.fetchHookInstalled = true;
+
+                    const module = this;
+                    const originalFetch = window.fetch;
+
+                    window.fetch = async function smallBloodPotionFetchHook(...args) {
+                        try {
+                            if (module.isAttackRequest(args) && module.shouldUsePotion(api)) {
+                                const didUsePotion = module.usePotion(api, 'before attack');
+
+                                if (didUsePotion) {
+                                    return new Promise(() => { });
+                                }
+                            }
+                        } catch (error) {
+                            console.error('[AutoBattleExtras] Small Blood Potion pre-attack guard failed:', error);
+                        }
+
+                        const response = await originalFetch.apply(this, args);
+
+                        try {
+                            if (module.isAttackRequest(args)) {
+                                const clone = response.clone();
+                                const text = await clone.text();
+
+                                try {
+                                    const data = JSON.parse(text);
+                                    module.rememberDamageFromResponse(api, data);
+                                } catch {
+                                    module.rememberDamageFromText(api, text, 'attack response text');
+                                }
+
+                                api.scheduleScan(50);
+                            }
+                        } catch (error) {
+                            console.error('[AutoBattleExtras] Small Blood Potion damage read failed:', error);
+                        }
+
+                        return response;
+                    };
+                },
+
+                installManualSubmitGuard(api) {
+                    if (this.manualSubmitGuardInstalled) return;
+
+                    this.manualSubmitGuardInstalled = true;
+
+                    document.addEventListener(
+                        'submit',
+                        (event) => {
+                            const form = event.target;
+
+                            if (!(form instanceof HTMLFormElement)) return;
+                            if (!form.matches('form.js-attack-form')) return;
+
+                            if (!this.shouldUsePotion(api)) return;
+
+                            const didUsePotion = this.usePotion(api, 'before manual attack');
+
+                            if (didUsePotion) {
+                                event.preventDefault();
+                                event.stopImmediatePropagation();
+                            }
+                        },
+                        true
+                    );
+                },
+
+                startFastScan(api) {
+                    if (this.fastScanInterval) return;
+
+                    this.fastScanInterval = window.setInterval(() => {
+                        const state = this.read(api);
+                        if (!state.enabled) return;
+
+                        const messageBox = document.querySelector('#ajaxMessage');
+                        const messageText = api.normalizeText(messageBox?.textContent || '');
+
+                        if (messageText && messageText !== this.lastSeenMessageText) {
+                            this.lastSeenMessageText = messageText;
+                            this.rememberDamageFromText(api, messageText, 'ajax message');
+                        }
+
+                        this.scanRunLogForDamageOrKill(api);
+
+                        if (this.shouldUsePotion(api)) {
+                            this.usePotion(api, 'HP at or below last monster damage');
+                        }
+                    }, 250);
+                },
+
+                render(panel, api) {
+                    const state = this.read(api);
+
+                    this.installFetchHook(api);
+                    this.installManualSubmitGuard(api);
+                    this.startFastScan(api);
+
+                    const enabledLabel = document.createElement('label');
+                    enabledLabel.style.display = 'flex';
+                    enabledLabel.style.gap = '8px';
+                    enabledLabel.style.alignItems = 'center';
+                    enabledLabel.style.marginBottom = '10px';
+
+                    const enabledCheckbox = api.createCheckbox(state.enabled, (checked) => {
+                        const latest = this.read(api);
+                        latest.enabled = checked;
+                        this.write(api, latest);
+
+                        api.setModuleStatus(this.id, checked ? 'Small Blood Potion Auto Use enabled.' : 'Small Blood Potion Auto Use paused.');
+                        api.scheduleScan(50);
+                    });
+
+                    enabledLabel.appendChild(enabledCheckbox);
+                    enabledLabel.appendChild(document.createTextNode('Automatically use Small Blood Potion'));
+
+                    const battleOnlyLabel = document.createElement('label');
+                    battleOnlyLabel.style.display = 'flex';
+                    battleOnlyLabel.style.gap = '8px';
+                    battleOnlyLabel.style.alignItems = 'center';
+                    battleOnlyLabel.style.marginBottom = '10px';
+
+                    const battleOnlyCheckbox = api.createCheckbox(state.onlyDuringBattle, (checked) => {
+                        const latest = this.read(api);
+                        latest.onlyDuringBattle = checked;
+                        this.write(api, latest);
+
+                        api.setModuleStatus(this.id, checked ? 'Only during battle enabled.' : 'Only during battle disabled.');
+                        api.scheduleScan(50);
+                    });
+
+                    battleOnlyLabel.appendChild(battleOnlyCheckbox);
+                    battleOnlyLabel.appendChild(document.createTextNode('Only use during active battle'));
+
+                    const resetOnKillLabel = document.createElement('label');
+                    resetOnKillLabel.style.display = 'flex';
+                    resetOnKillLabel.style.gap = '8px';
+                    resetOnKillLabel.style.alignItems = 'center';
+                    resetOnKillLabel.style.marginBottom = '10px';
+
+                    const resetOnKillCheckbox = api.createCheckbox(state.resetLastDamageOnKill, (checked) => {
+                        const latest = this.read(api);
+                        latest.resetLastDamageOnKill = checked;
+                        this.write(api, latest);
+
+                        api.setModuleStatus(this.id, checked ? 'Reset last damage on kill enabled.' : 'Reset last damage on kill disabled.');
+                        api.scheduleScan(50);
+                    });
+
+                    resetOnKillLabel.appendChild(resetOnKillCheckbox);
+                    resetOnKillLabel.appendChild(document.createTextNode('Reset last monster damage when a kill is detected'));
+
+                    const hint = document.createElement('div');
+                    hint.style.fontSize = '12px';
+                    hint.style.opacity = '0.8';
+                    hint.style.marginBottom = '8px';
+                    hint.textContent =
+                        'Uses a Small Blood Potion when current HP is less than or equal to the last recorded monster retaliation damage. Damage is read from combat messages, not from HP differences.';
+
+                    const clearButton = document.createElement('button');
+                    clearButton.type = 'button';
+                    clearButton.textContent = 'Reset last damage';
+                    clearButton.style.marginRight = '8px';
+
+                    clearButton.addEventListener('click', () => {
+                        this.clearLastMonsterDamage('manual reset');
+                        api.setModuleStatus(this.id, 'Last monster damage reset manually.');
+                    });
+
+                    const scanButton = document.createElement('button');
+                    scanButton.type = 'button';
+                    scanButton.textContent = 'Check now';
+
+                    scanButton.addEventListener('click', () => {
+                        const didUse = this.scan(api);
+
+                        if (!didUse) {
+                            const hp = this.getCurrentHp(api);
+                            const last = this.readLastMonsterDamage();
+                            const count = this.getSmallBloodPotionCount(api);
+
+                            api.setModuleStatus(
+                                this.id,
+                                'No potion used. Current HP: ' +
+                                (Number.isFinite(hp) ? hp : 'unknown') +
+                                ' | last monster damage: ' +
+                                (last.damage || 'unknown') +
+                                ' | available: x' +
+                                count
+                            );
+                        }
+                    });
+
+                    panel.appendChild(enabledLabel);
+                    panel.appendChild(battleOnlyLabel);
+                    panel.appendChild(resetOnKillLabel);
+                    panel.appendChild(hint);
+                    panel.appendChild(clearButton);
+                    panel.appendChild(scanButton);
+                },
+
+                scan(api) {
+                    const state = this.read(api);
+                    if (!state.enabled) return false;
+
+                    const messageBox = document.querySelector('#ajaxMessage');
+                    const messageText = api.normalizeText(messageBox?.textContent || '');
+
+                    if (messageText && messageText !== this.lastSeenMessageText) {
+                        this.lastSeenMessageText = messageText;
+                        this.rememberDamageFromText(api, messageText, 'ajax message');
+                    }
+
+                    this.scanRunLogForDamageOrKill(api);
+
+                    if (!this.shouldUsePotion(api)) return false;
+
+                    return this.usePotion(api, 'module scan');
+                }
+            });
+
+
+            /*
+            Add future modules here, before AutoBattleExtras.start().
+
+            Template:
+
+            AutoBattleExtras.registerModule({
+              id: 'newModuleId',
+              title: 'New Module',
+
+              defaults: {
+                enabled: true
+              },
+
+              read(api) {
+                return api.readState(this.id, this.defaults);
+              },
+
+              write(api, state) {
+                api.saveState(this.id, state);
+              },
+
+              render(panel, api) {
+                // Build module settings UI here.
+              },
+
+              scan(api) {
+                // Check the page and act if needed.
+              }
+            });
+          */
+
+            AutoBattleExtras.start();
+        })();
       },
     });
   },
@@ -6943,6 +15364,7 @@
 
     module.exports = [
       require('./adventurers-guild-layout'),
+      require('./auto-battle-extras'),
       require('./better-header'),
       require('./custom-navigation'),
       require('./battle-drawer-scroll'),
@@ -11759,6 +20181,46 @@
       main(window);
     }
   },
+  "routes/adventurers.js": function (module, exports, require) {
+    'use strict';
+
+    function normalizeSettings() {
+      return {};
+    }
+
+    module.exports = Object.freeze({
+      id: 'adventurers',
+      label: "Adventurer's Guild",
+      path: '/adventurers_guild.php?veyra_route=adventurers',
+      defaultEnabled: false,
+      defaultLoopMinutes: 5,
+      maxVisitMs: 2 * 60 * 60_000,
+      initialDelayMs: 10 * 60_000,
+
+      matchesUrl(url) {
+        return (
+          /\/adventurers_guild\.php\/?$/i.test(url.pathname) &&
+          url.searchParams.get('veyra_route') === 'adventurers'
+        );
+      },
+
+      createDefaultSettings: normalizeSettings,
+      normalizeSettings,
+
+      renderSettings(ctx) {
+        ctx.addSectionTitle('Quest automation');
+        const group = ctx.make('div', { className: ctx.cls('setting') });
+        group.appendChild(
+          ctx.make('div', {
+            className: ctx.cls('hint'),
+            text:
+              'The worker first farms every currently available Olympus quest target, then accepts, loots and turns in one quest at a time. Quest monsters stay protected from every bulk-loot feature until the run is complete. Auto Farm settings are restored afterwards.',
+          }),
+        );
+        ctx.container.appendChild(group);
+      },
+    });
+  },
   "routes/boss-settings.js": function (module, exports, require) {
     'use strict';
 
@@ -11869,6 +20331,581 @@
       renderBossSettings,
     };
   },
+  "routes/crucible.js": function (module, exports, require) {
+    'use strict';
+
+    const { normalizeDamageTarget } = require('../core/numbers');
+
+    const DEFAULT_DAMAGE = '1m';
+    const DEFAULT_ATTACK_COOLDOWN_MS = 100;
+    const MIN_ATTACK_COOLDOWN_MS = 100;
+    const MAX_ATTACK_COOLDOWN_MS = 2_000;
+
+    const CRUCIBLE_SKILLS = Object.freeze([
+      Object.freeze({ id: '0', name: 'Slash', cost: 1 }),
+      Object.freeze({ id: '-1', name: 'Power Slash', cost: 10 }),
+      Object.freeze({ id: '-2', name: 'Heroic Slash', cost: 50 }),
+      Object.freeze({ id: '-3', name: 'Ultimate Slash', cost: 100 }),
+      Object.freeze({ id: '-4', name: 'Legendary Slash', cost: 200 }),
+    ]);
+
+    const CRUCIBLE_PVE_NODES = Object.freeze(
+      [
+        {
+          id: 'gate_prism',
+          name: 'Gate Prism',
+          faceName: 'Prism Gate',
+          locationId: '11',
+          monsters: ['Prismblade Reaver', 'Mireglass Stalker', 'Siege-Root Howler'],
+        },
+        {
+          id: 'ash_lane',
+          name: 'Ash Lane',
+          faceName: 'Ash Lane',
+          locationId: '12',
+          monsters: ['Null Choir Adept', 'Calibration Warden', 'Bastion Iterant', 'Polyhedral Devourer'],
+        },
+        {
+          id: 'crown_lens',
+          name: 'Crown Lens',
+          faceName: 'Crown of Calibration',
+          locationId: '13',
+          // This node was still hidden in the supplied page capture. Its live
+          // monster names are discovered and persisted by the worker instead of
+          // guessing identifiers that the game may later change.
+          monsters: [],
+        },
+        {
+          id: 'zenith_lock',
+          name: 'Zenith Lock',
+          faceName: 'Apex',
+          locationId: '14',
+          isApex: true,
+          // The apex was locked in the supplied capture. Its live boss name is
+          // discovered from location 14 and inherits this node's configured mode.
+          monsters: [],
+        },
+      ].map((node) =>
+        Object.freeze({
+          ...node,
+          monsters: Object.freeze([...node.monsters]),
+        }),
+      ),
+    );
+
+    const CRUCIBLE_PVP_NODES = Object.freeze([
+      Object.freeze({ id: 'ring_ward', name: 'Ring Ward' }),
+      Object.freeze({ id: 'duel_heart', name: 'Duel Heart' }),
+      Object.freeze({ id: 'tyrant_conclave', name: 'Tyrant Conclave' }),
+    ]);
+
+    const CRUCIBLE_ARMY_NODES = Object.freeze([
+      Object.freeze({ id: 'veil_post', name: 'Veil Post' }),
+      Object.freeze({ id: 'captain_spine', name: 'Captain Spine' }),
+      Object.freeze({ id: 'abyssal_muster', name: 'Abyssal Muster' }),
+    ]);
+
+    const CRUCIBLE_ARMY_SHADOWS = Object.freeze([
+      Object.freeze({ id: '5', name: 'Drakzareth The Tyrant' }),
+      Object.freeze({ id: '3', name: 'Vessir the Sunfang Duelist' }),
+      Object.freeze({ id: '4', name: 'Hrazz the Dawnflame Oathkeeper' }),
+      Object.freeze({ id: '2', name: 'Skarn the Radiant General' }),
+      Object.freeze({ id: '6', name: 'Malreth the Corruptor' }),
+    ]);
+
+    const PVE_MODES = Object.freeze([
+      Object.freeze({ id: 'max-loot', label: 'Max loot (read live)' }),
+      Object.freeze({ id: 'max-exp', label: 'Max experience (read live)' }),
+      Object.freeze({ id: 'kill', label: 'Kill monster' }),
+      Object.freeze({ id: 'custom', label: 'Custom damage' }),
+    ]);
+
+    const ARMY_MODES = Object.freeze([
+      Object.freeze({ id: 'minimal', label: 'Minimal (one hit, then retreat)' }),
+      Object.freeze({ id: 'kill', label: 'Kill (all available captains)' }),
+    ]);
+
+    const PVE_NODE_IDS = new Set(CRUCIBLE_PVE_NODES.map((node) => node.id));
+    const SKILL_IDS = new Set(CRUCIBLE_SKILLS.map((skill) => skill.id));
+    const PVE_MODE_IDS = new Set(PVE_MODES.map((mode) => mode.id));
+    const ARMY_MODE_IDS = new Set(ARMY_MODES.map((mode) => mode.id));
+
+    function slug(value) {
+      return String(value ?? '')
+        .normalize?.('NFKD')
+        ?.replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 80) || '';
+    }
+
+    function targetIdForMonster(nodeId, name) {
+      const node = String(nodeId || '').trim();
+      const monster = slug(name);
+      return PVE_NODE_IDS.has(node) && monster ? `${node}:${monster}` : '';
+    }
+
+    const CRUCIBLE_PVE_MONSTERS = Object.freeze(
+      CRUCIBLE_PVE_NODES.flatMap((node) =>
+        node.monsters.map((name) =>
+          Object.freeze({
+            id: targetIdForMonster(node.id, name),
+            nodeId: node.id,
+            name,
+            discovered: false,
+          }),
+        ),
+      ),
+    );
+    const CANONICAL_TARGET_IDS = new Set(CRUCIBLE_PVE_MONSTERS.map((monster) => monster.id));
+
+    function normalizeCooldown(value) {
+      const number = Math.round(Number(value));
+      if (!Number.isFinite(number)) return DEFAULT_ATTACK_COOLDOWN_MS;
+      return Math.min(MAX_ATTACK_COOLDOWN_MS, Math.max(MIN_ATTACK_COOLDOWN_MS, number));
+    }
+
+    function normalizeTarget(value, fallback = null) {
+      const fallbackMode = PVE_MODE_IDS.has(fallback?.mode) ? fallback.mode : 'max-loot';
+      const fallbackDamage = normalizeDamageTarget(fallback?.damage, DEFAULT_DAMAGE);
+      return {
+        enabled: typeof value?.enabled === 'boolean' ? value.enabled : fallback?.enabled !== false,
+        mode: PVE_MODE_IDS.has(value?.mode) ? value.mode : fallbackMode,
+        damage: normalizeDamageTarget(value?.damage, fallbackDamage),
+      };
+    }
+
+    function normalizeDiscovery(value) {
+      const nodeId = String(value?.nodeId || '').trim();
+      const name = String(value?.name || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+      const id = targetIdForMonster(nodeId, name);
+      if (!id || CANONICAL_TARGET_IDS.has(id)) return null;
+      return { id, nodeId, name, discovered: true };
+    }
+
+    function normalizeDiscoveries(value) {
+      const discoveries = [];
+      const seen = new Set();
+      for (const raw of Array.isArray(value) ? value : []) {
+        const discovery = normalizeDiscovery(raw);
+        if (!discovery || seen.has(discovery.id)) continue;
+        seen.add(discovery.id);
+        discoveries.push(discovery);
+        if (discoveries.length >= 100) break;
+      }
+      return discoveries;
+    }
+
+    function monsterDefinitions(settings) {
+      return [...CRUCIBLE_PVE_MONSTERS, ...normalizeDiscoveries(settings?.discoveredMonsters)];
+    }
+
+    function normalizeArmyShadow(value) {
+      const id = String(value?.id ?? value?.shadowId ?? value?.shadow_id ?? '').trim();
+      const name = String(value?.name || value?.title || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+      if (!/^\d+$/.test(id) || Number(id) <= 0 || !name) return null;
+      return { id, name };
+    }
+
+    function normalizeArmyShadows(value) {
+      const shadows = [];
+      const seen = new Set();
+      for (const raw of [...CRUCIBLE_ARMY_SHADOWS, ...(Array.isArray(value) ? value : [])]) {
+        const shadow = normalizeArmyShadow(raw);
+        if (!shadow || seen.has(shadow.id)) continue;
+        seen.add(shadow.id);
+        shadows.push(shadow);
+        if (shadows.length >= 50) break;
+      }
+      return shadows;
+    }
+
+    function normalizeSettings(value) {
+      const nodeDefaults = {};
+      for (const node of CRUCIBLE_PVE_NODES) {
+        nodeDefaults[node.id] = normalizeTarget(value?.nodeDefaults?.[node.id]);
+      }
+
+      const discoveredMonsters = normalizeDiscoveries(value?.discoveredMonsters);
+      const targets = {};
+      for (const definition of [...CRUCIBLE_PVE_MONSTERS, ...discoveredMonsters]) {
+        targets[definition.id] = normalizeTarget(value?.targets?.[definition.id], nodeDefaults[definition.nodeId]);
+      }
+
+      const skill = String(value?.skill ?? '0');
+      const armyMode = String(value?.army?.mode || 'minimal');
+      const armyShadows = normalizeArmyShadows(value?.army?.shadows);
+      const validShadowIds = new Set(armyShadows.map((shadow) => shadow.id));
+      const selectedSource = Array.isArray(value?.army?.selectedShadowIds)
+        ? value.army.selectedShadowIds
+        : armyShadows.map((shadow) => shadow.id);
+      const selectedShadowIds = [...new Set(selectedSource.map(String))].filter((id) => validShadowIds.has(id));
+      return {
+        pveEnabled: value?.pveEnabled !== false,
+        skill: SKILL_IDS.has(skill) ? skill : '0',
+        attackCooldownMs: normalizeCooldown(value?.attackCooldownMs),
+        nodeDefaults,
+        discoveredMonsters,
+        targets,
+        pvp: { enabled: value?.pvp?.enabled !== false },
+        army: {
+          enabled: value?.army?.enabled !== false,
+          mode: ARMY_MODE_IDS.has(armyMode) ? armyMode : 'minimal',
+          shadows: armyShadows,
+          selectedShadowIds,
+        },
+      };
+    }
+
+    function mergeDiscoveredMonsters(value, discoveries) {
+      const settings = normalizeSettings(value);
+      const existing = new Set(settings.discoveredMonsters.map((monster) => monster.id));
+      let changed = false;
+      for (const raw of Array.isArray(discoveries) ? discoveries : []) {
+        const discovery = normalizeDiscovery(raw);
+        if (!discovery || existing.has(discovery.id)) continue;
+        existing.add(discovery.id);
+        settings.discoveredMonsters.push(discovery);
+        settings.targets[discovery.id] = normalizeTarget(null, settings.nodeDefaults[discovery.nodeId]);
+        changed = true;
+      }
+      return { changed, settings: normalizeSettings(settings) };
+    }
+
+    function mergeDiscoveredShadows(value, discoveries) {
+      const settings = normalizeSettings(value);
+      const existing = new Set(settings.army.shadows.map((shadow) => shadow.id));
+      let changed = false;
+      for (const raw of Array.isArray(discoveries) ? discoveries : []) {
+        const shadow = normalizeArmyShadow(raw);
+        if (!shadow || existing.has(shadow.id)) continue;
+        existing.add(shadow.id);
+        settings.army.shadows.push(shadow);
+        changed = true;
+      }
+      return { changed, settings: normalizeSettings(settings) };
+    }
+
+    function settingsForMonster(settingsValue, nodeId, name) {
+      const settings = normalizeSettings(settingsValue);
+      const id = targetIdForMonster(nodeId, name);
+      return {
+        id,
+        target: settings.targets[id] || settings.nodeDefaults[nodeId] || null,
+        known: Boolean(settings.targets[id]),
+      };
+    }
+
+    function setTouchSize(element) {
+      if (element?.style) element.style.minHeight = '44px';
+    }
+
+    function renderSettings(ctx) {
+      ctx.addSectionTitle('PvE');
+      const pveGeneral = ctx.make('div', { className: ctx.cls('setting') });
+      ctx.addCheckbox({
+        id: 'pve-enabled',
+        label: 'Enable PvE automation',
+        checked: ctx.settings.pveEnabled,
+        parent: pveGeneral,
+        onChange(checked) {
+          ctx.settings = ctx.updateSettings((settings) => {
+            settings.pveEnabled = checked;
+          });
+        },
+      });
+
+      const skillLabel = ctx.make('label', { text: 'Attack skill' });
+      const skillId = `${ctx.idPrefix}-pve-skill`;
+      skillLabel.setAttribute?.('for', skillId);
+      const skillSelect = ctx.make('select', { id: skillId, className: ctx.cls('select') });
+      for (const skill of CRUCIBLE_SKILLS) {
+        const option = ctx.make('option', { text: `${skill.name} (${skill.cost} stamina)` });
+        option.value = skill.id;
+        skillSelect.appendChild(option);
+      }
+      skillSelect.value = ctx.settings.skill;
+      setTouchSize(skillSelect);
+      skillSelect.addEventListener('change', () => {
+        ctx.settings = ctx.updateSettings((settings) => {
+          settings.skill = skillSelect.value;
+        });
+        skillSelect.value = ctx.settings.skill;
+      });
+      pveGeneral.appendChild(skillLabel);
+      pveGeneral.appendChild(skillSelect);
+      pveGeneral.appendChild(
+        ctx.make('div', {
+          className: ctx.cls('hint'),
+          text: 'Loot and experience caps are read from each live battle page immediately before attacking.',
+        }),
+      );
+      ctx.container.appendChild(pveGeneral);
+
+      const cooldownInput = ctx.addTextInput({
+        id: 'pve-attack-cooldown-ms',
+        label: 'Attack cooldown (ms)',
+        value: ctx.settings.attackCooldownMs,
+        type: 'number',
+        inputMode: 'numeric',
+        onChange(value) {
+          ctx.settings = ctx.updateSettings((settings) => {
+            settings.attackCooldownMs = value;
+          });
+          return ctx.settings.attackCooldownMs;
+        },
+      });
+      cooldownInput.min = String(MIN_ATTACK_COOLDOWN_MS);
+      cooldownInput.max = String(MAX_ATTACK_COOLDOWN_MS);
+      cooldownInput.step = '10';
+
+      function updateTarget(kind, key, mutator) {
+        ctx.settings = ctx.updateSettings((settings) => {
+          const target = kind === 'default' ? settings.nodeDefaults[key] : settings.targets[key];
+          if (target) mutator(target);
+        });
+        return kind === 'default' ? ctx.settings.nodeDefaults[key] : ctx.settings.targets[key];
+      }
+
+      function createTargetCard(definition, kind = 'target') {
+        const key = kind === 'default' ? definition.nodeId : definition.id;
+        const target = kind === 'default' ? ctx.settings.nodeDefaults[key] : ctx.settings.targets[key];
+        const domKey = String(key).replace(/[^\w-]+/g, '-');
+        const card = ctx.make('div', {
+          id: `${ctx.idPrefix}-pve-target-${domKey}`,
+          className: ctx.cls('setting'),
+        });
+        card.appendChild(ctx.make('div', { className: ctx.cls('setting-label'), text: definition.name }));
+
+        const enabledLabel = ctx.make('label', { className: ctx.cls('check') });
+        const enabled = ctx.make('input', {
+          id: `${ctx.idPrefix}-pve-target-${domKey}-enabled`,
+          type: 'checkbox',
+        });
+        enabled.checked = target.enabled;
+        enabled.addEventListener('change', () => {
+          updateTarget(kind, key, (next) => {
+            next.enabled = enabled.checked;
+          });
+        });
+        enabledLabel.appendChild(enabled);
+        enabledLabel.appendChild(
+          ctx.make('span', { text: kind === 'default' ? 'Use for newly discovered monsters' : 'Attack this monster' }),
+        );
+        setTouchSize(enabledLabel);
+        card.appendChild(enabledLabel);
+
+        const modeLabel = ctx.make('label', { text: 'Damage mode' });
+        const modeId = `${ctx.idPrefix}-pve-target-${domKey}-mode`;
+        modeLabel.setAttribute?.('for', modeId);
+        const mode = ctx.make('select', { id: modeId, className: ctx.cls('select') });
+        for (const optionDefinition of PVE_MODES) {
+          const option = ctx.make('option', { text: optionDefinition.label });
+          option.value = optionDefinition.id;
+          mode.appendChild(option);
+        }
+        mode.value = target.mode;
+        setTouchSize(mode);
+        card.appendChild(modeLabel);
+        card.appendChild(mode);
+
+        const damageGroup = ctx.make('div');
+        const damageId = `${ctx.idPrefix}-pve-target-${domKey}-damage`;
+        const damageLabel = ctx.make('label', { text: 'Custom damage target' });
+        damageLabel.setAttribute?.('for', damageId);
+        const damage = ctx.make('input', { id: damageId, className: ctx.cls('input'), type: 'text' });
+        damage.value = target.damage;
+        damage.placeholder = 'e.g. 3m';
+        damage.inputMode = 'decimal';
+        damage.autocomplete = 'off';
+        damageGroup.hidden = target.mode !== 'custom';
+        damageGroup.appendChild(damageLabel);
+        damageGroup.appendChild(damage);
+        card.appendChild(damageGroup);
+
+        mode.addEventListener('change', () => {
+          const next = updateTarget(kind, key, (settings) => {
+            settings.mode = mode.value;
+          });
+          mode.value = next.mode;
+          damageGroup.hidden = next.mode !== 'custom';
+        });
+        damage.addEventListener('change', () => {
+          const next = updateTarget(kind, key, (settings) => {
+            settings.damage = damage.value;
+          });
+          damage.value = next.damage;
+        });
+        return card;
+      }
+
+      const definitions = monsterDefinitions(ctx.settings);
+      for (const node of CRUCIBLE_PVE_NODES) {
+        const nodeCard = ctx.make('div', { className: ctx.cls('setting') });
+        nodeCard.appendChild(
+          ctx.make('div', {
+            className: ctx.cls('setting-label'),
+            text: `${node.faceName} · ${node.name}${node.isApex ? ' (Apex boss)' : ''}`,
+          }),
+        );
+        nodeCard.appendChild(
+          ctx.make('div', {
+            className: ctx.cls('hint'),
+            text: `Location ${node.locationId}. New live monster names inherit the default below and are saved individually.`,
+          }),
+        );
+        ctx.container.appendChild(nodeCard);
+        for (const definition of definitions.filter((monster) => monster.nodeId === node.id)) {
+          const label = definition.discovered ? `${definition.name} (discovered)` : definition.name;
+          ctx.container.appendChild(createTargetCard({ ...definition, name: label }));
+        }
+        ctx.container.appendChild(
+          createTargetCard(
+            { nodeId: node.id, name: `${node.name}: newly discovered monster default` },
+            'default',
+          ),
+        );
+      }
+
+      ctx.addSectionTitle('PvP');
+      const pvpGroup = ctx.make('div', { className: ctx.cls('setting') });
+      ctx.addCheckbox({
+        id: 'pvp-enabled',
+        label: 'Enable Crucible PvP nodes',
+        checked: ctx.settings.pvp.enabled,
+        parent: pvpGroup,
+        onChange(checked) {
+          ctx.settings = ctx.updateSettings((settings) => {
+            settings.pvp.enabled = checked;
+          });
+        },
+      });
+      pvpGroup.appendChild(
+        ctx.make('div', {
+          className: ctx.cls('hint'),
+          text: 'Uses Ring Ward, Duel Heart and Tyrant Conclave. The fullest open match is preferred.',
+        }),
+      );
+      ctx.container.appendChild(pvpGroup);
+
+      ctx.addSectionTitle('Army');
+      const armyGroup = ctx.make('div', { className: ctx.cls('setting') });
+      ctx.addCheckbox({
+        id: 'army-enabled',
+        label: 'Enable Crucible Army nodes',
+        checked: ctx.settings.army.enabled,
+        parent: armyGroup,
+        onChange(checked) {
+          ctx.settings = ctx.updateSettings((settings) => {
+            settings.army.enabled = checked;
+          });
+        },
+      });
+      const armyModeLabel = ctx.make('label', { text: 'Army damage mode' });
+      const armyModeId = `${ctx.idPrefix}-army-mode`;
+      armyModeLabel.setAttribute?.('for', armyModeId);
+      const armyMode = ctx.make('select', { id: armyModeId, className: ctx.cls('select') });
+      for (const definition of ARMY_MODES) {
+        const option = ctx.make('option', { text: definition.label });
+        option.value = definition.id;
+        armyMode.appendChild(option);
+      }
+      armyMode.value = ctx.settings.army.mode;
+      setTouchSize(armyMode);
+      armyMode.addEventListener('change', () => {
+        ctx.settings = ctx.updateSettings((settings) => {
+          settings.army.mode = armyMode.value;
+        });
+        armyMode.value = ctx.settings.army.mode;
+      });
+      armyGroup.appendChild(armyModeLabel);
+      armyGroup.appendChild(armyMode);
+      armyGroup.appendChild(
+        ctx.make('div', {
+          className: ctx.cls('hint'),
+          text: 'Minimal assigns one captain until a hit is verified, then retreats it. Kill assigns every available captain.',
+        }),
+      );
+
+      armyGroup.appendChild(
+        ctx.make('div', {
+          className: ctx.cls('setting-label'),
+          text: 'Shadows used by the automation formation',
+        }),
+      );
+      for (const shadow of ctx.settings.army.shadows) {
+        ctx.addCheckbox({
+          id: `army-shadow-${shadow.id}`,
+          label: shadow.name,
+          checked: ctx.settings.army.selectedShadowIds.includes(shadow.id),
+          parent: armyGroup,
+          onChange(checked) {
+            ctx.settings = ctx.updateSettings((settings) => {
+              const selected = new Set(settings.army.selectedShadowIds);
+              if (checked) selected.add(shadow.id);
+              else selected.delete(shadow.id);
+              settings.army.selectedShadowIds = [...selected];
+            });
+          },
+        });
+      }
+      armyGroup.appendChild(
+        ctx.make('div', {
+          className: ctx.cls('hint'),
+          text: 'The game still joins with its saved formation. The worker keeps only the selected special Shadows active and retreats unselected captains before assigning targets. Newly owned Shadows are discovered on the Shadow Army page and appear here unchecked.',
+        }),
+      );
+      ctx.container.appendChild(armyGroup);
+    }
+
+    module.exports = Object.freeze({
+      id: 'crucible',
+      label: 'The Polyhedral Crucible',
+      path: '/guild_dungeon.php?veyra_route=crucible',
+      defaultEnabled: false,
+      visitPathnames: Object.freeze([
+        '/guild_dungeon_cube.php',
+        '/guild_dungeon_location.php',
+        '/battle.php',
+        '/pvp_style_node.php',
+        '/pvp_style_battle.php',
+        '/guild_dungeon_cube_army_enter.php',
+        '/shadow_army_live_battle.php',
+        '/shadow_army.php',
+      ]),
+      defaultLoopMinutes: 5,
+      maxVisitMs: 60 * 60_000,
+      initialDelayMs: 15 * 60_000,
+      ARMY_MODES,
+      CRUCIBLE_ARMY_NODES,
+      CRUCIBLE_ARMY_SHADOWS,
+      CRUCIBLE_PVE_MONSTERS,
+      CRUCIBLE_PVE_NODES,
+      CRUCIBLE_PVP_NODES,
+      CRUCIBLE_SKILLS,
+      PVE_MODES,
+      mergeDiscoveredMonsters,
+      mergeDiscoveredShadows,
+      monsterDefinitions,
+      settingsForMonster,
+      targetIdForMonster,
+
+      matchesUrl(url) {
+        return (
+          /\/guild_dungeon\.php\/?$/i.test(url.pathname) &&
+          url.searchParams.get('veyra_route') === 'crucible'
+        );
+      },
+
+      createDefaultSettings() {
+        return normalizeSettings(null);
+      },
+
+      normalizeSettings,
+      renderSettings,
+    });
+  },
   "routes/index.js": function (module, exports, require) {
     'use strict';
 
@@ -11882,9 +20919,12 @@
 
     const olympus = require('./olympus');
     const pvp = require('./pvp');
+    const adventurers = require('./adventurers');
+    const crucible = require('./crucible');
+    const shadowbridge = require('./shadowbridge');
     const wave3 = require('./wave3');
 
-    const ROUTE_LIST = Object.freeze([pvp, wave3, olympus]);
+    const ROUTE_LIST = Object.freeze([pvp, wave3, olympus, adventurers, shadowbridge, crucible]);
     const ROUTES = Object.freeze(Object.fromEntries(ROUTE_LIST.map((route) => [route.id, route])));
     const ROUTE_IDS = Object.freeze(ROUTE_LIST.map((route) => route.id));
 
@@ -12043,6 +21083,17 @@
   "routes/pvp.js": function (module, exports, require) {
     'use strict';
 
+    const DEFAULT_MODE = 'autoplay';
+    const MODES = Object.freeze([
+      Object.freeze({ id: 'autoplay', label: 'Game Auto Play' }),
+      Object.freeze({ id: 'skill-planner', label: 'Solo PvP skill planner' }),
+    ]);
+
+    function normalizeSettings(value) {
+      const mode = MODES.some((candidate) => candidate.id === value?.mode) ? value.mode : DEFAULT_MODE;
+      return { mode };
+    }
+
     module.exports = Object.freeze({
       id: 'pvp',
       label: 'PvP',
@@ -12054,6 +21105,513 @@
       matchesUrl(url) {
         return /\/(?:pvp|pvp_battle)\.php\/?$/i.test(url.pathname);
       },
+
+      createDefaultSettings() {
+        return normalizeSettings(null);
+      },
+
+      normalizeSettings,
+
+      renderSettings(ctx) {
+        ctx.addSectionTitle('Battle mode');
+        const group = ctx.make('div', { className: ctx.cls('setting') });
+        const hintId = `${ctx.idPrefix}-mode-hint`;
+
+        for (const mode of MODES) {
+          const label = ctx.make('label', { className: ctx.cls('check') });
+          const input = ctx.make('input', {
+            id: `${ctx.idPrefix}-mode-${mode.id}`,
+            type: 'radio',
+          });
+          input.name = `${ctx.idPrefix}-mode`;
+          input.value = mode.id;
+          input.checked = ctx.settings.mode === mode.id;
+          input.setAttribute?.('aria-describedby', hintId);
+          if (label.style) label.style.minHeight = '44px';
+          input.addEventListener('change', () => {
+            if (!input.checked) return;
+            const next = ctx.updateSettings((settings) => {
+              settings.mode = mode.id;
+            });
+            ctx.settings.mode = next.mode;
+          });
+          label.appendChild(input);
+          label.appendChild(ctx.make('span', { text: mode.label }));
+          group.appendChild(label);
+        }
+
+        group.appendChild(
+          ctx.make('div', {
+            id: hintId,
+            className: ctx.cls('hint'),
+            text: "Game Auto Play uses the game's built-in automatic battle. Solo PvP skill planner uses the deliberate skill sequence from the PvP manager. The selected mode is used for every automated Solo PvP fight.",
+          }),
+        );
+        ctx.container.appendChild(group);
+      },
+    });
+  },
+  "routes/shadowbridge.js": function (module, exports, require) {
+    'use strict';
+
+    const { normalizeDamageTarget } = require('../core/numbers');
+
+    const DEFAULT_DAMAGE = '1m';
+    const DEFAULT_ATTACK_COOLDOWN_MS = 100;
+    const MIN_ATTACK_COOLDOWN_MS = 100;
+    const MAX_ATTACK_COOLDOWN_MS = 2_000;
+
+    const SHADOWBRIDGE_MONSTERS = Object.freeze(
+      [
+        ['talla-flint-stem', 'Talla Flint-Stem'],
+        ['gribble-junk-magus', 'Gribble Junk-Magus'],
+        ['pip-tanglefoot', 'Pip Tanglefoot'],
+        ['rukka-the-wolf-raider', 'Rukka The Wolf Raider'],
+        ['gorvash-the-stone-ram', 'Gorvash the Stone-Ram'],
+        ['droknar-night-blade', 'Droknar Night-Blade'],
+        ['nib-wickfingers', 'Nib Wickfingers'],
+        ['shagra-bone-singer', 'Shagra Bone-Singer'],
+        ['vorga-ash-shaman', 'Vorga Ash-Shaman'],
+        ['brog-skull', 'Brog Skull'],
+        ['hruk-forge-eater', 'Hruk Forge-Eater'],
+        ['krak-one-horn', 'Krak One-Horn'],
+        ['makra-the-mireborn', 'Makra the Mireborn'],
+        ['orc-stone-rend', 'Orc Stone-Rend'],
+        ['skrit-gear', 'Skrit Gear'],
+        ['tharka-blood-howl', 'Tharka Blood-Howl'],
+        ['urzul-iron-tusks', 'Urzul Iron-Tusks'],
+        ['zorgra-frost-vein', 'Zorgra Frost-Vein'],
+      ].map(([id, name]) => Object.freeze({ id, name })),
+    );
+
+    const SHADOWBRIDGE_BOSS_ROOM = Object.freeze({ id: 'boss-room', name: 'Boss Room' });
+
+    const SHADOWBRIDGE_SKILLS = Object.freeze([
+      Object.freeze({ id: '0', name: 'Slash', cost: 1 }),
+      Object.freeze({ id: '-1', name: 'Power Slash', cost: 10 }),
+      Object.freeze({ id: '-2', name: 'Heroic Slash', cost: 50 }),
+      Object.freeze({ id: '-3', name: 'Ultimate Slash', cost: 100 }),
+      Object.freeze({ id: '-4', name: 'Legendary Slash', cost: 200 }),
+    ]);
+
+    const NORMAL_MODES = Object.freeze([
+      Object.freeze({ id: 'max-loot', label: 'Max loot (read live)' }),
+      Object.freeze({ id: 'kill', label: 'Kill monster' }),
+      Object.freeze({ id: 'custom', label: 'Custom damage' }),
+    ]);
+
+    const BOSS_MODES = Object.freeze([
+      NORMAL_MODES[0],
+      Object.freeze({ id: 'max-exp', label: 'Max experience (read live)' }),
+      Object.freeze({ id: 'kill', label: 'Kill boss' }),
+      NORMAL_MODES[2],
+    ]);
+
+    const MONSTER_IDS = Object.freeze(SHADOWBRIDGE_MONSTERS.map((monster) => monster.id));
+    const MONSTER_ID_SET = new Set(MONSTER_IDS);
+    const SKILL_ID_SET = new Set(SHADOWBRIDGE_SKILLS.map((skill) => skill.id));
+
+    function normalizeOrder(value) {
+      const order = [];
+      const seen = new Set();
+      for (const rawId of Array.isArray(value) ? value : []) {
+        const id = String(rawId);
+        if (!MONSTER_ID_SET.has(id) || seen.has(id)) continue;
+        seen.add(id);
+        order.push(id);
+      }
+      for (const id of MONSTER_IDS) {
+        if (!seen.has(id)) order.push(id);
+      }
+      return order;
+    }
+
+    function normalizeCooldown(value) {
+      const number = Math.round(Number(value));
+      if (!Number.isFinite(number)) return DEFAULT_ATTACK_COOLDOWN_MS;
+      return Math.min(MAX_ATTACK_COOLDOWN_MS, Math.max(MIN_ATTACK_COOLDOWN_MS, number));
+    }
+
+    function normalizeTarget(value, allowedModes) {
+      const mode = allowedModes.some((candidate) => candidate.id === value?.mode) ? value.mode : 'max-loot';
+      return {
+        enabled: typeof value?.enabled === 'boolean' ? value.enabled : true,
+        mode,
+        damage: normalizeDamageTarget(value?.damage, DEFAULT_DAMAGE),
+      };
+    }
+
+    function normalizeSettings(value) {
+      const monsters = {};
+      for (const monster of SHADOWBRIDGE_MONSTERS) {
+        monsters[monster.id] = normalizeTarget(value?.monsters?.[monster.id], NORMAL_MODES);
+      }
+
+      const skill = String(value?.skill ?? '0');
+      return {
+        order: normalizeOrder(value?.order),
+        monsters,
+        bossRoom: normalizeTarget(value?.bossRoom, BOSS_MODES),
+        skill: SKILL_ID_SET.has(skill) ? skill : '0',
+        attackCooldownMs: normalizeCooldown(value?.attackCooldownMs),
+      };
+    }
+
+    function cleanDungeonSettings(value) {
+      const settings = normalizeSettings(value);
+      for (const monster of SHADOWBRIDGE_MONSTERS) {
+        settings.monsters[monster.id].enabled = true;
+        settings.monsters[monster.id].mode = 'kill';
+      }
+      settings.bossRoom.enabled = true;
+      settings.bossRoom.mode = 'kill';
+      return settings;
+    }
+
+    function setTouchSize(element, includeWidth = false) {
+      if (!element?.style) return;
+      element.style.minHeight = '44px';
+      if (includeWidth) element.style.minWidth = '44px';
+    }
+
+    function renderSettings(ctx) {
+      ctx.addSectionTitle('Combat');
+      const skillGroup = ctx.make('div', { className: ctx.cls('setting') });
+      const skillLabel = ctx.make('label', { text: 'Attack skill' });
+      const skillId = `${ctx.idPrefix}-skill`;
+      skillLabel.setAttribute?.('for', skillId);
+      const skillSelect = ctx.make('select', { id: skillId, className: ctx.cls('select') });
+      for (const skill of SHADOWBRIDGE_SKILLS) {
+        const option = ctx.make('option', { text: `${skill.name} (${skill.cost} stamina)` });
+        option.value = skill.id;
+        skillSelect.appendChild(option);
+      }
+      skillSelect.value = ctx.settings.skill;
+      setTouchSize(skillSelect);
+      skillSelect.addEventListener('change', () => {
+        ctx.settings = ctx.updateSettings((settings) => {
+          settings.skill = skillSelect.value;
+        });
+        skillSelect.value = ctx.settings.skill;
+      });
+      skillGroup.appendChild(skillLabel);
+      skillGroup.appendChild(skillSelect);
+      skillGroup.appendChild(
+        ctx.make('div', {
+          className: ctx.cls('hint'),
+          text: 'The selected base skill is used for every Shadowbridge attack.',
+        }),
+      );
+      ctx.container.appendChild(skillGroup);
+
+      const cooldownInput = ctx.addTextInput({
+        id: 'attack-cooldown-ms',
+        label: 'Attack cooldown (ms)',
+        value: ctx.settings.attackCooldownMs,
+        type: 'number',
+        inputMode: 'numeric',
+        onChange(value) {
+          ctx.settings = ctx.updateSettings((settings) => {
+            settings.attackCooldownMs = value;
+          });
+          return ctx.settings.attackCooldownMs;
+        },
+      });
+      cooldownInput.min = String(MIN_ATTACK_COOLDOWN_MS);
+      cooldownInput.max = String(MAX_ATTACK_COOLDOWN_MS);
+      cooldownInput.step = '10';
+
+      ctx.addSectionTitle('Targets');
+      const actionGroup = ctx.make('div', { className: ctx.cls('setting') });
+      const cleanButton = ctx.make('button', {
+        id: `${ctx.idPrefix}-clean-dungeon`,
+        className: ctx.cls('primary'),
+        type: 'button',
+        text: 'Clean Dungeon',
+        title: 'Enable every target and set it to Kill',
+      });
+      setTouchSize(cleanButton);
+      actionGroup.appendChild(cleanButton);
+      actionGroup.appendChild(
+        ctx.make('div', {
+          className: ctx.cls('hint'),
+          text:
+            'Max loot and max experience limits are read from the battle page immediately before attacking. ' +
+            'Use the arrow buttons to change the attack order on touch devices, or drag rows on desktop.',
+        }),
+      );
+      ctx.container.appendChild(actionGroup);
+
+      const list = ctx.make('div', { className: ctx.cls('setting-list') });
+      const cards = new Map();
+      const controls = new Map();
+      let draggedId = '';
+
+      function persistOrder(nextOrder) {
+        ctx.settings = ctx.updateSettings((settings) => {
+          settings.order = nextOrder;
+        });
+        renderOrder();
+      }
+
+      function moveBy(monsterId, offset) {
+        const order = [...ctx.settings.order];
+        const index = order.indexOf(monsterId);
+        const nextIndex = index + offset;
+        if (index < 0 || nextIndex < 0 || nextIndex >= order.length) return;
+        [order[index], order[nextIndex]] = [order[nextIndex], order[index]];
+        persistOrder(order);
+      }
+
+      function moveBefore(sourceId, targetId) {
+        if (sourceId === targetId || !MONSTER_ID_SET.has(sourceId) || !MONSTER_ID_SET.has(targetId)) return;
+        const order = ctx.settings.order.filter((id) => id !== sourceId);
+        const targetIndex = order.indexOf(targetId);
+        if (targetIndex < 0) return;
+        order.splice(targetIndex, 0, sourceId);
+        persistOrder(order);
+      }
+
+      function updateTarget(targetKey, mutator) {
+        ctx.settings = ctx.updateSettings((settings) => {
+          const target = targetKey === SHADOWBRIDGE_BOSS_ROOM.id ? settings.bossRoom : settings.monsters[targetKey];
+          mutator(target);
+        });
+        return targetKey === SHADOWBRIDGE_BOSS_ROOM.id
+          ? ctx.settings.bossRoom
+          : ctx.settings.monsters[targetKey];
+      }
+
+      function createTargetCard(definition, { boss = false, reorderable = false } = {}) {
+        const targetKey = definition.id;
+        const target = boss ? ctx.settings.bossRoom : ctx.settings.monsters[targetKey];
+        const modes = boss ? BOSS_MODES : NORMAL_MODES;
+        const card = ctx.make('div', {
+          id: `${ctx.idPrefix}-target-${targetKey}`,
+          className: ctx.cls('setting'),
+        });
+        card.setAttribute?.('data-target-id', targetKey);
+
+        const header = ctx.make('div');
+        if (header.style) {
+          header.style.display = 'flex';
+          header.style.alignItems = 'center';
+          header.style.justifyContent = 'space-between';
+          header.style.gap = '8px';
+        }
+        header.appendChild(ctx.make('div', { className: ctx.cls('setting-label'), text: definition.name }));
+
+        let upButton = null;
+        let downButton = null;
+        if (reorderable) {
+          const orderButtons = ctx.make('div');
+          if (orderButtons.style) {
+            orderButtons.style.display = 'flex';
+            orderButtons.style.gap = '6px';
+          }
+          upButton = ctx.make('button', {
+            id: `${ctx.idPrefix}-target-${targetKey}-up`,
+            className: ctx.cls('icon-button'),
+            type: 'button',
+            title: `Move ${definition.name} up`,
+            text: '↑',
+          });
+          downButton = ctx.make('button', {
+            id: `${ctx.idPrefix}-target-${targetKey}-down`,
+            className: ctx.cls('icon-button'),
+            type: 'button',
+            title: `Move ${definition.name} down`,
+            text: '↓',
+          });
+          upButton.setAttribute?.('aria-label', `Move ${definition.name} up`);
+          downButton.setAttribute?.('aria-label', `Move ${definition.name} down`);
+          setTouchSize(upButton, true);
+          setTouchSize(downButton, true);
+          upButton.addEventListener('click', () => moveBy(targetKey, -1));
+          downButton.addEventListener('click', () => moveBy(targetKey, 1));
+          orderButtons.appendChild(upButton);
+          orderButtons.appendChild(downButton);
+          header.appendChild(orderButtons);
+
+          card.draggable = true;
+          card.title = 'Drag to change attack order';
+          card.addEventListener('dragstart', (event) => {
+            draggedId = targetKey;
+            event.dataTransfer?.setData?.('text/plain', targetKey);
+            if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
+          });
+          card.addEventListener('dragover', (event) => {
+            if (draggedId && draggedId !== targetKey) event.preventDefault?.();
+          });
+          card.addEventListener('drop', (event) => {
+            event.preventDefault?.();
+            const sourceId = event.dataTransfer?.getData?.('text/plain') || draggedId;
+            moveBefore(sourceId, targetKey);
+            draggedId = '';
+          });
+          card.addEventListener('dragend', () => {
+            draggedId = '';
+          });
+        }
+        card.appendChild(header);
+
+        const enabledLabel = ctx.make('label', { className: ctx.cls('check') });
+        const enabledInput = ctx.make('input', {
+          id: `${ctx.idPrefix}-target-${targetKey}-enabled`,
+          type: 'checkbox',
+        });
+        enabledInput.checked = target.enabled;
+        setTouchSize(enabledLabel);
+        enabledInput.addEventListener('change', () => {
+          updateTarget(targetKey, (settings) => {
+            settings.enabled = enabledInput.checked;
+          });
+        });
+        enabledLabel.appendChild(enabledInput);
+        enabledLabel.appendChild(ctx.make('span', { text: boss ? 'Attack boss room' : 'Attack this monster' }));
+        card.appendChild(enabledLabel);
+
+        const modeLabel = ctx.make('label', { text: 'Damage mode' });
+        const modeId = `${ctx.idPrefix}-target-${targetKey}-mode`;
+        modeLabel.setAttribute?.('for', modeId);
+        const modeSelect = ctx.make('select', { id: modeId, className: ctx.cls('select') });
+        for (const mode of modes) {
+          const option = ctx.make('option', { text: mode.label });
+          option.value = mode.id;
+          modeSelect.appendChild(option);
+        }
+        modeSelect.value = target.mode;
+        setTouchSize(modeSelect);
+        card.appendChild(modeLabel);
+        card.appendChild(modeSelect);
+
+        const damageGroup = ctx.make('div');
+        const damageLabel = ctx.make('label', { text: 'Custom damage target' });
+        const damageId = `${ctx.idPrefix}-target-${targetKey}-damage`;
+        damageLabel.setAttribute?.('for', damageId);
+        const damageInput = ctx.make('input', {
+          id: damageId,
+          className: ctx.cls('input'),
+          type: 'text',
+        });
+        damageInput.value = target.damage;
+        damageInput.placeholder = 'e.g. 3m';
+        damageInput.inputMode = 'decimal';
+        damageInput.autocomplete = 'off';
+        damageGroup.hidden = target.mode !== 'custom';
+        damageGroup.appendChild(damageLabel);
+        damageGroup.appendChild(damageInput);
+        card.appendChild(damageGroup);
+
+        modeSelect.addEventListener('change', () => {
+          const next = updateTarget(targetKey, (settings) => {
+            settings.mode = modeSelect.value;
+          });
+          modeSelect.value = next.mode;
+          damageGroup.hidden = next.mode !== 'custom';
+        });
+        damageInput.addEventListener('change', () => {
+          const next = updateTarget(targetKey, (settings) => {
+            settings.damage = damageInput.value;
+          });
+          damageInput.value = next.damage;
+        });
+
+        controls.set(targetKey, {
+          enabledInput,
+          modeSelect,
+          damageInput,
+          damageGroup,
+          upButton,
+          downButton,
+        });
+        return card;
+      }
+
+      for (const monster of SHADOWBRIDGE_MONSTERS) {
+        cards.set(monster.id, createTargetCard(monster, { reorderable: true }));
+      }
+      ctx.container.appendChild(list);
+
+      ctx.addSectionTitle('Boss room');
+      const bossCard = createTargetCard(SHADOWBRIDGE_BOSS_ROOM, { boss: true });
+      bossCard.appendChild(
+        ctx.make('div', {
+          className: ctx.cls('hint'),
+          text:
+            'The boss is discovered from the unlocked Boss Room; its loot and experience limits are not stored ' +
+            'as fixed values.',
+        }),
+      );
+      ctx.container.appendChild(bossCard);
+
+      function renderOrder() {
+        ctx.settings.order.forEach((id) => list.appendChild(cards.get(id)));
+        ctx.settings.order.forEach((id, index) => {
+          const control = controls.get(id);
+          if (control?.upButton) control.upButton.disabled = index === 0;
+          if (control?.downButton) control.downButton.disabled = index === ctx.settings.order.length - 1;
+        });
+      }
+
+      function syncControls() {
+        for (const monster of SHADOWBRIDGE_MONSTERS) {
+          const target = ctx.settings.monsters[monster.id];
+          const control = controls.get(monster.id);
+          control.enabledInput.checked = target.enabled;
+          control.modeSelect.value = target.mode;
+          control.damageInput.value = target.damage;
+          control.damageGroup.hidden = target.mode !== 'custom';
+        }
+        const boss = controls.get(SHADOWBRIDGE_BOSS_ROOM.id);
+        boss.enabledInput.checked = ctx.settings.bossRoom.enabled;
+        boss.modeSelect.value = ctx.settings.bossRoom.mode;
+        boss.damageInput.value = ctx.settings.bossRoom.damage;
+        boss.damageGroup.hidden = ctx.settings.bossRoom.mode !== 'custom';
+        renderOrder();
+      }
+
+      cleanButton.addEventListener('click', () => {
+        ctx.settings = ctx.updateSettings((settings) => {
+          Object.assign(settings, cleanDungeonSettings(settings));
+        });
+        syncControls();
+      });
+
+      renderOrder();
+    }
+
+    module.exports = Object.freeze({
+      id: 'shadowbridge',
+      label: 'Shadowbridge Warrens',
+      path: '/guild_dungeon.php?veyra_route=shadowbridge',
+      defaultEnabled: false,
+      visitPathnames: Object.freeze([
+        '/guild_dungeon_instance.php',
+        '/guild_dungeon_location.php',
+        '/battle.php',
+      ]),
+      defaultLoopMinutes: 30,
+      maxVisitMs: 60 * 60_000,
+      initialDelayMs: 10 * 60_000,
+      SHADOWBRIDGE_BOSS_ROOM,
+      SHADOWBRIDGE_MONSTERS,
+      SHADOWBRIDGE_SKILLS,
+      cleanDungeonSettings,
+
+      matchesUrl(url) {
+        return (
+          /\/guild_dungeon\.php\/?$/i.test(url.pathname) &&
+          url.searchParams.get('veyra_route') === 'shadowbridge'
+        );
+      },
+
+      createDefaultSettings() {
+        return normalizeSettings(null);
+      },
+
+      normalizeSettings,
+      renderSettings,
     });
   },
   "routes/wave3.js": function (module, exports, require) {
@@ -12152,7 +21710,10 @@
 
     function normalizeRouteConfig(route, savedRoute) {
       const routeConfig = {
-        enabled: savedRoute?.enabled !== false,
+        enabled:
+          typeof savedRoute?.enabled === 'boolean'
+            ? savedRoute.enabled
+            : route.defaultEnabled !== false,
         loopMinutes: normalizeLoopMinutes(savedRoute?.loopMinutes, route.defaultLoopMinutes),
         potions: normalizePotionSettings(savedRoute?.potions, createDefaultPotionSettings()),
         settings: route.normalizeSettings ? route.normalizeSettings(savedRoute?.settings) : {},
@@ -12314,8 +21875,8 @@
         return next;
       }
 
-      function clearActiveVisit(runtime, outcome, config, now = Date.now()) {
-        const next = saveRuntime(completeRuntimeVisit(runtime, outcome, now, config), now);
+      function clearActiveVisit(runtime, outcome, config, now = Date.now(), hint = null) {
+        const next = saveRuntime(completeRuntimeVisit(runtime, outcome, now, config, hint), now);
         store.remove(COMMAND_KEY);
         return next;
       }
@@ -12444,10 +22005,11 @@
       const requestVisitDrain = (visit) => writeCommandPhase(visit, 'draining');
       const ensureVisitRunningCommand = (visit) => writeCommandPhase(visit, 'running');
 
-      function finishVisit(runtime, config, outcome, now) {
+      function finishVisit(runtime, config, outcome, now, hint = null) {
         const routeLabel = label(runtime.activeVisit.taskId);
-        clearActiveVisit(runtime, outcome, config, now);
-        setStatus(outcome === 'done' ? `${routeLabel} finished.` : `${routeLabel} stopped with an error.`);
+        clearActiveVisit(runtime, outcome, config, now, hint);
+        if (hint?.note && finiteTimestamp(hint.retryAt, 0) > now) setStatus(`${routeLabel}: ${hint.note}.`);
+        else setStatus(outcome === 'done' ? `${routeLabel} finished.` : `${routeLabel} stopped with an error.`);
         navigateHome(config);
       }
 
@@ -12580,7 +22142,10 @@
           workerStatus.safeToLeave === true &&
           (workerStatus.state === 'done' || workerStatus.state === 'error')
         ) {
-          finishVisit(runtime, config, workerStatus.state, now);
+          finishVisit(runtime, config, workerStatus.state, now, {
+            retryAt: workerStatus.retryAt,
+            note: workerStatus.note,
+          });
           return;
         }
 
@@ -12590,6 +22155,20 @@
             finishVisit(runtime, config, outcomeForSettledStatus(workerStatus), now);
             return;
           }
+
+          // Only a live unsafe/busy worker can justify waiting past the visit
+          // deadline. A missing or stale heartbeat cannot acknowledge the drain
+          // request and would otherwise strand the scheduler indefinitely.
+          const hasFreshUnsafeWorker =
+            isFreshWorkerStatus(workerStatus, now) &&
+            (workerStatus.safeToLeave !== true ||
+              workerStatus.state === 'busy' ||
+              workerStatus.state === 'working');
+          if (!hasFreshUnsafeWorker) {
+            finishVisit(runtime, config, 'error', now);
+            return;
+          }
+
           setStatus(`Time limit for ${label(visit.taskId)}; waiting for a safe handover …`);
           return;
         }
@@ -12703,6 +22282,7 @@
     module.exports = {
       LEASE_KEY,
       POLL_INTERVAL_MS,
+      TAB_KEY,
       createSchedulerEngine,
     };
   },
@@ -12761,9 +22341,21 @@
       return {
         version: PROTOCOL_VERSION,
         nextRunAt,
+        notes: {},
         activeVisit: null,
         lastResult: null,
       };
+    }
+
+    const MAX_RETRY_DELAY_MS = 24 * 60 * 60_000;
+
+    function normalizeNotes(value) {
+      const notes = {};
+      for (const route of ROUTE_LIST) {
+        const note = String(value?.[route.id] || '').slice(0, 60);
+        if (note) notes[route.id] = note;
+      }
+      return notes;
     }
 
     function normalizeRuntime(value, now = Date.now()) {
@@ -12787,6 +22379,7 @@
       return {
         version: PROTOCOL_VERSION,
         nextRunAt,
+        notes: normalizeNotes(value.notes),
         activeVisit: normalizeVisit(value.activeVisit),
         lastResult,
       };
@@ -12835,12 +22428,22 @@
       );
     }
 
-    function completeRuntimeVisit(runtime, outcome, now = Date.now(), config = null) {
+    // hint: { retryAt, note } from the worker. A future retryAt replaces the loop
+    // length for this one countdown, e.g. "come back when stamina has refilled".
+    function completeRuntimeVisit(runtime, outcome, now = Date.now(), config = null, hint = null) {
       const visit = normalizeVisit(runtime?.activeVisit);
       const next = normalizeRuntime(runtime, now);
       if (!visit) return next;
 
-      next.nextRunAt[visit.taskId] = now + loopIntervalMs(normalizeConfig(config), visit.taskId);
+      const retryAt = finiteTimestamp(hint?.retryAt, 0);
+      if (retryAt > now) {
+        next.nextRunAt[visit.taskId] = Math.min(retryAt, now + MAX_RETRY_DELAY_MS);
+        next.notes[visit.taskId] = String(hint?.note || '').slice(0, 60);
+        if (!next.notes[visit.taskId]) delete next.notes[visit.taskId];
+      } else {
+        next.nextRunAt[visit.taskId] = now + loopIntervalMs(normalizeConfig(config), visit.taskId);
+        delete next.notes[visit.taskId];
+      }
       next.activeVisit = null;
       next.lastResult = {
         taskId: visit.taskId,
@@ -13011,7 +22614,9 @@
       if (runtime?.activeVisit?.taskId === routeId) {
         return runtime.activeVisit.phase === 'running' ? 'Running now' : 'Preparing';
       }
-      return formatCountdown(runtime?.nextRunAt?.[routeId], now);
+      const countdown = formatCountdown(runtime?.nextRunAt?.[routeId], now);
+      const note = runtime?.notes?.[routeId];
+      return note ? `${note} · ${countdown}` : countdown;
     }
 
     // featureGroups: [{ title, settings: [definition] }] from features/runner.js

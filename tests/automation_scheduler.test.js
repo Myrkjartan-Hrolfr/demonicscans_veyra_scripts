@@ -73,10 +73,22 @@ test('default config gives every page a loop length and its own potion selection
   assert.equal(config.homeRouteId, 'pvp');
   for (const route of Object.values(ROUTES)) {
     const routeConfig = config.routes[route.id];
-    assert.equal(routeConfig.enabled, true);
+    assert.equal(routeConfig.enabled, route.defaultEnabled !== false);
     assert.equal(routeConfig.loopMinutes, route.defaultLoopMinutes);
     assert.deepEqual(routeConfig.potions, { stamina: [], heal: [] });
   }
+});
+
+test('new mutating routes stay disabled when an older config has no entry for them', () => {
+  const config = normalizeConfig({
+    version: 1,
+    enabled: true,
+    homeRouteId: 'pvp',
+    routes: { pvp: { enabled: true } },
+  });
+  assert.equal(config.routes.adventurers.enabled, false);
+  assert.equal(config.routes.shadowbridge.enabled, false);
+  assert.equal(config.routes.crucible.enabled, false);
 });
 
 test('potion selections are stored per page and stay independent', () => {
@@ -146,6 +158,8 @@ test('routes are recognised from URLs', () => {
   assert.equal(routeIdForUrl('/active_wave.php?gate=5&wave=9'), 'olympus');
   assert.equal(routeIdForUrl('/active_wave.php?gate=5&wave=17'), 'olympus');
   assert.equal(routeIdForUrl('/active_wave.php?gate=5&wave=18'), null);
+  assert.equal(routeIdForUrl('/adventurers_guild.php?veyra_route=adventurers'), 'adventurers');
+  assert.equal(routeIdForUrl('/adventurers_guild.php'), null);
   assert.equal(routeIdForUrl('/active_wave.php?gate=3&wave=5'), null);
   assert.equal(routeIdForUrl('/game_dash.php'), null);
 });
@@ -277,6 +291,8 @@ test('the bundle builds and evaluates without errors', () => {
   assert.ok(modules.includes('main.js'));
   const source = fs.readFileSync(outFile, 'utf8');
   assert.match(source, /^\/\/ ==UserScript==/);
+  assert.match(source, /Power Target List/);
+  assert.match(source, /Status Potion Auto Use/);
   // Without window/document the entry module must do nothing.
   vm.runInNewContext(source, { console, URL, URLSearchParams }, { filename: path.basename(outFile) });
 });

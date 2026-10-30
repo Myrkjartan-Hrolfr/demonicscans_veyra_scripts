@@ -130,7 +130,7 @@ function parseLeaderboard(doc) {
       pid,
       name: text(link) || `#${pid}`,
       avatar: attr(row.querySelector?.('.lb-avatar'), 'src') || '',
-      damage: parseGameNumber(text(row.querySelector?.('.lb-dmg')).replace(/[^\d,]/g, '')) ?? 0,
+      damage: parseAmount(text(row.querySelector?.('.lb-dmg'))) ?? 0,
     });
   }
   return rows;

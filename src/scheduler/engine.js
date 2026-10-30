@@ -381,6 +381,20 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
         finishVisit(runtime, config, outcomeForSettledStatus(workerStatus), now);
         return;
       }
+
+      // Only a live unsafe/busy worker can justify waiting past the visit
+      // deadline. A missing or stale heartbeat cannot acknowledge the drain
+      // request and would otherwise strand the scheduler indefinitely.
+      const hasFreshUnsafeWorker =
+        isFreshWorkerStatus(workerStatus, now) &&
+        (workerStatus.safeToLeave !== true ||
+          workerStatus.state === 'busy' ||
+          workerStatus.state === 'working');
+      if (!hasFreshUnsafeWorker) {
+        finishVisit(runtime, config, 'error', now);
+        return;
+      }
+
       setStatus(`Time limit for ${label(visit.taskId)}; waiting for a safe handover …`);
       return;
     }
@@ -494,5 +508,6 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
 module.exports = {
   LEASE_KEY,
   POLL_INTERVAL_MS,
+  TAB_KEY,
   createSchedulerEngine,
 };

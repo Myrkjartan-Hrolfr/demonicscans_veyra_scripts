@@ -1041,6 +1041,7 @@ test('a boss route takes over its active lease after mobile navigation loses ses
   };
   const storage = storageWithBossState(
     bossState({
+      visitId: 'mobile-visit',
       ownerId: 'owner-from-pvp-page',
       leaseUntil: FIXED_NOW + BOSS_CONFIG.leaseMs,
     }),
@@ -1054,7 +1055,7 @@ test('a boss route takes over its active lease after mobile navigation loses ses
   const mobileSessionStorage = createStorage();
   const { timers } = runUserscript({
     document,
-    href: 'https://demonicscans.org/active_wave.php?gate=3&wave=8',
+    href: 'https://demonicscans.org/active_wave.php?gate=3&wave=8&veyra_visit=mobile-visit',
     localStorage: storage,
     sessionStorage: mobileSessionStorage,
   });

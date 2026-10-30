@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const GENERAL = require('../src/features/general');
+const autoBattleExtras = require('../src/features/general/auto-battle-extras');
 const navigation = require('../src/features/general/custom-navigation');
 const attackButtons = require('../src/features/general/better-attack-buttons');
 const asterion = require('../src/features/general/asterion-detect');
@@ -65,6 +66,7 @@ test('general features keep veyra-hud keys and defaults', () => {
   assert.equal(defaults['ui-improvements:enableBuyAllButtons'], true);
   assert.equal(defaults['veyra:shops:damonBulkBuy'], true);
   assert.equal(GENERAL[0].id, 'adventurers-guild-layout');
+  assert.equal(GENERAL[1].id, 'auto-battle-extras');
 });
 
 test('features only match their pages', () => {
@@ -78,6 +80,8 @@ test('features only match their pages', () => {
   assert.equal(damon.matches(url('/olympus.php')), true);
   assert.equal(asterion.matches(url('/pets.php')), true);
   assert.equal(asterion.matches(url('/pets_shop.php')), false);
+  assert.equal(autoBattleExtras.matches(url('/occurrence_castle.php?floor=3')), true);
+  assert.equal(autoBattleExtras.matches(url('/game_dash.php')), false);
 });
 
 test('every general feature tolerates a page without its elements', async () => {

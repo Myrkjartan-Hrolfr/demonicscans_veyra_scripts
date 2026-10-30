@@ -10,9 +10,12 @@
 
 const olympus = require('./olympus');
 const pvp = require('./pvp');
+const adventurers = require('./adventurers');
+const crucible = require('./crucible');
+const shadowbridge = require('./shadowbridge');
 const wave3 = require('./wave3');
 
-const ROUTE_LIST = Object.freeze([pvp, wave3, olympus]);
+const ROUTE_LIST = Object.freeze([pvp, wave3, olympus, adventurers, shadowbridge, crucible]);
 const ROUTES = Object.freeze(Object.fromEntries(ROUTE_LIST.map((route) => [route.id, route])));
 const ROUTE_IDS = Object.freeze(ROUTE_LIST.map((route) => route.id));
 

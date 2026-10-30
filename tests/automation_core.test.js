@@ -115,6 +115,32 @@ test('postForm gives up after maxRetries and returns the last response', async (
   assert.equal(result.ok, false);
 });
 
+test('postForm rechecks permission before a rate-limit retry', async () => {
+  let allowed = true;
+  let fetches = 0;
+  const attempts = [];
+
+  await assert.rejects(
+    postForm('damage.php', {}, {
+      fetchImpl: async () => {
+        fetches += 1;
+        return fakeResponse(429, 'slow down');
+      },
+      sleepImpl: async () => {
+        allowed = false;
+      },
+      beforeAttempt: async ({ attempt }) => {
+        attempts.push(attempt);
+        if (!allowed) throw new Error('scheduler visit is draining');
+      },
+    }),
+    /draining/,
+  );
+
+  assert.equal(fetches, 1);
+  assert.deepEqual(attempts, [0, 1]);
+});
+
 test('potion settings keep only known items of the right type in priority order', () => {
   assert.deepEqual(normalizePotionSettings({ stamina: [35, 30, 108, 999, '251'], heal: [108, 30] }), {
     stamina: [30, 251, 35],

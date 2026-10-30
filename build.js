@@ -9,6 +9,8 @@ const path = require('node:path');
 const ROOT = __dirname;
 const SRC_DIR = path.join(ROOT, 'src');
 const HEADER_FILE = path.join(SRC_DIR, 'userscript.header');
+const AUTO_BATTLE_EXTRAS_FILE = path.join(ROOT, 'Auto Battle Extras.user.js');
+const AUTO_BATTLE_EXTRAS_MODULE = 'features/general/auto-battle-extras.js';
 const ENTRY = 'main.js';
 const OUT_FILE = path.join(ROOT, 'dist', 'veyra_automation.user.js');
 
@@ -34,6 +36,33 @@ function indent(text, prefix) {
     .split('\n')
     .map((line) => (line ? prefix + line : line))
     .join('\n');
+}
+
+function autoBattleExtrasModuleSource() {
+  const legacy = fs
+    .readFileSync(AUTO_BATTLE_EXTRAS_FILE, 'utf8')
+    .replace(/^\s*\/\/ ==UserScript==[\s\S]*?\/\/ ==\/UserScript==\s*/, '')
+    .trim();
+  return `'use strict';
+
+module.exports = Object.freeze({
+  id: 'auto-battle-extras',
+  group: 'Castle event',
+  settings: [],
+
+  matches(url) {
+    return /\\/occurrence_castle\\.php\\/?$/i.test(url.pathname);
+  },
+
+  run(ctx) {
+    const win = ctx.win;
+    if (!win || win.__veyraAutoBattleExtrasLoaded) return;
+    win.__veyraAutoBattleExtrasLoaded = true;
+    const window = win;
+    const document = ctx.doc;
+${indent(legacy, '    ')}
+  },
+});`;
 }
 
 // The runtime resolves relative require() calls against the requiring module,
@@ -74,7 +103,10 @@ function build() {
 
   const moduleSources = files.map((file) => {
     const id = moduleId(file);
-    const source = fs.readFileSync(file, 'utf8').trimEnd();
+    const source =
+      id === AUTO_BATTLE_EXTRAS_MODULE
+        ? autoBattleExtrasModuleSource()
+        : fs.readFileSync(file, 'utf8').trimEnd();
     return `  ${JSON.stringify(id)}: function (module, exports, require) {\n${indent(source, '    ')}\n  },`;
   });
 

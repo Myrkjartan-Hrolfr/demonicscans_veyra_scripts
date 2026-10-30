@@ -16,7 +16,10 @@ function normalizeLoopMinutes(value, fallback) {
 
 function normalizeRouteConfig(route, savedRoute) {
   const routeConfig = {
-    enabled: savedRoute?.enabled !== false,
+    enabled:
+      typeof savedRoute?.enabled === 'boolean'
+        ? savedRoute.enabled
+        : route.defaultEnabled !== false,
     loopMinutes: normalizeLoopMinutes(savedRoute?.loopMinutes, route.defaultLoopMinutes),
     potions: normalizePotionSettings(savedRoute?.potions, createDefaultPotionSettings()),
     settings: route.normalizeSettings ? route.normalizeSettings(savedRoute?.settings) : {},
