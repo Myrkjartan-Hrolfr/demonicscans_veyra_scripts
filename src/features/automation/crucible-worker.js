@@ -719,14 +719,13 @@ function createCrucibleWorker({
   async function joinArmyIfNeeded(visitId, battleId, state) {
     let summary = logic.armySummary(state);
     if (summary.own.length > 0) return state;
-    if (summary.viewer.has_roster === false) {
+    if (summary.viewer.can_join !== true && summary.viewer.has_roster === false) {
       // The initial live-page state can have been rendered before a freshly
       // saved formation became visible to the battle. Refresh once before
       // treating the server's roster flag as final.
       state = await armyStateAction(visitId, 'get_state', { battleId });
       summary = logic.armySummary(state);
       if (summary.own.length > 0) return state;
-      if (summary.viewer.has_roster === false) throw new Error('No saved Shadow Army formation is available.');
     }
     if (summary.viewer.can_join !== true) {
       // A captain that already retreated may no longer be present in the
@@ -734,6 +733,9 @@ function createCrucibleWorker({
       // is a waiting state, not evidence that a second join is safe.
       return null;
     }
+    // The live page itself exposes the Join button from can_join alone. Some
+    // real battle states report has_roster=false and can_join=true together;
+    // in that state the server still expects a join_battle request.
     setWorkingMessage(visitId, 'Joining the live fight with the saved Shadow Army formation.');
     state = await armyStateAction(visitId, 'join_battle', { battleId });
     summary = logic.armySummary(state);

@@ -520,10 +520,17 @@ function formationDocument({ activeShadowIds = ['5', '3'], locked = false } = {}
   })};`);
 }
 
-function armyState({ joined = false, enemyHp = 200, retreated = false, turnsActed = 0 } = {}) {
+function armyState({
+  joined = false,
+  enemyHp = 200,
+  retreated = false,
+  turnsActed = 0,
+  hasRoster = true,
+  canJoin = null,
+} = {}) {
   return {
     battle: { id: 51365, status: 'ACTIVE', winner_side: '' },
-    viewer: { has_roster: true, can_join: !joined },
+    viewer: { has_roster: hasRoster, can_join: canJoin === null ? !joined : canJoin },
     captains: [
       ...(joined
         ? [{ id: 101, source_shadow_id: 5, display_name: 'Drakzareth The Tyrant', side: 'ALLY', is_mine: true, is_dead: false, retreat_requested: retreated, turns_acted: turnsActed, squad_current_health: 100, squad_max_health: 100 }]
@@ -544,7 +551,7 @@ test('Army heals, joins, verifies one minimal hit and retreats the assigned capt
     `let fightCards = ${JSON.stringify([{ match_no: 1, battle_id: 0, status: 'open' }])}; let activeMatchNo = 0;`,
   );
   const live = scriptDocument(
-    `const battleId = 51365; const initialState = ${JSON.stringify(armyState())};`,
+    `const battleId = 51365; const initialState = ${JSON.stringify(armyState({ hasRoster: false, canJoin: true }))};`,
   );
   let healReads = 0;
   const env = createEnvironment({
