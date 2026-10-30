@@ -87,7 +87,10 @@ function scriptTexts(doc) {
 
 function assignmentStart(source, name) {
   if (!/^[A-Za-z_$][\w$]*$/.test(String(name || ''))) return -1;
-  const pattern = new RegExp(`\\b(?:const|let|var)\\s+${name}\\s*=\\s*`, 'g');
+  const pattern = new RegExp(
+    `(?:\\b(?:const|let|var)\\s+|\\bwindow\\s*\\.\\s*)${name}\\s*=\\s*`,
+    'g',
+  );
   const match = pattern.exec(source);
   return match ? pattern.lastIndex : -1;
 }
@@ -122,6 +125,59 @@ function balancedJsonSlice(source, start) {
   return '';
 }
 
+function quoteBareObjectKeys(source) {
+  let result = '';
+  let quote = '';
+  let escaped = false;
+  for (let index = 0; index < source.length;) {
+    const character = source[index];
+    if (quote) {
+      result += character;
+      index += 1;
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === quote) quote = '';
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      result += character;
+      index += 1;
+      continue;
+    }
+    if (/[A-Za-z_$]/.test(character)) {
+      let end = index + 1;
+      while (/[\w$]/.test(source[end] || '')) end += 1;
+      let next = end;
+      while (/\s/.test(source[next] || '')) next += 1;
+      let previous = index - 1;
+      while (/\s/.test(source[previous] || '')) previous -= 1;
+      const identifier = source.slice(index, end);
+      if (source[next] === ':' && (source[previous] === '{' || source[previous] === ',')) {
+        result += `"${identifier}"`;
+      } else {
+        result += identifier;
+      }
+      index = end;
+      continue;
+    }
+    result += character;
+    index += 1;
+  }
+  return result;
+}
+
+function parseObjectLiteral(slice) {
+  try {
+    return JSON.parse(slice);
+  } catch {
+    // PHP-rendered page data uses a JSON-compatible JavaScript object literal
+    // with bare property names. Quote only keys found outside string values;
+    // never execute the page source.
+    return JSON.parse(quoteBareObjectKeys(slice));
+  }
+}
+
 function extractAssignedJson(doc, name) {
   for (const source of scriptTexts(doc)) {
     const start = assignmentStart(source, name);
@@ -129,7 +185,7 @@ function extractAssignedJson(doc, name) {
     const slice = balancedJsonSlice(source, start);
     if (!slice) continue;
     try {
-      const value = JSON.parse(slice);
+      const value = parseObjectLiteral(slice);
       if (value && typeof value === 'object') return value;
     } catch {
       // A malformed or non-JSON assignment is not safe to execute or coerce.
@@ -442,6 +498,52 @@ function parseOwnedArmyShadows(doc) {
   return shadows.sort((left, right) => left.name.localeCompare(right.name));
 }
 
+function parseArmyFormationPage(doc) {
+  const data = extractAssignedJson(doc, 'FormationData');
+  if (!data || Array.isArray(data) || typeof data !== 'object') {
+    return {
+      found: false,
+      locked: false,
+      lockedMessage: '',
+      captainLimit: 0,
+      captains: [],
+    };
+  }
+  const captainLimit = Number(data.captainLimit);
+  const captains = data.captains && !Array.isArray(data.captains) && typeof data.captains === 'object'
+    ? Object.values(data.captains).map((captain) => ({
+      inventoryId: cleanInteger(captain?.inv_id),
+      shadowId: cleanInteger(captain?.shadow_id),
+      name: String(captain?.title || '').replace(/\s+/g, ' ').trim(),
+      inFormation: captain?.in_formation === true,
+      dead: captain?.dead === true,
+    })).filter((captain) => captain.inventoryId && captain.shadowId && captain.name)
+    : [];
+  return {
+    found: true,
+    locked: data.formationLocked === true,
+    lockedMessage: String(data.formationLockedMessage || '').replace(/\s+/g, ' ').trim(),
+    captainLimit: Number.isInteger(captainLimit) && captainLimit > 0 ? captainLimit : 1,
+    captains,
+  };
+}
+
+function buildArmyFormationPayload(action, fields = {}) {
+  if (action !== 'set_captain') return null;
+  const inventoryId = cleanInteger(fields.inventoryId);
+  if (!inventoryId) return null;
+  return { action, unit_inv_id: inventoryId };
+}
+
+function parseArmyFormationActionResponse(response) {
+  const json = wrappedJson(response);
+  const transportOk = response?.ok === undefined ? true : response.ok === true;
+  return {
+    ok: Boolean(transportOk && json?.ok === true),
+    message: responseMessage(response),
+  };
+}
+
 function buildArmyLivePayload(action, fields = {}) {
   const battleId = cleanInteger(fields.battleId);
   if (!battleId || !['get_state', 'join_battle', 'assign_target', 'retreat_captain'].includes(action)) return null;
@@ -594,6 +696,7 @@ module.exports = {
   actionableNodes,
   armySummary,
   buildArmyEnterPayload,
+  buildArmyFormationPayload,
   buildArmyLivePayload,
   buildCubeNodeEnterPayload,
   buildPvpClaimPayload,
@@ -606,6 +709,8 @@ module.exports = {
   nodeForLocationId,
   parseArmyActionResponse,
   parseArmyEnterResponse,
+  parseArmyFormationActionResponse,
+  parseArmyFormationPage,
   parseArmyHealAvailability,
   parseArmyLivePage,
   parseArmyNodePage,

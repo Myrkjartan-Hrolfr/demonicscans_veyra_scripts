@@ -13,6 +13,7 @@ const {
   DAMAGE_URL,
   MINIMAL_ARMY_CONTRIBUTIONS_KEY,
   PVP_ACTION_URL,
+  SHADOW_ARMY_FORMATION_URL,
   SHADOW_ARMY_URL,
   createCrucibleWorker,
   readStamina,
@@ -504,6 +505,21 @@ function ownedArmyDocumentWithoutHealControl() {
   );
 }
 
+function formationDocument({ activeShadowIds = ['5', '3'], locked = false } = {}) {
+  const active = new Set(activeShadowIds.map(String));
+  return scriptDocument(`window.FormationData = ${JSON.stringify({
+    ajaxUrl: '/shadow_army_formation.php',
+    formationLocked: locked,
+    formationLockedMessage: locked ? 'Formation locked by an active roster.' : '',
+    captainLimit: 4,
+    captains: {
+      5588: { inv_id: 5588, shadow_id: 5, title: 'Drakzareth The Tyrant', in_formation: active.has('5'), dead: false },
+      5406: { inv_id: 5406, shadow_id: 3, title: 'Vessir the Sunfang Duelist', in_formation: active.has('3'), dead: false },
+    },
+    normals: {},
+  })};`);
+}
+
 function armyState({ joined = false, enemyHp = 200, retreated = false, turnsActed = 0 } = {}) {
   return {
     battle: { id: 51365, status: 'ACTIVE', winner_side: '' },
@@ -540,6 +556,7 @@ test('Army heals, joins, verifies one minimal hit and retreats the assigned capt
         healReads += 1;
         return healDocument(healReads === 1);
       }
+      if (url === SHADOW_ARMY_FORMATION_URL) return formationDocument();
       if (/shadow_army_live_battle\.php/.test(url)) return live;
       throw new Error(`Unexpected GET ${url}`);
     },
@@ -615,6 +632,7 @@ test('Army joins when the real Army page omits the heal form because nothing is 
       if (/guild_dungeon_(?:enter|cube)\.php/.test(url) && !/army_enter/.test(url)) return cube;
       if (/guild_dungeon_cube_army_enter\.php/.test(url)) return armyNode;
       if (url === SHADOW_ARMY_URL) return ownedArmyDocumentWithoutHealControl();
+      if (url === SHADOW_ARMY_FORMATION_URL) return formationDocument();
       if (/shadow_army_live_battle\.php/.test(url)) return live;
       throw new Error(`Unexpected GET ${url}`);
     },
@@ -637,6 +655,72 @@ test('Army joins when the real Army page omits the heal form because nothing is 
   assert.equal(env.posts.some((entry) => entry.url === SHADOW_ARMY_URL), false);
   assert.equal(env.posts.some((entry) => entry.url === ARMY_ACTION_URL), true);
   assert.equal(env.posts.some((entry) => entry.params.action === 'assign_target'), true);
+  assert.equal(env.store.read(workerStatusKey('crucible')).state, 'done');
+});
+
+test('Army creates a missing saved formation and refreshes a stale no-roster battle state', async () => {
+  const config = disableSections(createDefaultConfig(), { army: true });
+  config.routes.crucible.settings.army.mode = 'minimal';
+  config.routes.crucible.settings.army.selectedShadowIds = ['5'];
+  const cube = cubeDocument([
+    { id: 5, key: 'veil_post', name: 'Veil Post', type: 'army', status: 'in_progress' },
+  ]);
+  const armyNode = scriptDocument(
+    `let fightCards = ${JSON.stringify([{ match_no: 1, battle_id: 51365, status: 'active' }])}; let activeMatchNo = 0;`,
+  );
+  const staleState = armyState();
+  staleState.viewer = { has_roster: false, can_join: false };
+  const live = scriptDocument(
+    `const battleId = 51365; const initialState = ${JSON.stringify(staleState)};`,
+  );
+  let formationSaved = false;
+  const env = createEnvironment({
+    config,
+    fetchDocumentImpl: async (url) => {
+      if (/guild_dungeon_(?:enter|cube)\.php/.test(url) && !/army_enter/.test(url)) return cube;
+      if (/guild_dungeon_cube_army_enter\.php/.test(url)) return armyNode;
+      if (url === SHADOW_ARMY_URL) return healDocument(false);
+      if (url === SHADOW_ARMY_FORMATION_URL) {
+        return formationDocument({ activeShadowIds: formationSaved ? ['5'] : [] });
+      }
+      if (/shadow_army_live_battle\.php/.test(url)) return live;
+      throw new Error(`Unexpected GET ${url}`);
+    },
+    postImpl: async (url, params) => {
+      if (url === SHADOW_ARMY_FORMATION_URL && params.action === 'set_captain') {
+        formationSaved = true;
+        return { ok: true, status: 200, text: '', json: { ok: true } };
+      }
+      if (url === ARMY_ACTION_URL) {
+        return { ok: true, status: 200, text: '', json: { ok: true, redirect: '/shadow_army_live_battle.php?battle_id=51365' } };
+      }
+      if (url === ARMY_LIVE_URL && params.action === 'get_state') {
+        return { ok: true, status: 200, text: '', json: { ok: true, state: armyState() } };
+      }
+      if (url === ARMY_LIVE_URL && params.action === 'join_battle') {
+        return { ok: true, status: 200, text: '', json: { ok: true, state: armyState({ joined: true }) } };
+      }
+      if (url === ARMY_LIVE_URL && params.action === 'assign_target') {
+        return { ok: true, status: 200, text: '', json: { ok: true, state: armyState({ joined: true, enemyHp: 190, turnsActed: 1 }) } };
+      }
+      if (url === ARMY_LIVE_URL && params.action === 'retreat_captain') {
+        return { ok: true, status: 200, text: '', json: { ok: true, state: armyState({ joined: true, enemyHp: 190, retreated: true, turnsActed: 1 }) } };
+      }
+      throw new Error(`Unexpected POST ${url} ${params.action || ''}`);
+    },
+  });
+
+  await env.worker.tick();
+
+  assert.deepEqual(env.posts.map((entry) => [entry.url, entry.params.action]), [
+    [SHADOW_ARMY_FORMATION_URL, 'set_captain'],
+    [ARMY_ACTION_URL, 'enter_fight'],
+    [ARMY_LIVE_URL, 'get_state'],
+    [ARMY_LIVE_URL, 'join_battle'],
+    [ARMY_LIVE_URL, 'assign_target'],
+    [ARMY_LIVE_URL, 'retreat_captain'],
+  ]);
+  assert.deepEqual(env.posts[0].params, { action: 'set_captain', unit_inv_id: '5588' });
   assert.equal(env.store.read(workerStatusKey('crucible')).state, 'done');
 });
 
@@ -669,6 +753,7 @@ test('Army retreats unselected Shadows and assigns only the selected formation c
       if (/guild_dungeon_(?:enter|cube)\.php/.test(url) && !/army_enter/.test(url)) return cube;
       if (/guild_dungeon_cube_army_enter\.php/.test(url)) return armyNode;
       if (url === SHADOW_ARMY_URL) return healDocument(false);
+      if (url === SHADOW_ARMY_FORMATION_URL) return formationDocument();
       if (/shadow_army_live_battle\.php/.test(url)) return live;
       throw new Error(`Unexpected GET ${url}`);
     },
@@ -723,6 +808,7 @@ test('Army minimal mode never retreats on another player\'s damage', async () =>
       if (/guild_dungeon_(?:enter|cube)\.php/.test(url) && !/army_enter/.test(url)) return cube;
       if (/guild_dungeon_cube_army_enter\.php/.test(url)) return armyNode;
       if (url === SHADOW_ARMY_URL) return healDocument(false);
+      if (url === SHADOW_ARMY_FORMATION_URL) return formationDocument();
       if (/shadow_army_live_battle\.php/.test(url)) return live;
       throw new Error(`Unexpected GET ${url}`);
     },

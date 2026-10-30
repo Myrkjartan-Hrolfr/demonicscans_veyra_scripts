@@ -344,3 +344,36 @@ test('discovers owned special Shadows from inert page JSON', () => {
     { id: '3', name: 'Vessir the Sunfang Duelist' },
   ]);
 });
+
+test('reads the real window.FormationData contract and builds a captain mutation', () => {
+  const doc = documentWith({
+    many: {
+      script: [element({
+        text: `window.FormationData = {
+          formationLocked: false,
+          formationLockedMessage: "Formation locked.",
+          captainLimit: 4,
+          captains: ${JSON.stringify({
+            5588: { inv_id: 5588, shadow_id: 5, title: 'Drakzareth The Tyrant', in_formation: true, dead: false },
+            5408: { inv_id: 5408, shadow_id: 4, title: 'Hrazz the Dawnflame Oathkeeper', in_formation: false, dead: false },
+          })}
+        };`,
+      })],
+    },
+  });
+  assert.deepEqual(logic.parseArmyFormationPage(doc), {
+    found: true,
+    locked: false,
+    lockedMessage: 'Formation locked.',
+    captainLimit: 4,
+    captains: [
+      { inventoryId: '5408', shadowId: '4', name: 'Hrazz the Dawnflame Oathkeeper', inFormation: false, dead: false },
+      { inventoryId: '5588', shadowId: '5', name: 'Drakzareth The Tyrant', inFormation: true, dead: false },
+    ],
+  });
+  assert.deepEqual(logic.buildArmyFormationPayload('set_captain', { inventoryId: 5408 }), {
+    action: 'set_captain',
+    unit_inv_id: '5408',
+  });
+  assert.equal(logic.parseArmyFormationActionResponse({ ok: true, json: { ok: true } }).ok, true);
+});

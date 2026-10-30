@@ -26,6 +26,7 @@ const PVP_STATE_URL = '/pvp_style_state.php';
 const ARMY_ACTION_URL = '/guild_dungeon_cube_army_action.php';
 const ARMY_LIVE_URL = '/shadow_army_live_battle.php';
 const SHADOW_ARMY_URL = '/shadow_army.php';
+const SHADOW_ARMY_FORMATION_URL = '/shadow_army_formation.php';
 const MINIMAL_ARMY_CONTRIBUTIONS_KEY = 'veyra:crucible:minimal-army-contributions:v1';
 
 const TIMING = Object.freeze({
@@ -646,6 +647,62 @@ function createCrucibleWorker({
     return true;
   }
 
+  async function ensureArmyFormation(visitId, route) {
+    const selectedIds = (route.settings.army.selectedShadowIds || []).map(String);
+    const selected = new Set(selectedIds);
+    const selectedOrder = new Map(selectedIds.map((id, index) => [id, index]));
+    if (selected.size === 0) throw new Error('Select at least one Shadow for the Crucible Army formation.');
+
+    assertCanMutate(visitId);
+    let formation = logic.parseArmyFormationPage(await fetchDocument(SHADOW_ARMY_FORMATION_URL));
+    if (!formation.found) throw new Error('The saved Shadow Army formation could not be read safely.');
+
+    const discoveries = formation.captains.map((captain) => ({ id: captain.shadowId, name: captain.name }));
+    if (discoveries.length > 0) {
+      assertCanMutate(visitId);
+      route.settings = saveShadowDiscoveries(discoveries);
+    }
+
+    const selectedReady = () => formation.captains.some(
+      (captain) => captain.inFormation && !captain.dead && selected.has(captain.shadowId),
+    );
+    if (selectedReady()) return formation;
+    if (formation.locked) {
+      throw new Error(formation.lockedMessage || 'The Shadow Army formation is locked by an active battle roster.');
+    }
+
+    const activeCount = formation.captains.filter((captain) => captain.inFormation).length;
+    const freeSlots = Math.max(0, formation.captainLimit - activeCount);
+    const candidates = formation.captains
+      .filter((captain) => selected.has(captain.shadowId) && !captain.inFormation && !captain.dead)
+      .sort((left, right) => selectedOrder.get(left.shadowId) - selectedOrder.get(right.shadowId));
+    if (freeSlots === 0) {
+      throw new Error('None of the selected Shadows is in the saved formation, and all captain slots are occupied.');
+    }
+    if (candidates.length === 0) {
+      throw new Error('No selected, living Shadow is available for the saved Army formation.');
+    }
+
+    for (const captain of candidates.slice(0, freeSlots)) {
+      const payload = logic.buildArmyFormationPayload('set_captain', { inventoryId: captain.inventoryId });
+      if (!payload) throw new Error(`Could not build a safe formation request for ${captain.name}.`);
+      assertCanMutate(visitId);
+      setWorkingMessage(visitId, `Adding ${captain.name} to the saved Shadow Army formation.`);
+      const response = await guardedPostForm(visitId, SHADOW_ARMY_FORMATION_URL, payload);
+      const result = logic.parseArmyFormationActionResponse(response);
+      if (!result.ok) {
+        throw new Error(`Adding ${captain.name} to the Army formation failed: ${result.message || 'unknown response'}`);
+      }
+    }
+
+    assertCanMutate(visitId);
+    formation = logic.parseArmyFormationPage(await fetchDocument(SHADOW_ARMY_FORMATION_URL));
+    if (!formation.found || !selectedReady()) {
+      throw new Error('The Shadow Army formation page did not confirm an available selected captain.');
+    }
+    return formation;
+  }
+
   async function armyStateAction(visitId, action, fields) {
     const payload = logic.buildArmyLivePayload(action, fields);
     if (!payload) throw new Error(`Could not build a safe Army ${action} request.`);
@@ -662,7 +719,15 @@ function createCrucibleWorker({
   async function joinArmyIfNeeded(visitId, battleId, state) {
     let summary = logic.armySummary(state);
     if (summary.own.length > 0) return state;
-    if (summary.viewer.has_roster === false) throw new Error('No saved Shadow Army formation is available.');
+    if (summary.viewer.has_roster === false) {
+      // The initial live-page state can have been rendered before a freshly
+      // saved formation became visible to the battle. Refresh once before
+      // treating the server's roster flag as final.
+      state = await armyStateAction(visitId, 'get_state', { battleId });
+      summary = logic.armySummary(state);
+      if (summary.own.length > 0) return state;
+      if (summary.viewer.has_roster === false) throw new Error('No saved Shadow Army formation is available.');
+    }
     if (summary.viewer.can_join !== true) {
       // A captain that already retreated may no longer be present in the
       // captain array while the player remains committed to this fight. That
@@ -821,9 +886,7 @@ function createCrucibleWorker({
     if (!fight) return { progressed: false, message: `${node.name} has no actionable Army fight.` };
 
     await healArmyIfAvailable(visitId, route);
-    if (route.settings.army.selectedShadowIds.length === 0) {
-      throw new Error('Select at least one Shadow for the Crucible Army formation.');
-    }
+    await ensureArmyFormation(visitId, route);
     const payload = logic.buildArmyEnterPayload({
       instanceId: cube.instanceId,
       nodeId: node.id,
@@ -1126,6 +1189,7 @@ module.exports = {
   PVP_STATE_URL,
   ROUTE_ID,
   SHADOW_ARMY_URL,
+  SHADOW_ARMY_FORMATION_URL,
   TIMING,
   VisitStop,
   createCrucibleWorker,

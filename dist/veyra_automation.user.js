@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.5.3
+// @version      0.5.4
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -3401,7 +3401,10 @@
 
     function assignmentStart(source, name) {
       if (!/^[A-Za-z_$][\w$]*$/.test(String(name || ''))) return -1;
-      const pattern = new RegExp(`\\b(?:const|let|var)\\s+${name}\\s*=\\s*`, 'g');
+      const pattern = new RegExp(
+        `(?:\\b(?:const|let|var)\\s+|\\bwindow\\s*\\.\\s*)${name}\\s*=\\s*`,
+        'g',
+      );
       const match = pattern.exec(source);
       return match ? pattern.lastIndex : -1;
     }
@@ -3436,6 +3439,59 @@
       return '';
     }
 
+    function quoteBareObjectKeys(source) {
+      let result = '';
+      let quote = '';
+      let escaped = false;
+      for (let index = 0; index < source.length;) {
+        const character = source[index];
+        if (quote) {
+          result += character;
+          index += 1;
+          if (escaped) escaped = false;
+          else if (character === '\\') escaped = true;
+          else if (character === quote) quote = '';
+          continue;
+        }
+        if (character === '"' || character === "'") {
+          quote = character;
+          result += character;
+          index += 1;
+          continue;
+        }
+        if (/[A-Za-z_$]/.test(character)) {
+          let end = index + 1;
+          while (/[\w$]/.test(source[end] || '')) end += 1;
+          let next = end;
+          while (/\s/.test(source[next] || '')) next += 1;
+          let previous = index - 1;
+          while (/\s/.test(source[previous] || '')) previous -= 1;
+          const identifier = source.slice(index, end);
+          if (source[next] === ':' && (source[previous] === '{' || source[previous] === ',')) {
+            result += `"${identifier}"`;
+          } else {
+            result += identifier;
+          }
+          index = end;
+          continue;
+        }
+        result += character;
+        index += 1;
+      }
+      return result;
+    }
+
+    function parseObjectLiteral(slice) {
+      try {
+        return JSON.parse(slice);
+      } catch {
+        // PHP-rendered page data uses a JSON-compatible JavaScript object literal
+        // with bare property names. Quote only keys found outside string values;
+        // never execute the page source.
+        return JSON.parse(quoteBareObjectKeys(slice));
+      }
+    }
+
     function extractAssignedJson(doc, name) {
       for (const source of scriptTexts(doc)) {
         const start = assignmentStart(source, name);
@@ -3443,7 +3499,7 @@
         const slice = balancedJsonSlice(source, start);
         if (!slice) continue;
         try {
-          const value = JSON.parse(slice);
+          const value = parseObjectLiteral(slice);
           if (value && typeof value === 'object') return value;
         } catch {
           // A malformed or non-JSON assignment is not safe to execute or coerce.
@@ -3756,6 +3812,52 @@
       return shadows.sort((left, right) => left.name.localeCompare(right.name));
     }
 
+    function parseArmyFormationPage(doc) {
+      const data = extractAssignedJson(doc, 'FormationData');
+      if (!data || Array.isArray(data) || typeof data !== 'object') {
+        return {
+          found: false,
+          locked: false,
+          lockedMessage: '',
+          captainLimit: 0,
+          captains: [],
+        };
+      }
+      const captainLimit = Number(data.captainLimit);
+      const captains = data.captains && !Array.isArray(data.captains) && typeof data.captains === 'object'
+        ? Object.values(data.captains).map((captain) => ({
+          inventoryId: cleanInteger(captain?.inv_id),
+          shadowId: cleanInteger(captain?.shadow_id),
+          name: String(captain?.title || '').replace(/\s+/g, ' ').trim(),
+          inFormation: captain?.in_formation === true,
+          dead: captain?.dead === true,
+        })).filter((captain) => captain.inventoryId && captain.shadowId && captain.name)
+        : [];
+      return {
+        found: true,
+        locked: data.formationLocked === true,
+        lockedMessage: String(data.formationLockedMessage || '').replace(/\s+/g, ' ').trim(),
+        captainLimit: Number.isInteger(captainLimit) && captainLimit > 0 ? captainLimit : 1,
+        captains,
+      };
+    }
+
+    function buildArmyFormationPayload(action, fields = {}) {
+      if (action !== 'set_captain') return null;
+      const inventoryId = cleanInteger(fields.inventoryId);
+      if (!inventoryId) return null;
+      return { action, unit_inv_id: inventoryId };
+    }
+
+    function parseArmyFormationActionResponse(response) {
+      const json = wrappedJson(response);
+      const transportOk = response?.ok === undefined ? true : response.ok === true;
+      return {
+        ok: Boolean(transportOk && json?.ok === true),
+        message: responseMessage(response),
+      };
+    }
+
     function buildArmyLivePayload(action, fields = {}) {
       const battleId = cleanInteger(fields.battleId);
       if (!battleId || !['get_state', 'join_battle', 'assign_target', 'retreat_captain'].includes(action)) return null;
@@ -3908,6 +4010,7 @@
       actionableNodes,
       armySummary,
       buildArmyEnterPayload,
+      buildArmyFormationPayload,
       buildArmyLivePayload,
       buildCubeNodeEnterPayload,
       buildPvpClaimPayload,
@@ -3920,6 +4023,8 @@
       nodeForLocationId,
       parseArmyActionResponse,
       parseArmyEnterResponse,
+      parseArmyFormationActionResponse,
+      parseArmyFormationPage,
       parseArmyHealAvailability,
       parseArmyLivePage,
       parseArmyNodePage,
@@ -3963,6 +4068,7 @@
     const ARMY_ACTION_URL = '/guild_dungeon_cube_army_action.php';
     const ARMY_LIVE_URL = '/shadow_army_live_battle.php';
     const SHADOW_ARMY_URL = '/shadow_army.php';
+    const SHADOW_ARMY_FORMATION_URL = '/shadow_army_formation.php';
     const MINIMAL_ARMY_CONTRIBUTIONS_KEY = 'veyra:crucible:minimal-army-contributions:v1';
 
     const TIMING = Object.freeze({
@@ -4583,6 +4689,62 @@
         return true;
       }
 
+      async function ensureArmyFormation(visitId, route) {
+        const selectedIds = (route.settings.army.selectedShadowIds || []).map(String);
+        const selected = new Set(selectedIds);
+        const selectedOrder = new Map(selectedIds.map((id, index) => [id, index]));
+        if (selected.size === 0) throw new Error('Select at least one Shadow for the Crucible Army formation.');
+
+        assertCanMutate(visitId);
+        let formation = logic.parseArmyFormationPage(await fetchDocument(SHADOW_ARMY_FORMATION_URL));
+        if (!formation.found) throw new Error('The saved Shadow Army formation could not be read safely.');
+
+        const discoveries = formation.captains.map((captain) => ({ id: captain.shadowId, name: captain.name }));
+        if (discoveries.length > 0) {
+          assertCanMutate(visitId);
+          route.settings = saveShadowDiscoveries(discoveries);
+        }
+
+        const selectedReady = () => formation.captains.some(
+          (captain) => captain.inFormation && !captain.dead && selected.has(captain.shadowId),
+        );
+        if (selectedReady()) return formation;
+        if (formation.locked) {
+          throw new Error(formation.lockedMessage || 'The Shadow Army formation is locked by an active battle roster.');
+        }
+
+        const activeCount = formation.captains.filter((captain) => captain.inFormation).length;
+        const freeSlots = Math.max(0, formation.captainLimit - activeCount);
+        const candidates = formation.captains
+          .filter((captain) => selected.has(captain.shadowId) && !captain.inFormation && !captain.dead)
+          .sort((left, right) => selectedOrder.get(left.shadowId) - selectedOrder.get(right.shadowId));
+        if (freeSlots === 0) {
+          throw new Error('None of the selected Shadows is in the saved formation, and all captain slots are occupied.');
+        }
+        if (candidates.length === 0) {
+          throw new Error('No selected, living Shadow is available for the saved Army formation.');
+        }
+
+        for (const captain of candidates.slice(0, freeSlots)) {
+          const payload = logic.buildArmyFormationPayload('set_captain', { inventoryId: captain.inventoryId });
+          if (!payload) throw new Error(`Could not build a safe formation request for ${captain.name}.`);
+          assertCanMutate(visitId);
+          setWorkingMessage(visitId, `Adding ${captain.name} to the saved Shadow Army formation.`);
+          const response = await guardedPostForm(visitId, SHADOW_ARMY_FORMATION_URL, payload);
+          const result = logic.parseArmyFormationActionResponse(response);
+          if (!result.ok) {
+            throw new Error(`Adding ${captain.name} to the Army formation failed: ${result.message || 'unknown response'}`);
+          }
+        }
+
+        assertCanMutate(visitId);
+        formation = logic.parseArmyFormationPage(await fetchDocument(SHADOW_ARMY_FORMATION_URL));
+        if (!formation.found || !selectedReady()) {
+          throw new Error('The Shadow Army formation page did not confirm an available selected captain.');
+        }
+        return formation;
+      }
+
       async function armyStateAction(visitId, action, fields) {
         const payload = logic.buildArmyLivePayload(action, fields);
         if (!payload) throw new Error(`Could not build a safe Army ${action} request.`);
@@ -4599,7 +4761,15 @@
       async function joinArmyIfNeeded(visitId, battleId, state) {
         let summary = logic.armySummary(state);
         if (summary.own.length > 0) return state;
-        if (summary.viewer.has_roster === false) throw new Error('No saved Shadow Army formation is available.');
+        if (summary.viewer.has_roster === false) {
+          // The initial live-page state can have been rendered before a freshly
+          // saved formation became visible to the battle. Refresh once before
+          // treating the server's roster flag as final.
+          state = await armyStateAction(visitId, 'get_state', { battleId });
+          summary = logic.armySummary(state);
+          if (summary.own.length > 0) return state;
+          if (summary.viewer.has_roster === false) throw new Error('No saved Shadow Army formation is available.');
+        }
         if (summary.viewer.can_join !== true) {
           // A captain that already retreated may no longer be present in the
           // captain array while the player remains committed to this fight. That
@@ -4758,9 +4928,7 @@
         if (!fight) return { progressed: false, message: `${node.name} has no actionable Army fight.` };
 
         await healArmyIfAvailable(visitId, route);
-        if (route.settings.army.selectedShadowIds.length === 0) {
-          throw new Error('Select at least one Shadow for the Crucible Army formation.');
-        }
+        await ensureArmyFormation(visitId, route);
         const payload = logic.buildArmyEnterPayload({
           instanceId: cube.instanceId,
           nodeId: node.id,
@@ -5063,6 +5231,7 @@
       PVP_STATE_URL,
       ROUTE_ID,
       SHADOW_ARMY_URL,
+      SHADOW_ARMY_FORMATION_URL,
       TIMING,
       VisitStop,
       createCrucibleWorker,
@@ -20929,7 +21098,7 @@
       armyGroup.appendChild(
         ctx.make('div', {
           className: ctx.cls('hint'),
-          text: 'The game still joins with its saved formation. The worker keeps only the selected special Shadows active and retreats unselected captains before assigning targets. Newly owned Shadows are discovered on the Shadow Army page and appear here unchecked.',
+          text: 'Before joining, the worker verifies the saved game formation and adds a selected captain when a slot is free. It never removes saved captains or their assigned normal Shadows. In battle it keeps only selected special Shadows active and retreats the others before assigning targets. Newly owned Shadows appear here unchecked.',
         }),
       );
       ctx.container.appendChild(armyGroup);

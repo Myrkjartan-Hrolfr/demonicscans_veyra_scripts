@@ -519,7 +519,7 @@ function renderSettings(ctx) {
   armyGroup.appendChild(
     ctx.make('div', {
       className: ctx.cls('hint'),
-      text: 'The game still joins with its saved formation. The worker keeps only the selected special Shadows active and retreats unselected captains before assigning targets. Newly owned Shadows are discovered on the Shadow Army page and appear here unchecked.',
+      text: 'Before joining, the worker verifies the saved game formation and adds a selected captain when a slot is free. It never removes saved captains or their assigned normal Shadows. In battle it keeps only selected special Shadows active and retreats the others before assigning targets. Newly owned Shadows appear here unchecked.',
     }),
   );
   ctx.container.appendChild(armyGroup);
