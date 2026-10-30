@@ -410,6 +410,82 @@ test('PvP claims the fullest match, confirms its slot and publishes a short node
   assert.match(status.note, /waiting for players/i);
 });
 
+test('a live PvP match is checked once and does not block the Army section', async () => {
+  const config = disableSections(createDefaultConfig(), { pvp: true, army: true });
+  const cube = cubeDocument([
+    { id: 7, key: 'ring_ward', name: 'Ring Ward', type: 'pvp', status: 'in_progress' },
+    { id: 5, key: 'veil_post', name: 'Veil Post', type: 'army', status: 'in_progress' },
+  ]);
+  const emptyArmyNode = scriptDocument('let fightCards = []; let activeMatchNo = 0;');
+  const env = createEnvironment({
+    config,
+    fetchDocumentImpl: async (url) => {
+      if (/guild_dungeon_(?:enter|cube)\.php/.test(url) && !/army_enter/.test(url)) return cube;
+      if (/pvp_style_node\.php/.test(url)) return pvpLobbyDocument(true);
+      if (/guild_dungeon_cube_army_enter\.php/.test(url)) return emptyArmyNode;
+      throw new Error(`Unexpected GET ${url}`);
+    },
+    fetchJsonImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: { ok: true, room_status: 'live', room_joined: true, match: { ended: false } },
+    }),
+  });
+
+  await env.worker.tick();
+
+  assert.equal(env.jsonGets.length, 1);
+  assert.equal(env.fetched.some((url) => /guild_dungeon_cube_army_enter\.php/.test(url)), true);
+  const status = env.store.read(workerStatusKey('crucible'));
+  assert.equal(status.state, 'done');
+  assert.match(status.note, /match in progress/i);
+});
+
+test('a PvE section failure does not undo or prevent PvP participation', async () => {
+  const config = disableSections(createDefaultConfig(), { pve: true, pvp: true });
+  const settings = config.routes.crucible.settings;
+  for (const target of Object.values(settings.targets)) target.enabled = false;
+  settings.targets['gate_prism:prismblade-reaver'] = { enabled: true, mode: 'max-loot', damage: '1m' };
+  const cube = cubeDocument([
+    { id: 7, key: 'ring_ward', name: 'Ring Ward', type: 'pvp', status: 'in_progress' },
+    { id: 2, face_key: 'front', key: 'gate_prism', name: 'Gate Prism', type: 'pve', status: 'available', linked_location_id: 11 },
+  ]);
+  let lobbyReads = 0;
+  const env = createEnvironment({
+    config,
+    fetchDocumentImpl: async (url) => {
+      if (/guild_dungeon_(?:enter|cube)\.php/.test(url)) return cube;
+      if (/pvp_style_node\.php/.test(url)) {
+        lobbyReads += 1;
+        return pvpLobbyDocument(lobbyReads > 1);
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    },
+    fetchJsonImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: { ok: true, room_status: 'open', room_joined: true, match: { ended: false } },
+    }),
+    postImpl: async (url) => {
+      if (url === PVP_ACTION_URL) {
+        return { ok: true, status: 200, json: { ok: true, message: 'Slot claimed' }, text: '' };
+      }
+      if (url === CUBE_ACTION_URL) {
+        return { ok: true, status: 200, json: { ok: false, message: 'Node changed' }, text: '' };
+      }
+      throw new Error(`Unexpected POST ${url}`);
+    },
+  });
+
+  await env.worker.tick();
+
+  assert.equal(env.posts[0].url, PVP_ACTION_URL);
+  assert.equal(env.posts[0].params.action, 'pick_slot');
+  const status = env.store.read(workerStatusKey('crucible'));
+  assert.equal(status.state, 'error');
+  assert.match(status.message, /PvE: Entering Gate Prism failed/i);
+});
+
 function healDocument(available) {
   const form = element({
     one: {
@@ -418,6 +494,14 @@ function healDocument(available) {
     },
   });
   return documentWith({ many: { form: [form] } });
+}
+
+function ownedArmyDocumentWithoutHealControl() {
+  return scriptDocument(
+    `const specialUnits = ${JSON.stringify({
+      5588: { shadow_id: 5, title: 'Drakzareth The Tyrant' },
+    })};`,
+  );
 }
 
 function armyState({ joined = false, enemyHp = 200, retreated = false, turnsActed = 0 } = {}) {
@@ -506,6 +590,49 @@ test('Army heals, joins, verifies one minimal hit and retreats the assigned capt
     [[ARMY_ACTION_URL, 'enter_fight']],
   );
   assert.match(env.store.read(workerStatusKey('crucible')).note, /contribution complete/i);
+});
+
+test('Army joins when the real Army page omits the heal form because nothing is healable', async () => {
+  const config = disableSections(createDefaultConfig(), { army: true });
+  config.routes.crucible.settings.army.mode = 'minimal';
+  const cube = cubeDocument([
+    { id: 5, key: 'veil_post', name: 'Veil Post', type: 'army', status: 'in_progress' },
+  ]);
+  const armyNode = scriptDocument(
+    `let fightCards = ${JSON.stringify([{ match_no: 1, battle_id: 51365, status: 'active' }])}; let activeMatchNo = 1;`,
+  );
+  const live = scriptDocument(
+    `const battleId = 51365; const initialState = ${JSON.stringify(armyState({ joined: true }))};`,
+  );
+  const env = createEnvironment({
+    config,
+    fetchDocumentImpl: async (url) => {
+      if (/guild_dungeon_(?:enter|cube)\.php/.test(url) && !/army_enter/.test(url)) return cube;
+      if (/guild_dungeon_cube_army_enter\.php/.test(url)) return armyNode;
+      if (url === SHADOW_ARMY_URL) return ownedArmyDocumentWithoutHealControl();
+      if (/shadow_army_live_battle\.php/.test(url)) return live;
+      throw new Error(`Unexpected GET ${url}`);
+    },
+    postImpl: async (url, params) => {
+      if (url === ARMY_ACTION_URL) {
+        return { ok: true, status: 200, text: '', json: { ok: true, redirect: '/shadow_army_live_battle.php?battle_id=51365' } };
+      }
+      if (url === ARMY_LIVE_URL && params.action === 'assign_target') {
+        return { ok: true, status: 200, text: '', json: { ok: true, state: armyState({ joined: true, enemyHp: 190, turnsActed: 1 }) } };
+      }
+      if (url === ARMY_LIVE_URL && params.action === 'retreat_captain') {
+        return { ok: true, status: 200, text: '', json: { ok: true, state: armyState({ joined: true, enemyHp: 190, retreated: true, turnsActed: 1 }) } };
+      }
+      throw new Error(`Unexpected POST ${url} ${params.action || ''}`);
+    },
+  });
+
+  await env.worker.tick();
+
+  assert.equal(env.posts.some((entry) => entry.url === SHADOW_ARMY_URL), false);
+  assert.equal(env.posts.some((entry) => entry.url === ARMY_ACTION_URL), true);
+  assert.equal(env.posts.some((entry) => entry.params.action === 'assign_target'), true);
+  assert.equal(env.store.read(workerStatusKey('crucible')).state, 'done');
 });
 
 test('Army retreats unselected Shadows and assigns only the selected formation captain', async () => {

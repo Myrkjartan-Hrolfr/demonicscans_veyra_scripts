@@ -31,7 +31,6 @@ const MINIMAL_ARMY_CONTRIBUTIONS_KEY = 'veyra:crucible:minimal-army-contribution
 const TIMING = Object.freeze({
   tickMs: 1_000,
   heartbeatMs: 5_000,
-  pvpPollMs: 2_500,
   armyPollMs: 1_500,
   regularRecheckMs: 5 * 60_000,
   refreshBattleEvery: 20,
@@ -547,27 +546,25 @@ function createCrucibleWorker({
   }
 
   async function monitorPvpMatch(visitId, cube, node, matchNo) {
-    let polls = 0;
-    while (true) {
-      assertCanMutate(visitId);
-      const response = await requestJson(pvpStateUrl(cube.instanceId, node.id, matchNo));
-      const state = logic.parsePvpState(response);
-      if (!state.ok) throw new Error(`PvP match #${matchNo} state failed: ${state.error}`);
-      if (state.ended) {
-        runtime.processedPvp.add(node.key);
-        return { progressed: true, message: `PvP match #${matchNo} ${state.won ? 'was won' : 'ended'}.` };
-      }
-      if (state.roomStatus !== 'live') {
-        return {
-          waitUntil: cappedRecheck(),
-          note: `${node.name} waiting for players`,
-          message: `PvP match #${matchNo} is still open; checking the Crucible again soon.`,
-        };
-      }
-      polls += 1;
-      setWorkingMessage(visitId, `Watching live ${node.name} match #${matchNo} (${polls}).`);
-      await sleepImpl(TIMING.pvpPollMs);
+    // A live Crucible PvP match resolves automatically. Poll it once per
+    // scheduler visit instead of occupying this worker until the match ends;
+    // otherwise the independent Army and PvE sections never get a turn.
+    assertCanMutate(visitId);
+    const response = await requestJson(pvpStateUrl(cube.instanceId, node.id, matchNo));
+    const state = logic.parsePvpState(response);
+    if (!state.ok) throw new Error(`PvP match #${matchNo} state failed: ${state.error}`);
+    if (state.ended) {
+      runtime.processedPvp.add(node.key);
+      return { progressed: true, message: `PvP match #${matchNo} ${state.won ? 'was won' : 'ended'}.` };
     }
+    const live = state.roomStatus === 'live';
+    return {
+      waitUntil: cappedRecheck(),
+      note: live ? `${node.name} match in progress` : `${node.name} waiting for players`,
+      message: live
+        ? `PvP match #${matchNo} is running automatically; checking the Crucible again soon.`
+        : `PvP match #${matchNo} is still open; checking the Crucible again soon.`,
+    };
   }
 
   async function processPvpNode(visitId, cube, node) {
@@ -627,7 +624,12 @@ function createCrucibleWorker({
       route.settings = saveShadowDiscoveries(shadows);
     }
     const availability = logic.parseArmyHealAvailability(armyDoc);
-    if (!availability.found) throw new Error('The Shadow Army heal-all control could not be found.');
+    // The game omits the heal form completely when no owned unit is ready to
+    // heal. A parsed special-unit list proves that this is the real Army page.
+    if (!availability.found) {
+      if (shadows.length > 0) return false;
+      throw new Error('The Shadow Army heal-all control and owned Shadows could not be found.');
+    }
     if (!availability.available) return false;
     setWorkingMessage(visitId, 'Healing all ready Shadow Army units before joining.');
     assertCanMutate(visitId);
@@ -637,7 +639,8 @@ function createCrucibleWorker({
     }
     const verifiedDoc = await fetchDocument(SHADOW_ARMY_URL);
     const verified = logic.parseArmyHealAvailability(verifiedDoc);
-    if (!verified.found || verified.available) {
+    const verifiedShadows = logic.parseOwnedArmyShadows(verifiedDoc);
+    if (verified.available || (!verified.found && verifiedShadows.length === 0)) {
       throw new Error('The Shadow Army page did not confirm that ready units were healed.');
     }
     return true;
@@ -896,6 +899,24 @@ function createCrucibleWorker({
     if (!entry) throw new Error('The Polyhedral Crucible entry was not found on the guild-dungeon page.');
     let cubeUrl = entry.url;
     let userId = '';
+    const failedSections = new Set();
+    const sectionErrors = [];
+
+    async function runSection(section, operation) {
+      if (failedSections.has(section)) return null;
+      try {
+        return await operation();
+      } catch (error) {
+        // Lease loss, cancellation, scheduler drain and resource stops apply
+        // to the whole visit and must retain their existing semantics.
+        if (error instanceof VisitStop) throw error;
+        failedSections.add(section);
+        const message = String(error?.message || error || 'unknown error');
+        sectionErrors.push(`${section}: ${message}`);
+        log(`${section} section failed independently: ${message}`, 'warn');
+        return null;
+      }
+    }
 
     for (let pass = 0; pass < TIMING.maxVisitPasses; pass += 1) {
       assertCanMutate(visitId);
@@ -905,45 +926,57 @@ function createCrucibleWorker({
       let progressed = false;
       const waiting = [];
 
-      if (route.settings.pveEnabled) {
-        const pveNodes = [
-          ...logic.actionableNodes(cube, 'pve'),
-          ...logic.actionableNodes(cube, 'boss'),
-        ];
-        if (pveNodes.length > 0 && !userId) {
-          userId = String(await getUserId() || '');
-          if (!userId) throw new Error('The player id could not be determined for Crucible PvE.');
-        }
-        for (const node of pveNodes) {
-          const count = await processPveNode(visitId, route, cube, node, userId);
-          progressed = count > 0 || progressed;
-        }
-        if (progressed) continue;
+      // Reserve or confirm the time-sensitive PvP slot before starting Army or
+      // potentially long PvE work. Each section fails independently so a
+      // changed page in one mode cannot suppress participation in the others.
+      if (route.settings.pvp.enabled) {
+        await runSection('PvP', async () => {
+          for (const node of logic.actionableNodes(cube, 'pvp')) {
+            if (runtime.processedPvp.has(node.key)) continue;
+            const result = await processPvpNode(visitId, cube, node);
+            if (result.progressed) {
+              progressed = true;
+              break;
+            }
+            if (result.waitUntil) waiting.push(result);
+          }
+        });
       }
 
       if (route.settings.army.enabled) {
-        for (const node of logic.actionableNodes(cube, 'army')) {
-          const result = await processArmyNode(visitId, route, cube, node);
-          if (result.progressed) {
-            progressed = true;
-            break;
+        await runSection('Army', async () => {
+          for (const node of logic.actionableNodes(cube, 'army')) {
+            const result = await processArmyNode(visitId, route, cube, node);
+            if (result.progressed) {
+              progressed = true;
+              break;
+            }
+            if (result.waitUntil) waiting.push(result);
           }
-          if (result.waitUntil) waiting.push(result);
-        }
-        if (progressed) continue;
+        });
       }
 
-      if (route.settings.pvp.enabled) {
-        for (const node of logic.actionableNodes(cube, 'pvp')) {
-          if (runtime.processedPvp.has(node.key)) continue;
-          const result = await processPvpNode(visitId, cube, node);
-          if (result.progressed) {
-            progressed = true;
-            break;
+      if (route.settings.pveEnabled) {
+        await runSection('PvE', async () => {
+          const pveNodes = [
+            ...logic.actionableNodes(cube, 'pve'),
+            ...logic.actionableNodes(cube, 'boss'),
+          ];
+          if (pveNodes.length > 0 && !userId) {
+            userId = String(await getUserId() || '');
+            if (!userId) throw new Error('The player id could not be determined for Crucible PvE.');
           }
-          if (result.waitUntil) waiting.push(result);
-        }
-        if (progressed) continue;
+          for (const node of pveNodes) {
+            const count = await processPveNode(visitId, route, cube, node, userId);
+            progressed = count > 0 || progressed;
+          }
+        });
+      }
+
+      if (progressed) continue;
+
+      if (sectionErrors.length > 0) {
+        throw new Error(sectionErrors.join(' | '));
       }
 
       const next = waitResult(waiting);
@@ -964,6 +997,7 @@ function createCrucibleWorker({
       );
       return;
     }
+    if (sectionErrors.length > 0) throw new Error(sectionErrors.join(' | '));
     throw new Error('Crucible did not settle after repeated node-state rescans.');
   }
 
