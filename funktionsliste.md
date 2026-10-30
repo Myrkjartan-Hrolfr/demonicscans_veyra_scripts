@@ -76,6 +76,7 @@ URLs: Wave 3 `active_wave.php?gate=3&wave=8`. Olympus `gate=5`: außen wave=9, H
 | 4.1.7 | Attack-Cooldown 100–2000 ms, Standard 100 ms | [vorh.] | Bei HTTP 429/503 bremst das Skript automatisch ab und prüft vor jedem Retry erneut Scheduler-Lease und Deadline. |
 | 4.1.8 | Skript wie `dungeon_auto_damage_fast`, aber eigenständig | [vorh.] | Keine Abhängigkeit vom externen UI-Improvements-Skript. |
 | 4.1.9 | Mehrere Locations (1–4) durchlaufen | [vorh.] | |
+| 4.1.10 | Live-Statusfenster während Shadowbridge-Angriffen | [vorh.] | Ein einklappbares, mobil angepasstes Fenster listet alle Ziele des aktuellen Besuchs in Angriffsreihenfolge. Es markiert wartend / aktiv / erledigt / Fehler und zeigt bei Schadenszielen den eigenen Schaden gegen die live gelesene Zielgrenze, im Kill-Modus die verbleibenden Monster-HP sowie jeweils die Angriffsanzahl. |
 
 ### 4.2 Castle of the Fallen Prince – vorerst zurückgestellt
 

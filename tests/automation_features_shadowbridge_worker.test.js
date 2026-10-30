@@ -13,6 +13,7 @@ const {
   createShadowbridgeWorker,
   readStamina,
 } = require('../src/features/automation/shadowbridge-worker');
+const { progressDetails } = require('../src/features/automation/shadowbridge-status');
 
 const NOW = 1_800_000_000_000;
 
@@ -250,6 +251,17 @@ test('reads stamina and orders all normal monsters before the dynamic boss room'
   assert.deepEqual(attackPlan(scans, settings).map((target) => target.monsterId), ['b', 'a', 'boss']);
 });
 
+test('formats Shadowbridge progress for damage targets and kill targets', () => {
+  assert.deepEqual(progressDetails({ status: 'active', currentDamage: 25, targetDamage: 100, attacks: 2 }), {
+    percent: 25,
+    text: '25 / 100 own damage · 2 attack(s)',
+  });
+  assert.deepEqual(progressDetails({ status: 'active', currentHp: 7_500, maxHp: 10_000, attacks: 3 }), {
+    percent: 25,
+    text: '7,500 / 10,000 monster HP · 3 attack(s)',
+  });
+});
+
 test('does not fetch or mutate when a different tab owns the scheduler lease', async () => {
   const storeSession = {
     available: true,
@@ -321,6 +333,26 @@ test('joins, attacks to the live loot limit and sends the base skill cost despit
   assert.equal(status.state, 'done');
   assert.equal(status.safeToLeave, true);
   assert.match(status.message, /1 target\(s\).*1 attack\(s\)/);
+  const progress = env.worker.statusView.snapshot();
+  assert.equal(progress.phase, 'done');
+  assert.deepEqual(
+    {
+      name: progress.entries[0].name,
+      status: progress.entries[0].status,
+      currentDamage: progress.entries[0].currentDamage,
+      targetDamage: progress.entries[0].targetDamage,
+      attacks: progress.entries[0].attacks,
+      percent: progress.entries[0].progress.percent,
+    },
+    {
+      name: 'Talla Flint-Stem',
+      status: 'completed',
+      currentDamage: 100,
+      targetDamage: 100,
+      attacks: 1,
+      percent: 100,
+    },
+  );
 });
 
 test('fails closed after join when current personal damage is absent from the leaderboard', async () => {

@@ -14,6 +14,7 @@ const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
 const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
 const { staminaCost, staminaMultiplier } = require('../shared/asterion');
 const logic = require('./shadowbridge-logic');
+const { createShadowbridgeStatusView } = require('./shadowbridge-status');
 
 const ROUTE_ID = 'shadowbridge';
 const JOIN_URL = '/dungeon_join_battle.php';
@@ -85,6 +86,7 @@ function createShadowbridgeWorker({
   sleepImpl = sleep,
   now = () => Date.now(),
   logger = console,
+  statusView = createShadowbridgeStatusView(doc),
 }) {
   const runtime = {
     stopped: false,
@@ -159,6 +161,7 @@ function createShadowbridgeWorker({
   function setWorkingMessage(visitId, message) {
     runtime.message = message;
     publish('working', false, message, visitId);
+    statusView.setSummary(message, 'working');
     log(message);
   }
 
@@ -166,6 +169,7 @@ function createShadowbridgeWorker({
     runtime.terminal = { visitId, state, message };
     runtime.runningVisitId = '';
     publish(state, true, message, visitId, true);
+    statusView.finish(message, state);
     log(message, state === 'error' ? 'warn' : 'info');
   }
 
@@ -334,13 +338,32 @@ function createShadowbridgeWorker({
 
   async function attackMonster(visitId, route, target, userId) {
     assertCanMutate(visitId);
+    statusView.updateTarget(target.key, { status: 'active', attacks: 0, error: '', result: '' });
     let battle = await fetchBattle(target, userId);
-    if (battle.snapshot.dead) return { reason: 'dead', attacks: 0 };
+    statusView.updateTarget(target.key, {
+      currentDamage: battle.snapshot.ownDamage,
+      currentHp: battle.snapshot.currentHp,
+      maxHp: battle.snapshot.maxHp,
+    });
+    if (battle.snapshot.dead) {
+      statusView.updateTarget(target.key, { status: 'completed', result: 'Already defeated' });
+      return { reason: 'dead', attacks: 0 };
+    }
     battle = await joinIfNeeded(visitId, target, userId, battle);
 
     let decision = resolveTarget(target, battle.snapshot);
     if (!decision.ok) throw new Error(`${target.name || 'Shadowbridge target'}: ${decision.error}`);
-    if (decision.done) return { reason: 'target', attacks: 0 };
+    statusView.updateTarget(target.key, {
+      currentDamage: battle.snapshot.ownDamage,
+      currentHp: battle.snapshot.currentHp,
+      maxHp: battle.snapshot.maxHp,
+      targetDamage: decision.targetDamage,
+      untilDead: decision.untilDead,
+    });
+    if (decision.done) {
+      statusView.updateTarget(target.key, { status: 'completed', result: 'Damage target already reached' });
+      return { reason: 'target', attacks: 0 };
+    }
 
     const skill = logic.skillForId(route.settings.skill);
     const payload = logic.buildDamagePayload({
@@ -358,6 +381,7 @@ function createShadowbridgeWorker({
     while (attempts < TIMING.maxAttacksPerMonster) {
       assertCanMutate(visitId);
       if (!decision.untilDead && Number.isFinite(ownDamage) && ownDamage >= decision.targetDamage) {
+        statusView.updateTarget(target.key, { status: 'completed', result: 'Damage target reached' });
         return { reason: 'target', attacks: attempts };
       }
       await resources.ensureHealth(battle.snapshot);
@@ -398,18 +422,42 @@ function createShadowbridgeWorker({
       resources.spendStamina(effectiveStaminaCost);
       if (Number.isFinite(ownDamage)) ownDamage += result.damage;
       if (Number.isFinite(result.playerHp)) battle.snapshot.playerHp = result.playerHp;
+      if (Number.isFinite(result.currentHp)) battle.snapshot.currentHp = result.currentHp;
+      if (Number.isFinite(result.maxHp)) battle.snapshot.maxHp = result.maxHp;
+      statusView.updateTarget(target.key, {
+        status: result.dead ? 'completed' : 'active',
+        attacks: attempts,
+        currentDamage: ownDamage,
+        currentHp: result.dead ? 0 : battle.snapshot.currentHp,
+        maxHp: battle.snapshot.maxHp,
+        targetDamage: decision.targetDamage,
+        result: result.dead ? 'Defeated' : '',
+      });
       if (result.dead) return { reason: 'dead', attacks: attempts };
       if (!decision.untilDead && Number.isFinite(ownDamage) && ownDamage >= decision.targetDamage) {
+        statusView.updateTarget(target.key, { status: 'completed', result: 'Damage target reached' });
         return { reason: 'target', attacks: attempts };
       }
 
       if (attempts % TIMING.refreshBattleEvery === 0 || result.currentHp === null) {
         battle = await fetchBattle(target, userId);
-        if (battle.snapshot.dead) return { reason: 'dead', attacks: attempts };
+        if (battle.snapshot.dead) {
+          statusView.updateTarget(target.key, { status: 'completed', currentHp: 0, result: 'Defeated' });
+          return { reason: 'dead', attacks: attempts };
+        }
         decision = resolveTarget(target, battle.snapshot);
         if (!decision.ok) throw new Error(`${target.name || 'Shadowbridge target'}: ${decision.error}`);
         ownDamage = battle.snapshot.ownDamage;
-        if (decision.done) return { reason: 'target', attacks: attempts };
+        statusView.updateTarget(target.key, {
+          currentDamage: ownDamage,
+          currentHp: battle.snapshot.currentHp,
+          maxHp: battle.snapshot.maxHp,
+          targetDamage: decision.targetDamage,
+        });
+        if (decision.done) {
+          statusView.updateTarget(target.key, { status: 'completed', result: 'Damage target reached' });
+          return { reason: 'target', attacks: attempts };
+        }
       }
       await sleepImpl(route.settings.attackCooldownMs);
     }
@@ -450,6 +498,7 @@ function createShadowbridgeWorker({
       return;
     }
 
+    statusView.begin('Looking for the active Shadowbridge Warrens instance.');
     setWorkingMessage(visitId, 'Looking for the active Shadowbridge Warrens instance.');
     const entry = logic.parseHubEntry(doc, currentUrl()?.href);
     if (!entry) throw new Error('The Shadowbridge Warrens entry was not found on the guild-dungeon page.');
@@ -463,6 +512,7 @@ function createShadowbridgeWorker({
       instanceUrl = new URL(`/guild_dungeon_instance.php?id=${encodeURIComponent(instance.instanceId)}`, win.location.origin).href;
       const scans = await scanLocations(visitId, instance);
       const plan = attackPlan(scans, route.settings, runtime.processed);
+      statusView.setPlan(plan);
       if (plan.length === 0) {
         const bossNote = route.settings.bossRoom.enabled && instance.bossLocked ? ' The Boss Room is still locked.' : '';
         setTerminal(
@@ -475,7 +525,16 @@ function createShadowbridgeWorker({
 
       for (const target of plan) {
         assertCanMutate(visitId);
-        const result = await attackMonster(visitId, route, target, String(userId));
+        let result = null;
+        try {
+          result = await attackMonster(visitId, route, target, String(userId));
+        } catch (error) {
+          statusView.updateTarget(target.key, {
+            status: 'error',
+            error: String(error?.message || error || 'Attack failed'),
+          });
+          throw error;
+        }
         runtime.processed.add(target.key);
         runtime.targets += 1;
         setWorkingMessage(
@@ -571,9 +630,10 @@ function createShadowbridgeWorker({
     doc.removeEventListener?.('visibilitychange', onVisibilityChange);
     win.removeEventListener?.('pageshow', onPageShow);
     win.removeEventListener?.('pagehide', onPageHide);
+    statusView.destroy();
   }
 
-  return { heartbeat, onPageHide, onPageShow, onVisibilityChange, runtime, start, stop, tick };
+  return { heartbeat, onPageHide, onPageShow, onVisibilityChange, runtime, start, statusView, stop, tick };
 }
 
 const shadowbridgeWorkerFeature = Object.freeze({
