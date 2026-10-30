@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 
 const { COMMAND_KEY, workerStatusKey } = require('../src/core/protocol');
 const { CONFIG_KEY, createDefaultConfig } = require('../src/scheduler/config');
+const { readCrucibleDebugLog } = require('../src/core/crucible-debug');
 const { LEASE_KEY, TAB_KEY } = require('../src/scheduler/engine');
 const { CRUCIBLE_PVP_WATCH_KEY } = require('../src/features/automation/crucible-pvp-watch');
 const {
@@ -197,7 +198,9 @@ test('reads Crucible stamina and never acts without the scheduler lease', async 
 });
 
 test('a draining visit finishes safely before any page request or mutation', async () => {
-  const env = createEnvironment({ phase: 'draining' });
+  const config = createDefaultConfig();
+  config.routes.crucible.settings.debugLogging = true;
+  const env = createEnvironment({ phase: 'draining', config });
   await env.worker.tick();
   const status = env.store.read(workerStatusKey('crucible'));
   assert.equal(status.state, 'done');
@@ -205,6 +208,9 @@ test('a draining visit finishes safely before any page request or mutation', asy
   assert.match(status.message, /stopped safely/i);
   assert.deepEqual(env.fetched, []);
   assert.deepEqual(env.posts, []);
+  const events = readCrucibleDebugLog(env.store).entries.map((entry) => entry.event);
+  assert.ok(events.includes('worker created'));
+  assert.ok(events.includes('terminal state'));
 });
 
 function statBlock(label, value, fullText = '') {

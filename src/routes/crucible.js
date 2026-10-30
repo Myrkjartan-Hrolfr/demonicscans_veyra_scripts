@@ -609,7 +609,9 @@ function renderSettings(ctx) {
   copyButton.addEventListener('click', async () => {
     refreshOutput();
     try {
-      await ctx.win?.navigator?.clipboard?.writeText?.(output.value);
+      const writeText = ctx.win?.navigator?.clipboard?.writeText;
+      if (typeof writeText !== 'function') throw new Error('Clipboard API unavailable');
+      await writeText.call(ctx.win.navigator.clipboard, output.value);
       copyButton.textContent = 'Copied';
     } catch {
       output.focus?.();

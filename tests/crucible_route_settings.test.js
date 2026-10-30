@@ -112,6 +112,7 @@ test('Crucible settings normalize every mode, skill, cooldown and dynamic monste
   const defaults = routeDefaults.settings;
   assert.equal(routeDefaults.enabled, false);
   assert.equal(defaults.pveEnabled, true);
+  assert.equal(defaults.debugLogging, false);
   assert.equal(defaults.pvp.enabled, true);
   assert.equal(defaults.army.enabled, true);
   assert.equal(defaults.army.mode, 'minimal');
@@ -128,6 +129,7 @@ test('Crucible settings normalize every mode, skill, cooldown and dynamic monste
       crucible: {
         settings: {
           skill: '-4',
+          debugLogging: true,
           attackCooldownMs: 9_999,
           pvp: { enabled: false },
           army: { enabled: true, mode: 'kill', selectedShadowIds: ['3'] },
@@ -143,6 +145,7 @@ test('Crucible settings normalize every mode, skill, cooldown and dynamic monste
     },
   }).routes.crucible.settings;
   assert.equal(saved.skill, '-4');
+  assert.equal(saved.debugLogging, true);
   assert.equal(saved.attackCooldownMs, 2_000);
   assert.equal(saved.pvp.enabled, false);
   assert.equal(saved.army.mode, 'kill');
@@ -186,14 +189,17 @@ test('new owned Shadows are persisted but remain unselected until the user enabl
   assert.deepEqual(merged.settings.army.selectedShadowIds, ['5']);
 });
 
-test('Crucible menu renders English PvE, PvP and Army controls with touch-sized selectors', () => {
+test('Crucible menu renders English PvE, PvP, Army and diagnostic controls with touch-sized selectors', () => {
   const harness = renderHarness();
   const prefix = 'veyra-automation-crucible';
   const titles = harness.container.children.map((child) => child.textContent).join(' ');
-  assert.match(titles, /PvE.*PvP.*Army/);
+  assert.match(titles, /PvE.*PvP.*Army.*Diagnostics/);
   assert.equal(harness.byId(`${prefix}-pve-enabled`).checked, true);
   assert.equal(harness.byId(`${prefix}-pvp-enabled`).checked, true);
   assert.equal(harness.byId(`${prefix}-army-enabled`).checked, true);
+  assert.equal(harness.byId(`${prefix}-debug-logging`).checked, false);
+  assert.equal(harness.byId(`${prefix}-debug-output`).readOnly, true);
+  assert.equal(harness.byId(`${prefix}-debug-copy`).textContent, 'Copy log');
   assert.equal(harness.byId(`${prefix}-pve-skill`).style.minHeight, '44px');
   assert.equal(harness.byId(`${prefix}-army-mode`).style.minHeight, '44px');
   assert.equal(harness.byId(`${prefix}-pve-target-zenith_lock-mode`).style.minHeight, '44px');
@@ -217,4 +223,9 @@ test('Crucible menu renders English PvE, PvP and Army controls with touch-sized 
   pvp.checked = false;
   pvp.dispatch('change');
   assert.equal(harness.getSettings().pvp.enabled, false);
+
+  const debug = harness.byId(`${prefix}-debug-logging`);
+  debug.checked = true;
+  debug.dispatch('change');
+  assert.equal(harness.getSettings().debugLogging, true);
 });

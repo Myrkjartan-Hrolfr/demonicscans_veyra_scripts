@@ -4,6 +4,7 @@ const CRUCIBLE_DEBUG_LOG_KEY = 'veyra:crucible:debug-log:v1';
 const CONFIG_KEY = 'veyra:orchestrator:config:v1';
 const LOG_VERSION = 1;
 const MAX_ENTRIES = 500;
+const MAX_DETAILS_LENGTH = 6_000;
 const MAX_STRING_LENGTH = 1_000;
 const MAX_ARRAY_LENGTH = 30;
 const REDACTED_KEY = /(?:csrf|token|password|passwd|secret|authorization|cookie|session)/i;
@@ -43,6 +44,22 @@ function sanitize(value, depth = 0, seen = new WeakSet()) {
   return result;
 }
 
+function boundedDetails(value) {
+  const result = sanitize(value);
+  let encoded = '';
+  try {
+    encoded = JSON.stringify(result);
+  } catch {
+    return { truncated: true, preview: '[unserializable diagnostic details]' };
+  }
+  if (encoded.length <= MAX_DETAILS_LENGTH) return result;
+  return {
+    truncated: true,
+    originalLength: encoded.length,
+    preview: `${encoded.slice(0, MAX_DETAILS_LENGTH)}…`,
+  };
+}
+
 function normalizeLog(value) {
   const entries = [];
   for (const raw of Array.isArray(value?.entries) ? value.entries.slice(-MAX_ENTRIES) : []) {
@@ -52,7 +69,7 @@ function normalizeLog(value) {
       at,
       source: String(raw?.source || 'crucible').slice(0, 60),
       event: String(raw?.event || 'event').slice(0, 120),
-      details: sanitize(raw?.details),
+      details: boundedDetails(raw?.details),
     });
   }
   return { version: LOG_VERSION, entries };
@@ -74,7 +91,7 @@ function appendCrucibleDebugLog(store, source, event, details = null, now = Date
       at: Number.isFinite(Number(now)) && Number(now) > 0 ? Number(now) : Date.now(),
       source: String(source || 'crucible').slice(0, 60),
       event: String(event || 'event').slice(0, 120),
-      details: sanitize(details),
+      details: boundedDetails(details),
     });
     if (log.entries.length > MAX_ENTRIES) log.entries.splice(0, log.entries.length - MAX_ENTRIES);
     return store?.write?.(CRUCIBLE_DEBUG_LOG_KEY, log) !== false;
@@ -140,6 +157,7 @@ function summarizeResponse(response) {
 module.exports = {
   CRUCIBLE_DEBUG_LOG_KEY,
   MAX_ENTRIES,
+  MAX_DETAILS_LENGTH,
   appendCrucibleDebugLog,
   clearCrucibleDebugLog,
   debugEnabled,

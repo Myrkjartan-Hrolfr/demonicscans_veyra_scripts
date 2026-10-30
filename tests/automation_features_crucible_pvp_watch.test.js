@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { CONFIG_KEY, createDefaultConfig } = require('../src/scheduler/config');
+const { readCrucibleDebugLog } = require('../src/core/crucible-debug');
 const { RUNTIME_KEY, createDefaultRuntime } = require('../src/scheduler/runtime');
 const {
   CRUCIBLE_PVP_WATCH_KEY,
@@ -79,11 +80,12 @@ function openLobby() {
   return documentWith({ many: { '.grid > .match': [card] } });
 }
 
-function createEnvironment({ fetchDocument, fetchJson, visitRewardPage } = {}) {
+function createEnvironment({ fetchDocument, fetchJson, visitRewardPage, debugLogging = false } = {}) {
   const config = createDefaultConfig();
   config.enabled = true;
   config.routes.crucible.enabled = true;
   config.routes.crucible.settings.pvp.enabled = true;
+  config.routes.crucible.settings.debugLogging = debugLogging;
   const runtime = createDefaultRuntime(NOW);
   runtime.nextRunAt.crucible = NOW + 60 * 60_000;
   const store = createStore({ [CONFIG_KEY]: config, [RUNTIME_KEY]: runtime });
@@ -242,7 +244,7 @@ test('background watcher extends a binding cooldown without waking or navigating
 });
 
 test('background watcher wakes Crucible immediately when a PvP slot is available', async () => {
-  const env = createEnvironment({ fetchDocument: async () => openLobby() });
+  const env = createEnvironment({ fetchDocument: async () => openLobby(), debugLogging: true });
   watchPvpLobby(env.store, {
     instanceId: 16126,
     nodeId: 7,
@@ -255,6 +257,10 @@ test('background watcher wakes Crucible immediately when a PvP slot is available
 
   assert.equal(env.store.read(RUNTIME_KEY).nextRunAt.crucible, NOW);
   assert.match(env.store.read(RUNTIME_KEY).notes.crucible, /slot ready/i);
+  const events = readCrucibleDebugLog(env.store).entries.map((entry) => entry.event);
+  assert.ok(events.includes('watch tick started'));
+  assert.ok(events.includes('lobby decision'));
+  assert.ok(events.includes('Crucible wake requested'));
 });
 
 test('background watcher polls a live match and wakes Crucible for its won reward', async () => {

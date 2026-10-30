@@ -5,6 +5,7 @@
 // status keys in core/protocol.js.
 
 const { finiteTimestamp } = require('../core/numbers');
+const { appendCrucibleDebugLog } = require('../core/crucible-debug');
 const {
   COMMAND_KEY,
   PROTOCOL_VERSION,
@@ -46,7 +47,12 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
     navigationPending: false,
     tickRunning: false,
     stopped: false,
+    debugLeaseAt: 0,
   };
+
+  function debugCrucible(event, details = null, now = Date.now()) {
+    appendCrucibleDebugLog(store, 'scheduler', event, details, now);
+  }
 
   const label = (routeId) => getRoute(routeId)?.label || routeId;
   const setStatus = (text) => ui.setStatus(text);
@@ -88,6 +94,16 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
     if (saved.routes[routeId].loopMinutes !== previousLoopMinutes) {
       saveRuntime(applyLoopChange(loadRuntime(now), routeId, loopIntervalMs(saved, routeId), now), now);
       ui.update(saved, loadRuntime(now));
+    }
+    if (routeId === 'crucible') {
+      debugCrucible('route configuration updated', {
+        enabled: saved.routes[routeId].enabled,
+        loopMinutes: saved.routes[routeId].loopMinutes,
+        debugLogging: saved.routes[routeId].settings.debugLogging,
+        pveEnabled: saved.routes[routeId].settings.pveEnabled,
+        pvpEnabled: saved.routes[routeId].settings.pvp.enabled,
+        armyEnabled: saved.routes[routeId].settings.army.enabled,
+      }, now);
     }
     return saved.routes[routeId];
   }
@@ -169,7 +185,7 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
 
   function startVisit(runtime, route, config, now = Date.now()) {
     setStatus(`Preparing ${route.label} …`);
-    return saveActiveVisit(
+    const next = saveActiveVisit(
       runtime,
       {
         version: PROTOCOL_VERSION,
@@ -182,6 +198,14 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
       },
       now,
     );
+    if (route.id === 'crucible') {
+      debugCrucible('visit scheduled', {
+        visit: next.activeVisit,
+        loopMinutes: config.routes.crucible.loopMinutes,
+        currentUrl: currentUrl().href,
+      }, now);
+    }
+    return next;
   }
 
   function readWorkerStatus(routeId) {
@@ -232,8 +256,19 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
   const ensureVisitRunningCommand = (visit) => writeCommandPhase(visit, 'running');
 
   function finishVisit(runtime, config, outcome, now, hint = null) {
-    const routeLabel = label(runtime.activeVisit.taskId);
-    clearActiveVisit(runtime, outcome, config, now, hint);
+    const visit = runtime.activeVisit;
+    const routeLabel = label(visit.taskId);
+    const completed = clearActiveVisit(runtime, outcome, config, now, hint);
+    if (visit.taskId === 'crucible') {
+      debugCrucible('visit finished', {
+        visit,
+        outcome,
+        hint,
+        nextRunAt: completed.nextRunAt.crucible,
+        configuredLoopMinutes: config.routes.crucible.loopMinutes,
+        workerStatus: readWorkerStatus('crucible'),
+      }, now);
+    }
     if (hint?.note && finiteTimestamp(hint.retryAt, 0) > now) setStatus(`${routeLabel}: ${hint.note}.`);
     else setStatus(outcome === 'done' ? `${routeLabel} finished.` : `${routeLabel} stopped with an error.`);
     navigateHome(config);
@@ -420,6 +455,10 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
       let runtime = loadRuntime(now);
 
       if (!claimLease(now)) {
+        if (now - state.debugLeaseAt >= 30_000) {
+          state.debugLeaseAt = now;
+          debugCrucible('scheduler lease not owned', { currentUrl: currentUrl().href }, now);
+        }
         setStatus('Another tab is controlling the scheduler.');
         ui.update(config, runtime);
         return;
@@ -457,6 +496,11 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
       ui.update(config, loadRuntime(now));
     } catch (error) {
       console.error('[Veyra] Scheduler tick failed.', error);
+      debugCrucible('scheduler tick failed', {
+        error: String(error?.message || error),
+        stack: String(error?.stack || ''),
+        currentUrl: currentUrl().href,
+      });
       setStatus('Scheduler error');
     } finally {
       state.tickRunning = false;

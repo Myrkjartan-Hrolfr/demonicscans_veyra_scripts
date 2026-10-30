@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.7.0
+// @version      0.7.1
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -40,6 +40,176 @@
   'use strict';
 
   const __modules = {
+  "core/crucible-debug.js": function (module, exports, require) {
+    'use strict';
+
+    const CRUCIBLE_DEBUG_LOG_KEY = 'veyra:crucible:debug-log:v1';
+    const CONFIG_KEY = 'veyra:orchestrator:config:v1';
+    const LOG_VERSION = 1;
+    const MAX_ENTRIES = 500;
+    const MAX_DETAILS_LENGTH = 6_000;
+    const MAX_STRING_LENGTH = 1_000;
+    const MAX_ARRAY_LENGTH = 30;
+    const REDACTED_KEY = /(?:csrf|token|password|passwd|secret|authorization|cookie|session)/i;
+
+    function debugEnabled(store) {
+      try {
+        return store?.read?.(CONFIG_KEY)?.routes?.crucible?.settings?.debugLogging === true;
+      } catch {
+        return false;
+      }
+    }
+
+    function sanitize(value, depth = 0, seen = new WeakSet()) {
+      if (value === null || value === undefined || typeof value === 'boolean' || typeof value === 'number') {
+        return value ?? null;
+      }
+      if (typeof value === 'string') {
+        return value.length > MAX_STRING_LENGTH ? `${value.slice(0, MAX_STRING_LENGTH)}…` : value;
+      }
+      if (typeof value === 'bigint') return String(value);
+      if (typeof value === 'function') return '[function]';
+      if (depth >= 5) return '[depth limit]';
+      if (typeof value !== 'object') return String(value);
+      if (seen.has(value)) return '[circular]';
+      seen.add(value);
+
+      if (Array.isArray(value)) {
+        const result = value.slice(0, MAX_ARRAY_LENGTH).map((entry) => sanitize(entry, depth + 1, seen));
+        if (value.length > MAX_ARRAY_LENGTH) result.push(`[${value.length - MAX_ARRAY_LENGTH} more]`);
+        return result;
+      }
+
+      const result = {};
+      for (const [key, entry] of Object.entries(value).slice(0, 60)) {
+        result[key] = REDACTED_KEY.test(key) ? '[redacted]' : sanitize(entry, depth + 1, seen);
+      }
+      return result;
+    }
+
+    function boundedDetails(value) {
+      const result = sanitize(value);
+      let encoded = '';
+      try {
+        encoded = JSON.stringify(result);
+      } catch {
+        return { truncated: true, preview: '[unserializable diagnostic details]' };
+      }
+      if (encoded.length <= MAX_DETAILS_LENGTH) return result;
+      return {
+        truncated: true,
+        originalLength: encoded.length,
+        preview: `${encoded.slice(0, MAX_DETAILS_LENGTH)}…`,
+      };
+    }
+
+    function normalizeLog(value) {
+      const entries = [];
+      for (const raw of Array.isArray(value?.entries) ? value.entries.slice(-MAX_ENTRIES) : []) {
+        const at = Number(raw?.at);
+        if (!Number.isFinite(at) || at <= 0) continue;
+        entries.push({
+          at,
+          source: String(raw?.source || 'crucible').slice(0, 60),
+          event: String(raw?.event || 'event').slice(0, 120),
+          details: boundedDetails(raw?.details),
+        });
+      }
+      return { version: LOG_VERSION, entries };
+    }
+
+    function readCrucibleDebugLog(store) {
+      try {
+        return normalizeLog(store?.read?.(CRUCIBLE_DEBUG_LOG_KEY));
+      } catch {
+        return normalizeLog(null);
+      }
+    }
+
+    function appendCrucibleDebugLog(store, source, event, details = null, now = Date.now()) {
+      if (!debugEnabled(store)) return false;
+      try {
+        const log = readCrucibleDebugLog(store);
+        log.entries.push({
+          at: Number.isFinite(Number(now)) && Number(now) > 0 ? Number(now) : Date.now(),
+          source: String(source || 'crucible').slice(0, 60),
+          event: String(event || 'event').slice(0, 120),
+          details: boundedDetails(details),
+        });
+        if (log.entries.length > MAX_ENTRIES) log.entries.splice(0, log.entries.length - MAX_ENTRIES);
+        return store?.write?.(CRUCIBLE_DEBUG_LOG_KEY, log) !== false;
+      } catch {
+        return false;
+      }
+    }
+
+    function clearCrucibleDebugLog(store) {
+      try {
+        if (typeof store?.remove === 'function') return store.remove(CRUCIBLE_DEBUG_LOG_KEY) !== false;
+        return store?.write?.(CRUCIBLE_DEBUG_LOG_KEY, normalizeLog(null)) !== false;
+      } catch {
+        return false;
+      }
+    }
+
+    function formatCrucibleDebugLog(value) {
+      const log = value?.entries ? normalizeLog(value) : normalizeLog(null);
+      if (log.entries.length === 0) return 'No Crucible diagnostic entries recorded.';
+      return log.entries
+        .map((entry) => {
+          let timestamp = String(entry.at);
+          try {
+            timestamp = new Date(entry.at).toISOString();
+          } catch {
+            // Numeric timestamp remains readable.
+          }
+          const details = entry.details === null ? '' : ` ${JSON.stringify(entry.details)}`;
+          return `[${timestamp}] [${entry.source}] ${entry.event}${details}`;
+        })
+        .join('\n');
+    }
+
+    function summarizeResponse(response) {
+      const json = response?.json && typeof response.json === 'object' ? response.json : null;
+      const state = json?.state && typeof json.state === 'object' ? json.state : null;
+      return sanitize({
+        ok: response?.ok,
+        status: response?.status,
+        text: String(response?.text || '').slice(0, 500),
+        json: json
+          ? {
+              ok: json.ok,
+              success: json.success,
+              status: json.status,
+              message: json.message,
+              error: json.error,
+              redirect: json.redirect,
+              room_status: json.room_status,
+              room_joined: json.room_joined,
+              match: json.match,
+              battle: state?.battle,
+              viewer: state?.viewer,
+              captainCount: Array.isArray(state?.captains) ? state.captains.length : undefined,
+              engagementCount: Array.isArray(state?.engagements) ? state.engagements.length : undefined,
+              keys: Object.keys(json).slice(0, 40),
+            }
+          : null,
+      });
+    }
+
+    module.exports = {
+      CRUCIBLE_DEBUG_LOG_KEY,
+      MAX_ENTRIES,
+      MAX_DETAILS_LENGTH,
+      appendCrucibleDebugLog,
+      clearCrucibleDebugLog,
+      debugEnabled,
+      formatCrucibleDebugLog,
+      readCrucibleDebugLog,
+      sanitize,
+      summarizeResponse,
+    };
+  },
   "core/game.js": function (module, exports, require) {
     'use strict';
 
@@ -4104,6 +4274,7 @@
     // navigates away from the user's current page.
 
     const { finiteTimestamp } = require('../../core/numbers');
+    const { appendCrucibleDebugLog, summarizeResponse } = require('../../core/crucible-debug');
     const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
     const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
     const { RUNTIME_KEY, normalizeRuntime } = require('../../scheduler/runtime');
@@ -4154,6 +4325,7 @@
       });
       if (!watch) return null;
       store.write(CRUCIBLE_PVP_WATCH_KEY, watch);
+      appendCrucibleDebugLog(store, 'pvp-watcher', 'watch scheduled', watch, now);
       return watch;
     }
 
@@ -4188,6 +4360,11 @@
       runtime.nextRunAt.crucible = Math.min(runtime.nextRunAt.crucible, now);
       runtime.notes.crucible = String(note || 'Crucible PvP ready').slice(0, 60);
       store.write(RUNTIME_KEY, runtime);
+      appendCrucibleDebugLog(store, 'pvp-watcher', 'Crucible wake requested', {
+        note,
+        watch,
+        nextRunAt: runtime.nextRunAt.crucible,
+      }, now);
       writePvpWatch(store, { ...watch, nextCheckAt: now + PVP_WAKE_HOLD_MS }, now);
     }
 
@@ -4314,6 +4491,10 @@
     }) {
       const runtime = { checking: false, stopped: false, interval: null };
 
+      function debug(event, details = null) {
+        appendCrucibleDebugLog(store, 'pvp-watcher', event, details, now());
+      }
+
       function ownsLease() {
         if (ownsSchedulerLease) return ownsSchedulerLease();
         let ownerId = '';
@@ -4352,16 +4533,22 @@
       }
 
       async function checkMatch(watch) {
-        const response = await fetchJson(pvpStateUrl(win.location.origin, watch));
+        const stateUrl = pvpStateUrl(win.location.origin, watch);
+        debug('match state request', { url: stateUrl, watch });
+        const response = await fetchJson(stateUrl);
+        debug('match state response', { watch, response: summarizeResponse(response) });
         if (!isCurrent(watch)) return;
         const state = logic.parsePvpState(response);
+        debug('match state parsed', { watch, state });
         if (!state.ok) throw new Error(state.error || 'invalid PvP state response');
         if (state.ended) {
           if (state.won) {
             if (!state.roomJoined) throw new Error('won PvP state did not confirm reward eligibility');
             const battleUrl = logic.buildPvpBattleUrl(win.location.origin, watch);
             if (!battleUrl) throw new Error('invalid won PvP match URL');
+            debug('reward page visit started', { battleUrl, watch });
             const rewardPage = await visitRewardPage(battleUrl, watch);
+            debug('reward page visit completed', { watch, rewardPage });
             if (!isCurrent(watch)) return;
             if (!rewardPage.ok) throw new Error('won PvP reward page could not be verified');
           }
@@ -4382,9 +4569,11 @@
 
       async function checkLobby(watch) {
         const url = pvpLobbyUrl(win.location.origin, watch);
+        debug('lobby document request', { url, watch });
         const lobby = logic.parsePvpLobby(await fetchDocument(url), url);
         if (!isCurrent(watch)) return;
         const action = logic.choosePvpAction(lobby);
+        debug('lobby decision', { watch, lobby, action });
         if (action.kind === 'wait') {
           reschedule(watch, action.waitMs);
           return;
@@ -4409,13 +4598,16 @@
         const watch = normalizePvpWatch(store.read(CRUCIBLE_PVP_WATCH_KEY));
         if (!watch || watch.nextCheckAt > now()) return;
         runtime.checking = true;
+        debug('watch tick started', { watch });
         try {
           if (watch.mode === 'match') await checkMatch(watch);
           else await checkLobby(watch);
         } catch (error) {
           logger?.warn?.('[Veyra] Crucible PvP background check failed.', error);
+          debug('watch tick failed', { watch, error: String(error?.message || error), stack: String(error?.stack || '') });
           if (isCurrent(watch)) reschedule(watch, PVP_ERROR_RETRY_MS);
         } finally {
+          debug('watch tick finished', { watch });
           runtime.checking = false;
         }
       }
@@ -4484,6 +4676,11 @@
     // sequentially. Every mutation is guarded by the current visit id and lease.
 
     const { parseFraction, parseGameNumber } = require('../../core/numbers');
+    const {
+      appendCrucibleDebugLog,
+      sanitize,
+      summarizeResponse,
+    } = require('../../core/crucible-debug');
     const { COMMAND_KEY, normalizeVisit, publishWorkerStatus } = require('../../core/protocol');
     const { pickPotion, readPotionInventory, usePotion } = require('../../core/potions');
     const { createJsonStore, getStorage } = require('../../core/storage');
@@ -4590,7 +4787,73 @@
         attacks: 0,
         targets: 0,
         armyActions: 0,
+        debugSkipSignature: '',
+        debugSkipAt: 0,
       };
+
+      function debug(event, details = null) {
+        appendCrucibleDebugLog(store, 'worker', event, details, now());
+      }
+
+      function documentSummary(document) {
+        return sanitize({
+          title: document?.querySelector?.('title')?.textContent || '',
+          heading: document?.querySelector?.('h1, .h, .title')?.textContent || '',
+          scripts: document?.querySelectorAll?.('script')?.length ?? null,
+        });
+      }
+
+      function debugSkip(signature, details) {
+        const t = now();
+        if (runtime.debugSkipSignature === signature && t - runtime.debugSkipAt < 30_000) return;
+        runtime.debugSkipSignature = signature;
+        runtime.debugSkipAt = t;
+        debug('worker tick skipped', { reason: signature, ...details });
+      }
+
+      const rawFetchDocument = fetchDocument;
+      fetchDocument = async (url, ...args) => {
+        debug('document request', { url: String(url) });
+        try {
+          const result = await rawFetchDocument(url, ...args);
+          debug('document response', { url: String(url), ...documentSummary(result) });
+          return result;
+        } catch (error) {
+          debug('document request failed', { url: String(url), error: String(error?.message || error) });
+          throw error;
+        }
+      };
+
+      const rawPostForm = postForm;
+      postForm = async (url, params, options) => {
+        debug('POST request', { url: String(url), params });
+        try {
+          const response = await rawPostForm(url, params, options);
+          debug('POST response', { url: String(url), response: summarizeResponse(response) });
+          return response;
+        } catch (error) {
+          debug('POST request failed', { url: String(url), error: String(error?.message || error) });
+          throw error;
+        }
+      };
+
+      const rawVisitRewardPage = visitRewardPage;
+      visitRewardPage = async (url, expected) => {
+        debug('reward page visit started', { url: String(url), expected });
+        try {
+          const result = await rawVisitRewardPage(url, expected);
+          debug('reward page visit completed', result);
+          return result;
+        } catch (error) {
+          debug('reward page visit failed', { error: String(error?.message || error), expected });
+          throw error;
+        }
+      };
+
+      debug('worker created', {
+        url: String(win?.location?.href || ''),
+        asterionMultiplier,
+      });
 
       function currentUrl() {
         try {
@@ -4650,8 +4913,10 @@
       }
 
       function setWorkingMessage(visitId, message) {
+        const changed = runtime.message !== message;
         runtime.message = message;
         publish('working', false, message, visitId);
+        if (changed) debug('working state', { visitId, message });
         log(message);
       }
 
@@ -4665,6 +4930,7 @@
         };
         runtime.runningVisitId = '';
         publish(state, true, message, visitId, { ...runtime.terminal, force: true });
+        debug('terminal state', runtime.terminal);
         log(message, state === 'error' ? 'warn' : 'info');
       }
 
@@ -4721,16 +4987,27 @@
       }
 
       async function requestJson(url) {
-        if (fetchJson) return fetchJson(url);
-        const response = await win.fetch(url, { credentials: 'same-origin', cache: 'no-store' });
-        const raw = await response.text();
-        let json = null;
+        debug('JSON request', { url: String(url) });
         try {
-          json = JSON.parse(raw);
-        } catch {
-          // The semantic parser will reject HTML/login/error pages.
+          let result = null;
+          if (fetchJson) result = await fetchJson(url);
+          else {
+            const response = await win.fetch(url, { credentials: 'same-origin', cache: 'no-store' });
+            const raw = await response.text();
+            let json = null;
+            try {
+              json = JSON.parse(raw);
+            } catch {
+              // The semantic parser will reject HTML/login/error pages.
+            }
+            result = { ok: response.ok, status: response.status, text: raw, json };
+          }
+          debug('JSON response', { url: String(url), response: summarizeResponse(result) });
+          return result;
+        } catch (error) {
+          debug('JSON request failed', { url: String(url), error: String(error?.message || error) });
+          throw error;
         }
-        return { ok: response.ok, status: response.status, text: raw, json };
       }
 
       async function readDashboard(visitId) {
@@ -4865,6 +5142,18 @@
         if (battle.snapshot.dead) return { reason: 'dead', attacks: 0 };
         battle = await joinPveIfNeeded(visitId, target, userId, battle);
         let decision = resolvePveTarget(target, battle.snapshot);
+        debug('PvE damage decision', {
+          visitId,
+          target: {
+            name: target.name,
+            monsterId: target.monsterId,
+            instanceId: target.instanceId,
+            mode: target.target.mode,
+            configuredDamage: target.target.damage,
+          },
+          snapshot: battle.snapshot,
+          decision,
+        });
         if (!decision.ok) throw new Error(`${target.name || 'Crucible PvE target'}: ${decision.error}`);
         if (decision.done) return { reason: 'target', attacks: 0 };
 
@@ -4980,6 +5269,13 @@
         const locationDoc = await fetchDocument(entered.redirect);
         const monsters = dungeonLogic.parseLocationPage(locationDoc, entered.redirect);
         const discoveries = logic.discoverPveMonsters(definition, monsters);
+        debug('PvE location parsed', {
+          visitId,
+          node: { id: node.id, key: node.key, name: node.name, linkedLocationId: node.linkedLocationId },
+          definition,
+          monsters,
+          discoveries,
+        });
         assertCanMutate(visitId);
         route.settings = saveDiscoveries(discoveries);
         let processed = 0;
@@ -4989,6 +5285,14 @@
           const key = `${monster.instanceId || cube.instanceId}:${monster.monsterId}`;
           if (monster.dead || runtime.processedPve.has(key)) continue;
           const selected = crucibleRoute.settingsForMonster(route.settings, definition.id, monster.name);
+          debug('PvE target decision', {
+            visitId,
+            monster: { name: monster.name, monsterId: monster.monsterId, dead: monster.dead, joined: monster.joined },
+            settingsId: selected.id,
+            known: selected.known,
+            target: selected.target,
+            skipped: !selected.target?.enabled,
+          });
           if (!selected.target?.enabled) continue;
           const target = {
             ...monster,
@@ -5042,6 +5346,14 @@
         assertCanMutate(visitId);
         const response = await requestJson(pvpStateUrl(cube.instanceId, node.id, matchNo));
         const state = logic.parsePvpState(response);
+        debug('PvP match state parsed', {
+          visitId,
+          instanceId: cube.instanceId,
+          nodeId: node.id,
+          nodeName: node.name,
+          matchNo,
+          state,
+        });
         if (!state.ok) throw new Error(`PvP match #${matchNo} state failed: ${state.error}`);
         if (state.ended) {
           let rewardCount = 0;
@@ -5107,6 +5419,12 @@
         let lobbyDoc = await fetchDocument(lobbyUrl);
         let lobby = logic.parsePvpLobby(lobbyDoc, lobbyUrl);
         let action = logic.choosePvpAction(lobby);
+        debug('PvP lobby decision', {
+          visitId,
+          node: { id: node.id, key: node.key, name: node.name, status: node.status },
+          lobby,
+          action,
+        });
 
         if (action.kind === 'existing') {
           return monitorPvpMatch(visitId, cube, node, action.match.matchNo);
@@ -5157,6 +5475,7 @@
         lobbyDoc = await fetchDocument(lobbyUrl);
         lobby = logic.parsePvpLobby(lobbyDoc, lobbyUrl);
         action = logic.choosePvpAction(lobby);
+        debug('PvP claim confirmation decision', { visitId, lobby, action, expectedMatchNo: payload.match_no });
         if (action.kind !== 'existing' || action.match.matchNo !== Number(payload.match_no)) {
           throw new Error('The PvP lobby did not confirm the claimed slot.');
         }
@@ -5256,6 +5575,14 @@
         assertCanMutate(visitId);
         const response = await guardedPostForm(visitId, ARMY_LIVE_URL, payload);
         const result = logic.parseArmyActionResponse(response);
+        debug('Army action parsed', {
+          visitId,
+          action,
+          fields,
+          ok: result.ok,
+          message: result.message,
+          summary: result.state ? logic.armySummary(result.state) : null,
+        });
         if (!result.ok) {
           throw new Error(`Army ${action} failed: ${result.message || `HTTP ${response?.status || '?'}`}`);
         }
@@ -5432,6 +5759,12 @@
         const pageDoc = await fetchDocument(pageUrl.href);
         const page = logic.parseArmyNodePage(pageDoc);
         const fight = logic.chooseArmyFight(page);
+        debug('Army fight decision', {
+          visitId,
+          node: { id: node.id, key: node.key, name: node.name, status: node.status },
+          page,
+          fight,
+        });
         if (!fight) return { progressed: false, message: `${node.name} has no actionable Army fight.` };
 
         await healArmyIfAvailable(visitId, route);
@@ -5449,6 +5782,11 @@
         if (!entered.ok) throw new Error(`Entering the Army fight failed: ${entered.message || 'invalid redirect'}`);
         const liveDoc = await fetchDocument(entered.redirect);
         const live = logic.parseArmyLivePage(liveDoc);
+        debug('Army live page parsed', {
+          visitId,
+          battleId: live.battleId,
+          summary: live.state ? logic.armySummary(live.state) : null,
+        });
         if (!live.battleId || !live.state) throw new Error('The live Army battle state could not be read safely.');
         if (!logic.armySummary(live.state).active) {
           return { progressed: true, message: `${node.name} Army fight already ended.` };
@@ -5486,6 +5824,20 @@
         assertCanMutate(visitId);
         const cubeDoc = await fetchDocument(url);
         const cube = logic.parseCubePage(cubeDoc, url);
+        debug('Crucible cube parsed', {
+          visitId,
+          url,
+          instanceId: cube.instanceId,
+          nodes: cube.nodes.map((node) => ({
+            id: node.id,
+            key: node.key,
+            name: node.name,
+            type: node.type,
+            status: node.status,
+            faceKey: node.faceKey,
+            linkedLocationId: node.linkedLocationId,
+          })),
+        });
         if (!/^\d+$/.test(cube.instanceId)) throw new Error('The Crucible instance id could not be read.');
         if (cube.nodes.length === 0) throw new Error('The Crucible STATE nodes could not be read.');
         return cube;
@@ -5501,6 +5853,17 @@
       async function executeVisit(command) {
         const visitId = command.visitId;
         let route = routeConfig();
+        debug('visit execution started', {
+          visitId,
+          deadlineAt: command.deadlineAt,
+          settings: {
+            pveEnabled: route.settings.pveEnabled,
+            pvpEnabled: route.settings.pvp.enabled,
+            armyEnabled: route.settings.army.enabled,
+            armyMode: route.settings.army.mode,
+            selectedShadowIds: route.settings.army.selectedShadowIds,
+          },
+        });
         if (!route.settings.pveEnabled && !route.settings.pvp.enabled && !route.settings.army.enabled) {
           setTerminal(visitId, 'done', 'Crucible has no enabled automation section.');
           return;
@@ -5517,7 +5880,10 @@
         async function runSection(section, operation) {
           if (failedSections.has(section)) return null;
           try {
-            return await operation();
+            debug('section started', { visitId, section });
+            const result = await operation();
+            debug('section completed', { visitId, section, result });
+            return result;
           } catch (error) {
             // Lease loss, cancellation, scheduler drain and resource stops apply
             // to the whole visit and must retain their existing semantics.
@@ -5525,6 +5891,7 @@
             failedSections.add(section);
             const message = String(error?.message || error || 'unknown error');
             sectionErrors.push(`${section}: ${message}`);
+            debug('section failed', { visitId, section, message, stack: String(error?.stack || '') });
             log(`${section} section failed independently: ${message}`, 'warn');
             return null;
           }
@@ -5533,6 +5900,7 @@
         for (let pass = 0; pass < TIMING.maxVisitPasses; pass += 1) {
           assertCanMutate(visitId);
           const cube = await loadCube(visitId, cubeUrl);
+          debug('visit pass', { visitId, pass: pass + 1, instanceId: cube.instanceId });
           cubeUrl = new URL(`/guild_dungeon_cube.php?instance_id=${encodeURIComponent(cube.instanceId)}`, win.location.origin).href;
           route = routeConfig();
           let progressed = false;
@@ -5623,7 +5991,10 @@
           if (!runtime.runningVisitId) publish('idle', true, 'Crucible is idle on the dungeon page.');
           return;
         }
-        if (!ownsSchedulerLease()) return;
+        if (!ownsSchedulerLease()) {
+          debugSkip('scheduler lease not owned', { visitId: command.visitId });
+          return;
+        }
         if (runtime.terminal?.visitId === command.visitId) {
           publish(runtime.terminal.state, true, runtime.terminal.message, command.visitId, runtime.terminal);
           return;
@@ -5641,6 +6012,7 @@
         runtime.attacks = 0;
         runtime.targets = 0;
         runtime.armyActions = 0;
+        debug('worker tick started visit', { visitId: command.visitId, phase: command.phase, deadlineAt: command.deadlineAt });
         try {
           await executeVisit(command);
         } catch (error) {
@@ -21599,6 +21971,12 @@
     'use strict';
 
     const { normalizeDamageTarget } = require('../core/numbers');
+    const {
+      appendCrucibleDebugLog,
+      clearCrucibleDebugLog,
+      formatCrucibleDebugLog,
+      readCrucibleDebugLog,
+    } = require('../core/crucible-debug');
 
     const DEFAULT_DAMAGE = '1m';
     const DEFAULT_ATTACK_COOLDOWN_MS = 100;
@@ -21806,6 +22184,7 @@
         : armyShadows.map((shadow) => shadow.id);
       const selectedShadowIds = [...new Set(selectedSource.map(String))].filter((id) => validShadowIds.has(id));
       return {
+        debugLogging: value?.debugLogging === true,
         pveEnabled: value?.pveEnabled !== false,
         skill: SKILL_IDS.has(skill) ? skill : '0',
         attackCooldownMs: normalizeCooldown(value?.attackCooldownMs),
@@ -22121,6 +22500,105 @@
         }),
       );
       ctx.container.appendChild(armyGroup);
+
+      ctx.addSectionTitle('Diagnostics');
+      const diagnostics = ctx.make('div', { className: ctx.cls('setting') });
+      ctx.addCheckbox({
+        id: 'debug-logging',
+        label: 'Enable Crucible diagnostic logging',
+        checked: ctx.settings.debugLogging,
+        parent: diagnostics,
+        onChange(checked) {
+          if (!checked) {
+            appendCrucibleDebugLog(ctx.store, 'ui', 'diagnostic logging disabled');
+          }
+          ctx.settings = ctx.updateSettings((settings) => {
+            settings.debugLogging = checked;
+          });
+          if (checked) {
+            appendCrucibleDebugLog(ctx.store, 'ui', 'diagnostic logging enabled', {
+              userAgent: ctx.win?.navigator?.userAgent || '',
+            });
+          }
+        },
+      });
+      diagnostics.appendChild(
+        ctx.make('div', {
+          className: ctx.cls('hint'),
+          text: 'Stores up to 500 sanitized entries locally. Requests, decisions, node states and exact failures are included. Disable it after reproducing the problem.',
+        }),
+      );
+
+      const output = ctx.make('textarea', {
+        id: `${ctx.idPrefix}-debug-output`,
+        className: ctx.cls('input'),
+      });
+      output.readOnly = true;
+      output.rows = 12;
+      output.value = formatCrucibleDebugLog(readCrucibleDebugLog(ctx.store));
+      if (output.style) {
+        output.style.width = '100%';
+        output.style.minHeight = '220px';
+        output.style.resize = 'vertical';
+        output.style.fontFamily = 'ui-monospace, SFMono-Regular, Consolas, monospace';
+        output.style.fontSize = '10px';
+      }
+      diagnostics.appendChild(output);
+
+      const buttons = ctx.make('div');
+      if (buttons.style) {
+        buttons.style.display = 'flex';
+        buttons.style.flexWrap = 'wrap';
+        buttons.style.gap = '8px';
+        buttons.style.marginTop = '8px';
+      }
+      function refreshOutput() {
+        output.value = formatCrucibleDebugLog(readCrucibleDebugLog(ctx.store));
+        output.scrollTop = output.scrollHeight || 0;
+      }
+      const refreshButton = ctx.make('button', {
+        id: `${ctx.idPrefix}-debug-refresh`,
+        className: ctx.cls('primary'),
+        type: 'button',
+        text: 'Refresh log',
+      });
+      const copyButton = ctx.make('button', {
+        id: `${ctx.idPrefix}-debug-copy`,
+        className: ctx.cls('primary'),
+        type: 'button',
+        text: 'Copy log',
+      });
+      const clearButton = ctx.make('button', {
+        id: `${ctx.idPrefix}-debug-clear`,
+        className: ctx.cls('primary'),
+        type: 'button',
+        text: 'Clear log',
+      });
+      for (const button of [refreshButton, copyButton, clearButton]) setTouchSize(button);
+      refreshButton.addEventListener('click', refreshOutput);
+      copyButton.addEventListener('click', async () => {
+        refreshOutput();
+        try {
+          const writeText = ctx.win?.navigator?.clipboard?.writeText;
+          if (typeof writeText !== 'function') throw new Error('Clipboard API unavailable');
+          await writeText.call(ctx.win.navigator.clipboard, output.value);
+          copyButton.textContent = 'Copied';
+        } catch {
+          output.focus?.();
+          output.select?.();
+          const copied = ctx.doc?.execCommand?.('copy') === true;
+          copyButton.textContent = copied ? 'Copied' : 'Select and copy';
+        }
+      });
+      clearButton.addEventListener('click', () => {
+        clearCrucibleDebugLog(ctx.store);
+        refreshOutput();
+      });
+      buttons.appendChild(refreshButton);
+      buttons.appendChild(copyButton);
+      buttons.appendChild(clearButton);
+      diagnostics.appendChild(buttons);
+      ctx.container.appendChild(diagnostics);
     }
 
     module.exports = Object.freeze({
@@ -23324,6 +23802,7 @@
     // status keys in core/protocol.js.
 
     const { finiteTimestamp } = require('../core/numbers');
+    const { appendCrucibleDebugLog } = require('../core/crucible-debug');
     const {
       COMMAND_KEY,
       PROTOCOL_VERSION,
@@ -23365,7 +23844,12 @@
         navigationPending: false,
         tickRunning: false,
         stopped: false,
+        debugLeaseAt: 0,
       };
+
+      function debugCrucible(event, details = null, now = Date.now()) {
+        appendCrucibleDebugLog(store, 'scheduler', event, details, now);
+      }
 
       const label = (routeId) => getRoute(routeId)?.label || routeId;
       const setStatus = (text) => ui.setStatus(text);
@@ -23407,6 +23891,16 @@
         if (saved.routes[routeId].loopMinutes !== previousLoopMinutes) {
           saveRuntime(applyLoopChange(loadRuntime(now), routeId, loopIntervalMs(saved, routeId), now), now);
           ui.update(saved, loadRuntime(now));
+        }
+        if (routeId === 'crucible') {
+          debugCrucible('route configuration updated', {
+            enabled: saved.routes[routeId].enabled,
+            loopMinutes: saved.routes[routeId].loopMinutes,
+            debugLogging: saved.routes[routeId].settings.debugLogging,
+            pveEnabled: saved.routes[routeId].settings.pveEnabled,
+            pvpEnabled: saved.routes[routeId].settings.pvp.enabled,
+            armyEnabled: saved.routes[routeId].settings.army.enabled,
+          }, now);
         }
         return saved.routes[routeId];
       }
@@ -23488,7 +23982,7 @@
 
       function startVisit(runtime, route, config, now = Date.now()) {
         setStatus(`Preparing ${route.label} …`);
-        return saveActiveVisit(
+        const next = saveActiveVisit(
           runtime,
           {
             version: PROTOCOL_VERSION,
@@ -23501,6 +23995,14 @@
           },
           now,
         );
+        if (route.id === 'crucible') {
+          debugCrucible('visit scheduled', {
+            visit: next.activeVisit,
+            loopMinutes: config.routes.crucible.loopMinutes,
+            currentUrl: currentUrl().href,
+          }, now);
+        }
+        return next;
       }
 
       function readWorkerStatus(routeId) {
@@ -23551,8 +24053,19 @@
       const ensureVisitRunningCommand = (visit) => writeCommandPhase(visit, 'running');
 
       function finishVisit(runtime, config, outcome, now, hint = null) {
-        const routeLabel = label(runtime.activeVisit.taskId);
-        clearActiveVisit(runtime, outcome, config, now, hint);
+        const visit = runtime.activeVisit;
+        const routeLabel = label(visit.taskId);
+        const completed = clearActiveVisit(runtime, outcome, config, now, hint);
+        if (visit.taskId === 'crucible') {
+          debugCrucible('visit finished', {
+            visit,
+            outcome,
+            hint,
+            nextRunAt: completed.nextRunAt.crucible,
+            configuredLoopMinutes: config.routes.crucible.loopMinutes,
+            workerStatus: readWorkerStatus('crucible'),
+          }, now);
+        }
         if (hint?.note && finiteTimestamp(hint.retryAt, 0) > now) setStatus(`${routeLabel}: ${hint.note}.`);
         else setStatus(outcome === 'done' ? `${routeLabel} finished.` : `${routeLabel} stopped with an error.`);
         navigateHome(config);
@@ -23739,6 +24252,10 @@
           let runtime = loadRuntime(now);
 
           if (!claimLease(now)) {
+            if (now - state.debugLeaseAt >= 30_000) {
+              state.debugLeaseAt = now;
+              debugCrucible('scheduler lease not owned', { currentUrl: currentUrl().href }, now);
+            }
             setStatus('Another tab is controlling the scheduler.');
             ui.update(config, runtime);
             return;
@@ -23776,6 +24293,11 @@
           ui.update(config, loadRuntime(now));
         } catch (error) {
           console.error('[Veyra] Scheduler tick failed.', error);
+          debugCrucible('scheduler tick failed', {
+            error: String(error?.message || error),
+            stack: String(error?.stack || ''),
+            currentUrl: currentUrl().href,
+          });
           setStatus('Scheduler error');
         } finally {
           state.tickRunning = false;
@@ -23839,7 +24361,7 @@
 
     function startScheduler({ win, store, sessionStore, featureGroups = [], featureSettings = null }) {
       const doc = win.document;
-      const ui = createSchedulerUi({ doc, win, featureGroups, featureSettings });
+      const ui = createSchedulerUi({ doc, win, store, featureGroups, featureSettings });
       const engine = createSchedulerEngine({ win, store, sessionStore, ui });
 
       ui.mount(engine);
@@ -24166,7 +24688,7 @@
 
     // featureGroups: [{ title, settings: [definition] }] from features/runner.js
     // featureSettings: core/settings.js store used to read and save them
-    function createSchedulerUi({ doc, win, featureGroups = [], featureSettings = null }) {
+    function createSchedulerUi({ doc, win, store = null, featureGroups = [], featureSettings = null }) {
       const state = {
         actions: null,
         statusText: '',
@@ -24290,6 +24812,9 @@
         return {
           routeId,
           settings: routeConfig.settings,
+          store,
+          win,
+          doc,
           make,
           cls,
           idPrefix,
