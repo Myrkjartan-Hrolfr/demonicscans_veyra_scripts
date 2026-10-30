@@ -2,7 +2,14 @@
 
 const { normalizeBossSettings, renderBossSettings } = require('./boss-settings');
 
-const boss = (id, name) => Object.freeze({ id, name, defaultDamage: '1b', defaultEnabled: false });
+const boss = (id, name, options = {}) => Object.freeze({
+  id,
+  name,
+  defaultDamage: '1b',
+  defaultEnabled: false,
+  ...options,
+});
+const phasedBoss = (id, name) => boss(id, name, { phase3: true, defaultPhase3Damage: '0' });
 
 // One scheduler page for all Olympus domains; a visit walks through them in
 // this order. Each domain has a herald and its god.
@@ -22,7 +29,7 @@ const OLYMPUS_DOMAINS = Object.freeze([
     wave: 10,
     bosses: Object.freeze([
       boss('pan', 'Pan, Wild Herald of Hermes'),
-      boss('hermes', 'Hermes, Divine Herald of the Endless Road'),
+      phasedBoss('hermes', 'Hermes, Divine Herald of the Endless Road'),
     ]),
   }),
   Object.freeze({
@@ -31,7 +38,7 @@ const OLYMPUS_DOMAINS = Object.freeze([
     wave: 11,
     bosses: Object.freeze([
       boss('orion', 'Orion, Eternal Hunter of Artemis'),
-      boss('artemis', 'Artemis, Divine Huntress of the Moonlit Wilds'),
+      phasedBoss('artemis', 'Artemis, Divine Huntress of the Moonlit Wilds'),
     ]),
   }),
   Object.freeze({
@@ -40,7 +47,7 @@ const OLYMPUS_DOMAINS = Object.freeze([
     wave: 12,
     bosses: Object.freeze([
       boss('triton', 'Triton, Herald of the Deep Crown'),
-      boss('poseidon', 'Poseidon, Sovereign of the Drowned Steps'),
+      phasedBoss('poseidon', 'Poseidon, Sovereign of the Drowned Steps'),
     ]),
   }),
   Object.freeze({
@@ -49,7 +56,7 @@ const OLYMPUS_DOMAINS = Object.freeze([
     wave: 13,
     bosses: Object.freeze([
       boss('deimos', 'Deimos, Herald of Panic'),
-      boss('ares', 'Ares, Sovereign of the Red Bastion'),
+      phasedBoss('ares', 'Ares, Sovereign of the Red Bastion'),
     ]),
   }),
   Object.freeze({
@@ -58,7 +65,7 @@ const OLYMPUS_DOMAINS = Object.freeze([
     wave: 14,
     bosses: Object.freeze([
       boss('asclepius', 'Asclepius, Herald of Golden Mercy'),
-      boss('apollo', 'Apollo, Sovereign of the Sun Basilica'),
+      phasedBoss('apollo', 'Apollo, Sovereign of the Sun Basilica'),
     ]),
   }),
   Object.freeze({
@@ -67,7 +74,7 @@ const OLYMPUS_DOMAINS = Object.freeze([
     wave: 15,
     bosses: Object.freeze([
       boss('nike', 'Nike, Herald of Unbroken Victory'),
-      boss('athena', 'Athena, Sovereign of the Ivory War Library'),
+      phasedBoss('athena', 'Athena, Sovereign of the Ivory War Library'),
     ]),
   }),
   Object.freeze({
@@ -76,7 +83,7 @@ const OLYMPUS_DOMAINS = Object.freeze([
     wave: 16,
     bosses: Object.freeze([
       boss('nemesis', 'Nemesis, Herald of Reckoning'),
-      boss('hera', 'Hera, Sovereign of the Crown Court'),
+      phasedBoss('hera', 'Hera, Sovereign of the Crown Court'),
     ]),
   }),
   Object.freeze({
@@ -85,7 +92,7 @@ const OLYMPUS_DOMAINS = Object.freeze([
     wave: 17,
     bosses: Object.freeze([
       boss('aeolus', 'Aeolus, Herald of Bound Winds'),
-      boss('zeus', 'Zeus, Sovereign of the Storm Throne'),
+      phasedBoss('zeus', 'Zeus, Sovereign of the Storm Throne'),
     ]),
   }),
 ]);
@@ -109,7 +116,7 @@ module.exports = Object.freeze({
   id: 'olympus',
   label: 'Olympus',
   path: domainPath(OLYMPUS_DOMAINS[0]),
-  visitPathnames: Object.freeze(['/battle.php']),
+  visitPathnames: Object.freeze(['/battle.php', '/pvp_style_battle.php']),
   defaultLoopMinutes: 30,
   maxVisitMs: 45 * 60_000,
   initialDelayMs: 5 * 60_000,

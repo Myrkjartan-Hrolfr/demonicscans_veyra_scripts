@@ -3,7 +3,12 @@
 // Shared settings for boss pages (Wave 3, Olympus): per boss an attack
 // checkbox and a damage target, plus the attacks Monster Auto Battle uses.
 
-const { normalizeDamageTarget } = require('../core/numbers');
+const {
+  formatGameNumber,
+  normalizeAdditionalDamageTarget,
+  normalizeDamageTarget,
+  parseGameNumber,
+} = require('../core/numbers');
 
 const STANDARD_SKILLS = Object.freeze([
   Object.freeze({ id: '-5', name: 'Skill −5', cost: 1_000 }),
@@ -29,12 +34,19 @@ function normalizeBossSettings(value, bossList) {
   const bosses = {};
   for (const boss of bossList) {
     const saved = value?.bosses?.[boss.id];
-    bosses[boss.id] = {
+    const normalized = {
       // Names identify the boss on the page and must not come from storage.
       name: boss.name,
       enabled: typeof saved?.enabled === 'boolean' ? saved.enabled : boss.defaultEnabled !== false,
       damage: normalizeDamageTarget(saved?.damage, boss.defaultDamage),
     };
+    if (boss.phase3 === true) {
+      normalized.phase3Damage = normalizeAdditionalDamageTarget(
+        saved?.phase3Damage,
+        boss.defaultPhase3Damage,
+      );
+    }
+    bosses[boss.id] = normalized;
   }
   return { bosses, skills: normalizeSkills(value?.skills) };
 }
@@ -82,9 +94,12 @@ function renderBossSettings(ctx, sections) {
           });
         },
       });
+      let updateCombinedHint = () => {};
       ctx.addTextInput({
         id: `boss-${boss.id}-damage`,
-        label: 'Damage target (e.g. 500m, 3b)',
+        label: boss.phase3 === true
+          ? 'Phase 1 damage target (e.g. 500m, 3b)'
+          : 'Damage target (e.g. 500m, 3b)',
         value: bossSettings.damage,
         placeholder: boss.defaultDamage,
         inputMode: 'decimal',
@@ -92,9 +107,39 @@ function renderBossSettings(ctx, sections) {
           const next = ctx.updateSettings((settings) => {
             settings.bosses[boss.id].damage = normalizeDamageTarget(value, boss.defaultDamage);
           });
+          ctx.settings = next;
+          updateCombinedHint(next.bosses[boss.id]);
           return next.bosses[boss.id].damage;
         },
       });
+      if (boss.phase3 === true) {
+        ctx.addTextInput({
+          id: `boss-${boss.id}-phase3-damage`,
+          label: 'Phase 3 additional damage target (e.g. 500m, 4b)',
+          value: bossSettings.phase3Damage,
+          placeholder: boss.defaultPhase3Damage || '0',
+          inputMode: 'decimal',
+          onChange(value) {
+            const next = ctx.updateSettings((settings) => {
+              settings.bosses[boss.id].phase3Damage = normalizeAdditionalDamageTarget(
+                value,
+                boss.defaultPhase3Damage,
+              );
+            });
+            ctx.settings = next;
+            updateCombinedHint(next.bosses[boss.id]);
+            return next.bosses[boss.id].phase3Damage;
+          },
+        });
+        const combinedHint = ctx.make('div', { className: ctx.cls('hint') });
+        updateCombinedHint = (settings) => {
+          const phase1 = parseGameNumber(settings?.damage) || 0;
+          const phase3 = parseGameNumber(settings?.phase3Damage) || 0;
+          combinedHint.textContent = `Overall target after Phase 3: ${formatGameNumber(phase1 + phase3)} (Phase 1 + Phase 3).`;
+        };
+        updateCombinedHint(bossSettings);
+        ctx.container.appendChild(combinedHint);
+      }
     }
   }
 }

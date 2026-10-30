@@ -3,7 +3,7 @@
 Grundlage: `arbeitsauftrag.txt`, die bestehenden Skripte und die Beispielseiten in `veyra_seiten.txt`.
 Status-Legende: **[vorh.]** existiert schon weitgehend · **[anp.]** existiert, muss angepasst werden · **[neu]** neu zu bauen · **[?]** offene Frage
 
-Aktueller Stand: Alle beauftragten Punkte sind umgesetzt. Castle of the Fallen Prince ist ab Version 0.7.0 als eigene, zunächst deaktivierte Route enthalten. Nur die ausdrücklich ausgeschlossenen Punkte 5.4, 7.15 und 7.16 bleiben unverändert.
+Aktueller Stand: Alle beauftragten Punkte sind umgesetzt. Ab Version 0.8.0 automatisiert Olympus zusätzlich die persönlichen Phasen 2 und 3 der acht Götterbosse. Castle of the Fallen Prince ist ab Version 0.7.0 als eigene, zunächst deaktivierte Route enthalten. Nur die ausdrücklich ausgeschlossenen Punkte 5.4, 7.15 und 7.16 bleiben unverändert.
 
 ---
 
@@ -49,6 +49,9 @@ URLs: Wave 3 `active_wave.php?gate=3&wave=8`. Olympus `gate=5`: außen wave=9, H
 | 2.8 | Skript: Beitreten, falls noch nicht beigetreten | [vorh.] | POST `user_join_battle.php` mit `monster_id` und `user_id`, mit sicherem Fallback auf die Join-Schaltfläche der Battle-Seite. |
 | 2.9 | Skript: Angreifen, bis das Ziel erreicht ist | [vorh.] | Der schedulerfähige Worker steuert das ins Bundle portierte Monster Auto Battle und prüft danach den erreichten Eigenschaden. |
 | 2.10 | Skript: Stamina nachfüllen bzw. heilen gemäß Einstellungen | [vorh.] | Monster Auto Battle erhält die pro Route ausgewählten Stamina- und Heiltränke. |
+| 2.11 | Olympus-Götter: separates Schadensziel für Phase 1 und Phase 3 | [vorh.] | Hermes, Artemis, Poseidon, Ares, Apollo, Athena, Hera und Zeus haben zwei Felder. Das Phase-3-Feld ist zusätzlicher Schaden; intern wird für die Ascended-Form das kumulative Ziel `Phase 1 + Phase 3` verwendet (z. B. `3b + 4b = 7b`). |
+| 2.12 | Olympus-Götter: Phase-2-Duell automatisch betreten und gewinnen | [vorh.] | Der Worker übernimmt den dynamischen `active_id`-Link, liest Zug/Tokens/Ziel aus `pvp_style_state.php` und verwendet Power Slash, solange dessen aktueller Tokenpreis bezahlbar ist, sonst Slash. Niederlagen werden über die vorgesehene Retry-Aktion neu gestartet. |
+| 2.13 | Nach Phase 2 automatisch zur Ascended-Form zurückkehren | [vorh.] | Nach bestätigtem Duellsieg wird derselbe dynamische Boss wieder geöffnet. Die Ascended-PvE-Seite wird erkannt und Monster Auto Battle bis zum kumulativen Ziel fortgesetzt. |
 
 ## 3. PvP
 
@@ -189,7 +192,7 @@ Die Lizenz erlaubt Bündeln und Ändern; der MIT-Copyright-Hinweis muss im Bundl
 - **F19 veyra-hud:** Alles kommt ins Bundle außer Debug-Konsole, Gamba Enhanced und Equipment Presets (Abschnitt 7).
 - **F20 Shadowbridge-Grenzen:** Die Lootgrenze wird live von der Battle-Seite gelesen; die EXP-Grenze spielt bei Mobs keine Rolle. Im Bossraum sind alle vier Modi möglich (4.1.1a, 4.1.1b).
 
-- **F22 Wave/Olympus:** Die Bosse werden weiter über Monster Auto Battle angegriffen; MAB ist dafür ins Bundle portiert und wird über `src/features/battle/mab-bridge.js` gesteuert. Olympus ist eine einzige Seite im Menü, deren Besuch nacheinander alle Domänen mit aktivierten Bossen abläuft.
+- **F22 Wave/Olympus:** Die Bosse werden weiter über Monster Auto Battle angegriffen; MAB ist dafür ins Bundle portiert und wird über `src/features/battle/mab-bridge.js` gesteuert. Olympus ist eine einzige Seite im Menü, deren Besuch nacheinander alle Domänen mit aktivierten Bossen abläuft. Bei den acht Götterbossen übernimmt der Worker zusätzlich das persönliche Phase-2-Duell und setzt Phase 3 mit dem kumulativen Ziel aus den getrennten Phase-1-/Phase-3-Einstellungen fort.
 - **F21 Asterion:** An `damage.php` gehen immer die Basis-Staminakosten (1/10/50/100/200). Asterion wirkt nur auf die Anzeige und auf Stamina-Prüfungen, nicht auf `stamina_cost`. Das gilt auch für die neue Shadowbridge-Logik (4.1); `dungeon_auto_damage_fast` hatte hier multipliziert.
 
 ## Offene Fragen

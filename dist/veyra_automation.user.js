@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.7.2
+// @version      0.8.0
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -565,6 +565,20 @@
       return isValid(normalizedFallback) ? normalizedFallback : '3b';
     }
 
+    // Additional phase damage may intentionally be zero. Keep the same compact
+    // input format as normal damage targets while accepting that one extra value.
+    function normalizeAdditionalDamageTarget(value, fallback = '0') {
+      const isValid = (candidate) => {
+        const parsed = parseGameNumber(candidate);
+        return parsed !== null && parsed >= 0;
+      };
+
+      const normalized = compactNumberText(value);
+      if (isValid(normalized)) return normalized;
+      const normalizedFallback = compactNumberText(fallback);
+      return isValid(normalizedFallback) ? normalizedFallback : '0';
+    }
+
     function formatGameNumber(value) {
       const number = finiteNumber(value, 0);
       const suffixes = Object.entries(SUFFIX_MULTIPLIERS).reverse();
@@ -592,6 +606,7 @@
       finiteNumber,
       finiteTimestamp,
       formatGameNumber,
+      normalizeAdditionalDamageTarget,
       normalizeDamageTarget,
       parseFraction,
       parseGameNumber,
@@ -1929,6 +1944,9 @@
       monsterContainer: '.monster-container',
       battleJoin: '#join-battle',
       battleCard: '.battle-card.monster-card[data-monster-id]',
+      battleTitle: '.battle-card.monster-card .card-title',
+      monsterImage: '#monsterImage',
+      phaseDuel: 'a[href*="pvp_style_battle.php"][href*="source=monster_phase"]',
     });
 
     function attr(element, name) {
@@ -2008,6 +2026,32 @@
       return doc?.querySelector?.(SELECTORS.battleJoin) || null;
     }
 
+    function findPhaseDuelControl(doc, base = 'https://demonicscans.org') {
+      const element = doc?.querySelector?.(SELECTORS.phaseDuel) || null;
+      const href = attr(element, 'href');
+      if (!element || !href) return null;
+      try {
+        const url = new URL(href, base);
+        const activeId = String(url.searchParams.get('active_id') || '').trim();
+        if (
+          !/\/pvp_style_battle\.php\/?$/i.test(url.pathname) ||
+          url.searchParams.get('source') !== 'monster_phase' ||
+          !activeId
+        ) {
+          return null;
+        }
+        return { element, href: `${url.pathname}${url.search}`, activeId };
+      } catch {
+        return null;
+      }
+    }
+
+    function isAscendedBattle(doc) {
+      const title = String(doc?.querySelector?.(SELECTORS.battleTitle)?.textContent || '').toLowerCase();
+      const image = attr(doc?.querySelector?.(SELECTORS.monsterImage), 'src').toLowerCase();
+      return title.includes('ascended') || image.includes('ascended pve');
+    }
+
     function setCookie(doc, name, value, days = 30) {
       try {
         doc.cookie = `${name}=${encodeURIComponent(value)}; Max-Age=${days * 86_400}; Path=/; SameSite=Lax`;
@@ -2029,7 +2073,9 @@
       SELECTORS,
       battleMonsterId,
       findBattleJoinControl,
+      findPhaseDuelControl,
       hasBossList,
+      isAscendedBattle,
       monsterIdFromHref,
       readCookieText,
       readMonsterCards,
@@ -2044,7 +2090,7 @@
     // planning, command evaluation and the private run state. No DOM access, so
     // everything here is unit-testable.
 
-    const { parseGameNumber } = require('../../core/numbers');
+    const { formatGameNumber, parseGameNumber } = require('../../core/numbers');
     const protocol = require('../../core/protocol');
     const wave3 = require('../../routes/wave3');
     const olympus = require('../../routes/olympus');
@@ -2074,7 +2120,7 @@
       maxFightsPerBoss: 3,
     });
 
-    const RUN_PHASES = Object.freeze(['hub', 'opening', 'battle', 'returning', 'finished']);
+    const RUN_PHASES = Object.freeze(['hub', 'opening', 'battle', 'duel', 'returning', 'finished']);
 
     // ------------------------------------------------------------------ routes
 
@@ -2130,6 +2176,14 @@
       return Boolean(url && /\/battle\.php\/?$/i.test(url.pathname));
     }
 
+    function isPhaseDuelUrl(url) {
+      return Boolean(
+        url &&
+          /\/pvp_style_battle\.php\/?$/i.test(url.pathname) &&
+          url.searchParams.get('source') === 'monster_phase',
+      );
+    }
+
     function withVisit(path, visitId, origin = 'https://demonicscans.org') {
       const url = new URL(path, origin);
       if (visitId) url.searchParams.set(VISIT_PARAM, visitId);
@@ -2140,6 +2194,19 @@
       return `/battle.php?id=${encodeURIComponent(String(monsterId))}`;
     }
 
+    function battleDamageTarget(target, ascended = false) {
+      const useCombined = target?.phased === true && ascended === true;
+      const value = useCombined
+        ? Number(target.damageValue)
+        : Number(target?.phase1DamageValue ?? target?.damageValue);
+      const fallback = Number(target?.damageValue) || 0;
+      const damageValue = Number.isFinite(value) && value > 0 ? value : fallback;
+      const damage = useCombined
+        ? String(target.damage || formatGameNumber(damageValue))
+        : String(target?.phase1Damage || target?.damage || formatGameNumber(damageValue));
+      return { phase: useCombined ? 3 : 1, damage, damageValue };
+    }
+
     // Enabled bosses per domain, in visit order. Domains without an enabled boss
     // are left out, so they are never visited.
     function buildPlan(routeId, routeConfig) {
@@ -2148,14 +2215,25 @@
       for (const domain of allDomains(routeId)) {
         const bosses = domain.bosses.map((boss) => {
           const saved = configured[boss.id];
-          const damageText = String(saved?.damage || boss.defaultDamage || '3b');
-          const damageValue = parseGameNumber(damageText) || parseGameNumber(boss.defaultDamage) || 3e9;
+          const phase1Damage = String(saved?.damage || boss.defaultDamage || '3b');
+          const phase1DamageValue = parseGameNumber(phase1Damage) || parseGameNumber(boss.defaultDamage) || 3e9;
+          const phased = routeId === 'olympus' && boss.phase3 === true;
+          const phase3Damage = phased
+            ? String(saved?.phase3Damage ?? boss.defaultPhase3Damage ?? '0')
+            : '0';
+          const phase3DamageValue = phased ? (parseGameNumber(phase3Damage) ?? 0) : 0;
+          const damageValue = phase1DamageValue + phase3DamageValue;
           return {
             id: boss.id,
             name: boss.name,
             enabled: saved?.enabled === true,
-            damage: damageText,
+            phased,
+            damage: phased ? formatGameNumber(damageValue) : phase1Damage,
             damageValue,
+            phase1Damage,
+            phase1DamageValue,
+            phase3Damage,
+            phase3DamageValue,
           };
         });
         if (bosses.some((boss) => boss.enabled)) {
@@ -2235,8 +2313,13 @@
         const base = {
           bossId: boss.id,
           name: boss.name,
+          phased: boss.phased === true,
           damage: boss.damage,
           damageValue: boss.damageValue,
+          phase1Damage: boss.phase1Damage,
+          phase1DamageValue: boss.phase1DamageValue,
+          phase3Damage: boss.phase3Damage,
+          phase3DamageValue: boss.phase3DamageValue,
         };
         const sorted = [...matched].sort(
           (left, right) =>
@@ -2291,6 +2374,57 @@
             fightCount(run, match.monsterId) < LIMITS.maxFightsPerBoss,
         ) || null
       );
+    }
+
+    function phaseDuelOutcome(state) {
+      const roomStatus = String(state?.room_status || '').toLowerCase();
+      const ended = state?.match?.ended === true;
+      const winner = String(state?.match?.winner_side || '').toLowerCase();
+      if ((ended && winner === 'ally') || roomStatus === 'cleared') return 'won';
+      if (roomStatus === 'lost' || ended) return 'lost';
+      return 'active';
+    }
+
+    function phaseDuelTargetKey(state) {
+      const players = state?.teams?.enemy?.players_by_num;
+      const candidates = Array.isArray(players) ? players : Object.values(players || {});
+      const target = candidates.find((candidate) => candidate?.key && candidate.alive !== false);
+      return String(target?.key || '');
+    }
+
+    // Olympus phase duels are solo matches. Power Slash is preferred for as long
+    // as its current token cost is affordable; Slash is the deterministic fallback.
+    function decidePhaseDuelAction(state, userId = '') {
+      const outcome = phaseDuelOutcome(state);
+      if (outcome === 'won') return { kind: 'won' };
+      if (outcome === 'lost') return { kind: 'retry' };
+      if (!state || state.ok === false) return { kind: 'wait', reason: 'invalid-state' };
+
+      const me = state.me || {};
+      const turn = state.turn || {};
+      const expectedUserId = String(userId || '');
+      if (!me.in_match || me.alive === false) return { kind: 'wait', reason: 'not-ready' };
+      if (String(turn.side || '') !== 'ally') return { kind: 'wait', reason: 'enemy-turn' };
+      if (expectedUserId && String(turn.user_id || '') !== expectedUserId) {
+        return { kind: 'wait', reason: 'other-turn' };
+      }
+
+      const targetKey = phaseDuelTargetKey(state);
+      if (!targetKey) return { kind: 'wait', reason: 'no-target' };
+      const tokens = Math.max(0, Number.parseInt(me.tokens || 0, 10));
+      const skills = Array.isArray(me.skills) ? me.skills : [];
+      const findSkill = (id) => skills.find((skill) => String(skill?.id) === id) || null;
+      const affordable = (skill) => skill && tokens >= Math.max(0, Number.parseInt(skill.cost || 0, 10));
+      const powerSlash = findSkill('-1');
+      const slash = findSkill('0');
+      const skill = affordable(powerSlash) ? powerSlash : (affordable(slash) ? slash : null);
+      if (!skill) return { kind: 'wait', reason: 'no-affordable-attack' };
+      return {
+        kind: 'attack',
+        skillId: String(skill.id),
+        skillName: String(skill.name || (String(skill.id) === '-1' ? 'Power Slash' : 'Slash')),
+        targetKey,
+      };
     }
 
     // ---------------------------------------------------------------- command
@@ -2374,13 +2508,28 @@
       const monsterId = String(value.monsterId || '').trim();
       const damageValue = Number(value.damageValue);
       if (!monsterId || !Number.isFinite(damageValue) || damageValue <= 0) return null;
+      const phased = value.phased === true;
+      const phase1DamageValue = Number(value.phase1DamageValue);
+      const normalizedPhase1 = Number.isFinite(phase1DamageValue) && phase1DamageValue > 0
+        ? phase1DamageValue
+        : damageValue;
+      const phase3DamageValue = Number(value.phase3DamageValue);
+      const normalizedPhase3 = phased && Number.isFinite(phase3DamageValue) && phase3DamageValue >= 0
+        ? phase3DamageValue
+        : 0;
+      const combinedValue = phased ? normalizedPhase1 + normalizedPhase3 : damageValue;
       return {
         monsterId,
         bossId: String(value.bossId || ''),
         name: String(value.name || ''),
         domainId: String(value.domainId || ''),
-        damage: String(value.damage || ''),
-        damageValue,
+        phased,
+        damage: String(value.damage || formatGameNumber(combinedValue)),
+        damageValue: combinedValue,
+        phase1Damage: String(value.phase1Damage || value.damage || formatGameNumber(normalizedPhase1)),
+        phase1DamageValue: normalizedPhase1,
+        phase3Damage: String(value.phase3Damage ?? '0'),
+        phase3DamageValue: normalizedPhase3,
       };
     }
 
@@ -2595,6 +2744,7 @@
       actionExhausted,
       actionReady,
       allDomains,
+      battleDamageTarget,
       battlePath,
       beginFight,
       bossNamePrefix,
@@ -2604,6 +2754,7 @@
       completeTarget,
       createRunState,
       decideAfterFight,
+      decidePhaseDuelAction,
       domainIdForUrl,
       enterDomain,
       evaluateCommand,
@@ -2614,6 +2765,7 @@
       hubRouteForUrl,
       isAliveFilterActive,
       isBattleUrl,
+      isPhaseDuelUrl,
       isJoinFatal,
       isJoinSuccess,
       isLeaseHeldByOther,
@@ -2624,6 +2776,8 @@
       normalizeBossName,
       normalizeRunState,
       parseCookies,
+      phaseDuelOutcome,
+      phaseDuelTargetKey,
       reachedTarget,
       recordAction,
       refreshAfterResume,
@@ -2659,6 +2813,8 @@
     const { TIMING, VISIT_PARAM } = logic;
     const LOG_PREFIX = '[Veyra:boss-worker]';
     const JOIN_URL = 'user_join_battle.php';
+    const PHASE_DUEL_STATE_URL = '/pvp_style_state.php';
+    const PHASE_DUEL_ACTION_URL = '/pvp_style_action.php';
 
     function createBossWorker({
       win,
@@ -2666,6 +2822,7 @@
       store,
       sessionStore = null,
       postForm,
+      fetchJson = null,
       getUserId,
       bridge = mabBridge,
       now = () => Date.now(),
@@ -3090,9 +3247,9 @@
         }
       }
 
-      function attachFight(controller, monsterId) {
+      function attachFight(controller, monsterId, damageTarget) {
         detachFight();
-        const fight = { controller, monsterId, handled: false, unsubscribe: null };
+        const fight = { controller, monsterId, damageTarget, handled: false, unsubscribe: null };
         rt.fight = fight;
         try {
           fight.unsubscribe = controller.onChange?.(() => checkFight()) || null;
@@ -3188,17 +3345,46 @@
           return;
         }
 
+        const phaseDuel = dom.findPhaseDuelControl(doc, win.location.origin);
+        if (phaseDuel && run.routeId === 'olympus' && run.target.phased) {
+          if (phaseDuel.activeId !== run.target.monsterId) {
+            saveRun(
+              logic.failTarget(
+                run,
+                `Phase duel ${phaseDuel.activeId} did not match boss ${run.target.monsterId}.`,
+                t,
+                { abandon: true },
+              ),
+            );
+            log('The phase-duel link points to a different boss; returning to the domain.', 'warn');
+            returnToHub(run);
+            return;
+          }
+          try {
+            currentController()?.stop?.();
+          } catch {
+            // The phase page normally has no running MAB controller.
+          }
+          detachFight();
+          run = saveRun(logic.setPhase(run, 'duel', t));
+          log(`Entering ${run.target.name}'s Phase 2 duel.`);
+          navigate(phaseDuel.href, run.visitId);
+          return;
+        }
+
         if (run.phase !== 'battle') run = saveRun(logic.setPhase(run, 'battle', t));
+
+        const damageTarget = logic.battleDamageTarget(run.target, dom.isAscendedBattle(doc));
 
         if (rt.fight) {
           checkFight();
           return;
         }
         publish(run.routeId, run.visitId, 'busy', false, rt.lastLog || `Preparing the fight against ${run.target.name}.`);
-        if (!rt.fightStarting) startFight(run);
+        if (!rt.fightStarting) startFight(run, damageTarget);
       }
 
-      function startFight(run) {
+      function startFight(run, damageTarget) {
         rt.fightStarting = true;
         const { visitId } = run;
         const { monsterId } = run.target;
@@ -3230,7 +3416,7 @@
               reloadPage();
               return;
             }
-            configureAndStart(controller, current, t);
+            configureAndStart(controller, current, damageTarget, t);
           } catch (error) {
             log(`Starting the boss fight failed: ${error?.message || error}`, 'warn');
           } finally {
@@ -3281,7 +3467,7 @@
         log(`Joining failed (${text || 'no answer'}); retrying.`, 'warn');
       }
 
-      function configureAndStart(controller, run, t) {
+      function configureAndStart(controller, run, damageTarget, t) {
         const routeConfig = loadRouteConfig(run.routeId);
         const skills = routeConfig?.settings?.skills?.length ? [...routeConfig.settings.skills] : ['0'];
         const potions = {
@@ -3289,16 +3475,17 @@
           heal: [...(routeConfig?.potions?.heal || [])],
         };
 
-        attachFight(controller, run.target.monsterId);
+        attachFight(controller, run.target.monsterId, damageTarget);
+        controller.setTargetDamage(damageTarget.damageValue);
         const state = controllerState(controller);
         const alreadyDone =
-          state?.finished && logic.decideAfterFight(state.reason) === 'complete';
+          state?.finished &&
+          logic.decideAfterFight(state.reason) === 'complete' &&
+          (state.reason === 'defeated' || Number(state.yourDamage) >= damageTarget.damageValue);
 
         if (state?.running) {
-          controller.setTargetDamage(run.target.damageValue);
           log(`Monster Auto Battle is already running against ${run.target.name}; watching it.`);
         } else if (!alreadyDone) {
-          controller.setTargetDamage(run.target.damageValue);
           if (controller.setAttacks(skills) === false) {
             detachFight();
             finish(run, 'error', 'None of the configured attacks is available in Monster Auto Battle.', t);
@@ -3306,7 +3493,9 @@
           }
           controller.setPotions(potions);
           controller.start();
-          log(`Monster Auto Battle started against ${run.target.name} with a ${run.target.damage} damage target.`);
+          log(
+            `Monster Auto Battle started against ${run.target.name} with a ${damageTarget.damage} Phase ${damageTarget.phase} target.`,
+          );
         }
         saveRun(logic.clearAction(run));
         checkFight();
@@ -3328,7 +3517,7 @@
             run.visitId,
             'busy',
             false,
-            `Fighting ${run.target.name}: ${damage} / ${run.target.damage}.`,
+            `Fighting ${run.target.name} (Phase ${fight.damageTarget.phase}): ${damage} / ${fight.damageTarget.damage}.`,
           );
           return;
         }
@@ -3342,7 +3531,7 @@
           log(
             state.reason === 'defeated'
               ? `${run.target.name} was defeated; returning to the hub.`
-              : `${run.target.name} reached the ${run.target.damage} target; returning to the hub.`,
+              : `${run.target.name} reached the ${fight.damageTarget.damage} Phase ${fight.damageTarget.phase} target; returning to the hub.`,
           );
           returnToHub(run);
         } else if (decision === 'stop-visit') {
@@ -3353,6 +3542,154 @@
           log(`${reasonText} Returning to the hub.`, 'warn');
           returnToHub(run);
         }
+      }
+
+      // -------------------------------------------------------- Olympus duel
+
+      async function requestPhaseDuelState(monsterId) {
+        const url = new URL(PHASE_DUEL_STATE_URL, win.location.origin || 'https://demonicscans.org');
+        url.searchParams.set('source', 'monster_phase');
+        url.searchParams.set('since_log_id', '0');
+        url.searchParams.set('active_id', String(monsterId));
+
+        if (fetchJson) {
+          const result = await fetchJson(url.href);
+          const json = result?.json || result;
+          if (result?.ok === false || !json || json.ok === false) {
+            throw new Error(String(json?.error || json?.message || `Phase state failed (${result?.status || '?'})`));
+          }
+          return json;
+        }
+
+        if (typeof win.fetch !== 'function') throw new Error('Phase state cannot be requested on this page.');
+        const response = await win.fetch(url.href, { credentials: 'same-origin', cache: 'no-store' });
+        const text = await response.text();
+        let json = null;
+        try {
+          json = JSON.parse(text);
+        } catch {
+          // The error below deliberately rejects login and HTML error pages.
+        }
+        if (!response.ok || !json || json.ok === false) {
+          throw new Error(String(json?.error || json?.message || `Phase state failed (${response.status})`));
+        }
+        return json;
+      }
+
+      function requireSuccessfulPhaseAction(response) {
+        const json = response?.json;
+        if (response?.ok === false || json?.ok === false) {
+          throw new Error(String(json?.error || json?.message || response?.text || 'Phase action failed.'));
+        }
+        return json || response;
+      }
+
+      function phaseDuelTick(url, t) {
+        const visitParam = url.searchParams.get(VISIT_PARAM) || '';
+        const activeId = String(url.searchParams.get('active_id') || '');
+        let run = loadRun(t);
+        if (!run || !visitParam || run.visitId !== visitParam) return;
+
+        const cmd = readCommand(t);
+        if (run.finished) {
+          if (cmd.visitId === run.visitId) {
+            publish(run.routeId, run.visitId, run.finished.state, true, run.finished.message);
+          }
+          return;
+        }
+
+        run = acquire(run, t, url);
+        if (!run) {
+          log('Another tab owns the active Olympus phase duel; this tab is waiting.');
+          return;
+        }
+        if (cmd.kind !== 'running' || cmd.visitId !== run.visitId) {
+          stopAndFinish(run, cmd, t);
+          return;
+        }
+        if (!run.target || run.routeId !== 'olympus' || !run.target.phased) {
+          log('No phased Olympus boss owns this duel; returning to the domain.', 'warn');
+          returnToHub(run);
+          return;
+        }
+        if (!activeId || activeId !== run.target.monsterId) {
+          saveRun(
+            logic.failTarget(
+              run,
+              `Opened phase duel ${activeId || 'unknown'} instead of ${run.target.monsterId}.`,
+              t,
+              { abandon: true },
+            ),
+          );
+          log('The open phase duel belongs to a different boss; returning to the domain.', 'warn');
+          returnToHub(run);
+          return;
+        }
+
+        if (run.phase !== 'duel') run = saveRun(logic.setPhase(run, 'duel', t));
+        publish(run.routeId, run.visitId, 'busy', false, rt.lastLog || `Fighting ${run.target.name}'s Phase 2 duel.`);
+        if (!rt.actionPending) runPhaseDuelStep(run);
+      }
+
+      function runPhaseDuelStep(run) {
+        rt.actionPending = true;
+        const { visitId } = run;
+        const monsterId = run.target.monsterId;
+        void (async () => {
+          try {
+            const state = await requestPhaseDuelState(monsterId);
+            let current = validateBattleRun(visitId, monsterId, now());
+            if (!current) return;
+            const userId = await getUserId?.();
+            current = validateBattleRun(visitId, monsterId, now());
+            if (!current) return;
+            const decision = logic.decidePhaseDuelAction(state, userId);
+
+            if (decision.kind === 'won') {
+              saveRun(logic.setPhase(logic.clearAction(current), 'battle', now()));
+              log(`${current.target.name}'s Phase 2 duel was won; returning for Phase 3.`);
+              navigate(logic.battlePath(monsterId), visitId);
+              return;
+            }
+
+            if (decision.kind === 'retry') {
+              const response = await postForm(PHASE_DUEL_ACTION_URL, {
+                source: 'monster_phase',
+                active_id: monsterId,
+                action: 'retry',
+              });
+              requireSuccessfulPhaseAction(response);
+              log(`${current.target.name}'s Phase 2 duel was restarted after a defeat.`);
+              return;
+            }
+
+            if (decision.kind === 'attack') {
+              const response = await postForm(PHASE_DUEL_ACTION_URL, {
+                source: 'monster_phase',
+                active_id: monsterId,
+                action: 'use_skill',
+                skill_id: decision.skillId,
+                target_key: decision.targetKey,
+              });
+              requireSuccessfulPhaseAction(response);
+              log(`Phase 2: used ${decision.skillName} against ${current.target.name}.`);
+              return;
+            }
+
+            const messages = {
+              'enemy-turn': 'Phase 2: waiting for the enemy turn to finish.',
+              'other-turn': 'Phase 2: waiting for the player turn.',
+              'not-ready': 'Phase 2: waiting for the duel state to become actionable.',
+              'no-target': 'Phase 2: waiting for the living duel target.',
+              'no-affordable-attack': 'Phase 2: waiting for Slash to become available.',
+            };
+            log(messages[decision.reason] || 'Phase 2: waiting for the next turn.');
+          } catch (error) {
+            log(`Phase 2 duel action failed: ${error?.message || error}`, 'warn');
+          } finally {
+            rt.actionPending = false;
+          }
+        })();
       }
 
       // ---------------------------------------------------------- lifecycle
@@ -3388,6 +3725,7 @@
           if (!url) return;
           if (logic.hubRouteForUrl(url)) hubTick(url, t);
           else if (logic.isBattleUrl(url)) battleTick(url, t);
+          else if (logic.isPhaseDuelUrl(url)) phaseDuelTick(url, t);
         } catch (error) {
           failOnError(error);
         } finally {
@@ -3459,7 +3797,10 @@
       group: 'Automation',
       settings: [],
       matches(url) {
-        return /\/(?:active_wave|battle)\.php\/?$/i.test(url.pathname);
+        return (
+          /\/(?:active_wave|battle)\.php\/?$/i.test(url.pathname) ||
+          logic.isPhaseDuelUrl(url)
+        );
       },
       run(ctx) {
         const worker = createBossWorker({
@@ -3477,6 +3818,8 @@
 
     module.exports = {
       JOIN_URL,
+      PHASE_DUEL_ACTION_URL,
+      PHASE_DUEL_STATE_URL,
       bossWorkerFeature,
       createBossWorker,
     };
@@ -21867,7 +22210,12 @@
     // Shared settings for boss pages (Wave 3, Olympus): per boss an attack
     // checkbox and a damage target, plus the attacks Monster Auto Battle uses.
 
-    const { normalizeDamageTarget } = require('../core/numbers');
+    const {
+      formatGameNumber,
+      normalizeAdditionalDamageTarget,
+      normalizeDamageTarget,
+      parseGameNumber,
+    } = require('../core/numbers');
 
     const STANDARD_SKILLS = Object.freeze([
       Object.freeze({ id: '-5', name: 'Skill −5', cost: 1_000 }),
@@ -21893,12 +22241,19 @@
       const bosses = {};
       for (const boss of bossList) {
         const saved = value?.bosses?.[boss.id];
-        bosses[boss.id] = {
+        const normalized = {
           // Names identify the boss on the page and must not come from storage.
           name: boss.name,
           enabled: typeof saved?.enabled === 'boolean' ? saved.enabled : boss.defaultEnabled !== false,
           damage: normalizeDamageTarget(saved?.damage, boss.defaultDamage),
         };
+        if (boss.phase3 === true) {
+          normalized.phase3Damage = normalizeAdditionalDamageTarget(
+            saved?.phase3Damage,
+            boss.defaultPhase3Damage,
+          );
+        }
+        bosses[boss.id] = normalized;
       }
       return { bosses, skills: normalizeSkills(value?.skills) };
     }
@@ -21946,9 +22301,12 @@
               });
             },
           });
+          let updateCombinedHint = () => {};
           ctx.addTextInput({
             id: `boss-${boss.id}-damage`,
-            label: 'Damage target (e.g. 500m, 3b)',
+            label: boss.phase3 === true
+              ? 'Phase 1 damage target (e.g. 500m, 3b)'
+              : 'Damage target (e.g. 500m, 3b)',
             value: bossSettings.damage,
             placeholder: boss.defaultDamage,
             inputMode: 'decimal',
@@ -21956,9 +22314,39 @@
               const next = ctx.updateSettings((settings) => {
                 settings.bosses[boss.id].damage = normalizeDamageTarget(value, boss.defaultDamage);
               });
+              ctx.settings = next;
+              updateCombinedHint(next.bosses[boss.id]);
               return next.bosses[boss.id].damage;
             },
           });
+          if (boss.phase3 === true) {
+            ctx.addTextInput({
+              id: `boss-${boss.id}-phase3-damage`,
+              label: 'Phase 3 additional damage target (e.g. 500m, 4b)',
+              value: bossSettings.phase3Damage,
+              placeholder: boss.defaultPhase3Damage || '0',
+              inputMode: 'decimal',
+              onChange(value) {
+                const next = ctx.updateSettings((settings) => {
+                  settings.bosses[boss.id].phase3Damage = normalizeAdditionalDamageTarget(
+                    value,
+                    boss.defaultPhase3Damage,
+                  );
+                });
+                ctx.settings = next;
+                updateCombinedHint(next.bosses[boss.id]);
+                return next.bosses[boss.id].phase3Damage;
+              },
+            });
+            const combinedHint = ctx.make('div', { className: ctx.cls('hint') });
+            updateCombinedHint = (settings) => {
+              const phase1 = parseGameNumber(settings?.damage) || 0;
+              const phase3 = parseGameNumber(settings?.phase3Damage) || 0;
+              combinedHint.textContent = `Overall target after Phase 3: ${formatGameNumber(phase1 + phase3)} (Phase 1 + Phase 3).`;
+            };
+            updateCombinedHint(bossSettings);
+            ctx.container.appendChild(combinedHint);
+          }
         }
       }
     }
@@ -22691,7 +23079,14 @@
 
     const { normalizeBossSettings, renderBossSettings } = require('./boss-settings');
 
-    const boss = (id, name) => Object.freeze({ id, name, defaultDamage: '1b', defaultEnabled: false });
+    const boss = (id, name, options = {}) => Object.freeze({
+      id,
+      name,
+      defaultDamage: '1b',
+      defaultEnabled: false,
+      ...options,
+    });
+    const phasedBoss = (id, name) => boss(id, name, { phase3: true, defaultPhase3Damage: '0' });
 
     // One scheduler page for all Olympus domains; a visit walks through them in
     // this order. Each domain has a herald and its god.
@@ -22711,7 +23106,7 @@
         wave: 10,
         bosses: Object.freeze([
           boss('pan', 'Pan, Wild Herald of Hermes'),
-          boss('hermes', 'Hermes, Divine Herald of the Endless Road'),
+          phasedBoss('hermes', 'Hermes, Divine Herald of the Endless Road'),
         ]),
       }),
       Object.freeze({
@@ -22720,7 +23115,7 @@
         wave: 11,
         bosses: Object.freeze([
           boss('orion', 'Orion, Eternal Hunter of Artemis'),
-          boss('artemis', 'Artemis, Divine Huntress of the Moonlit Wilds'),
+          phasedBoss('artemis', 'Artemis, Divine Huntress of the Moonlit Wilds'),
         ]),
       }),
       Object.freeze({
@@ -22729,7 +23124,7 @@
         wave: 12,
         bosses: Object.freeze([
           boss('triton', 'Triton, Herald of the Deep Crown'),
-          boss('poseidon', 'Poseidon, Sovereign of the Drowned Steps'),
+          phasedBoss('poseidon', 'Poseidon, Sovereign of the Drowned Steps'),
         ]),
       }),
       Object.freeze({
@@ -22738,7 +23133,7 @@
         wave: 13,
         bosses: Object.freeze([
           boss('deimos', 'Deimos, Herald of Panic'),
-          boss('ares', 'Ares, Sovereign of the Red Bastion'),
+          phasedBoss('ares', 'Ares, Sovereign of the Red Bastion'),
         ]),
       }),
       Object.freeze({
@@ -22747,7 +23142,7 @@
         wave: 14,
         bosses: Object.freeze([
           boss('asclepius', 'Asclepius, Herald of Golden Mercy'),
-          boss('apollo', 'Apollo, Sovereign of the Sun Basilica'),
+          phasedBoss('apollo', 'Apollo, Sovereign of the Sun Basilica'),
         ]),
       }),
       Object.freeze({
@@ -22756,7 +23151,7 @@
         wave: 15,
         bosses: Object.freeze([
           boss('nike', 'Nike, Herald of Unbroken Victory'),
-          boss('athena', 'Athena, Sovereign of the Ivory War Library'),
+          phasedBoss('athena', 'Athena, Sovereign of the Ivory War Library'),
         ]),
       }),
       Object.freeze({
@@ -22765,7 +23160,7 @@
         wave: 16,
         bosses: Object.freeze([
           boss('nemesis', 'Nemesis, Herald of Reckoning'),
-          boss('hera', 'Hera, Sovereign of the Crown Court'),
+          phasedBoss('hera', 'Hera, Sovereign of the Crown Court'),
         ]),
       }),
       Object.freeze({
@@ -22774,7 +23169,7 @@
         wave: 17,
         bosses: Object.freeze([
           boss('aeolus', 'Aeolus, Herald of Bound Winds'),
-          boss('zeus', 'Zeus, Sovereign of the Storm Throne'),
+          phasedBoss('zeus', 'Zeus, Sovereign of the Storm Throne'),
         ]),
       }),
     ]);
@@ -22798,7 +23193,7 @@
       id: 'olympus',
       label: 'Olympus',
       path: domainPath(OLYMPUS_DOMAINS[0]),
-      visitPathnames: Object.freeze(['/battle.php']),
+      visitPathnames: Object.freeze(['/battle.php', '/pvp_style_battle.php']),
       defaultLoopMinutes: 30,
       maxVisitMs: 45 * 60_000,
       initialDelayMs: 5 * 60_000,

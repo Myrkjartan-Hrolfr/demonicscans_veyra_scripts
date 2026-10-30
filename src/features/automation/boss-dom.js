@@ -13,6 +13,9 @@ const SELECTORS = Object.freeze({
   monsterContainer: '.monster-container',
   battleJoin: '#join-battle',
   battleCard: '.battle-card.monster-card[data-monster-id]',
+  battleTitle: '.battle-card.monster-card .card-title',
+  monsterImage: '#monsterImage',
+  phaseDuel: 'a[href*="pvp_style_battle.php"][href*="source=monster_phase"]',
 });
 
 function attr(element, name) {
@@ -92,6 +95,32 @@ function findBattleJoinControl(doc) {
   return doc?.querySelector?.(SELECTORS.battleJoin) || null;
 }
 
+function findPhaseDuelControl(doc, base = 'https://demonicscans.org') {
+  const element = doc?.querySelector?.(SELECTORS.phaseDuel) || null;
+  const href = attr(element, 'href');
+  if (!element || !href) return null;
+  try {
+    const url = new URL(href, base);
+    const activeId = String(url.searchParams.get('active_id') || '').trim();
+    if (
+      !/\/pvp_style_battle\.php\/?$/i.test(url.pathname) ||
+      url.searchParams.get('source') !== 'monster_phase' ||
+      !activeId
+    ) {
+      return null;
+    }
+    return { element, href: `${url.pathname}${url.search}`, activeId };
+  } catch {
+    return null;
+  }
+}
+
+function isAscendedBattle(doc) {
+  const title = String(doc?.querySelector?.(SELECTORS.battleTitle)?.textContent || '').toLowerCase();
+  const image = attr(doc?.querySelector?.(SELECTORS.monsterImage), 'src').toLowerCase();
+  return title.includes('ascended') || image.includes('ascended pve');
+}
+
 function setCookie(doc, name, value, days = 30) {
   try {
     doc.cookie = `${name}=${encodeURIComponent(value)}; Max-Age=${days * 86_400}; Path=/; SameSite=Lax`;
@@ -113,7 +142,9 @@ module.exports = {
   SELECTORS,
   battleMonsterId,
   findBattleJoinControl,
+  findPhaseDuelControl,
   hasBossList,
+  isAscendedBattle,
   monsterIdFromHref,
   readCookieText,
   readMonsterCards,

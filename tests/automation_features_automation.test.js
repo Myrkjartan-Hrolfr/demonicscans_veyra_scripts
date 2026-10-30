@@ -178,12 +178,15 @@ function createEnv({ routeId = 'olympus', configure, visitId = 'v1', phase = 'ru
     });
   }
   const posts = [];
+  const fetches = [];
   const env = {
     store,
     storage,
     sessionStore,
     clock,
     posts,
+    fetches,
+    phaseStates: [],
     joinAnswer: 'You have successfully joined the battle!',
     controller: null,
     status: (route) => store.read(workerStatusKey(route)),
@@ -202,6 +205,10 @@ function createEnv({ routeId = 'olympus', configure, visitId = 'v1', phase = 'ru
           posts.push({ url, params });
           return { ok: true, status: 200, text: env.joinAnswer };
         },
+        fetchJson: async (url) => {
+          fetches.push(url);
+          return env.phaseStates.shift() || { ok: false, error: 'No queued phase state.' };
+        },
         getUserId: async () => 159129,
         bridge: {
           whenController: async () => env.controller,
@@ -217,10 +224,13 @@ function createEnv({ routeId = 'olympus', configure, visitId = 'v1', phase = 'ru
   return env;
 }
 
-function enableOlympus(config, ids, damage = '10b') {
+function enableOlympus(config, ids, damage = '10b', phase3Damage = null) {
   for (const id of ids) {
     config.routes.olympus.settings.bosses[id].enabled = true;
     config.routes.olympus.settings.bosses[id].damage = damage;
+    if (phase3Damage !== null && 'phase3Damage' in config.routes.olympus.settings.bosses[id]) {
+      config.routes.olympus.settings.bosses[id].phase3Damage = phase3Damage;
+    }
   }
   config.routes.olympus.potions = { stamina: [30], heal: [108] };
   config.routes.olympus.settings.skills = ['0', '-1'];
@@ -360,6 +370,53 @@ test('the Olympus plan only contains domains with enabled bosses, in visit order
   assert.equal(logic.nextDomainId('olympus', plan, 'hera'), 'zeus');
   assert.equal(logic.nextDomainId('olympus', plan, 'zeus'), null);
   assert.deepEqual(logic.buildPlan('olympus', createDefaultConfig().routes.olympus), []);
+});
+
+test('phased Olympus gods keep Phase 1 and Phase 3 separate but use their sum on the hub', () => {
+  const config = createDefaultConfig();
+  enableOlympus(config, ['zeus'], '3b', '4b');
+  const zeus = logic.buildPlan('olympus', config.routes.olympus)[0].bosses.find((boss) => boss.id === 'zeus');
+  assert.equal(zeus.phased, true);
+  assert.equal(zeus.phase1DamageValue, 3e9);
+  assert.equal(zeus.phase3DamageValue, 4e9);
+  assert.equal(zeus.damageValue, 7e9);
+  assert.equal(zeus.damage, '7b');
+  assert.deepEqual(logic.battleDamageTarget(zeus, false), { phase: 1, damage: '3b', damageValue: 3e9 });
+  assert.deepEqual(logic.battleDamageTarget(zeus, true), { phase: 3, damage: '7b', damageValue: 7e9 });
+});
+
+test('Olympus duel logic prefers affordable Power Slash and falls back to Slash', () => {
+  const state = {
+    ok: true,
+    room_status: 'live',
+    match: { ended: false },
+    turn: { side: 'ally', user_id: 159129 },
+    me: {
+      in_match: true,
+      alive: true,
+      tokens: 40,
+      skills: [
+        { id: '0', name: 'Slash', cost: 0 },
+        { id: '-1', name: 'Power Slash', cost: 9 },
+      ],
+    },
+    teams: { enemy: { players_by_num: { 3: { key: 'enemy:monster_phase:7', alive: true } } } },
+  };
+  assert.deepEqual(logic.decidePhaseDuelAction(state, 159129), {
+    kind: 'attack',
+    skillId: '-1',
+    skillName: 'Power Slash',
+    targetKey: 'enemy:monster_phase:7',
+  });
+  assert.equal(logic.decidePhaseDuelAction({ ...state, me: { ...state.me, tokens: 8 } }, 159129).skillId, '0');
+  assert.deepEqual(
+    logic.decidePhaseDuelAction({ ...state, room_status: 'cleared', match: { ended: true, winner_side: 'ally' } }),
+    { kind: 'won' },
+  );
+  assert.deepEqual(
+    logic.decidePhaseDuelAction({ ...state, room_status: 'lost', match: { ended: true, winner_side: 'enemy' } }),
+    { kind: 'retry' },
+  );
 });
 
 test('hub URLs map to their route and domain', () => {
@@ -503,6 +560,20 @@ test('DOM readers parse auto-summon and monster cards', () => {
   assert.equal(dom.battleMonsterId(new URL('https://demonicscans.org/battle.php?id=5'), fakeDoc()), '5');
 });
 
+test('DOM readers recognize the Olympus phase-duel link and Ascended PvE form', () => {
+  const phaseLink = el({ attrs: { href: 'pvp_style_battle.php?source=monster_phase&active_id=557845671' } });
+  const phaseDoc = fakeDoc({ selectors: { [dom.SELECTORS.phaseDuel]: phaseLink } });
+  assert.deepEqual(dom.findPhaseDuelControl(phaseDoc), {
+    element: phaseLink,
+    href: '/pvp_style_battle.php?source=monster_phase&active_id=557845671',
+    activeId: '557845671',
+  });
+  assert.equal(
+    dom.isAscendedBattle(fakeDoc({ selectors: { [dom.SELECTORS.battleTitle]: el({ text: 'Zeus, Ascended Sovereign' }) } })),
+    true,
+  );
+});
+
 // ------------------------------------------------------------------ worker
 
 test('the feature is registered for wave and battle pages', () => {
@@ -511,6 +582,14 @@ test('the feature is registered for wave and battle pages', () => {
   assert.deepEqual(bossWorkerFeature.settings, []);
   assert.equal(bossWorkerFeature.matches(new URL(`${HUB}?gate=5&wave=9`)), true);
   assert.equal(bossWorkerFeature.matches(new URL('https://demonicscans.org/battle.php?id=1')), true);
+  assert.equal(
+    bossWorkerFeature.matches(new URL('https://demonicscans.org/pvp_style_battle.php?source=monster_phase&active_id=1')),
+    true,
+  );
+  assert.equal(
+    bossWorkerFeature.matches(new URL('https://demonicscans.org/pvp_style_battle.php?source=cube&instance_id=1')),
+    false,
+  );
   assert.equal(bossWorkerFeature.matches(new URL('https://demonicscans.org/pvp.php')), false);
 });
 
@@ -653,6 +732,55 @@ function battleRun(env, { routeId = 'olympus', monsterId = '557125237', domainId
   env.store.write(logic.RUN_KEY, { ...run, ownerId: '' });
 }
 
+function phasedBattleRun(env, { monsterId = '557845671', domainId = 'zeus' } = {}) {
+  let run = logic.createRunState({ visitId: 'v1', routeId: 'olympus', ownerId: 'other-tab', now: env.clock.time });
+  run = logic.enterDomain(run, domainId, env.clock.time);
+  run = logic.selectTarget(
+    run,
+    {
+      monsterId,
+      bossId: domainId,
+      name: 'Zeus, Sovereign of the Storm Throne',
+      phased: true,
+      damage: '7b',
+      damageValue: 7e9,
+      phase1Damage: '3b',
+      phase1DamageValue: 3e9,
+      phase3Damage: '4b',
+      phase3DamageValue: 4e9,
+    },
+    domainId,
+    env.clock.time,
+  );
+  run = logic.beginFight(run, env.clock.time);
+  env.store.write(logic.RUN_KEY, { ...run, ownerId: '' });
+}
+
+function livePhaseState(tokens = 40) {
+  return {
+    ok: true,
+    room_status: 'live',
+    match: { ended: false },
+    turn: { side: 'ally', user_id: 159129 },
+    me: {
+      in_match: true,
+      alive: true,
+      tokens,
+      skills: [
+        { id: '0', name: 'Slash', cost: 0 },
+        { id: '-1', name: 'Power Slash', cost: 9 },
+      ],
+    },
+    teams: {
+      enemy: {
+        players_by_num: {
+          3: { key: 'enemy:monster_phase:557845671', alive: true },
+        },
+      },
+    },
+  };
+}
+
 test('the battle page drives Monster Auto Battle and returns to the domain hub', async () => {
   const env = createEnv({ configure: (config) => enableOlympus(config, ['hera']) });
   battleRun(env);
@@ -675,6 +803,87 @@ test('the battle page drives Monster Auto Battle and returns to the domain hub',
   const run = env.run();
   assert.deepEqual(run.processed, ['557125237']);
   assert.equal(run.target, null);
+});
+
+test('a phased Olympus battle opens its matching Phase 2 duel with the visit marker', () => {
+  const env = createEnv({ configure: (config) => enableOlympus(config, ['zeus'], '3b', '4b') });
+  phasedBattleRun(env);
+  const phaseLink = el({ attrs: { href: 'pvp_style_battle.php?source=monster_phase&active_id=557845671' } });
+  const doc = fakeDoc({ selectors: { [dom.SELECTORS.phaseDuel]: phaseLink } });
+  const { win, worker } = env.page(
+    'https://demonicscans.org/battle.php?id=557845671&veyra_visit=v1',
+    doc,
+  );
+  worker.tick();
+  assert.deepEqual(win.replaced, [
+    'https://demonicscans.org/pvp_style_battle.php?source=monster_phase&active_id=557845671&veyra_visit=v1',
+  ]);
+  assert.equal(env.run().phase, 'duel');
+});
+
+test('the Phase 2 worker uses Power Slash while affordable and Slash otherwise', async () => {
+  const env = createEnv({ configure: (config) => enableOlympus(config, ['zeus'], '3b', '4b') });
+  phasedBattleRun(env);
+  env.phaseStates.push(livePhaseState(40));
+  let page = env.page(
+    'https://demonicscans.org/pvp_style_battle.php?source=monster_phase&active_id=557845671&veyra_visit=v1',
+    fakeDoc(),
+  );
+  page.worker.tick();
+  await flush();
+  assert.match(env.fetches[0], /pvp_style_state\.php\?source=monster_phase/);
+  assert.deepEqual(env.posts.at(-1), {
+    url: '/pvp_style_action.php',
+    params: {
+      source: 'monster_phase',
+      active_id: '557845671',
+      action: 'use_skill',
+      skill_id: '-1',
+      target_key: 'enemy:monster_phase:557845671',
+    },
+  });
+
+  env.phaseStates.push(livePhaseState(8));
+  page = env.page(
+    'https://demonicscans.org/pvp_style_battle.php?source=monster_phase&active_id=557845671&veyra_visit=v1',
+    fakeDoc(),
+  );
+  page.worker.tick();
+  await flush();
+  assert.equal(env.posts.at(-1).params.skill_id, '0');
+});
+
+test('a won Phase 2 duel returns to the same boss and Phase 3 uses the combined damage target', async () => {
+  const env = createEnv({ configure: (config) => enableOlympus(config, ['zeus'], '3b', '4b') });
+  phasedBattleRun(env);
+  env.phaseStates.push({
+    ...livePhaseState(),
+    room_status: 'cleared',
+    match: { ended: true, winner_side: 'ally' },
+  });
+  let page = env.page(
+    'https://demonicscans.org/pvp_style_battle.php?source=monster_phase&active_id=557845671&veyra_visit=v1',
+    fakeDoc(),
+  );
+  page.worker.tick();
+  await flush();
+  assert.deepEqual(page.win.replaced, [
+    'https://demonicscans.org/battle.php?id=557845671&veyra_visit=v1',
+  ]);
+  assert.equal(env.run().phase, 'battle');
+  assert.equal(env.run().target.damageValue, 7e9);
+
+  env.controller = stubController();
+  const ascendedDoc = fakeDoc({
+    selectors: { [dom.SELECTORS.battleTitle]: el({ text: 'Zeus, Ascended Sovereign of the Storm Throne' }) },
+  });
+  page = env.page('https://demonicscans.org/battle.php?id=557845671&veyra_visit=v1', ascendedDoc);
+  page.worker.tick();
+  await flush();
+  assert.deepEqual(env.controller.calls.slice(0, 2), [
+    ['target', 7e9],
+    ['attacks', ['-1', '0']],
+  ]);
 });
 
 test('a failed fight returns to the hub for a retry; no stamina ends the visit', async () => {

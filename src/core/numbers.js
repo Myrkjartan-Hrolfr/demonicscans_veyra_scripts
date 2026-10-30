@@ -67,6 +67,20 @@ function normalizeDamageTarget(value, fallback = '3b') {
   return isValid(normalizedFallback) ? normalizedFallback : '3b';
 }
 
+// Additional phase damage may intentionally be zero. Keep the same compact
+// input format as normal damage targets while accepting that one extra value.
+function normalizeAdditionalDamageTarget(value, fallback = '0') {
+  const isValid = (candidate) => {
+    const parsed = parseGameNumber(candidate);
+    return parsed !== null && parsed >= 0;
+  };
+
+  const normalized = compactNumberText(value);
+  if (isValid(normalized)) return normalized;
+  const normalizedFallback = compactNumberText(fallback);
+  return isValid(normalizedFallback) ? normalizedFallback : '0';
+}
+
 function formatGameNumber(value) {
   const number = finiteNumber(value, 0);
   const suffixes = Object.entries(SUFFIX_MULTIPLIERS).reverse();
@@ -94,6 +108,7 @@ module.exports = {
   finiteNumber,
   finiteTimestamp,
   formatGameNumber,
+  normalizeAdditionalDamageTarget,
   normalizeDamageTarget,
   parseFraction,
   parseGameNumber,

@@ -4,7 +4,7 @@
 // planning, command evaluation and the private run state. No DOM access, so
 // everything here is unit-testable.
 
-const { parseGameNumber } = require('../../core/numbers');
+const { formatGameNumber, parseGameNumber } = require('../../core/numbers');
 const protocol = require('../../core/protocol');
 const wave3 = require('../../routes/wave3');
 const olympus = require('../../routes/olympus');
@@ -34,7 +34,7 @@ const LIMITS = Object.freeze({
   maxFightsPerBoss: 3,
 });
 
-const RUN_PHASES = Object.freeze(['hub', 'opening', 'battle', 'returning', 'finished']);
+const RUN_PHASES = Object.freeze(['hub', 'opening', 'battle', 'duel', 'returning', 'finished']);
 
 // ------------------------------------------------------------------ routes
 
@@ -90,6 +90,14 @@ function isBattleUrl(url) {
   return Boolean(url && /\/battle\.php\/?$/i.test(url.pathname));
 }
 
+function isPhaseDuelUrl(url) {
+  return Boolean(
+    url &&
+      /\/pvp_style_battle\.php\/?$/i.test(url.pathname) &&
+      url.searchParams.get('source') === 'monster_phase',
+  );
+}
+
 function withVisit(path, visitId, origin = 'https://demonicscans.org') {
   const url = new URL(path, origin);
   if (visitId) url.searchParams.set(VISIT_PARAM, visitId);
@@ -100,6 +108,19 @@ function battlePath(monsterId) {
   return `/battle.php?id=${encodeURIComponent(String(monsterId))}`;
 }
 
+function battleDamageTarget(target, ascended = false) {
+  const useCombined = target?.phased === true && ascended === true;
+  const value = useCombined
+    ? Number(target.damageValue)
+    : Number(target?.phase1DamageValue ?? target?.damageValue);
+  const fallback = Number(target?.damageValue) || 0;
+  const damageValue = Number.isFinite(value) && value > 0 ? value : fallback;
+  const damage = useCombined
+    ? String(target.damage || formatGameNumber(damageValue))
+    : String(target?.phase1Damage || target?.damage || formatGameNumber(damageValue));
+  return { phase: useCombined ? 3 : 1, damage, damageValue };
+}
+
 // Enabled bosses per domain, in visit order. Domains without an enabled boss
 // are left out, so they are never visited.
 function buildPlan(routeId, routeConfig) {
@@ -108,14 +129,25 @@ function buildPlan(routeId, routeConfig) {
   for (const domain of allDomains(routeId)) {
     const bosses = domain.bosses.map((boss) => {
       const saved = configured[boss.id];
-      const damageText = String(saved?.damage || boss.defaultDamage || '3b');
-      const damageValue = parseGameNumber(damageText) || parseGameNumber(boss.defaultDamage) || 3e9;
+      const phase1Damage = String(saved?.damage || boss.defaultDamage || '3b');
+      const phase1DamageValue = parseGameNumber(phase1Damage) || parseGameNumber(boss.defaultDamage) || 3e9;
+      const phased = routeId === 'olympus' && boss.phase3 === true;
+      const phase3Damage = phased
+        ? String(saved?.phase3Damage ?? boss.defaultPhase3Damage ?? '0')
+        : '0';
+      const phase3DamageValue = phased ? (parseGameNumber(phase3Damage) ?? 0) : 0;
+      const damageValue = phase1DamageValue + phase3DamageValue;
       return {
         id: boss.id,
         name: boss.name,
         enabled: saved?.enabled === true,
-        damage: damageText,
+        phased,
+        damage: phased ? formatGameNumber(damageValue) : phase1Damage,
         damageValue,
+        phase1Damage,
+        phase1DamageValue,
+        phase3Damage,
+        phase3DamageValue,
       };
     });
     if (bosses.some((boss) => boss.enabled)) {
@@ -195,8 +227,13 @@ function matchHubBosses({ bosses = [], summons = [], cards = [] }) {
     const base = {
       bossId: boss.id,
       name: boss.name,
+      phased: boss.phased === true,
       damage: boss.damage,
       damageValue: boss.damageValue,
+      phase1Damage: boss.phase1Damage,
+      phase1DamageValue: boss.phase1DamageValue,
+      phase3Damage: boss.phase3Damage,
+      phase3DamageValue: boss.phase3DamageValue,
     };
     const sorted = [...matched].sort(
       (left, right) =>
@@ -251,6 +288,57 @@ function chooseNextBoss(matches, run) {
         fightCount(run, match.monsterId) < LIMITS.maxFightsPerBoss,
     ) || null
   );
+}
+
+function phaseDuelOutcome(state) {
+  const roomStatus = String(state?.room_status || '').toLowerCase();
+  const ended = state?.match?.ended === true;
+  const winner = String(state?.match?.winner_side || '').toLowerCase();
+  if ((ended && winner === 'ally') || roomStatus === 'cleared') return 'won';
+  if (roomStatus === 'lost' || ended) return 'lost';
+  return 'active';
+}
+
+function phaseDuelTargetKey(state) {
+  const players = state?.teams?.enemy?.players_by_num;
+  const candidates = Array.isArray(players) ? players : Object.values(players || {});
+  const target = candidates.find((candidate) => candidate?.key && candidate.alive !== false);
+  return String(target?.key || '');
+}
+
+// Olympus phase duels are solo matches. Power Slash is preferred for as long
+// as its current token cost is affordable; Slash is the deterministic fallback.
+function decidePhaseDuelAction(state, userId = '') {
+  const outcome = phaseDuelOutcome(state);
+  if (outcome === 'won') return { kind: 'won' };
+  if (outcome === 'lost') return { kind: 'retry' };
+  if (!state || state.ok === false) return { kind: 'wait', reason: 'invalid-state' };
+
+  const me = state.me || {};
+  const turn = state.turn || {};
+  const expectedUserId = String(userId || '');
+  if (!me.in_match || me.alive === false) return { kind: 'wait', reason: 'not-ready' };
+  if (String(turn.side || '') !== 'ally') return { kind: 'wait', reason: 'enemy-turn' };
+  if (expectedUserId && String(turn.user_id || '') !== expectedUserId) {
+    return { kind: 'wait', reason: 'other-turn' };
+  }
+
+  const targetKey = phaseDuelTargetKey(state);
+  if (!targetKey) return { kind: 'wait', reason: 'no-target' };
+  const tokens = Math.max(0, Number.parseInt(me.tokens || 0, 10));
+  const skills = Array.isArray(me.skills) ? me.skills : [];
+  const findSkill = (id) => skills.find((skill) => String(skill?.id) === id) || null;
+  const affordable = (skill) => skill && tokens >= Math.max(0, Number.parseInt(skill.cost || 0, 10));
+  const powerSlash = findSkill('-1');
+  const slash = findSkill('0');
+  const skill = affordable(powerSlash) ? powerSlash : (affordable(slash) ? slash : null);
+  if (!skill) return { kind: 'wait', reason: 'no-affordable-attack' };
+  return {
+    kind: 'attack',
+    skillId: String(skill.id),
+    skillName: String(skill.name || (String(skill.id) === '-1' ? 'Power Slash' : 'Slash')),
+    targetKey,
+  };
 }
 
 // ---------------------------------------------------------------- command
@@ -334,13 +422,28 @@ function normalizeTarget(value) {
   const monsterId = String(value.monsterId || '').trim();
   const damageValue = Number(value.damageValue);
   if (!monsterId || !Number.isFinite(damageValue) || damageValue <= 0) return null;
+  const phased = value.phased === true;
+  const phase1DamageValue = Number(value.phase1DamageValue);
+  const normalizedPhase1 = Number.isFinite(phase1DamageValue) && phase1DamageValue > 0
+    ? phase1DamageValue
+    : damageValue;
+  const phase3DamageValue = Number(value.phase3DamageValue);
+  const normalizedPhase3 = phased && Number.isFinite(phase3DamageValue) && phase3DamageValue >= 0
+    ? phase3DamageValue
+    : 0;
+  const combinedValue = phased ? normalizedPhase1 + normalizedPhase3 : damageValue;
   return {
     monsterId,
     bossId: String(value.bossId || ''),
     name: String(value.name || ''),
     domainId: String(value.domainId || ''),
-    damage: String(value.damage || ''),
-    damageValue,
+    phased,
+    damage: String(value.damage || formatGameNumber(combinedValue)),
+    damageValue: combinedValue,
+    phase1Damage: String(value.phase1Damage || value.damage || formatGameNumber(normalizedPhase1)),
+    phase1DamageValue: normalizedPhase1,
+    phase3Damage: String(value.phase3Damage ?? '0'),
+    phase3DamageValue: normalizedPhase3,
   };
 }
 
@@ -555,6 +658,7 @@ module.exports = {
   actionExhausted,
   actionReady,
   allDomains,
+  battleDamageTarget,
   battlePath,
   beginFight,
   bossNamePrefix,
@@ -564,6 +668,7 @@ module.exports = {
   completeTarget,
   createRunState,
   decideAfterFight,
+  decidePhaseDuelAction,
   domainIdForUrl,
   enterDomain,
   evaluateCommand,
@@ -574,6 +679,7 @@ module.exports = {
   hubRouteForUrl,
   isAliveFilterActive,
   isBattleUrl,
+  isPhaseDuelUrl,
   isJoinFatal,
   isJoinSuccess,
   isLeaseHeldByOther,
@@ -584,6 +690,8 @@ module.exports = {
   normalizeBossName,
   normalizeRunState,
   parseCookies,
+  phaseDuelOutcome,
+  phaseDuelTargetKey,
   reachedTarget,
   recordAction,
   refreshAfterResume,

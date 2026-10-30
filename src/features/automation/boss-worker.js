@@ -20,6 +20,8 @@ const logic = require('./boss-logic');
 const { TIMING, VISIT_PARAM } = logic;
 const LOG_PREFIX = '[Veyra:boss-worker]';
 const JOIN_URL = 'user_join_battle.php';
+const PHASE_DUEL_STATE_URL = '/pvp_style_state.php';
+const PHASE_DUEL_ACTION_URL = '/pvp_style_action.php';
 
 function createBossWorker({
   win,
@@ -27,6 +29,7 @@ function createBossWorker({
   store,
   sessionStore = null,
   postForm,
+  fetchJson = null,
   getUserId,
   bridge = mabBridge,
   now = () => Date.now(),
@@ -451,9 +454,9 @@ function createBossWorker({
     }
   }
 
-  function attachFight(controller, monsterId) {
+  function attachFight(controller, monsterId, damageTarget) {
     detachFight();
-    const fight = { controller, monsterId, handled: false, unsubscribe: null };
+    const fight = { controller, monsterId, damageTarget, handled: false, unsubscribe: null };
     rt.fight = fight;
     try {
       fight.unsubscribe = controller.onChange?.(() => checkFight()) || null;
@@ -549,17 +552,46 @@ function createBossWorker({
       return;
     }
 
+    const phaseDuel = dom.findPhaseDuelControl(doc, win.location.origin);
+    if (phaseDuel && run.routeId === 'olympus' && run.target.phased) {
+      if (phaseDuel.activeId !== run.target.monsterId) {
+        saveRun(
+          logic.failTarget(
+            run,
+            `Phase duel ${phaseDuel.activeId} did not match boss ${run.target.monsterId}.`,
+            t,
+            { abandon: true },
+          ),
+        );
+        log('The phase-duel link points to a different boss; returning to the domain.', 'warn');
+        returnToHub(run);
+        return;
+      }
+      try {
+        currentController()?.stop?.();
+      } catch {
+        // The phase page normally has no running MAB controller.
+      }
+      detachFight();
+      run = saveRun(logic.setPhase(run, 'duel', t));
+      log(`Entering ${run.target.name}'s Phase 2 duel.`);
+      navigate(phaseDuel.href, run.visitId);
+      return;
+    }
+
     if (run.phase !== 'battle') run = saveRun(logic.setPhase(run, 'battle', t));
+
+    const damageTarget = logic.battleDamageTarget(run.target, dom.isAscendedBattle(doc));
 
     if (rt.fight) {
       checkFight();
       return;
     }
     publish(run.routeId, run.visitId, 'busy', false, rt.lastLog || `Preparing the fight against ${run.target.name}.`);
-    if (!rt.fightStarting) startFight(run);
+    if (!rt.fightStarting) startFight(run, damageTarget);
   }
 
-  function startFight(run) {
+  function startFight(run, damageTarget) {
     rt.fightStarting = true;
     const { visitId } = run;
     const { monsterId } = run.target;
@@ -591,7 +623,7 @@ function createBossWorker({
           reloadPage();
           return;
         }
-        configureAndStart(controller, current, t);
+        configureAndStart(controller, current, damageTarget, t);
       } catch (error) {
         log(`Starting the boss fight failed: ${error?.message || error}`, 'warn');
       } finally {
@@ -642,7 +674,7 @@ function createBossWorker({
     log(`Joining failed (${text || 'no answer'}); retrying.`, 'warn');
   }
 
-  function configureAndStart(controller, run, t) {
+  function configureAndStart(controller, run, damageTarget, t) {
     const routeConfig = loadRouteConfig(run.routeId);
     const skills = routeConfig?.settings?.skills?.length ? [...routeConfig.settings.skills] : ['0'];
     const potions = {
@@ -650,16 +682,17 @@ function createBossWorker({
       heal: [...(routeConfig?.potions?.heal || [])],
     };
 
-    attachFight(controller, run.target.monsterId);
+    attachFight(controller, run.target.monsterId, damageTarget);
+    controller.setTargetDamage(damageTarget.damageValue);
     const state = controllerState(controller);
     const alreadyDone =
-      state?.finished && logic.decideAfterFight(state.reason) === 'complete';
+      state?.finished &&
+      logic.decideAfterFight(state.reason) === 'complete' &&
+      (state.reason === 'defeated' || Number(state.yourDamage) >= damageTarget.damageValue);
 
     if (state?.running) {
-      controller.setTargetDamage(run.target.damageValue);
       log(`Monster Auto Battle is already running against ${run.target.name}; watching it.`);
     } else if (!alreadyDone) {
-      controller.setTargetDamage(run.target.damageValue);
       if (controller.setAttacks(skills) === false) {
         detachFight();
         finish(run, 'error', 'None of the configured attacks is available in Monster Auto Battle.', t);
@@ -667,7 +700,9 @@ function createBossWorker({
       }
       controller.setPotions(potions);
       controller.start();
-      log(`Monster Auto Battle started against ${run.target.name} with a ${run.target.damage} damage target.`);
+      log(
+        `Monster Auto Battle started against ${run.target.name} with a ${damageTarget.damage} Phase ${damageTarget.phase} target.`,
+      );
     }
     saveRun(logic.clearAction(run));
     checkFight();
@@ -689,7 +724,7 @@ function createBossWorker({
         run.visitId,
         'busy',
         false,
-        `Fighting ${run.target.name}: ${damage} / ${run.target.damage}.`,
+        `Fighting ${run.target.name} (Phase ${fight.damageTarget.phase}): ${damage} / ${fight.damageTarget.damage}.`,
       );
       return;
     }
@@ -703,7 +738,7 @@ function createBossWorker({
       log(
         state.reason === 'defeated'
           ? `${run.target.name} was defeated; returning to the hub.`
-          : `${run.target.name} reached the ${run.target.damage} target; returning to the hub.`,
+          : `${run.target.name} reached the ${fight.damageTarget.damage} Phase ${fight.damageTarget.phase} target; returning to the hub.`,
       );
       returnToHub(run);
     } else if (decision === 'stop-visit') {
@@ -714,6 +749,154 @@ function createBossWorker({
       log(`${reasonText} Returning to the hub.`, 'warn');
       returnToHub(run);
     }
+  }
+
+  // -------------------------------------------------------- Olympus duel
+
+  async function requestPhaseDuelState(monsterId) {
+    const url = new URL(PHASE_DUEL_STATE_URL, win.location.origin || 'https://demonicscans.org');
+    url.searchParams.set('source', 'monster_phase');
+    url.searchParams.set('since_log_id', '0');
+    url.searchParams.set('active_id', String(monsterId));
+
+    if (fetchJson) {
+      const result = await fetchJson(url.href);
+      const json = result?.json || result;
+      if (result?.ok === false || !json || json.ok === false) {
+        throw new Error(String(json?.error || json?.message || `Phase state failed (${result?.status || '?'})`));
+      }
+      return json;
+    }
+
+    if (typeof win.fetch !== 'function') throw new Error('Phase state cannot be requested on this page.');
+    const response = await win.fetch(url.href, { credentials: 'same-origin', cache: 'no-store' });
+    const text = await response.text();
+    let json = null;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      // The error below deliberately rejects login and HTML error pages.
+    }
+    if (!response.ok || !json || json.ok === false) {
+      throw new Error(String(json?.error || json?.message || `Phase state failed (${response.status})`));
+    }
+    return json;
+  }
+
+  function requireSuccessfulPhaseAction(response) {
+    const json = response?.json;
+    if (response?.ok === false || json?.ok === false) {
+      throw new Error(String(json?.error || json?.message || response?.text || 'Phase action failed.'));
+    }
+    return json || response;
+  }
+
+  function phaseDuelTick(url, t) {
+    const visitParam = url.searchParams.get(VISIT_PARAM) || '';
+    const activeId = String(url.searchParams.get('active_id') || '');
+    let run = loadRun(t);
+    if (!run || !visitParam || run.visitId !== visitParam) return;
+
+    const cmd = readCommand(t);
+    if (run.finished) {
+      if (cmd.visitId === run.visitId) {
+        publish(run.routeId, run.visitId, run.finished.state, true, run.finished.message);
+      }
+      return;
+    }
+
+    run = acquire(run, t, url);
+    if (!run) {
+      log('Another tab owns the active Olympus phase duel; this tab is waiting.');
+      return;
+    }
+    if (cmd.kind !== 'running' || cmd.visitId !== run.visitId) {
+      stopAndFinish(run, cmd, t);
+      return;
+    }
+    if (!run.target || run.routeId !== 'olympus' || !run.target.phased) {
+      log('No phased Olympus boss owns this duel; returning to the domain.', 'warn');
+      returnToHub(run);
+      return;
+    }
+    if (!activeId || activeId !== run.target.monsterId) {
+      saveRun(
+        logic.failTarget(
+          run,
+          `Opened phase duel ${activeId || 'unknown'} instead of ${run.target.monsterId}.`,
+          t,
+          { abandon: true },
+        ),
+      );
+      log('The open phase duel belongs to a different boss; returning to the domain.', 'warn');
+      returnToHub(run);
+      return;
+    }
+
+    if (run.phase !== 'duel') run = saveRun(logic.setPhase(run, 'duel', t));
+    publish(run.routeId, run.visitId, 'busy', false, rt.lastLog || `Fighting ${run.target.name}'s Phase 2 duel.`);
+    if (!rt.actionPending) runPhaseDuelStep(run);
+  }
+
+  function runPhaseDuelStep(run) {
+    rt.actionPending = true;
+    const { visitId } = run;
+    const monsterId = run.target.monsterId;
+    void (async () => {
+      try {
+        const state = await requestPhaseDuelState(monsterId);
+        let current = validateBattleRun(visitId, monsterId, now());
+        if (!current) return;
+        const userId = await getUserId?.();
+        current = validateBattleRun(visitId, monsterId, now());
+        if (!current) return;
+        const decision = logic.decidePhaseDuelAction(state, userId);
+
+        if (decision.kind === 'won') {
+          saveRun(logic.setPhase(logic.clearAction(current), 'battle', now()));
+          log(`${current.target.name}'s Phase 2 duel was won; returning for Phase 3.`);
+          navigate(logic.battlePath(monsterId), visitId);
+          return;
+        }
+
+        if (decision.kind === 'retry') {
+          const response = await postForm(PHASE_DUEL_ACTION_URL, {
+            source: 'monster_phase',
+            active_id: monsterId,
+            action: 'retry',
+          });
+          requireSuccessfulPhaseAction(response);
+          log(`${current.target.name}'s Phase 2 duel was restarted after a defeat.`);
+          return;
+        }
+
+        if (decision.kind === 'attack') {
+          const response = await postForm(PHASE_DUEL_ACTION_URL, {
+            source: 'monster_phase',
+            active_id: monsterId,
+            action: 'use_skill',
+            skill_id: decision.skillId,
+            target_key: decision.targetKey,
+          });
+          requireSuccessfulPhaseAction(response);
+          log(`Phase 2: used ${decision.skillName} against ${current.target.name}.`);
+          return;
+        }
+
+        const messages = {
+          'enemy-turn': 'Phase 2: waiting for the enemy turn to finish.',
+          'other-turn': 'Phase 2: waiting for the player turn.',
+          'not-ready': 'Phase 2: waiting for the duel state to become actionable.',
+          'no-target': 'Phase 2: waiting for the living duel target.',
+          'no-affordable-attack': 'Phase 2: waiting for Slash to become available.',
+        };
+        log(messages[decision.reason] || 'Phase 2: waiting for the next turn.');
+      } catch (error) {
+        log(`Phase 2 duel action failed: ${error?.message || error}`, 'warn');
+      } finally {
+        rt.actionPending = false;
+      }
+    })();
   }
 
   // ---------------------------------------------------------- lifecycle
@@ -749,6 +932,7 @@ function createBossWorker({
       if (!url) return;
       if (logic.hubRouteForUrl(url)) hubTick(url, t);
       else if (logic.isBattleUrl(url)) battleTick(url, t);
+      else if (logic.isPhaseDuelUrl(url)) phaseDuelTick(url, t);
     } catch (error) {
       failOnError(error);
     } finally {
@@ -820,7 +1004,10 @@ const bossWorkerFeature = Object.freeze({
   group: 'Automation',
   settings: [],
   matches(url) {
-    return /\/(?:active_wave|battle)\.php\/?$/i.test(url.pathname);
+    return (
+      /\/(?:active_wave|battle)\.php\/?$/i.test(url.pathname) ||
+      logic.isPhaseDuelUrl(url)
+    );
   },
   run(ctx) {
     const worker = createBossWorker({
@@ -838,6 +1025,8 @@ const bossWorkerFeature = Object.freeze({
 
 module.exports = {
   JOIN_URL,
+  PHASE_DUEL_ACTION_URL,
+  PHASE_DUEL_STATE_URL,
   bossWorkerFeature,
   createBossWorker,
 };
