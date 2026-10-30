@@ -90,6 +90,25 @@ test('finds only the dynamic Shadowbridge entry on the dungeon hub', () => {
   });
 });
 
+test('finds a named dungeon with its current instance id instead of a stored id', () => {
+  const selector = 'a[href*="guild_dungeon_enter.php"]';
+  const castleCard = element({ text: 'Castle of the Fallen Prince Instance #98765 Enter' });
+  const link = element({
+    attrs: { href: '/guild_dungeon_enter.php?id=98765' },
+    parent: castleCard,
+  });
+  const doc = documentWith({ many: { [selector]: [link] } });
+
+  assert.deepEqual(
+    logic.parseNamedHubEntry(doc, 'Castle of the Fallen Prince', 'https://demonicscans.org/guild_dungeon.php'),
+    {
+      instanceId: '98765',
+      url: 'https://demonicscans.org/guild_dungeon_enter.php?id=98765',
+    },
+  );
+  assert.equal(logic.parseNamedHubEntry(doc, 'Shadowbridge Warrens'), null);
+});
+
 test('discovers unlocked locations dynamically and reports a locked boss room', () => {
   const location = (id, label) => element({
     text: label,
@@ -244,7 +263,15 @@ test('resolves normal and boss damage modes without treating max HP as a kill ta
     ownDamage: 1_250_000,
     lootRequirement: 2_000_000,
     expCapDamage: 4_000_000,
+    maxHp: 10_000_000,
   };
+  assert.deepEqual(logic.resolveDamageTarget({ mode: 'max-damage', snapshot }), {
+    ok: true,
+    done: false,
+    untilDead: false,
+    targetDamage: 10_000_000,
+    remaining: 8_750_000,
+  });
   assert.deepEqual(logic.resolveDamageTarget({ mode: 'max-loot', snapshot }), {
     ok: true,
     done: false,

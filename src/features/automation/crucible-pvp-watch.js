@@ -129,6 +129,7 @@ function visitPvpRewardPage(win, doc, url, expected, options = {}) {
     const frame = doc.createElement('iframe');
     let timeout = null;
     let settled = false;
+    let verifiedRewardPage = null;
 
     function finish(error, result = null) {
       if (settled) return;
@@ -159,6 +160,7 @@ function visitPvpRewardPage(win, doc, url, expected, options = {}) {
         finish(new Error('cleared PvP reward page could not be verified'));
         return;
       }
+      verifiedRewardPage = rewardPage;
 
       const checkModal = () => {
         if (settled) return;
@@ -178,10 +180,24 @@ function visitPvpRewardPage(win, doc, url, expected, options = {}) {
       checkModal();
     }, { once: true });
 
-    timeout = schedule(
-      () => finish(new Error('PvP reward page did not confirm its victory reward in time')),
-      timeoutMs,
-    );
+    timeout = schedule(() => {
+      // The page stores a per-room "reward seen" flag in localStorage. On a
+      // repeated or previously manual visit the exact cleared victory page is
+      // loaded and its scripts run, but the modal is intentionally not shown
+      // again. Waiting through the confirmation window is sufficient: the
+      // iframe is a real same-origin document (unlike fetch), the ended joined
+      // match was confirmed before opening it, and its ids/status/reward data
+      // were verified above.
+      if (verifiedRewardPage) {
+        finish(null, {
+          ...verifiedRewardPage,
+          rewardModalShown: false,
+          rewardPageVerified: true,
+        });
+        return;
+      }
+      finish(new Error('PvP reward page did not finish loading in time'));
+    }, timeoutMs);
     frame.src = target.href;
     host.appendChild(frame);
   });
@@ -251,9 +267,13 @@ function createCruciblePvpWatcher({
         if (!isCurrent(watch)) return;
         if (!rewardPage.ok) throw new Error('won PvP reward page could not be verified');
       }
+      const lobbyWatch = watchPvpLobby(store, {
+        ...watch,
+        nextCheckAt: now() + PVP_LOBBY_CHECK_MS,
+      }, now());
       wakeCrucible(
         store,
-        watch,
+        lobbyWatch || watch,
         state.won ? `${watch.nodeName} reward collected` : `${watch.nodeName} match ended`,
         now(),
       );

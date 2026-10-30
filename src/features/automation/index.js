@@ -5,6 +5,7 @@ const { bossWorkerFeature } = require('./boss-worker');
 const { crucibleWorkerFeature } = require('./crucible-worker');
 const { cruciblePvpWatcherFeature } = require('./crucible-pvp-watch');
 const { pvpWorkerFeature } = require('./pvp-worker');
+const { princeWorkerFeature } = require('./prince-worker');
 const { shadowbridgeWorkerFeature } = require('./shadowbridge-worker');
 
 module.exports = [
@@ -12,6 +13,7 @@ module.exports = [
   pvpWorkerFeature,
   adventurersWorkerFeature,
   shadowbridgeWorkerFeature,
+  princeWorkerFeature,
   crucibleWorkerFeature,
   cruciblePvpWatcherFeature,
 ];

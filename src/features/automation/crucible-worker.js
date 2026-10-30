@@ -1118,7 +1118,10 @@ function createCrucibleWorker({
           visitId,
           'done',
           `${next.message} Completed ${runtime.targets} PvE target(s), ${runtime.attacks} PvE attack(s) and ${runtime.armyActions} Army action(s).`,
-          { retryAt: next.waitUntil, note: next.note },
+          // PvP is watched independently in the background. Other in-progress
+          // sections are revisited on the user-configured Crucible loop. A
+          // fixed five-minute retry here would silently replace that setting.
+          { note: next.note },
         );
         return;
       }
@@ -1168,7 +1171,6 @@ function createCrucibleWorker({
       } else {
         const detail = String(error?.message || error || 'unknown error');
         setTerminal(command.visitId, 'error', `Crucible failed safely: ${detail}`, {
-          retryAt: cappedRecheck(),
           note: `Error: ${detail}`.slice(0, 60),
         });
       }

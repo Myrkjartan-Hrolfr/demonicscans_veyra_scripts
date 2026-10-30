@@ -410,7 +410,7 @@ test('PvP claims the fullest match, confirms its slot and publishes a short node
   });
   const status = env.store.read(workerStatusKey('crucible'));
   assert.equal(status.state, 'done');
-  assert.equal(status.retryAt, NOW + 30 * 60_000);
+  assert.equal(status.retryAt, 0);
   assert.match(status.note, /waiting for players/i);
   assert.deepEqual(env.store.read(CRUCIBLE_PVP_WATCH_KEY), {
     version: 1,
@@ -536,6 +536,7 @@ test('a PvE section failure does not undo or prevent PvP participation', async (
   assert.equal(env.posts[0].params.action, 'pick_slot');
   const status = env.store.read(workerStatusKey('crucible'));
   assert.equal(status.state, 'error');
+  assert.equal(status.retryAt, 0);
   assert.match(status.message, /PvE: Entering Gate Prism failed/i);
 });
 
@@ -657,7 +658,7 @@ test('Army heals, joins, verifies one minimal hit and retreats the assigned capt
   });
   const status = env.store.read(workerStatusKey('crucible'));
   assert.equal(status.state, 'done');
-  assert.equal(status.retryAt, NOW + 5 * 60_000);
+  assert.equal(status.retryAt, 0);
   assert.match(status.note, /contribution complete/i);
   assert.deepEqual(env.store.read(MINIMAL_ARMY_CONTRIBUTIONS_KEY), {
     records: [{ battleId: '51365', captainId: '101', verifiedAt: NOW }],

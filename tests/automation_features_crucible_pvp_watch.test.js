@@ -164,6 +164,60 @@ test('reward visit uses a hidden real document and waits for its victory modal',
   assert.equal(removed, true);
 });
 
+test('reward visit accepts the verified cleared page when its already-seen modal stays hidden', async () => {
+  const rewardDoc = documentWith({
+    many: {
+      script: [element({
+        text: `const SOURCE_PARAMS = {"instance_id":"16219","node_id":"7","match_no":"7"};
+          const ROOM_STATUS = "cleared";
+          const PVP_REWARD_ITEMS = [{"item_id":337,"qty":35}];`,
+      })],
+    },
+  });
+  rewardDoc.getElementById = () => ({
+    classList: { contains: () => false },
+    getAttribute: () => 'true',
+  });
+  const listeners = {};
+  let timeoutCallback = null;
+  const frame = {
+    contentDocument: rewardDoc,
+    style: { setProperty() {} },
+    setAttribute() {},
+    addEventListener(type, callback) { listeners[type] = callback; },
+    remove() {},
+  };
+  const win = {
+    location: { origin: 'https://demonicscans.org' },
+    setTimeout(callback, delay) {
+      if (delay >= 1000) timeoutCallback = callback;
+      return delay;
+    },
+    clearTimeout() {},
+  };
+  const doc = {
+    body: {
+      appendChild() {
+        listeners.load();
+        timeoutCallback();
+      },
+    },
+    createElement() { return frame; },
+  };
+
+  const result = await visitPvpRewardPage(
+    win,
+    doc,
+    'https://demonicscans.org/pvp_style_battle.php?source=cube&instance_id=16219&node_id=7&match_no=7',
+    { instanceId: 16219, nodeId: 7, matchNo: 7 },
+    { timeoutMs: 1000 },
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.rewardModalShown, false);
+  assert.equal(result.rewardPageVerified, true);
+});
+
 test('background watcher extends a binding cooldown without waking or navigating', async () => {
   let reads = 0;
   const env = createEnvironment({
@@ -237,6 +291,7 @@ test('background watcher polls a live match and wakes Crucible for its won rewar
   assert.match(rewardPageRequested, /match_no=2/);
   assert.equal(env.store.read(RUNTIME_KEY).nextRunAt.crucible, NOW);
   assert.match(env.store.read(RUNTIME_KEY).notes.crucible, /reward collected/i);
+  assert.equal(env.store.read(CRUCIBLE_PVP_WATCH_KEY).mode, 'lobby');
 });
 
 test('background watcher never opens the reward page before the joined match has ended', async () => {

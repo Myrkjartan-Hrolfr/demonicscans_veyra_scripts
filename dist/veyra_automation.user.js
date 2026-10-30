@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.6.0
+// @version      0.7.0
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -4227,6 +4227,7 @@
         const frame = doc.createElement('iframe');
         let timeout = null;
         let settled = false;
+        let verifiedRewardPage = null;
 
         function finish(error, result = null) {
           if (settled) return;
@@ -4257,6 +4258,7 @@
             finish(new Error('cleared PvP reward page could not be verified'));
             return;
           }
+          verifiedRewardPage = rewardPage;
 
           const checkModal = () => {
             if (settled) return;
@@ -4276,10 +4278,24 @@
           checkModal();
         }, { once: true });
 
-        timeout = schedule(
-          () => finish(new Error('PvP reward page did not confirm its victory reward in time')),
-          timeoutMs,
-        );
+        timeout = schedule(() => {
+          // The page stores a per-room "reward seen" flag in localStorage. On a
+          // repeated or previously manual visit the exact cleared victory page is
+          // loaded and its scripts run, but the modal is intentionally not shown
+          // again. Waiting through the confirmation window is sufficient: the
+          // iframe is a real same-origin document (unlike fetch), the ended joined
+          // match was confirmed before opening it, and its ids/status/reward data
+          // were verified above.
+          if (verifiedRewardPage) {
+            finish(null, {
+              ...verifiedRewardPage,
+              rewardModalShown: false,
+              rewardPageVerified: true,
+            });
+            return;
+          }
+          finish(new Error('PvP reward page did not finish loading in time'));
+        }, timeoutMs);
         frame.src = target.href;
         host.appendChild(frame);
       });
@@ -4349,9 +4365,13 @@
             if (!isCurrent(watch)) return;
             if (!rewardPage.ok) throw new Error('won PvP reward page could not be verified');
           }
+          const lobbyWatch = watchPvpLobby(store, {
+            ...watch,
+            nextCheckAt: now() + PVP_LOBBY_CHECK_MS,
+          }, now());
           wakeCrucible(
             store,
-            watch,
+            lobbyWatch || watch,
             state.won ? `${watch.nodeName} reward collected` : `${watch.nodeName} match ended`,
             now(),
           );
@@ -5577,7 +5597,10 @@
               visitId,
               'done',
               `${next.message} Completed ${runtime.targets} PvE target(s), ${runtime.attacks} PvE attack(s) and ${runtime.armyActions} Army action(s).`,
-              { retryAt: next.waitUntil, note: next.note },
+              // PvP is watched independently in the background. Other in-progress
+              // sections are revisited on the user-configured Crucible loop. A
+              // fixed five-minute retry here would silently replace that setting.
+              { note: next.note },
             );
             return;
           }
@@ -5627,7 +5650,6 @@
           } else {
             const detail = String(error?.message || error || 'unknown error');
             setTerminal(command.visitId, 'error', `Crucible failed safely: ${detail}`, {
-              retryAt: cappedRecheck(),
               note: `Error: ${detail}`.slice(0, 60),
             });
           }
@@ -5734,6 +5756,7 @@
     const { crucibleWorkerFeature } = require('./crucible-worker');
     const { cruciblePvpWatcherFeature } = require('./crucible-pvp-watch');
     const { pvpWorkerFeature } = require('./pvp-worker');
+    const { princeWorkerFeature } = require('./prince-worker');
     const { shadowbridgeWorkerFeature } = require('./shadowbridge-worker');
 
     module.exports = [
@@ -5741,9 +5764,130 @@
       pvpWorkerFeature,
       adventurersWorkerFeature,
       shadowbridgeWorkerFeature,
+      princeWorkerFeature,
       crucibleWorkerFeature,
       cruciblePvpWatcherFeature,
     ];
+  },
+  "features/automation/prince-worker.js": function (module, exports, require) {
+    'use strict';
+
+    const { createJsonStore, getStorage } = require('../../core/storage');
+    const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
+    const princeRoute = require('../../routes/prince');
+    const { staminaMultiplier } = require('../shared/asterion');
+    const dungeonLogic = require('./shadowbridge-logic');
+    const { createShadowbridgeStatusView } = require('./shadowbridge-status');
+    const { createShadowbridgeWorker } = require('./shadowbridge-worker');
+
+    const ROUTE_ID = 'prince';
+
+    function attackPlan(scans, settings, processed = new Set()) {
+      const candidates = [];
+      let sequence = 0;
+      for (const scan of scans || []) {
+        const selected = princeRoute.settingsForLocation(settings, scan.location);
+        if (!selected?.target.enabled) continue;
+        for (const monster of scan.monsters || []) {
+          const key = `${monster.instanceId || scan.location.instanceId}:${monster.monsterId}`;
+          if (monster.dead || processed.has(key)) continue;
+          candidates.push({
+            ...monster,
+            key,
+            name: monster.name || selected.displayName,
+            location: scan.location,
+            target: selected.target,
+            targetId: selected.definition.id,
+            isBoss: selected.definition.isBoss,
+            sequence: sequence++,
+          });
+        }
+      }
+      const order = new Map(princeRoute.PRINCE_TARGETS.map((target, index) => [target.id, index]));
+      return candidates.sort(
+        (left, right) =>
+          (order.get(left.targetId) ?? Number.MAX_SAFE_INTEGER) -
+            (order.get(right.targetId) ?? Number.MAX_SAFE_INTEGER) ||
+          left.sequence - right.sequence,
+      );
+    }
+
+    function saveDiscoveries({ scans, route, store }) {
+      const merged = princeRoute.mergeDiscoveredMonsters(route.settings, scans);
+      if (!merged.changed) return;
+      route.settings = merged.settings;
+      const config = normalizeConfig(store.read(CONFIG_KEY));
+      config.routes[ROUTE_ID].settings = merged.settings;
+      store.write(CONFIG_KEY, config);
+    }
+
+    function createPrinceWorker(options) {
+      const statusView =
+        options.statusView ||
+        createShadowbridgeStatusView(options.doc, {
+          title: 'Castle attack progress',
+          idleText: 'Scanning Castle of the Fallen Prince…',
+          workingText: 'Castle attack is working…',
+          fallbackTargetName: 'Castle monster',
+        });
+      return createShadowbridgeWorker({
+        ...options,
+        statusView,
+        profile: {
+          routeId: ROUTE_ID,
+          dungeonName: princeRoute.DUNGEON_NAME,
+          workerName: 'Castle of the Fallen Prince',
+          parseHubEntry(doc, baseUrl) {
+            return dungeonLogic.parseNamedHubEntry(doc, princeRoute.DUNGEON_NAME, baseUrl);
+          },
+          attackPlan,
+          hasEnabledTargets(settings) {
+            return Object.values(settings.targets || {}).some((target) => target.enabled);
+          },
+          isBossEnabled(settings) {
+            return settings.targets?.['true-heir-throne']?.enabled === true;
+          },
+          onScans: saveDiscoveries,
+        },
+      });
+    }
+
+    const princeWorkerFeature = Object.freeze({
+      id: 'prince-worker',
+      group: 'Automation',
+      settings: [],
+      matches(url) {
+        return /\/guild_dungeon\.php\/?$/i.test(url.pathname);
+      },
+      run(ctx) {
+        let multiplier = 1;
+        try {
+          multiplier = staminaMultiplier(ctx);
+        } catch {
+          // The optional shared setting is unavailable only in isolated tests.
+        }
+        const worker = createPrinceWorker({
+          win: ctx.win,
+          doc: ctx.doc,
+          store: ctx.store,
+          sessionStore: createJsonStore(getStorage('sessionStorage', ctx.win), '[Veyra]'),
+          fetchDocument: ctx.fetchDocument,
+          postForm: ctx.postForm,
+          getUserId: ctx.getUserId,
+          asterionMultiplier: multiplier,
+        });
+        worker.start();
+        return worker;
+      },
+    });
+
+    module.exports = {
+      ROUTE_ID,
+      attackPlan,
+      createPrinceWorker,
+      princeWorkerFeature,
+      saveDiscoveries,
+    };
   },
   "features/automation/pvp-logic.js": function (module, exports, require) {
     'use strict';
@@ -6847,10 +6991,12 @@
       return null;
     }
 
-    // Finds the dynamic instance entry.  A hub can contain several dungeons, so
-    // an enter link is accepted only when its surrounding card names Shadowbridge.
-    function parseHubEntry(doc, baseUrl = 'https://demonicscans.org/guild_dungeon.php') {
-      const wanted = normalizeMonsterName(SHADOWBRIDGE_NAME);
+    // Finds a dynamic dungeon instance entry by its visible name. A hub can
+    // contain several dungeons, so an enter link is accepted only when its
+    // surrounding card names the requested dungeon.
+    function parseNamedHubEntry(doc, dungeonName, baseUrl = 'https://demonicscans.org/guild_dungeon.php') {
+      const wanted = normalizeMonsterName(dungeonName);
+      if (!wanted) return null;
       for (const link of all(doc, 'a[href*="guild_dungeon_enter.php"]')) {
         const card = namedDungeonCard(link, wanted);
         if (!card) continue;
@@ -6870,6 +7016,10 @@
         if (url && /^\d+$/.test(instanceId)) return { instanceId, url: url.href };
       }
       return null;
+    }
+
+    function parseHubEntry(doc, baseUrl = 'https://demonicscans.org/guild_dungeon.php') {
+      return parseNamedHubEntry(doc, SHADOWBRIDGE_NAME, baseUrl);
     }
 
     function instanceIdFromPage(doc, pageUrl = '') {
@@ -7098,13 +7248,21 @@
       }
 
       let targetDamage = null;
-      if (mode === 'max-loot') targetDamage = positiveAmount(snapshot.lootRequirement);
+      if (mode === 'max-damage') targetDamage = positiveAmount(snapshot.maxHp);
+      else if (mode === 'max-loot') targetDamage = positiveAmount(snapshot.lootRequirement);
       else if (mode === 'max-exp' && allowMaxExp) targetDamage = positiveAmount(snapshot.expCapDamage);
       else if (mode === 'custom') targetDamage = positiveAmount(damage);
       else return { ok: false, error: `Unsupported Shadowbridge damage mode: ${String(mode || '')}.` };
 
       if (targetDamage === null) {
-        const label = mode === 'max-loot' ? 'loot requirement' : mode === 'max-exp' ? 'EXP cap' : 'custom damage';
+        const label =
+          mode === 'max-damage'
+            ? 'maximum monster HP'
+            : mode === 'max-loot'
+              ? 'loot requirement'
+              : mode === 'max-exp'
+                ? 'EXP cap'
+                : 'custom damage';
         return { ok: false, error: `The ${label} could not be read safely.` };
       }
       if (!snapshot.ownDamageKnown || !Number.isFinite(snapshot.ownDamage)) {
@@ -7227,6 +7385,7 @@
       parseAttackResponse,
       parseBattleSnapshot,
       parseHubEntry,
+      parseNamedHubEntry,
       parseInstancePage,
       parseJoinResponse,
       parseLocationPage,
@@ -7307,6 +7466,7 @@
 
     function modeLabel(mode) {
       return ({
+        'max-damage': 'Max damage',
         'max-loot': 'Max loot',
         'max-exp': 'Max EXP',
         custom: 'Custom damage',
@@ -7348,7 +7508,11 @@
       };
     }
 
-    function createShadowbridgeStatusView(doc) {
+    function createShadowbridgeStatusView(doc, options = {}) {
+      const title = String(options.title || 'Shadowbridge attack progress');
+      const idleText = String(options.idleText || 'Scanning dungeon…');
+      const workingText = String(options.workingText || 'Dungeon attack is working…');
+      const fallbackTargetName = String(options.fallbackTargetName || 'Dungeon monster');
       const state = {
         active: false,
         collapsed: false,
@@ -7397,13 +7561,13 @@
 
         const head = make('div', 'sbp-head');
         const copy = make('div');
-        copy.appendChild(make('div', 'sbp-title', 'Shadowbridge attack progress'));
-        summary = make('div', 'sbp-summary', state.summary || 'Scanning dungeon…');
+        copy.appendChild(make('div', 'sbp-title', title));
+        summary = make('div', 'sbp-summary', state.summary || idleText);
         copy.appendChild(summary);
         toggle = make('button', 'sbp-toggle', '−');
         toggle.type = 'button';
         toggle.title = 'Collapse progress';
-        toggle.setAttribute?.('aria-label', 'Collapse Shadowbridge progress');
+          toggle.setAttribute?.('aria-label', 'Collapse dungeon progress');
         toggle.addEventListener?.('click', () => {
           state.collapsed = !state.collapsed;
           panel.dataset.collapsed = String(state.collapsed);
@@ -7424,7 +7588,7 @@
         if (!state.active || !ensurePanel()) return;
         panel.dataset.state = state.phase;
         panel.dataset.collapsed = String(state.collapsed);
-        summary.textContent = state.summary || 'Shadowbridge is working…';
+        summary.textContent = state.summary || workingText;
         const rows = [];
         for (const key of state.order) {
           const entry = state.entries.get(key);
@@ -7434,7 +7598,7 @@
           row.dataset.key = key;
           row.dataset.status = entry.status || 'queued';
           const nameWrap = make('div');
-          nameWrap.appendChild(make('div', 'sbp-name', entry.name || 'Shadowbridge monster'));
+          nameWrap.appendChild(make('div', 'sbp-name', entry.name || fallbackTargetName));
           const meta = [entry.locationLabel, modeLabel(entry.mode)].filter(Boolean).join(' · ');
           nameWrap.appendChild(make('div', 'sbp-meta', meta));
           row.appendChild(nameWrap);
@@ -7470,7 +7634,7 @@
             attacks: 0,
             ...existing,
             key,
-            name: String(target.name || existing.name || 'Shadowbridge monster'),
+            name: String(target.name || existing.name || fallbackTargetName),
             locationLabel: String(target.location?.label || existing.locationLabel || ''),
             mode: String(target.target?.mode || existing.mode || ''),
           });
@@ -7618,7 +7782,13 @@
       now = () => Date.now(),
       logger = console,
       statusView = createShadowbridgeStatusView(doc),
+      profile = {},
     }) {
+      const routeId = String(profile.routeId || ROUTE_ID);
+      const dungeonName = String(profile.dungeonName || 'Shadowbridge Warrens');
+      const workerName = String(profile.workerName || dungeonName);
+      const parseHubEntry = profile.parseHubEntry || logic.parseHubEntry;
+      const buildPlan = profile.attackPlan || attackPlan;
       const runtime = {
         stopped: false,
         ticking: false,
@@ -7646,13 +7816,13 @@
         return Boolean(
           url &&
             /\/guild_dungeon\.php\/?$/i.test(url.pathname) &&
-            url.searchParams.get('veyra_route') === ROUTE_ID,
+            url.searchParams.get('veyra_route') === routeId,
         );
       }
 
       function readCommand() {
         const command = normalizeVisit(store.read(COMMAND_KEY), () => true);
-        return command?.taskId === ROUTE_ID ? command : null;
+        return command?.taskId === routeId ? command : null;
       }
 
       function ownsSchedulerLease(t = now()) {
@@ -7678,15 +7848,15 @@
         runtime.message = message;
         return publishWorkerStatus(
           store,
-          ROUTE_ID,
-          { visitId, workerId: ROUTE_ID, state, safeToLeave, message },
+          routeId,
+          { visitId, workerId: routeId, state, safeToLeave, message },
           t,
         );
       }
 
       function log(message, level = 'info') {
         const method = level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'info';
-        logger?.[method]?.(`[Veyra:shadowbridge-worker] ${message}`);
+        logger?.[method]?.(`[Veyra:${routeId}-worker] ${message}`);
       }
 
       function setWorkingMessage(visitId, message) {
@@ -7705,16 +7875,16 @@
       }
 
       function assertCanMutate(visitId) {
-        if (runtime.stopped) throw new VisitStop('cancelled', 'Shadowbridge worker stopped.');
+        if (runtime.stopped) throw new VisitStop('cancelled', `${workerName} worker stopped.`);
         const command = readCommand();
         if (!command || command.visitId !== visitId) {
-          throw new VisitStop('cancelled', 'The Shadowbridge scheduler visit changed.');
+          throw new VisitStop('cancelled', `The ${workerName} scheduler visit changed.`);
         }
         if (!ownsSchedulerLease()) {
-          throw new VisitStop('ownership', 'Another tab owns the Shadowbridge scheduler visit.');
+          throw new VisitStop('ownership', `Another tab owns the ${workerName} scheduler visit.`);
         }
         if (command.phase === 'draining' || now() >= command.deadlineAt) {
-          throw new VisitStop('drain', 'Shadowbridge stopped safely at the scheduler deadline.');
+          throw new VisitStop('drain', `${workerName} stopped safely at the scheduler deadline.`);
         }
         return command;
       }
@@ -7731,7 +7901,7 @@
       }
 
       function routeConfig() {
-        return normalizeConfig(store.read(CONFIG_KEY)).routes[ROUTE_ID];
+        return normalizeConfig(store.read(CONFIG_KEY)).routes[routeId];
       }
 
       async function readDashboard(visitId) {
@@ -7792,7 +7962,7 @@
           if (!Number.isFinite(snapshot.playerHp) || !Number.isFinite(snapshot.playerMaxHp) || snapshot.playerMaxHp <= 0) {
             return true;
           }
-          if (snapshot.playerHp <= 0) throw new VisitStop('resource', 'Player HP reached zero; Shadowbridge stopped.');
+          if (snapshot.playerHp <= 0) throw new VisitStop('resource', `Player HP reached zero; ${workerName} stopped.`);
           if (snapshot.playerHp / snapshot.playerMaxHp > TIMING.lowHpFraction) return true;
           await ensureInventory();
           const potion = pickPotion(inventory, route.potions.heal);
@@ -7846,7 +8016,7 @@
           monsterId: target.monsterId,
           userId,
         });
-        if (!payload) throw new Error('Could not build a safe Shadowbridge join request.');
+        if (!payload) throw new Error(`Could not build a safe ${workerName} join request.`);
         assertCanMutate(visitId);
         setWorkingMessage(visitId, `Joining ${target.name || 'Shadowbridge monster'}.`);
         const response = await guardedPostForm(visitId, JOIN_URL, payload);
@@ -7883,7 +8053,7 @@
         battle = await joinIfNeeded(visitId, target, userId, battle);
 
         let decision = resolveTarget(target, battle.snapshot);
-        if (!decision.ok) throw new Error(`${target.name || 'Shadowbridge target'}: ${decision.error}`);
+        if (!decision.ok) throw new Error(`${target.name || `${workerName} target`}: ${decision.error}`);
         statusView.updateTarget(target.key, {
           currentDamage: battle.snapshot.ownDamage,
           currentHp: battle.snapshot.currentHp,
@@ -7902,7 +8072,7 @@
           monsterId: target.monsterId,
           skillId: route.settings.skill,
         });
-        if (!skill || !payload) throw new Error('The selected Shadowbridge skill is invalid.');
+        if (!skill || !payload) throw new Error(`The selected ${workerName} skill is invalid.`);
         const effectiveStaminaCost = staminaCost(skill.cost, asterionMultiplier);
         const resources = createResourceManager(visitId, route, battle.doc);
         let ownDamage = battle.snapshot.ownDamage;
@@ -7921,13 +8091,13 @@
 
           setWorkingMessage(
             visitId,
-            `Attacking ${target.name || 'Shadowbridge boss'} (${attempts + 1}${
+            `Attacking ${target.name || `${workerName} monster`} (${attempts + 1}${
               decision.untilDead ? ', until defeated' : `, ${Math.max(0, decision.targetDamage - ownDamage)} damage remaining`
             }).`,
           );
           const response = await guardedPostForm(visitId, DAMAGE_URL, payload, {
             onRateLimit({ waitMs }) {
-              setWorkingMessage(visitId, `Shadowbridge rate limit: waiting ${Math.ceil(waitMs / 1_000)} seconds.`);
+              setWorkingMessage(visitId, `${workerName} rate limit: waiting ${Math.ceil(waitMs / 1_000)} seconds.`);
             },
           });
           const result = logic.parseAttackResponse(response);
@@ -7977,7 +8147,7 @@
               return { reason: 'dead', attacks: attempts };
             }
             decision = resolveTarget(target, battle.snapshot);
-            if (!decision.ok) throw new Error(`${target.name || 'Shadowbridge target'}: ${decision.error}`);
+            if (!decision.ok) throw new Error(`${target.name || `${workerName} target`}: ${decision.error}`);
             ownDamage = battle.snapshot.ownDamage;
             statusView.updateTarget(target.key, {
               currentDamage: ownDamage,
@@ -7992,14 +8162,14 @@
           }
           await sleepImpl(route.settings.attackCooldownMs);
         }
-        throw new Error(`${target.name || 'Shadowbridge target'} exceeded the per-monster attack safety limit.`);
+        throw new Error(`${target.name || `${workerName} target`} exceeded the per-monster attack safety limit.`);
       }
 
       async function scanLocations(visitId, instance) {
         const scans = [];
         for (const location of instance.locations) {
           assertCanMutate(visitId);
-          setWorkingMessage(visitId, `Scanning ${location.label || `Shadowbridge location ${location.id}`}.`);
+          setWorkingMessage(visitId, `Scanning ${location.label || `${workerName} location ${location.id}`}.`);
           const locationDoc = await fetchDocument(location.url);
           scans.push({
             location,
@@ -8013,9 +8183,9 @@
         assertCanMutate(visitId);
         const instanceDoc = await fetchDocument(url);
         const instance = logic.parseInstancePage(instanceDoc, url);
-        if (!instance.instanceId) throw new Error('The Shadowbridge instance id could not be read.');
+        if (!instance.instanceId) throw new Error(`The ${workerName} instance id could not be read.`);
         if (instance.locations.length === 0) {
-          throw new Error('No unlocked Shadowbridge locations were found on the instance page.');
+          throw new Error(`No unlocked ${workerName} locations were found on the instance page.`);
         }
         return instance;
       }
@@ -8023,18 +8193,20 @@
       async function executeVisit(command) {
         const visitId = command.visitId;
         const route = routeConfig();
-        const enabledNormal = Object.values(route.settings.monsters).some((target) => target.enabled);
-        if (!enabledNormal && !route.settings.bossRoom.enabled) {
-          setTerminal(visitId, 'done', 'Shadowbridge has no enabled targets.');
+        const hasEnabledTargets = profile.hasEnabledTargets
+          ? profile.hasEnabledTargets(route.settings)
+          : Object.values(route.settings.monsters).some((target) => target.enabled) || route.settings.bossRoom.enabled;
+        if (!hasEnabledTargets) {
+          setTerminal(visitId, 'done', `${workerName} has no enabled targets.`);
           return;
         }
 
-        statusView.begin('Looking for the active Shadowbridge Warrens instance.');
-        setWorkingMessage(visitId, 'Looking for the active Shadowbridge Warrens instance.');
-        const entry = logic.parseHubEntry(doc, currentUrl()?.href);
-        if (!entry) throw new Error('The Shadowbridge Warrens entry was not found on the guild-dungeon page.');
+        statusView.begin(`Looking for the active ${dungeonName} instance.`);
+        setWorkingMessage(visitId, `Looking for the active ${dungeonName} instance.`);
+        const entry = parseHubEntry(doc, currentUrl()?.href);
+        if (!entry) throw new Error(`The ${dungeonName} entry was not found on the guild-dungeon page.`);
         const userId = await getUserId();
-        if (!userId) throw new Error('The player id could not be determined for Shadowbridge.');
+        if (!userId) throw new Error(`The player id could not be determined for ${workerName}.`);
 
         let instanceUrl = entry.url;
         for (let pass = 0; pass < TIMING.maxScanPasses; pass += 1) {
@@ -8042,14 +8214,18 @@
           const instance = await loadInstance(visitId, instanceUrl);
           instanceUrl = new URL(`/guild_dungeon_instance.php?id=${encodeURIComponent(instance.instanceId)}`, win.location.origin).href;
           const scans = await scanLocations(visitId, instance);
-          const plan = attackPlan(scans, route.settings, runtime.processed);
+          profile.onScans?.({ scans, route, store });
+          const plan = buildPlan(scans, route.settings, runtime.processed);
           statusView.setPlan(plan);
           if (plan.length === 0) {
-            const bossNote = route.settings.bossRoom.enabled && instance.bossLocked ? ' The Boss Room is still locked.' : '';
+            const bossEnabled = profile.isBossEnabled
+              ? profile.isBossEnabled(route.settings)
+              : route.settings.bossRoom?.enabled === true;
+            const bossNote = bossEnabled && instance.bossLocked ? ' The Boss Room is still locked.' : '';
             setTerminal(
               visitId,
               'done',
-              `Shadowbridge finished ${runtime.targets} target(s) with ${runtime.attacks} attack(s).${bossNote}`,
+              `${workerName} finished ${runtime.targets} target(s) with ${runtime.attacks} attack(s).${bossNote}`,
             );
             return;
           }
@@ -8070,7 +8246,7 @@
             runtime.targets += 1;
             setWorkingMessage(
               visitId,
-              `${target.name || 'Shadowbridge boss'} ${
+              `${target.name || `${workerName} monster`} ${
                 result.reason === 'dead' ? 'is defeated' : 'reached its configured damage target'
               }; checking the next target.`,
             );
@@ -8079,14 +8255,14 @@
           // Re-read the instance after each complete plan: killing the last normal
           // monster can unlock a dynamically linked Boss Room.
         }
-        throw new Error('Shadowbridge did not settle after repeated instance rescans.');
+        throw new Error(`${workerName} did not settle after repeated instance rescans.`);
       }
 
       async function tick() {
         if (runtime.stopped || runtime.ticking || !isMarkedHub()) return;
         const command = readCommand();
         if (!command) {
-          if (!runtime.runningVisitId) publish('idle', true, 'Shadowbridge is idle on the dungeon page.');
+          if (!runtime.runningVisitId) publish('idle', true, `${workerName} is idle on the dungeon page.`);
           return;
         }
         if (!ownsSchedulerLease()) return;
@@ -8095,7 +8271,7 @@
           return;
         }
         if (command.phase === 'draining' || now() >= command.deadlineAt) {
-          setTerminal(command.visitId, 'done', 'Shadowbridge stopped safely before starting another action.');
+          setTerminal(command.visitId, 'done', `${workerName} stopped safely before starting another action.`);
           return;
         }
 
@@ -8112,7 +8288,7 @@
             if (error.kind === 'ownership' || error.kind === 'cancelled') return;
             setTerminal(command.visitId, 'done', error.message);
           } else {
-            setTerminal(command.visitId, 'error', `Shadowbridge failed safely: ${error?.message || error}`);
+            setTerminal(command.visitId, 'error', `${workerName} failed safely: ${error?.message || error}`);
           }
         } finally {
           runtime.ticking = false;
@@ -8125,7 +8301,7 @@
         publish(
           'working',
           false,
-          runtime.message || 'Shadowbridge is working.',
+          runtime.message || `${workerName} is working.`,
           runtime.runningVisitId,
           true,
         );
@@ -22010,9 +22186,10 @@
     const adventurers = require('./adventurers');
     const crucible = require('./crucible');
     const shadowbridge = require('./shadowbridge');
+    const prince = require('./prince');
     const wave3 = require('./wave3');
 
-    const ROUTE_LIST = Object.freeze([pvp, wave3, olympus, adventurers, shadowbridge, crucible]);
+    const ROUTE_LIST = Object.freeze([pvp, wave3, olympus, adventurers, shadowbridge, prince, crucible]);
     const ROUTES = Object.freeze(Object.fromEntries(ROUTE_LIST.map((route) => [route.id, route])));
     const ROUTE_IDS = Object.freeze(ROUTE_LIST.map((route) => route.id));
 
@@ -22166,6 +22343,286 @@
           OLYMPUS_DOMAINS.map((domain) => ({ title: domain.label, bosses: domain.bosses })),
         );
       },
+    });
+  },
+  "routes/prince.js": function (module, exports, require) {
+    'use strict';
+
+    const { normalizeDamageTarget } = require('../core/numbers');
+    const shadowbridge = require('./shadowbridge');
+
+    const DUNGEON_NAME = 'Castle of the Fallen Prince';
+    const DEFAULT_DAMAGE = '1m';
+    const DEFAULT_ATTACK_COOLDOWN_MS = 100;
+    const MIN_ATTACK_COOLDOWN_MS = 100;
+    const MAX_ATTACK_COOLDOWN_MS = 2_000;
+
+    // Room names are stable configuration keys. Instance and battle ids are
+    // deliberately absent: both are discovered again during every scheduler run.
+    const PRINCE_TARGETS = Object.freeze(
+      [
+        ['vizier-hall', "The Vizier's Conspiracy Hall", 'The Goblin Royal Vizier', false],
+        ['bloodbound-hall', 'Hall of the Bloodbound', '', false],
+        ['beasts-room', 'Room of Beasts', '', false],
+        ['dead-crown-room', 'Room of the Dead Crown', '', false],
+        ['true-heir-throne', 'The True Heir Throne', '', true],
+      ].map(([id, locationName, knownMonsterName, isBoss]) =>
+        Object.freeze({ id, locationName, knownMonsterName, isBoss }),
+      ),
+    );
+
+    const SKILL_ID_SET = new Set(shadowbridge.SHADOWBRIDGE_SKILLS.map((skill) => skill.id));
+    const DAMAGE_MODES = Object.freeze([
+      Object.freeze({ id: 'max-damage', label: 'Max damage (current max HP)' }),
+      Object.freeze({ id: 'kill', label: 'Kill monster' }),
+      Object.freeze({ id: 'custom', label: 'Custom damage' }),
+    ]);
+    const DAMAGE_MODE_SET = new Set(DAMAGE_MODES.map((mode) => mode.id));
+
+    function normalizedText(value) {
+      return String(value || '')
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[’‘`]/g, "'")
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+    }
+
+    function targetForLocation(location) {
+      const label = normalizedText(location?.label);
+      if (!label) return null;
+      return PRINCE_TARGETS.find((target) => label.includes(normalizedText(target.locationName))) || null;
+    }
+
+    function normalizeCooldown(value) {
+      const number = Math.round(Number(value));
+      if (!Number.isFinite(number)) return DEFAULT_ATTACK_COOLDOWN_MS;
+      return Math.min(MAX_ATTACK_COOLDOWN_MS, Math.max(MIN_ATTACK_COOLDOWN_MS, number));
+    }
+
+    function normalizeMonsterName(value) {
+      const name = String(value || '').replace(/\s+/g, ' ').trim();
+      return name && name.length <= 160 ? name : '';
+    }
+
+    function normalizeTarget(value) {
+      return {
+        enabled: typeof value?.enabled === 'boolean' ? value.enabled : true,
+        mode: DAMAGE_MODE_SET.has(value?.mode) ? value.mode : 'max-damage',
+        damage: normalizeDamageTarget(value?.damage, DEFAULT_DAMAGE),
+      };
+    }
+
+    function normalizeSettings(value) {
+      const targets = {};
+      const discoveredNames = {};
+      for (const definition of PRINCE_TARGETS) {
+        targets[definition.id] = normalizeTarget(value?.targets?.[definition.id]);
+        discoveredNames[definition.id] =
+          normalizeMonsterName(value?.discoveredNames?.[definition.id]) || definition.knownMonsterName;
+      }
+      const skill = String(value?.skill ?? '0');
+      return {
+        targets,
+        discoveredNames,
+        skill: SKILL_ID_SET.has(skill) ? skill : '0',
+        attackCooldownMs: normalizeCooldown(value?.attackCooldownMs),
+      };
+    }
+
+    function mergeDiscoveredMonsters(settings, scans = []) {
+      const merged = normalizeSettings(settings);
+      let changed = false;
+      for (const scan of scans) {
+        const definition = targetForLocation(scan?.location);
+        const name = normalizeMonsterName(scan?.monsters?.find((monster) => !monster.dead)?.name || scan?.monsters?.[0]?.name);
+        if (!definition || !name || merged.discoveredNames[definition.id] === name) continue;
+        merged.discoveredNames[definition.id] = name;
+        changed = true;
+      }
+      return { changed, settings: merged };
+    }
+
+    function settingsForLocation(settings, location) {
+      const definition = targetForLocation(location);
+      if (!definition) return null;
+      const normalized = normalizeSettings(settings);
+      return {
+        definition,
+        target: normalized.targets[definition.id],
+        displayName: normalized.discoveredNames[definition.id] || `Monster in ${definition.locationName}`,
+      };
+    }
+
+    function setTouchSize(element) {
+      if (element?.style) element.style.minHeight = '44px';
+    }
+
+    function renderSettings(ctx) {
+      ctx.addSectionTitle('Combat');
+      const skillGroup = ctx.make('div', { className: ctx.cls('setting') });
+      const skillLabel = ctx.make('label', { text: 'Attack skill' });
+      const skillId = `${ctx.idPrefix}-skill`;
+      skillLabel.setAttribute?.('for', skillId);
+      const skillSelect = ctx.make('select', { id: skillId, className: ctx.cls('select') });
+      for (const skill of shadowbridge.SHADOWBRIDGE_SKILLS) {
+        const option = ctx.make('option', { text: `${skill.name} (${skill.cost} stamina)` });
+        option.value = skill.id;
+        skillSelect.appendChild(option);
+      }
+      skillSelect.value = ctx.settings.skill;
+      setTouchSize(skillSelect);
+      skillSelect.addEventListener('change', () => {
+        ctx.settings = ctx.updateSettings((settings) => {
+          settings.skill = skillSelect.value;
+        });
+        skillSelect.value = ctx.settings.skill;
+      });
+      skillGroup.appendChild(skillLabel);
+      skillGroup.appendChild(skillSelect);
+      skillGroup.appendChild(
+        ctx.make('div', {
+          className: ctx.cls('hint'),
+          text: 'Instance id, monster battle id and maximum HP are always read from the currently active dungeon.',
+        }),
+      );
+      ctx.container.appendChild(skillGroup);
+
+      const cooldownInput = ctx.addTextInput({
+        id: 'attack-cooldown-ms',
+        label: 'Attack cooldown (ms)',
+        value: ctx.settings.attackCooldownMs,
+        type: 'number',
+        inputMode: 'numeric',
+        onChange(value) {
+          ctx.settings = ctx.updateSettings((settings) => {
+            settings.attackCooldownMs = value;
+          });
+          return ctx.settings.attackCooldownMs;
+        },
+      });
+      cooldownInput.min = String(MIN_ATTACK_COOLDOWN_MS);
+      cooldownInput.max = String(MAX_ATTACK_COOLDOWN_MS);
+      cooldownInput.step = '10';
+
+      ctx.addSectionTitle('Five monsters');
+      for (const definition of PRINCE_TARGETS) {
+        const target = ctx.settings.targets[definition.id];
+        const discoveredName = ctx.settings.discoveredNames[definition.id];
+        const card = ctx.make('div', {
+          id: `${ctx.idPrefix}-target-${definition.id}`,
+          className: ctx.cls('setting'),
+        });
+        card.appendChild(
+          ctx.make('div', {
+            className: ctx.cls('setting-label'),
+            text: discoveredName || `Monster in ${definition.locationName}`,
+          }),
+        );
+        card.appendChild(
+          ctx.make('div', {
+            className: ctx.cls('hint'),
+            text: `${definition.locationName}${definition.isBoss ? ' (Boss)' : ''}`,
+          }),
+        );
+
+        const enabledLabel = ctx.make('label', { className: ctx.cls('check') });
+        const enabledInput = ctx.make('input', {
+          id: `${ctx.idPrefix}-target-${definition.id}-enabled`,
+          type: 'checkbox',
+        });
+        enabledInput.checked = target.enabled;
+        enabledInput.addEventListener('change', () => {
+          ctx.settings = ctx.updateSettings((settings) => {
+            settings.targets[definition.id].enabled = enabledInput.checked;
+          });
+        });
+        enabledLabel.appendChild(enabledInput);
+        enabledLabel.appendChild(ctx.make('span', { text: 'Attack this monster' }));
+        card.appendChild(enabledLabel);
+
+        const modeId = `${ctx.idPrefix}-target-${definition.id}-mode`;
+        const modeLabel = ctx.make('label', { text: 'Damage mode' });
+        modeLabel.setAttribute?.('for', modeId);
+        const modeSelect = ctx.make('select', { id: modeId, className: ctx.cls('select') });
+        for (const mode of DAMAGE_MODES) {
+          const option = ctx.make('option', { text: mode.label });
+          option.value = mode.id;
+          modeSelect.appendChild(option);
+        }
+        modeSelect.value = target.mode;
+        setTouchSize(modeSelect);
+        card.appendChild(modeLabel);
+        card.appendChild(modeSelect);
+
+        const damageGroup = ctx.make('div');
+        const damageId = `${ctx.idPrefix}-target-${definition.id}-damage`;
+        const damageLabel = ctx.make('label', { text: 'Custom damage target' });
+        damageLabel.setAttribute?.('for', damageId);
+        const damageInput = ctx.make('input', {
+          id: damageId,
+          className: ctx.cls('input'),
+          type: 'text',
+        });
+        damageInput.value = target.damage;
+        damageInput.placeholder = 'e.g. 3m';
+        damageInput.inputMode = 'decimal';
+        damageGroup.hidden = target.mode !== 'custom';
+        damageGroup.appendChild(damageLabel);
+        damageGroup.appendChild(damageInput);
+        card.appendChild(damageGroup);
+
+        modeSelect.addEventListener('change', () => {
+          ctx.settings = ctx.updateSettings((settings) => {
+            settings.targets[definition.id].mode = modeSelect.value;
+          });
+          modeSelect.value = ctx.settings.targets[definition.id].mode;
+          damageGroup.hidden = modeSelect.value !== 'custom';
+        });
+        damageInput.addEventListener('change', () => {
+          ctx.settings = ctx.updateSettings((settings) => {
+            settings.targets[definition.id].damage = damageInput.value;
+          });
+          damageInput.value = ctx.settings.targets[definition.id].damage;
+        });
+        ctx.container.appendChild(card);
+      }
+    }
+
+    module.exports = Object.freeze({
+      id: 'prince',
+      label: DUNGEON_NAME,
+      path: '/guild_dungeon.php?veyra_route=prince',
+      defaultEnabled: false,
+      visitPathnames: Object.freeze([
+        '/guild_dungeon_instance.php',
+        '/guild_dungeon_location.php',
+        '/battle.php',
+      ]),
+      defaultLoopMinutes: 30,
+      maxVisitMs: 60 * 60_000,
+      initialDelayMs: 10 * 60_000,
+      DAMAGE_MODES,
+      DUNGEON_NAME,
+      PRINCE_TARGETS,
+      mergeDiscoveredMonsters,
+      settingsForLocation,
+      targetForLocation,
+
+      matchesUrl(url) {
+        return (
+          /\/guild_dungeon\.php\/?$/i.test(url.pathname) &&
+          url.searchParams.get('veyra_route') === 'prince'
+        );
+      },
+
+      createDefaultSettings() {
+        return normalizeSettings(null);
+      },
+
+      normalizeSettings,
+      renderSettings,
     });
   },
   "routes/pvp.js": function (module, exports, require) {

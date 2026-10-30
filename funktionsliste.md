@@ -3,7 +3,7 @@
 Grundlage: `arbeitsauftrag.txt`, die bestehenden Skripte und die Beispielseiten in `veyra_seiten.txt`.
 Status-Legende: **[vorh.]** existiert schon weitgehend · **[anp.]** existiert, muss angepasst werden · **[neu]** neu zu bauen · **[?]** offene Frage
 
-Aktueller Stand: Alle beauftragten Punkte sind umgesetzt. Nur die ausdrücklich ausgeschlossenen bzw. zurückgestellten Punkte 4.2, 5.4, 7.15 und 7.16 bleiben unverändert.
+Aktueller Stand: Alle beauftragten Punkte sind umgesetzt. Castle of the Fallen Prince ist ab Version 0.7.0 als eigene, zunächst deaktivierte Route enthalten. Nur die ausdrücklich ausgeschlossenen Punkte 5.4, 7.15 und 7.16 bleiben unverändert.
 
 ---
 
@@ -24,14 +24,14 @@ Aktueller Stand: Alle beauftragten Punkte sind umgesetzt. Nur die ausdrücklich 
 |---|---|---|---|
 | 1.1 | Start/Stop des gesamten Ablaufs | [vorh.] | |
 | 1.2 | Menü mit einer Liste aller aufrufbaren Seiten | [vorh.] | Die bestehende Seitenleiste mit Unteransicht bleibt (F12). |
-| 1.3 | Pro Seite: Name, Countdown bis zum nächsten Aufruf, Toggle zum Aktivieren/Deaktivieren, Button für das Untermenü | [vorh.] | Für PvP, Wave 3, Olympus, Adventurer's Guild, Shadowbridge und Crucible vorhanden. |
+| 1.3 | Pro Seite: Name, Countdown bis zum nächsten Aufruf, Toggle zum Aktivieren/Deaktivieren, Button für das Untermenü | [vorh.] | Für PvP, Wave 3, Olympus, Adventurer's Guild, Shadowbridge, Castle of the Fallen Prince und Crucible vorhanden. |
 | 1.4 | Countdown abgelaufen → zur Seite navigieren und Seitenskript starten | [vorh.] | |
 | 1.5 | Seitenskript fertig → zur Hauptseite zurück und Countdown neu starten | [vorh.] | |
 | 1.6 | Untermenü-Standardfeld: Looplänge in Minuten | [vorh.] | Jede Route hat ein eigenes editierbares Minutenfeld (1–1440); eine Verkürzung zieht einen laufenden Countdown sofort vor. |
 | 1.7 | Untermenü-Standardauswahl: Stamina-Tränke und Heiltränke | [vorh.] | Pro Route getrennte Auswahl für 30 Small, 251 Large, 35 Full, 359 Adventurer Stamina und 108 Full HP. |
 | 1.8 | Hauptseite wählbar | [vorh.] | |
 | 1.9 | Höchstdauer pro Besuch / Timeout, danach geordneter Rückzug | [vorh.] | `maxVisit` und Drain-Logik sind vorhanden. |
-| 1.10 | Neue Routen: Olympus-Domänen, Shadowbridge, Crucible (Prince später) | [vorh.] | Prince bleibt wie beauftragt zurückgestellt. Shadowbridge und Crucible sind nach einem Update sicherheitshalber zunächst deaktiviert. |
+| 1.10 | Neue Routen: Olympus-Domänen, Shadowbridge, Castle of the Fallen Prince und Crucible | [vorh.] | Die mutierenden Dungeon-Routen sind nach einem Update sicherheitshalber zunächst deaktiviert. |
 
 ## 2. Wave-Seiten (Wave 3 + Olympus)
 
@@ -78,7 +78,15 @@ URLs: Wave 3 `active_wave.php?gate=3&wave=8`. Olympus `gate=5`: außen wave=9, H
 | 4.1.9 | Mehrere Locations (1–4) durchlaufen | [vorh.] | |
 | 4.1.10 | Live-Statusfenster während Shadowbridge-Angriffen | [vorh.] | Ein einklappbares, mobil angepasstes Fenster listet alle Ziele des aktuellen Besuchs in Angriffsreihenfolge. Es markiert wartend / aktiv / erledigt / Fehler und zeigt bei Schadenszielen den eigenen Schaden gegen die live gelesene Zielgrenze, im Kill-Modus die verbleibenden Monster-HP sowie jeweils die Angriffsanzahl. |
 
-### 4.2 Castle of the Fallen Prince – vorerst zurückgestellt
+### 4.2 Castle of the Fallen Prince
+
+| # | Funktion | Status | Notiz |
+|---|---|---|---|
+| 4.2.1 | Eigene Scheduler-Route mit fünf einzeln aktivierbaren Monstern | [vorh.] | Die Ziele sind an die stabilen sichtbaren Raumnamen gebunden. Die wechselnde Dungeon-Instanz-ID und die Battle-ID werden bei jedem Lauf live entdeckt und niemals fest gespeichert. |
+| 4.2.2 | Schadensmodi Kill / Max Damage / individueller Schaden | [vorh.] | „Max Damage“ liest unmittelbar vor dem Angriff die aktuelle maximale Monster-HP von `battle.php` und verwendet sie als persönliches Schadensziel. Das individuelle Feld akzeptiert auch Kurzformen wie `3m` oder `3b`. |
+| 4.2.3 | Monster automatisch beitreten und nach Einstellung angreifen | [vorh.] | Nicht beigetretene Kämpfe werden über `dungeon_join_battle.php` betreten. Angriffe verwenden dieselbe scheduler-, Potion-, Rate-Limit- und Asterion-sichere Engine wie Shadowbridge. |
+| 4.2.4 | Dynamische Monsterdaten und Boss-Freischaltung | [vorh.] | Alle aktuell offenen Räume werden live gescannt. Entdeckte Monsternamen werden für die Einstellungsanzeige gespeichert; nach einem Durchlauf wird die Instanz erneut gelesen, damit der freigeschaltete Thronsaal ohne feste Location-ID gefunden wird. |
+| 4.2.5 | Live-Statusfenster | [vorh.] | Zeigt Warteschlange, aktives Ziel, Eigenschaden bzw. Monster-HP, Angriffsanzahl, Abschluss und Fehler mobil sowie auf Desktop an. |
 
 ### 4.3 The Polyhedral Crucible
 
@@ -96,7 +104,7 @@ URLs: Wave 3 `active_wave.php?gate=3&wave=8`. Olympus `gate=5`: außen wave=9, H
 | 4.3.6b | Schritt 3: Match mit freiem Platz wählen (bevorzugt das mit den meisten belegten Plätzen) und Platz belegen | [vorh.] | Match-Karten `.grid > .match` mit Badge `OPEN`/`CLEARED` und `.meta` „Match #N / Slots x/5“. Ein freier Platz hat kein `.name`, der eigene trägt `.selfMark` „YOUR SLOT“. Belegen: POST `pvp_style_action.php` mit `source=cube`, `action=pick_slot`, `instance_id`, `node_id`, `match_no`, `slot_index` (1–5); kein CSRF nötig. Das Match startet automatisch, sobald 5/5 Plätze belegt sind (oder ein Officer es früher startet). |
 | 4.3.6c | Schritt 4: Kampf abwarten | [vorh.] | Sobald das Team vollständig ist, läuft der Kampf automatisch. Ein globaler Hintergrund-Wächter prüft das Match unabhängig vom normalen Crucible-Loop per GET `pvp_style_state.php` mit `room_status` und `match.ended`. Diese Prüfungen verursachen keinen Seitenwechsel und blockieren Army/PvE nicht; ein regulärer Besuch nach 30 Minuten bleibt nur als Fallback bestehen. |
 | 4.3.6d | Schritt 5: Ende erkennen und neu planen | [vorh.] | Bei `match.ended` (Sieg: `winner_side='ally'` bzw. `room_status='cleared'`) setzt der Hintergrund-Wächter Crucible sofort fällig. Auch eine bekannte PvP-Bindungswartezeit sowie volle Lobbys werden direkt per HTTP nachgeprüft; erst ein verfügbarer Slot löst einen Seitenbesuch aus. |
-| 4.3.6e | Schritt 6: Siegesbelohnung automatisch einsammeln | [vorh.] | Es gibt keinen Collect-Button. Erst nach `match.ended`, Alliierter-Sieg und bestätigter eigener Teilnahme öffnet der Hintergrund-Wächter die zugehörige `pvp_style_battle.php?source=cube&instance_id&node_id&match_no` als unsichtbares Same-Origin-Dokument. Ein bloßer `fetch()` reicht nicht, weil er das Seiten-JavaScript (`tick()` → `pvp_style_state.php`) nicht ausführt. `PVP_REWARD_ITEMS` ist bereits vor dem Kampf gefüllt und beweist keine Vergabe; Erfolg gilt erst bei passenden `SOURCE_PARAMS`, `ROOM_STATUS='cleared'` und sichtbar geschaltetem `#rewardsModal` im versteckten Dokument. Der Haupttab wechselt dabei nicht die Seite; bei einem normalen Crucible-Besuch dient derselbe Ablauf als Fallback. |
+| 4.3.6e | Schritt 6: Siegesbelohnung automatisch einsammeln | [vorh.] | Es gibt keinen Collect-Button. Erst nach `match.ended`, Alliierter-Sieg und bestätigter eigener Teilnahme öffnet der Hintergrund-Wächter die zugehörige `pvp_style_battle.php?source=cube&instance_id&node_id&match_no` als unsichtbares Same-Origin-Dokument. Ein bloßer `fetch()` reicht nicht, weil er das Seiten-JavaScript (`tick()` → `pvp_style_state.php`) nicht ausführt. `SOURCE_PARAMS`, `ROOM_STATUS='cleared'` und die Reward-Daten müssen exakt passen. Ein sichtbares `#rewardsModal` bestätigt einen neuen Abruf sofort; bleibt es wegen des seit früher gesetzten „gesehen“-Schlüssels verborgen, gilt die vollständig geladene und über das Bestätigungsfenster ausgeführte echte Siegerseite ebenfalls als erfolgreicher Besuch. Anschließend wechselt der Wächter ausdrücklich zurück in den Lobby-Modus und weckt Crucible für den nächsten Kampf. |
 | 4.3.7 | Army: Aktivieren-Toggle und Schadensmodus (minimal / töten) | [vorh.] | Zeile 69 im Arbeitsauftrag sagt „PvE“, gemeint ist anhand des Kontexts Army. |
 | 4.3.8 | Army: Auflistung und Auswahl der verfügbaren eigenen Shadows | [vorh.] | Eigene Special Shadows werden anhand von `specialUnits`/`shadow_id` sowie `window.FormationData` entdeckt. Vor dem Kampf prüft der Worker `shadow_army_formation.php`; fehlt ein ausgewählter Captain und ist ein Platz frei, wird er per `set_captain` gespeichert und die Formation anschließend erneut verifiziert. Bestehende Captains und zugewiesene normale Shadows werden nicht gelöscht. Im Live-Kampf bleiben nur ausgewählte Captains aktiv; nicht ausgewählte werden vor der Zielzuweisung zurückgezogen. Neu entdeckte Shadows bleiben zunächst abgewählt. |
 | 4.3.9 | Army-Skript, Schritt 1: Knotenseite `guild_dungeon_cube_army_enter.php?instance_id&node_id` | [vorh.] | Fight-Karten `.fight[data-match-no]` mit Status open / active / failed / cleared. API: POST `guild_dungeon_cube_army_action.php` mit `action=enter_fight`, `instance_id`, `node_id`, `match_no` → gleich-origin-validierter `redirect`. |
@@ -105,6 +113,7 @@ URLs: Wave 3 `active_wave.php?gate=3&wave=8`. Olympus `gate=5`: außen wave=9, H
 | 4.3.12 | Army-Skript, Schritt 4: Fertig, wenn `battle.status` nicht mehr `ACTIVE` ist; dann den nächsten offenen Fight bzw. den nächsten Knoten wählen | [vorh.] | |
 | 4.3.13 | Army heilen: Vor dem Beitreten, wenn die Armee tot oder verwundet ist | [vorh.] | `heal_all_units` wird nur bei aktivem Button gesendet und danach durch erneutes Lesen der Seite bestätigt. Fehlt der Heal-Button bei gleichzeitig erfolgreich gelesenen eigenen Shadows, gilt korrekt: aktuell nichts heilbar. |
 | 4.3.14 | Apex-Boss „Zenith Lock“ (`type=boss`, Location 14) | [vorh.] | Eigener Apex-Einstellungsblock mit Active-Toggle und Max Loot / Max EXP / Kill / individuellem Schaden. Der Live-Bossname wird beim Öffnen entdeckt; der Eintritt erfolgt über `enter_node` und einen gleich-origin-validierten Location-14-Redirect. |
+| 4.3.15 | Konfigurierte Crucible-Looplänge nach jedem Besuch beibehalten | [vorh.] | Warte-, Army- und Fehlerzustände überschreiben den Scheduler-Countdown nicht mehr pauschal mit fünf Minuten. PvP bleibt unabhängig davon im Hintergrund überwacht und kann Crucible bei einem tatsächlich verfügbaren Slot oder beendeten Match sofort vorziehen. |
 
 ---
 

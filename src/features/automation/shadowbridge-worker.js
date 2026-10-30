@@ -87,7 +87,13 @@ function createShadowbridgeWorker({
   now = () => Date.now(),
   logger = console,
   statusView = createShadowbridgeStatusView(doc),
+  profile = {},
 }) {
+  const routeId = String(profile.routeId || ROUTE_ID);
+  const dungeonName = String(profile.dungeonName || 'Shadowbridge Warrens');
+  const workerName = String(profile.workerName || dungeonName);
+  const parseHubEntry = profile.parseHubEntry || logic.parseHubEntry;
+  const buildPlan = profile.attackPlan || attackPlan;
   const runtime = {
     stopped: false,
     ticking: false,
@@ -115,13 +121,13 @@ function createShadowbridgeWorker({
     return Boolean(
       url &&
         /\/guild_dungeon\.php\/?$/i.test(url.pathname) &&
-        url.searchParams.get('veyra_route') === ROUTE_ID,
+        url.searchParams.get('veyra_route') === routeId,
     );
   }
 
   function readCommand() {
     const command = normalizeVisit(store.read(COMMAND_KEY), () => true);
-    return command?.taskId === ROUTE_ID ? command : null;
+    return command?.taskId === routeId ? command : null;
   }
 
   function ownsSchedulerLease(t = now()) {
@@ -147,15 +153,15 @@ function createShadowbridgeWorker({
     runtime.message = message;
     return publishWorkerStatus(
       store,
-      ROUTE_ID,
-      { visitId, workerId: ROUTE_ID, state, safeToLeave, message },
+      routeId,
+      { visitId, workerId: routeId, state, safeToLeave, message },
       t,
     );
   }
 
   function log(message, level = 'info') {
     const method = level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'info';
-    logger?.[method]?.(`[Veyra:shadowbridge-worker] ${message}`);
+    logger?.[method]?.(`[Veyra:${routeId}-worker] ${message}`);
   }
 
   function setWorkingMessage(visitId, message) {
@@ -174,16 +180,16 @@ function createShadowbridgeWorker({
   }
 
   function assertCanMutate(visitId) {
-    if (runtime.stopped) throw new VisitStop('cancelled', 'Shadowbridge worker stopped.');
+    if (runtime.stopped) throw new VisitStop('cancelled', `${workerName} worker stopped.`);
     const command = readCommand();
     if (!command || command.visitId !== visitId) {
-      throw new VisitStop('cancelled', 'The Shadowbridge scheduler visit changed.');
+      throw new VisitStop('cancelled', `The ${workerName} scheduler visit changed.`);
     }
     if (!ownsSchedulerLease()) {
-      throw new VisitStop('ownership', 'Another tab owns the Shadowbridge scheduler visit.');
+      throw new VisitStop('ownership', `Another tab owns the ${workerName} scheduler visit.`);
     }
     if (command.phase === 'draining' || now() >= command.deadlineAt) {
-      throw new VisitStop('drain', 'Shadowbridge stopped safely at the scheduler deadline.');
+      throw new VisitStop('drain', `${workerName} stopped safely at the scheduler deadline.`);
     }
     return command;
   }
@@ -200,7 +206,7 @@ function createShadowbridgeWorker({
   }
 
   function routeConfig() {
-    return normalizeConfig(store.read(CONFIG_KEY)).routes[ROUTE_ID];
+    return normalizeConfig(store.read(CONFIG_KEY)).routes[routeId];
   }
 
   async function readDashboard(visitId) {
@@ -261,7 +267,7 @@ function createShadowbridgeWorker({
       if (!Number.isFinite(snapshot.playerHp) || !Number.isFinite(snapshot.playerMaxHp) || snapshot.playerMaxHp <= 0) {
         return true;
       }
-      if (snapshot.playerHp <= 0) throw new VisitStop('resource', 'Player HP reached zero; Shadowbridge stopped.');
+      if (snapshot.playerHp <= 0) throw new VisitStop('resource', `Player HP reached zero; ${workerName} stopped.`);
       if (snapshot.playerHp / snapshot.playerMaxHp > TIMING.lowHpFraction) return true;
       await ensureInventory();
       const potion = pickPotion(inventory, route.potions.heal);
@@ -315,7 +321,7 @@ function createShadowbridgeWorker({
       monsterId: target.monsterId,
       userId,
     });
-    if (!payload) throw new Error('Could not build a safe Shadowbridge join request.');
+    if (!payload) throw new Error(`Could not build a safe ${workerName} join request.`);
     assertCanMutate(visitId);
     setWorkingMessage(visitId, `Joining ${target.name || 'Shadowbridge monster'}.`);
     const response = await guardedPostForm(visitId, JOIN_URL, payload);
@@ -352,7 +358,7 @@ function createShadowbridgeWorker({
     battle = await joinIfNeeded(visitId, target, userId, battle);
 
     let decision = resolveTarget(target, battle.snapshot);
-    if (!decision.ok) throw new Error(`${target.name || 'Shadowbridge target'}: ${decision.error}`);
+    if (!decision.ok) throw new Error(`${target.name || `${workerName} target`}: ${decision.error}`);
     statusView.updateTarget(target.key, {
       currentDamage: battle.snapshot.ownDamage,
       currentHp: battle.snapshot.currentHp,
@@ -371,7 +377,7 @@ function createShadowbridgeWorker({
       monsterId: target.monsterId,
       skillId: route.settings.skill,
     });
-    if (!skill || !payload) throw new Error('The selected Shadowbridge skill is invalid.');
+    if (!skill || !payload) throw new Error(`The selected ${workerName} skill is invalid.`);
     const effectiveStaminaCost = staminaCost(skill.cost, asterionMultiplier);
     const resources = createResourceManager(visitId, route, battle.doc);
     let ownDamage = battle.snapshot.ownDamage;
@@ -390,13 +396,13 @@ function createShadowbridgeWorker({
 
       setWorkingMessage(
         visitId,
-        `Attacking ${target.name || 'Shadowbridge boss'} (${attempts + 1}${
+        `Attacking ${target.name || `${workerName} monster`} (${attempts + 1}${
           decision.untilDead ? ', until defeated' : `, ${Math.max(0, decision.targetDamage - ownDamage)} damage remaining`
         }).`,
       );
       const response = await guardedPostForm(visitId, DAMAGE_URL, payload, {
         onRateLimit({ waitMs }) {
-          setWorkingMessage(visitId, `Shadowbridge rate limit: waiting ${Math.ceil(waitMs / 1_000)} seconds.`);
+          setWorkingMessage(visitId, `${workerName} rate limit: waiting ${Math.ceil(waitMs / 1_000)} seconds.`);
         },
       });
       const result = logic.parseAttackResponse(response);
@@ -446,7 +452,7 @@ function createShadowbridgeWorker({
           return { reason: 'dead', attacks: attempts };
         }
         decision = resolveTarget(target, battle.snapshot);
-        if (!decision.ok) throw new Error(`${target.name || 'Shadowbridge target'}: ${decision.error}`);
+        if (!decision.ok) throw new Error(`${target.name || `${workerName} target`}: ${decision.error}`);
         ownDamage = battle.snapshot.ownDamage;
         statusView.updateTarget(target.key, {
           currentDamage: ownDamage,
@@ -461,14 +467,14 @@ function createShadowbridgeWorker({
       }
       await sleepImpl(route.settings.attackCooldownMs);
     }
-    throw new Error(`${target.name || 'Shadowbridge target'} exceeded the per-monster attack safety limit.`);
+    throw new Error(`${target.name || `${workerName} target`} exceeded the per-monster attack safety limit.`);
   }
 
   async function scanLocations(visitId, instance) {
     const scans = [];
     for (const location of instance.locations) {
       assertCanMutate(visitId);
-      setWorkingMessage(visitId, `Scanning ${location.label || `Shadowbridge location ${location.id}`}.`);
+      setWorkingMessage(visitId, `Scanning ${location.label || `${workerName} location ${location.id}`}.`);
       const locationDoc = await fetchDocument(location.url);
       scans.push({
         location,
@@ -482,9 +488,9 @@ function createShadowbridgeWorker({
     assertCanMutate(visitId);
     const instanceDoc = await fetchDocument(url);
     const instance = logic.parseInstancePage(instanceDoc, url);
-    if (!instance.instanceId) throw new Error('The Shadowbridge instance id could not be read.');
+    if (!instance.instanceId) throw new Error(`The ${workerName} instance id could not be read.`);
     if (instance.locations.length === 0) {
-      throw new Error('No unlocked Shadowbridge locations were found on the instance page.');
+      throw new Error(`No unlocked ${workerName} locations were found on the instance page.`);
     }
     return instance;
   }
@@ -492,18 +498,20 @@ function createShadowbridgeWorker({
   async function executeVisit(command) {
     const visitId = command.visitId;
     const route = routeConfig();
-    const enabledNormal = Object.values(route.settings.monsters).some((target) => target.enabled);
-    if (!enabledNormal && !route.settings.bossRoom.enabled) {
-      setTerminal(visitId, 'done', 'Shadowbridge has no enabled targets.');
+    const hasEnabledTargets = profile.hasEnabledTargets
+      ? profile.hasEnabledTargets(route.settings)
+      : Object.values(route.settings.monsters).some((target) => target.enabled) || route.settings.bossRoom.enabled;
+    if (!hasEnabledTargets) {
+      setTerminal(visitId, 'done', `${workerName} has no enabled targets.`);
       return;
     }
 
-    statusView.begin('Looking for the active Shadowbridge Warrens instance.');
-    setWorkingMessage(visitId, 'Looking for the active Shadowbridge Warrens instance.');
-    const entry = logic.parseHubEntry(doc, currentUrl()?.href);
-    if (!entry) throw new Error('The Shadowbridge Warrens entry was not found on the guild-dungeon page.');
+    statusView.begin(`Looking for the active ${dungeonName} instance.`);
+    setWorkingMessage(visitId, `Looking for the active ${dungeonName} instance.`);
+    const entry = parseHubEntry(doc, currentUrl()?.href);
+    if (!entry) throw new Error(`The ${dungeonName} entry was not found on the guild-dungeon page.`);
     const userId = await getUserId();
-    if (!userId) throw new Error('The player id could not be determined for Shadowbridge.');
+    if (!userId) throw new Error(`The player id could not be determined for ${workerName}.`);
 
     let instanceUrl = entry.url;
     for (let pass = 0; pass < TIMING.maxScanPasses; pass += 1) {
@@ -511,14 +519,18 @@ function createShadowbridgeWorker({
       const instance = await loadInstance(visitId, instanceUrl);
       instanceUrl = new URL(`/guild_dungeon_instance.php?id=${encodeURIComponent(instance.instanceId)}`, win.location.origin).href;
       const scans = await scanLocations(visitId, instance);
-      const plan = attackPlan(scans, route.settings, runtime.processed);
+      profile.onScans?.({ scans, route, store });
+      const plan = buildPlan(scans, route.settings, runtime.processed);
       statusView.setPlan(plan);
       if (plan.length === 0) {
-        const bossNote = route.settings.bossRoom.enabled && instance.bossLocked ? ' The Boss Room is still locked.' : '';
+        const bossEnabled = profile.isBossEnabled
+          ? profile.isBossEnabled(route.settings)
+          : route.settings.bossRoom?.enabled === true;
+        const bossNote = bossEnabled && instance.bossLocked ? ' The Boss Room is still locked.' : '';
         setTerminal(
           visitId,
           'done',
-          `Shadowbridge finished ${runtime.targets} target(s) with ${runtime.attacks} attack(s).${bossNote}`,
+          `${workerName} finished ${runtime.targets} target(s) with ${runtime.attacks} attack(s).${bossNote}`,
         );
         return;
       }
@@ -539,7 +551,7 @@ function createShadowbridgeWorker({
         runtime.targets += 1;
         setWorkingMessage(
           visitId,
-          `${target.name || 'Shadowbridge boss'} ${
+          `${target.name || `${workerName} monster`} ${
             result.reason === 'dead' ? 'is defeated' : 'reached its configured damage target'
           }; checking the next target.`,
         );
@@ -548,14 +560,14 @@ function createShadowbridgeWorker({
       // Re-read the instance after each complete plan: killing the last normal
       // monster can unlock a dynamically linked Boss Room.
     }
-    throw new Error('Shadowbridge did not settle after repeated instance rescans.');
+    throw new Error(`${workerName} did not settle after repeated instance rescans.`);
   }
 
   async function tick() {
     if (runtime.stopped || runtime.ticking || !isMarkedHub()) return;
     const command = readCommand();
     if (!command) {
-      if (!runtime.runningVisitId) publish('idle', true, 'Shadowbridge is idle on the dungeon page.');
+      if (!runtime.runningVisitId) publish('idle', true, `${workerName} is idle on the dungeon page.`);
       return;
     }
     if (!ownsSchedulerLease()) return;
@@ -564,7 +576,7 @@ function createShadowbridgeWorker({
       return;
     }
     if (command.phase === 'draining' || now() >= command.deadlineAt) {
-      setTerminal(command.visitId, 'done', 'Shadowbridge stopped safely before starting another action.');
+      setTerminal(command.visitId, 'done', `${workerName} stopped safely before starting another action.`);
       return;
     }
 
@@ -581,7 +593,7 @@ function createShadowbridgeWorker({
         if (error.kind === 'ownership' || error.kind === 'cancelled') return;
         setTerminal(command.visitId, 'done', error.message);
       } else {
-        setTerminal(command.visitId, 'error', `Shadowbridge failed safely: ${error?.message || error}`);
+        setTerminal(command.visitId, 'error', `${workerName} failed safely: ${error?.message || error}`);
       }
     } finally {
       runtime.ticking = false;
@@ -594,7 +606,7 @@ function createShadowbridgeWorker({
     publish(
       'working',
       false,
-      runtime.message || 'Shadowbridge is working.',
+      runtime.message || `${workerName} is working.`,
       runtime.runningVisitId,
       true,
     );

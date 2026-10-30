@@ -97,10 +97,12 @@ function namedDungeonCard(link, wantedName) {
   return null;
 }
 
-// Finds the dynamic instance entry.  A hub can contain several dungeons, so
-// an enter link is accepted only when its surrounding card names Shadowbridge.
-function parseHubEntry(doc, baseUrl = 'https://demonicscans.org/guild_dungeon.php') {
-  const wanted = normalizeMonsterName(SHADOWBRIDGE_NAME);
+// Finds a dynamic dungeon instance entry by its visible name. A hub can
+// contain several dungeons, so an enter link is accepted only when its
+// surrounding card names the requested dungeon.
+function parseNamedHubEntry(doc, dungeonName, baseUrl = 'https://demonicscans.org/guild_dungeon.php') {
+  const wanted = normalizeMonsterName(dungeonName);
+  if (!wanted) return null;
   for (const link of all(doc, 'a[href*="guild_dungeon_enter.php"]')) {
     const card = namedDungeonCard(link, wanted);
     if (!card) continue;
@@ -120,6 +122,10 @@ function parseHubEntry(doc, baseUrl = 'https://demonicscans.org/guild_dungeon.ph
     if (url && /^\d+$/.test(instanceId)) return { instanceId, url: url.href };
   }
   return null;
+}
+
+function parseHubEntry(doc, baseUrl = 'https://demonicscans.org/guild_dungeon.php') {
+  return parseNamedHubEntry(doc, SHADOWBRIDGE_NAME, baseUrl);
 }
 
 function instanceIdFromPage(doc, pageUrl = '') {
@@ -348,13 +354,21 @@ function resolveDamageTarget({ mode, damage, isBoss = false, allowMaxExp = isBos
   }
 
   let targetDamage = null;
-  if (mode === 'max-loot') targetDamage = positiveAmount(snapshot.lootRequirement);
+  if (mode === 'max-damage') targetDamage = positiveAmount(snapshot.maxHp);
+  else if (mode === 'max-loot') targetDamage = positiveAmount(snapshot.lootRequirement);
   else if (mode === 'max-exp' && allowMaxExp) targetDamage = positiveAmount(snapshot.expCapDamage);
   else if (mode === 'custom') targetDamage = positiveAmount(damage);
   else return { ok: false, error: `Unsupported Shadowbridge damage mode: ${String(mode || '')}.` };
 
   if (targetDamage === null) {
-    const label = mode === 'max-loot' ? 'loot requirement' : mode === 'max-exp' ? 'EXP cap' : 'custom damage';
+    const label =
+      mode === 'max-damage'
+        ? 'maximum monster HP'
+        : mode === 'max-loot'
+          ? 'loot requirement'
+          : mode === 'max-exp'
+            ? 'EXP cap'
+            : 'custom damage';
     return { ok: false, error: `The ${label} could not be read safely.` };
   }
   if (!snapshot.ownDamageKnown || !Number.isFinite(snapshot.ownDamage)) {
@@ -477,6 +491,7 @@ module.exports = {
   parseAttackResponse,
   parseBattleSnapshot,
   parseHubEntry,
+  parseNamedHubEntry,
   parseInstancePage,
   parseJoinResponse,
   parseLocationPage,

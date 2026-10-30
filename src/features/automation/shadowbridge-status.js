@@ -70,6 +70,7 @@ function formatNumber(value) {
 
 function modeLabel(mode) {
   return ({
+    'max-damage': 'Max damage',
     'max-loot': 'Max loot',
     'max-exp': 'Max EXP',
     custom: 'Custom damage',
@@ -111,7 +112,11 @@ function progressDetails(entry = {}) {
   };
 }
 
-function createShadowbridgeStatusView(doc) {
+function createShadowbridgeStatusView(doc, options = {}) {
+  const title = String(options.title || 'Shadowbridge attack progress');
+  const idleText = String(options.idleText || 'Scanning dungeon…');
+  const workingText = String(options.workingText || 'Dungeon attack is working…');
+  const fallbackTargetName = String(options.fallbackTargetName || 'Dungeon monster');
   const state = {
     active: false,
     collapsed: false,
@@ -160,13 +165,13 @@ function createShadowbridgeStatusView(doc) {
 
     const head = make('div', 'sbp-head');
     const copy = make('div');
-    copy.appendChild(make('div', 'sbp-title', 'Shadowbridge attack progress'));
-    summary = make('div', 'sbp-summary', state.summary || 'Scanning dungeon…');
+    copy.appendChild(make('div', 'sbp-title', title));
+    summary = make('div', 'sbp-summary', state.summary || idleText);
     copy.appendChild(summary);
     toggle = make('button', 'sbp-toggle', '−');
     toggle.type = 'button';
     toggle.title = 'Collapse progress';
-    toggle.setAttribute?.('aria-label', 'Collapse Shadowbridge progress');
+      toggle.setAttribute?.('aria-label', 'Collapse dungeon progress');
     toggle.addEventListener?.('click', () => {
       state.collapsed = !state.collapsed;
       panel.dataset.collapsed = String(state.collapsed);
@@ -187,7 +192,7 @@ function createShadowbridgeStatusView(doc) {
     if (!state.active || !ensurePanel()) return;
     panel.dataset.state = state.phase;
     panel.dataset.collapsed = String(state.collapsed);
-    summary.textContent = state.summary || 'Shadowbridge is working…';
+    summary.textContent = state.summary || workingText;
     const rows = [];
     for (const key of state.order) {
       const entry = state.entries.get(key);
@@ -197,7 +202,7 @@ function createShadowbridgeStatusView(doc) {
       row.dataset.key = key;
       row.dataset.status = entry.status || 'queued';
       const nameWrap = make('div');
-      nameWrap.appendChild(make('div', 'sbp-name', entry.name || 'Shadowbridge monster'));
+      nameWrap.appendChild(make('div', 'sbp-name', entry.name || fallbackTargetName));
       const meta = [entry.locationLabel, modeLabel(entry.mode)].filter(Boolean).join(' · ');
       nameWrap.appendChild(make('div', 'sbp-meta', meta));
       row.appendChild(nameWrap);
@@ -233,7 +238,7 @@ function createShadowbridgeStatusView(doc) {
         attacks: 0,
         ...existing,
         key,
-        name: String(target.name || existing.name || 'Shadowbridge monster'),
+        name: String(target.name || existing.name || fallbackTargetName),
         locationLabel: String(target.location?.label || existing.locationLabel || ''),
         mode: String(target.target?.mode || existing.mode || ''),
       });
