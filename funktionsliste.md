@@ -42,7 +42,7 @@ URLs: Wave 3 `active_wave.php?gate=3&wave=8`. Olympus `gate=5`: außen wave=9, H
 | 2.1 | Menü: Bossliste mit Checkbox „angreifen“ | [vorh.] | Jeder Wave-3- und Olympus-Boss hat einen eigenen Active-Toggle. |
 | 2.2 | Menü: Schadensziel pro Boss (Zahl oder `3M`/`3b`) | [vorh.] | `normalizeDamageTarget` |
 | 2.3 | Menü: Stamina-Tränke auswählbar | [vorh.] | Nutzt die gemeinsame routenspezifische Trankauswahl. |
-| 2.4 | Menü: Angriff/Skill auswählbar (Slash 0, Power −1, Heroic −2, Ultimate −3, Legendary −4, evtl. −5) | [vorh.] | Bis zu drei Skills in fester Kostenreihenfolge; alle sechs IDs sind auswählbar. |
+| 2.4 | Menü: Angriff/Skill auswählbar (Slash 0, Power −1, Heroic −2, Ultimate −3, Legendary −4, evtl. −5) | [vorh.] | Bis zu drei Skills; alle sechs IDs sind auswählbar und werden immer vom teuersten zum billigsten Angriff priorisiert. Das gilt auch für Monster Auto Battle und Strategic Attack. |
 | 2.5 | Alle Olympus-Bosse in einem gemeinsamen Untermenü einstellbar | [vorh.] | Neun Domänen mit je zwei Zielen werden in einem Olympus-Untermenü konfiguriert und in einem Besuch nacheinander abgearbeitet. |
 | 2.6 | Skript: Prüfen, welche Bosse aktiv sind | [vorh.] | Erkennung über kanonische Namen/Aliasse und `.auto-summon-card`, nicht über das unzuverlässige `data-boss`. |
 | 2.7 | Skript: Eigenen Schaden prüfen (`data-userdmg`) | [vorh.] | |

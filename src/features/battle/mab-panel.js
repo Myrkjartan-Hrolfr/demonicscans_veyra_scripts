@@ -5,7 +5,7 @@
 // #mabStart, #mabStop, #mabStatus, #mabAttack1-3, #mabPoisonAttack,
 // #mabAutoStamina, ...) because other scripts and muscle memory use them.
 
-const { ATTACK_GROUPS, attackOptionLabel } = require('./mab-attacks');
+const { ATTACK_GROUPS, attackOptionLabel, sortAttackKeysByCost } = require('./mab-attacks');
 const { cursorAfterFormat, formatNumber, formatTargetDisplay } = require('./mab-parse');
 const { getConfiguredPotionAmount, movePotion, supportsMultiplePotionUse } = require('./mab-potions');
 const { ID } = require('./mab-settings');
@@ -362,8 +362,11 @@ function createPanel(engine, doc) {
 
   function readForm() {
     const { settings } = state;
-    settings.attackKeys = [1, 2, 3].map(
-      (number, index) => $(`#mabAttack${number}`)?.value || settings.attackKeys[index] || '',
+    settings.attackKeys = sortAttackKeysByCost(
+      state.attacks,
+      [1, 2, 3].map(
+        (number, index) => $(`#mabAttack${number}`)?.value || settings.attackKeys[index] || '',
+      ),
     );
     settings.poisonAttackKey = $('#mabPoisonAttack')?.value || '';
     settings.targetDamage = $('#mabTarget')?.value.trim() || '0';
@@ -444,7 +447,10 @@ function createPanel(engine, doc) {
     for (const selector of FORM_FIELDS) {
       const element = $(selector);
       if (!element) continue;
-      element.addEventListener('change', readForm);
+      element.addEventListener('change', () => {
+        readForm();
+        if (/^#mabAttack\d+$/.test(selector)) renderAttackOptions();
+      });
       if (element.matches?.('input[type="text"], input[type="number"]')) element.addEventListener('input', readForm);
     }
 

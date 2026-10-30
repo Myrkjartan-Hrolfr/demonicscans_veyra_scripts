@@ -27,7 +27,9 @@ const SKILLS = Object.freeze({
   'legendary slash': Object.freeze({ name: 'legendary slash', id: -4, cost: 200 }),
 });
 
-const SKILL_NAMES = Object.freeze(Object.keys(SKILLS));
+const SKILL_NAMES = Object.freeze(
+  Object.keys(SKILLS).sort((left, right) => SKILLS[right].cost - SKILLS[left].cost),
+);
 
 function getSkill(name) {
   const key = String(name ?? '')
@@ -37,8 +39,8 @@ function getSkill(name) {
   return Object.prototype.hasOwnProperty.call(SKILLS, key) ? SKILLS[key] : null;
 }
 
-// Accepts the stored value (array, or a JSON string of one) and keeps the
-// known skill names in order.
+// Accepts the stored value (array, or a JSON string of one), keeps known
+// skills, and enforces the shared expensive-to-cheap attack priority.
 function normalizeStrategy(value) {
   let list = value;
   if (typeof list === 'string') {
@@ -49,7 +51,12 @@ function normalizeStrategy(value) {
     }
   }
   if (!Array.isArray(list)) return [];
-  return list.map(getSkill).filter(Boolean).map((skill) => skill.name);
+  return list
+    .map(getSkill)
+    .filter(Boolean)
+    .map((skill, index) => ({ skill, index }))
+    .sort((left, right) => right.skill.cost - left.skill.cost || left.index - right.index)
+    .map(({ skill }) => skill.name);
 }
 
 // Total stamina of a strategy; each attack is rounded up separately, like
@@ -205,7 +212,7 @@ async function runStrategy({
   let limitReached = false;
   let pendingStart = startTime ?? now();
 
-  const list = Array.isArray(strategy) ? strategy : normalizeStrategy(strategy);
+  const list = normalizeStrategy(strategy);
   for (const skillName of list) {
     const skill = getSkill(skillName);
     if (!skill) {

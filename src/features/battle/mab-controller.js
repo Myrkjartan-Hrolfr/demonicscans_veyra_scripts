@@ -47,7 +47,8 @@ function createController(engine, syncForm = () => {}) {
     },
 
     // Fills Attack 1-3 with the attacks whose data-skill-id matches, in the
-    // given order (unknown ids are skipped, more than three are ignored,
+    // descending resource-cost order (unknown ids are skipped, more than
+    // three are ignored,
     // fewer repeat the last one so no other attack is used as a fallback).
     // A configured poison attack is turned off unless its skill id is listed.
     setAttacks(skillIds) {

@@ -176,7 +176,7 @@ test('boss pages store attack toggles, damage targets and up to three skills', (
   assert.equal(wave3.bosses.vessir.enabled, false);
   assert.equal(wave3.bosses.vessir.damage, '2b');
   assert.equal(wave3.bosses.skarn.enabled, true);
-  assert.deepEqual(wave3.skills, ['0', '-1', '-2']);
+  assert.deepEqual(wave3.skills, ['-4', '-2', '-1']);
 
   const olympus = config.routes.olympus.settings;
   assert.equal(olympus.bosses.zeus.enabled, true);

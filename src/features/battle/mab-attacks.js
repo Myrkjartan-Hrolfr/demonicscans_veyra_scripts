@@ -64,7 +64,7 @@ function reconcileAttackKeys(settings, attacks) {
     keys[index] =
       attacks.find((attack) => !keys.includes(attack.key))?.key || attacks[index]?.key || attacks[0]?.key || '';
   }
-  settings.attackKeys = keys;
+  settings.attackKeys = sortAttackKeysByCost(attacks, keys);
   if (settings.poisonAttackKey && !attacks.some((attack) => attack.key === settings.poisonAttackKey)) {
     settings.poisonAttackKey = '';
   }
@@ -75,21 +75,47 @@ function findAttack(attacks, key) {
   return (key && attacks.find((attack) => attack.key === key)) || null;
 }
 
+function attackCost(attack) {
+  return {
+    stamina: Number(attack?.costs?.stamina) || 0,
+    mana: Number(attack?.costs?.mana) || 0,
+  };
+}
+
+// Attack 1 has absolute priority in MAB and Attack 2/3 are its fallbacks.
+// Normalise every multi-attack selection to expensive -> cheap, while keeping
+// equal-cost choices stable.
+function sortAttackKeysByCost(attacks, keys) {
+  return (Array.isArray(keys) ? keys : [])
+    .map((key, index) => ({ key, index, attack: findAttack(attacks, key) }))
+    .sort((left, right) => {
+      const a = attackCost(left.attack);
+      const b = attackCost(right.attack);
+      return b.stamina - a.stamina || b.mana - a.mana || left.index - right.index;
+    })
+    .map((entry) => entry.key);
+}
+
 // Maps standard skill ids ('0', '-1', ...) to attack keys in the given
 // order. Unknown ids are skipped; with a standard and a class button for the
 // same id the standard one wins. Returns three slot keys (the last match is
 // repeated for unused fallback slots) or null when no id matched.
 function mapSkillIdsToAttackKeys(attacks, skillIds) {
-  const keys = [];
+  const selected = [];
   for (const rawId of Array.isArray(skillIds) ? skillIds : []) {
     const skillId = String(rawId ?? '').trim();
     if (!skillId) continue;
     const matches = attacks.filter((attack) => attack.skillId === skillId);
     const attack = matches.find((candidate) => candidate.group === GROUP_STANDARD) || matches[0];
-    if (attack && !keys.includes(attack.key)) keys.push(attack.key);
+    if (attack && !selected.some((candidate) => candidate.key === attack.key)) selected.push(attack);
   }
-  if (keys.length === 0) return null;
-  const slots = keys.slice(0, 3);
+  if (selected.length === 0) return null;
+  selected.sort((left, right) => {
+    const a = attackCost(left);
+    const b = attackCost(right);
+    return b.stamina - a.stamina || b.mana - a.mana;
+  });
+  const slots = selected.slice(0, 3).map((attack) => attack.key);
   while (slots.length < 3) slots.push(slots[slots.length - 1]);
   return slots;
 }
@@ -112,4 +138,5 @@ module.exports = {
   getAttackCosts,
   mapSkillIdsToAttackKeys,
   reconcileAttackKeys,
+  sortAttackKeysByCost,
 };

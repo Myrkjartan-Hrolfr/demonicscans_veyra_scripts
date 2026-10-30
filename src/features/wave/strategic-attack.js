@@ -299,7 +299,7 @@ function createController(ctx) {
     doc.addEventListener('keydown', onKey);
 
     modal.appendChild(make(doc, 'h3', { text: '🧠 Attack Strategy Builder' }));
-    modal.appendChild(make(doc, 'div', { className: 'vs-label', text: 'Tap a skill to add it to the end:' }));
+    modal.appendChild(make(doc, 'div', { className: 'vs-label', text: 'Tap a skill to add it:' }));
     const picker = make(doc, 'div', { className: 'vs-picker' });
     for (const name of SKILL_NAMES) {
       const button = make(doc, 'button', {
@@ -314,7 +314,7 @@ function createController(ctx) {
       picker.appendChild(button);
     }
     modal.appendChild(picker);
-    modal.appendChild(make(doc, 'div', { className: 'vs-label', text: 'Strategy order:' }));
+    modal.appendChild(make(doc, 'div', { className: 'vs-label', text: 'Attack order (highest cost first):' }));
     const chips = make(doc, 'div', { className: 'vs-chips' });
     modal.appendChild(chips);
     const cost = make(doc, 'div');
@@ -398,12 +398,6 @@ function createController(ctx) {
           });
           chip.appendChild(button);
         };
-        control('↑', 'Move up', index === 0, (next) => {
-          [next[index - 1], next[index]] = [next[index], next[index - 1]];
-        });
-        control('↓', 'Move down', index === strategy.length - 1, (next) => {
-          [next[index + 1], next[index]] = [next[index], next[index + 1]];
-        });
         control('✕', 'Remove', false, (next) => next.splice(index, 1), 'vs-remove');
         chips.appendChild(chip);
       });

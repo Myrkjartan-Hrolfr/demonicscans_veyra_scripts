@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.5.0
+// @version      0.5.1
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -7228,7 +7228,7 @@
         keys[index] =
           attacks.find((attack) => !keys.includes(attack.key))?.key || attacks[index]?.key || attacks[0]?.key || '';
       }
-      settings.attackKeys = keys;
+      settings.attackKeys = sortAttackKeysByCost(attacks, keys);
       if (settings.poisonAttackKey && !attacks.some((attack) => attack.key === settings.poisonAttackKey)) {
         settings.poisonAttackKey = '';
       }
@@ -7239,21 +7239,47 @@
       return (key && attacks.find((attack) => attack.key === key)) || null;
     }
 
+    function attackCost(attack) {
+      return {
+        stamina: Number(attack?.costs?.stamina) || 0,
+        mana: Number(attack?.costs?.mana) || 0,
+      };
+    }
+
+    // Attack 1 has absolute priority in MAB and Attack 2/3 are its fallbacks.
+    // Normalise every multi-attack selection to expensive -> cheap, while keeping
+    // equal-cost choices stable.
+    function sortAttackKeysByCost(attacks, keys) {
+      return (Array.isArray(keys) ? keys : [])
+        .map((key, index) => ({ key, index, attack: findAttack(attacks, key) }))
+        .sort((left, right) => {
+          const a = attackCost(left.attack);
+          const b = attackCost(right.attack);
+          return b.stamina - a.stamina || b.mana - a.mana || left.index - right.index;
+        })
+        .map((entry) => entry.key);
+    }
+
     // Maps standard skill ids ('0', '-1', ...) to attack keys in the given
     // order. Unknown ids are skipped; with a standard and a class button for the
     // same id the standard one wins. Returns three slot keys (the last match is
     // repeated for unused fallback slots) or null when no id matched.
     function mapSkillIdsToAttackKeys(attacks, skillIds) {
-      const keys = [];
+      const selected = [];
       for (const rawId of Array.isArray(skillIds) ? skillIds : []) {
         const skillId = String(rawId ?? '').trim();
         if (!skillId) continue;
         const matches = attacks.filter((attack) => attack.skillId === skillId);
         const attack = matches.find((candidate) => candidate.group === GROUP_STANDARD) || matches[0];
-        if (attack && !keys.includes(attack.key)) keys.push(attack.key);
+        if (attack && !selected.some((candidate) => candidate.key === attack.key)) selected.push(attack);
       }
-      if (keys.length === 0) return null;
-      const slots = keys.slice(0, 3);
+      if (selected.length === 0) return null;
+      selected.sort((left, right) => {
+        const a = attackCost(left);
+        const b = attackCost(right);
+        return b.stamina - a.stamina || b.mana - a.mana;
+      });
+      const slots = selected.slice(0, 3).map((attack) => attack.key);
       while (slots.length < 3) slots.push(slots[slots.length - 1]);
       return slots;
     }
@@ -7276,6 +7302,7 @@
       getAttackCosts,
       mapSkillIdsToAttackKeys,
       reconcileAttackKeys,
+      sortAttackKeysByCost,
     };
   },
   "features/battle/mab-bridge.js": function (module, exports, require) {
@@ -7391,7 +7418,8 @@
         },
 
         // Fills Attack 1-3 with the attacks whose data-skill-id matches, in the
-        // given order (unknown ids are skipped, more than three are ignored,
+        // descending resource-cost order (unknown ids are skipped, more than
+        // three are ignored,
         // fewer repeat the last one so no other attack is used as a fallback).
         // A configured poison attack is turned off unless its skill id is listed.
         setAttacks(skillIds) {
@@ -8793,7 +8821,7 @@
     // #mabStart, #mabStop, #mabStatus, #mabAttack1-3, #mabPoisonAttack,
     // #mabAutoStamina, ...) because other scripts and muscle memory use them.
 
-    const { ATTACK_GROUPS, attackOptionLabel } = require('./mab-attacks');
+    const { ATTACK_GROUPS, attackOptionLabel, sortAttackKeysByCost } = require('./mab-attacks');
     const { cursorAfterFormat, formatNumber, formatTargetDisplay } = require('./mab-parse');
     const { getConfiguredPotionAmount, movePotion, supportsMultiplePotionUse } = require('./mab-potions');
     const { ID } = require('./mab-settings');
@@ -9150,8 +9178,11 @@
 
       function readForm() {
         const { settings } = state;
-        settings.attackKeys = [1, 2, 3].map(
-          (number, index) => $(`#mabAttack${number}`)?.value || settings.attackKeys[index] || '',
+        settings.attackKeys = sortAttackKeysByCost(
+          state.attacks,
+          [1, 2, 3].map(
+            (number, index) => $(`#mabAttack${number}`)?.value || settings.attackKeys[index] || '',
+          ),
         );
         settings.poisonAttackKey = $('#mabPoisonAttack')?.value || '';
         settings.targetDamage = $('#mabTarget')?.value.trim() || '0';
@@ -9232,7 +9263,10 @@
         for (const selector of FORM_FIELDS) {
           const element = $(selector);
           if (!element) continue;
-          element.addEventListener('change', readForm);
+          element.addEventListener('change', () => {
+            readForm();
+            if (/^#mabAttack\d+$/.test(selector)) renderAttackOptions();
+          });
           if (element.matches?.('input[type="text"], input[type="number"]')) element.addEventListener('input', readForm);
         }
 
@@ -18609,7 +18643,9 @@
       'legendary slash': Object.freeze({ name: 'legendary slash', id: -4, cost: 200 }),
     });
 
-    const SKILL_NAMES = Object.freeze(Object.keys(SKILLS));
+    const SKILL_NAMES = Object.freeze(
+      Object.keys(SKILLS).sort((left, right) => SKILLS[right].cost - SKILLS[left].cost),
+    );
 
     function getSkill(name) {
       const key = String(name ?? '')
@@ -18619,8 +18655,8 @@
       return Object.prototype.hasOwnProperty.call(SKILLS, key) ? SKILLS[key] : null;
     }
 
-    // Accepts the stored value (array, or a JSON string of one) and keeps the
-    // known skill names in order.
+    // Accepts the stored value (array, or a JSON string of one), keeps known
+    // skills, and enforces the shared expensive-to-cheap attack priority.
     function normalizeStrategy(value) {
       let list = value;
       if (typeof list === 'string') {
@@ -18631,7 +18667,12 @@
         }
       }
       if (!Array.isArray(list)) return [];
-      return list.map(getSkill).filter(Boolean).map((skill) => skill.name);
+      return list
+        .map(getSkill)
+        .filter(Boolean)
+        .map((skill, index) => ({ skill, index }))
+        .sort((left, right) => right.skill.cost - left.skill.cost || left.index - right.index)
+        .map(({ skill }) => skill.name);
     }
 
     // Total stamina of a strategy; each attack is rounded up separately, like
@@ -18787,7 +18828,7 @@
       let limitReached = false;
       let pendingStart = startTime ?? now();
 
-      const list = Array.isArray(strategy) ? strategy : normalizeStrategy(strategy);
+      const list = normalizeStrategy(strategy);
       for (const skillName of list) {
         const skill = getSkill(skillName);
         if (!skill) {
@@ -19969,7 +20010,7 @@
         doc.addEventListener('keydown', onKey);
 
         modal.appendChild(make(doc, 'h3', { text: '🧠 Attack Strategy Builder' }));
-        modal.appendChild(make(doc, 'div', { className: 'vs-label', text: 'Tap a skill to add it to the end:' }));
+        modal.appendChild(make(doc, 'div', { className: 'vs-label', text: 'Tap a skill to add it:' }));
         const picker = make(doc, 'div', { className: 'vs-picker' });
         for (const name of SKILL_NAMES) {
           const button = make(doc, 'button', {
@@ -19984,7 +20025,7 @@
           picker.appendChild(button);
         }
         modal.appendChild(picker);
-        modal.appendChild(make(doc, 'div', { className: 'vs-label', text: 'Strategy order:' }));
+        modal.appendChild(make(doc, 'div', { className: 'vs-label', text: 'Attack order (highest cost first):' }));
         const chips = make(doc, 'div', { className: 'vs-chips' });
         modal.appendChild(chips);
         const cost = make(doc, 'div');
@@ -20068,12 +20109,6 @@
               });
               chip.appendChild(button);
             };
-            control('↑', 'Move up', index === 0, (next) => {
-              [next[index - 1], next[index]] = [next[index], next[index - 1]];
-            });
-            control('↓', 'Move down', index === strategy.length - 1, (next) => {
-              [next[index + 1], next[index]] = [next[index], next[index + 1]];
-            });
             control('✕', 'Remove', false, (next) => next.splice(index, 1), 'vs-remove');
             chips.appendChild(chip);
           });
@@ -20230,12 +20265,12 @@
     const { normalizeDamageTarget } = require('../core/numbers');
 
     const STANDARD_SKILLS = Object.freeze([
-      Object.freeze({ id: '0', name: 'Slash', cost: 1 }),
-      Object.freeze({ id: '-1', name: 'Power Slash', cost: 10 }),
-      Object.freeze({ id: '-2', name: 'Heroic Slash', cost: 50 }),
-      Object.freeze({ id: '-3', name: 'Ultimate Slash', cost: 100 }),
-      Object.freeze({ id: '-4', name: 'Legendary Slash', cost: 200 }),
       Object.freeze({ id: '-5', name: 'Skill −5', cost: 1_000 }),
+      Object.freeze({ id: '-4', name: 'Legendary Slash', cost: 200 }),
+      Object.freeze({ id: '-3', name: 'Ultimate Slash', cost: 100 }),
+      Object.freeze({ id: '-2', name: 'Heroic Slash', cost: 50 }),
+      Object.freeze({ id: '-1', name: 'Power Slash', cost: 10 }),
+      Object.freeze({ id: '0', name: 'Slash', cost: 1 }),
     ]);
 
     // Monster Auto Battle has three attack slots.
@@ -20287,7 +20322,7 @@
       skillGroup.appendChild(
         ctx.make('div', {
           className: ctx.cls('hint'),
-          text: `Up to ${MAX_SKILLS} attacks, used from the cheapest to the most expensive. Class skills can be chosen in Monster Auto Battle.`,
+          text: `Up to ${MAX_SKILLS} attacks, always used from the most expensive to the cheapest. Class skills can be chosen in Monster Auto Battle.`,
         }),
       );
       ctx.container.appendChild(skillGroup);

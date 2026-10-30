@@ -6,12 +6,12 @@
 const { normalizeDamageTarget } = require('../core/numbers');
 
 const STANDARD_SKILLS = Object.freeze([
-  Object.freeze({ id: '0', name: 'Slash', cost: 1 }),
-  Object.freeze({ id: '-1', name: 'Power Slash', cost: 10 }),
-  Object.freeze({ id: '-2', name: 'Heroic Slash', cost: 50 }),
-  Object.freeze({ id: '-3', name: 'Ultimate Slash', cost: 100 }),
-  Object.freeze({ id: '-4', name: 'Legendary Slash', cost: 200 }),
   Object.freeze({ id: '-5', name: 'Skill −5', cost: 1_000 }),
+  Object.freeze({ id: '-4', name: 'Legendary Slash', cost: 200 }),
+  Object.freeze({ id: '-3', name: 'Ultimate Slash', cost: 100 }),
+  Object.freeze({ id: '-2', name: 'Heroic Slash', cost: 50 }),
+  Object.freeze({ id: '-1', name: 'Power Slash', cost: 10 }),
+  Object.freeze({ id: '0', name: 'Slash', cost: 1 }),
 ]);
 
 // Monster Auto Battle has three attack slots.
@@ -63,7 +63,7 @@ function renderBossSettings(ctx, sections) {
   skillGroup.appendChild(
     ctx.make('div', {
       className: ctx.cls('hint'),
-      text: `Up to ${MAX_SKILLS} attacks, used from the cheapest to the most expensive. Class skills can be chosen in Monster Auto Battle.`,
+      text: `Up to ${MAX_SKILLS} attacks, always used from the most expensive to the cheapest. Class skills can be chosen in Monster Auto Battle.`,
     }),
   );
   ctx.container.appendChild(skillGroup);

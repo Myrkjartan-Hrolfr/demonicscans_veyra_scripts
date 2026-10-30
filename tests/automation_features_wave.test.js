@@ -200,7 +200,7 @@ test('page helpers: low HP, joined count, heal result', () => {
 // --------------------------------------------------------------- attack
 
 test('strategy normalization and stamina cost with Asterion', () => {
-  assert.deepEqual(attack.normalizeStrategy(['Slash', 'POWER  slash', 'nope']), ['slash', 'power slash']);
+  assert.deepEqual(attack.normalizeStrategy(['Slash', 'POWER  slash', 'nope']), ['power slash', 'slash']);
   assert.deepEqual(attack.normalizeStrategy('["heroic slash"]'), ['heroic slash']);
   assert.deepEqual(attack.normalizeStrategy('not json'), []);
   assert.deepEqual(attack.normalizeStrategy(null), []);
@@ -211,7 +211,7 @@ test('strategy normalization and stamina cost with Asterion', () => {
   assert.equal(attack.strategyCost(all, 1.5), 2 + 15 + 75 + 150 + 300);
   assert.deepEqual(
     all.map((name) => attack.SKILLS[name].id),
-    [0, -1, -2, -3, -4],
+    [-4, -3, -2, -1, 0],
   );
   assert.equal(attack.normalizeWaitBuffer(10), 100);
   assert.equal(attack.normalizeWaitBuffer('abc'), 1050);
@@ -241,7 +241,7 @@ test('parseDamage reads JSON fields, <strong> numbers and "dealt" text', () => {
   assert.equal(attack.stripTags('A <strong>1</strong>&amp;<br>B'), 'A 1& B');
 });
 
-test('runStrategy attacks in order, waits the buffer and stops on failure', async () => {
+test('runStrategy attacks from the most expensive skill to the cheapest', async () => {
   const clock = fakeClock();
   const post = stubPost([
     { status: 'success', message: 'dealt <strong>100</strong>' },
@@ -258,7 +258,7 @@ test('runStrategy attacks in order, waits the buffer and stops on failure', asyn
   assert.deepEqual(
     post.calls.map((call) => call.params),
     [
-      { monster_id: 7, skill_id: 0, stamina_cost: 1 },
+      { monster_id: 7, skill_id: -2, stamina_cost: 50 },
       { monster_id: 7, skill_id: -1, stamina_cost: 10 },
     ],
   );
@@ -384,7 +384,7 @@ test('joinMonster needs a user id', async () => {
 test('strategy is stored as a JSON array through ctx.store', () => {
   const storage = createStorage({ 'ui-improvements:attackStrategy': '["slash","Legendary Slash","bogus"]' });
   const store = createJsonStore(storage);
-  assert.deepEqual(strategic.readStrategy(store), ['slash', 'legendary slash']);
+  assert.deepEqual(strategic.readStrategy(store), ['legendary slash', 'slash']);
   strategic.writeStrategy(store, ['power slash', 'x']);
   assert.equal(storage.getItem('ui-improvements:attackStrategy'), '["power slash"]');
   assert.deepEqual(strategic.readStrategy(null), []);

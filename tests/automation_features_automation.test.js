@@ -662,7 +662,7 @@ test('the battle page drives Monster Auto Battle and returns to the domain hub',
   await flush();
   assert.deepEqual(env.controller.calls, [
     ['target', 1e10],
-    ['attacks', ['0', '-1']],
+    ['attacks', ['-1', '0']],
     ['potions', { stamina: [30], heal: [108] }],
     ['start'],
   ]);

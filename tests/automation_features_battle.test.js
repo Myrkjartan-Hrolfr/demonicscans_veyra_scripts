@@ -234,11 +234,16 @@ test('attack discovery reads names, groups and costs from buttons', () => {
   assert.equal(attackFromButton(null).name, 'Unnamed Attack');
 });
 
-test('attack slots keep valid choices and fill missing ones', () => {
-  const attacks = ['0|Slash', '-1|Power', '-2|Heroic'].map((key) => ({ key, skillId: key.split('|')[0] }));
+test('attack slots keep valid choices, fill missing ones and sort expensive to cheap', () => {
+  const costs = [1, 10, 50];
+  const attacks = ['0|Slash', '-1|Power', '-2|Heroic'].map((key, index) => ({
+    key,
+    skillId: key.split('|')[0],
+    costs: { stamina: costs[index], mana: 0 },
+  }));
   const settings = { attackKeys: ['-1|Power', 'gone', ''], poisonAttackKey: 'gone' };
   reconcileAttackKeys(settings, attacks);
-  assert.deepEqual(settings.attackKeys, ['-1|Power', '0|Slash', '-2|Heroic']);
+  assert.deepEqual(settings.attackKeys, ['-2|Heroic', '-1|Power', '0|Slash']);
   assert.equal(settings.poisonAttackKey, '');
 
   const single = { attackKeys: ['', '', ''], poisonAttackKey: '' };
@@ -248,17 +253,17 @@ test('attack slots keep valid choices and fill missing ones', () => {
 
 test('controller skill ids map onto attack slots', () => {
   const attacks = [
-    { key: '0|Slash', skillId: '0', group: 'Standard Attacks' },
-    { key: '-1|Power', skillId: '-1', group: 'Standard Attacks' },
-    { key: '-1|Class copy', skillId: '-1', group: 'Class Attacks' },
-    { key: '-2|Heroic', skillId: '-2', group: 'Standard Attacks' },
-    { key: '-3|Ultimate', skillId: '-3', group: 'Standard Attacks' },
+    { key: '0|Slash', skillId: '0', group: 'Standard Attacks', costs: { stamina: 1, mana: 0 } },
+    { key: '-1|Power', skillId: '-1', group: 'Standard Attacks', costs: { stamina: 10, mana: 0 } },
+    { key: '-1|Class copy', skillId: '-1', group: 'Class Attacks', costs: { stamina: 10, mana: 0 } },
+    { key: '-2|Heroic', skillId: '-2', group: 'Standard Attacks', costs: { stamina: 50, mana: 0 } },
+    { key: '-3|Ultimate', skillId: '-3', group: 'Standard Attacks', costs: { stamina: 100, mana: 0 } },
   ];
   assert.deepEqual(mapSkillIdsToAttackKeys(attacks, ['-1', '0']), ['-1|Power', '0|Slash', '0|Slash']);
   assert.deepEqual(mapSkillIdsToAttackKeys(attacks, [-2]), ['-2|Heroic', '-2|Heroic', '-2|Heroic']);
   assert.deepEqual(mapSkillIdsToAttackKeys(attacks, ['99', '-3', '-3', '0', '-1', '-2']), [
     '-3|Ultimate',
-    '0|Slash',
+    '-2|Heroic',
     '-1|Power',
   ]);
   assert.equal(mapSkillIdsToAttackKeys(attacks, ['99']), null);
@@ -531,7 +536,7 @@ test('controller maps attacks, potions and target into the saved settings', asyn
 
   assert.equal(controller.setAttacks(['42']), false);
   assert.equal(controller.setAttacks(['0', '-1']), true);
-  assert.deepEqual(engine.state.settings.attackKeys, ['0|Slash (1)', '-1|Power Slash', '-1|Power Slash']);
+  assert.deepEqual(engine.state.settings.attackKeys, ['-1|Power Slash', '0|Slash (1)', '0|Slash (1)']);
   assert.equal(engine.state.settings.poisonAttackKey, '');
 
   controller.setPotions({ stamina: [251], heal: [108] });
