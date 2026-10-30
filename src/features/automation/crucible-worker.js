@@ -1033,7 +1033,11 @@ function createCrucibleWorker({
         if (error.kind === 'ownership' || error.kind === 'cancelled') return;
         setTerminal(command.visitId, 'done', error.message, { retryAt: error.retryAt, note: error.note });
       } else {
-        setTerminal(command.visitId, 'error', `Crucible failed safely: ${error?.message || error}`);
+        const detail = String(error?.message || error || 'unknown error');
+        setTerminal(command.visitId, 'error', `Crucible failed safely: ${detail}`, {
+          retryAt: cappedRecheck(),
+          note: `Error: ${detail}`.slice(0, 60),
+        });
       }
     } finally {
       runtime.ticking = false;

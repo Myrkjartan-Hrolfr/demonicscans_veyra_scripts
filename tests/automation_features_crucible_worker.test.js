@@ -568,8 +568,13 @@ test('Army heals, joins, verifies one minimal hit and retreats the assigned capt
     [ARMY_LIVE_URL, 'assign_target'],
     [ARMY_LIVE_URL, 'retreat_captain'],
   ]);
+  assert.equal(
+    env.posts.filter((entry) => entry.url === ARMY_LIVE_URL).every((entry) => entry.params.csrf === ''),
+    true,
+  );
   assert.deepEqual(env.posts[3].params, {
     action: 'assign_target',
+    csrf: '',
     battle_id: '51365',
     attacker_captain_unit_id: '101',
     defender_captain_unit_id: '201',

@@ -284,12 +284,14 @@ test('plans Army assignments and requires a personal turn plus enemy health loss
   assert.equal(logic.hasVerifiedArmyHit(initial, after, 102, 201), false);
   assert.deepEqual(logic.buildArmyLivePayload('assign_target', { battleId: 51365, attackerId: 101, defenderId: 201 }), {
     action: 'assign_target',
+    csrf: '',
     battle_id: '51365',
     attacker_captain_unit_id: '101',
     defender_captain_unit_id: '201',
   });
   assert.deepEqual(logic.buildArmyLivePayload('retreat_captain', { battleId: 51365, captainId: 101 }), {
     action: 'retreat_captain',
+    csrf: '',
     battle_id: '51365',
     captain_unit_id: '101',
   });

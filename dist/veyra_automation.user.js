@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.5.2
+// @version      0.5.3
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -3759,7 +3759,10 @@
     function buildArmyLivePayload(action, fields = {}) {
       const battleId = cleanInteger(fields.battleId);
       if (!battleId || !['get_state', 'join_battle', 'assign_target', 'retreat_captain'].includes(action)) return null;
-      const payload = { action, battle_id: battleId };
+      // The live Army page includes this field on every request, even though the
+      // current page token is the empty string. Preserve the exact wire contract;
+      // some deployments distinguish a present empty field from a missing one.
+      const payload = { action, csrf: '', battle_id: battleId };
       if (action === 'assign_target') {
         const attacker = cleanInteger(fields.attackerId);
         const defender = cleanInteger(fields.defenderId);
@@ -4967,7 +4970,11 @@
             if (error.kind === 'ownership' || error.kind === 'cancelled') return;
             setTerminal(command.visitId, 'done', error.message, { retryAt: error.retryAt, note: error.note });
           } else {
-            setTerminal(command.visitId, 'error', `Crucible failed safely: ${error?.message || error}`);
+            const detail = String(error?.message || error || 'unknown error');
+            setTerminal(command.visitId, 'error', `Crucible failed safely: ${detail}`, {
+              retryAt: cappedRecheck(),
+              note: `Error: ${detail}`.slice(0, 60),
+            });
           }
         } finally {
           runtime.ticking = false;

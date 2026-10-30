@@ -445,7 +445,10 @@ function parseOwnedArmyShadows(doc) {
 function buildArmyLivePayload(action, fields = {}) {
   const battleId = cleanInteger(fields.battleId);
   if (!battleId || !['get_state', 'join_battle', 'assign_target', 'retreat_captain'].includes(action)) return null;
-  const payload = { action, battle_id: battleId };
+  // The live Army page includes this field on every request, even though the
+  // current page token is the empty string. Preserve the exact wire contract;
+  // some deployments distinguish a present empty field from a missing one.
+  const payload = { action, csrf: '', battle_id: battleId };
   if (action === 'assign_target') {
     const attacker = cleanInteger(fields.attackerId);
     const defender = cleanInteger(fields.defenderId);
