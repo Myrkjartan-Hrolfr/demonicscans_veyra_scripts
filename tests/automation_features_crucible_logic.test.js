@@ -198,6 +198,26 @@ test('uses an existing PvP slot, otherwise chooses the fullest open match and ex
   assert.equal(eliteChoice.match.status, 'open');
 });
 
+test('ignores historical cleared own slots and joins the fullest current open PvP match', () => {
+  const lobby = logic.parsePvpLobby(documentWith({
+    many: {
+      '.grid > .match': [
+        pvpCard(7, 5, { status: 'CLEARED', own: true }),
+        pvpCard(9, 5, { status: 'CLEARED', own: true }),
+        pvpCard(10, 1),
+        pvpCard(11, 0),
+        pvpCard(12, 4),
+      ],
+    },
+  }));
+
+  const choice = logic.choosePvpAction(lobby);
+  assert.deepEqual(
+    { kind: choice.kind, matchNo: choice.match.matchNo, slotIndex: choice.slotIndex },
+    { kind: 'claim', matchNo: 12, slotIndex: 5 },
+  );
+});
+
 test('requires semantic success from PvP responses and identifies a finished ally win', () => {
   assert.equal(logic.parsePvpClaimResponse({ ok: true, json: { ok: true, message: 'Slot claimed' } }).ok, true);
   assert.equal(logic.parsePvpClaimResponse({ ok: true, text: '<html>Login</html>', json: null }).ok, false);

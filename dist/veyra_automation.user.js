@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.7.1
+// @version      0.7.2
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -3790,7 +3790,11 @@
 
     function choosePvpAction(lobby) {
       const matches = Array.isArray(lobby?.matches) ? lobby.matches : [];
-      const existing = matches.find((match) => match.ownSlot && ['open', 'live', 'cleared'].includes(match.status));
+      // Cleared cards remain in the lobby history and continue to show YOUR SLOT.
+      // They are not an active commitment. Treating one as "existing" traps the
+      // watcher on an old result forever and prevents claiming a current open
+      // match. A freshly joined match is tracked separately by the match watcher.
+      const existing = matches.find((match) => match.ownSlot && ['open', 'live'].includes(match.status));
       if (existing) return { kind: 'existing', match: existing };
       if (Number.isFinite(lobby?.waitMs) && lobby.waitMs > 0) {
         return { kind: 'wait', waitMs: lobby.waitMs, warning: lobby.warning || '' };

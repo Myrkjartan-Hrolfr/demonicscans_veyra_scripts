@@ -354,14 +354,14 @@ function pvpSlot({ name = '', own = false } = {}) {
   });
 }
 
-function pvpCard(matchNo, occupied, own = false) {
+function pvpCard(matchNo, occupied, own = false, status = 'OPEN') {
   const slots = Array.from({ length: 5 }, (_, index) =>
     index < occupied ? pvpSlot({ name: own && index === 0 ? 'Me' : `Player ${index + 1}`, own: own && index === 0 }) : pvpSlot(),
   );
   return element({
     one: {
       '.meta': element({ text: `Match #${matchNo} / Slots ${occupied}/5` }),
-      '.badge': element({ text: 'OPEN' }),
+      '.badge': element({ text: status }),
       'a[href*="pvp_style_battle.php"]': element({
         attrs: { href: `/pvp_style_battle.php?source=cube&instance_id=16126&node_id=7&match_no=${matchNo}` },
       }),
@@ -429,6 +429,57 @@ test('PvP claims the fullest match, confirms its slot and publishes a short node
     nextCheckAt: NOW + 15_000,
     updatedAt: NOW,
   });
+});
+
+test('PvP ignores cleared historical own slots and claims the current fullest open match', async () => {
+  const config = disableSections(createDefaultConfig(), { pvp: true });
+  const cube = cubeDocument([
+    { id: 7, key: 'ring_ward', name: 'Ring Ward', type: 'pvp', status: 'in_progress' },
+  ]);
+  let lobbyReads = 0;
+  const historicalLobby = (confirmed) => documentWith({
+    many: {
+      '.grid > .match': [
+        pvpCard(7, 5, true, 'CLEARED'),
+        pvpCard(9, 5, true, 'CLEARED'),
+        pvpCard(10, 1),
+        pvpCard(12, confirmed ? 5 : 4, confirmed),
+      ],
+    },
+  });
+  const env = createEnvironment({
+    config,
+    fetchDocumentImpl: async (url) => {
+      if (/guild_dungeon_(?:enter|cube)\.php/.test(url)) return cube;
+      if (/pvp_style_node\.php/.test(url)) {
+        lobbyReads += 1;
+        return historicalLobby(lobbyReads > 1);
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    },
+    fetchJsonImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: { ok: true, room_status: 'open', room_joined: true, match: { ended: false } },
+    }),
+    postImpl: async (url) => {
+      if (url === PVP_ACTION_URL) return { ok: true, status: 200, json: { ok: true, message: 'Slot claimed' }, text: '' };
+      throw new Error(`Unexpected POST ${url}`);
+    },
+  });
+
+  await env.worker.tick();
+
+  assert.equal(env.posts.length, 1);
+  assert.deepEqual(env.posts[0].params, {
+    source: 'cube',
+    action: 'pick_slot',
+    instance_id: '16126',
+    node_id: '7',
+    match_no: '12',
+    slot_index: '5',
+  });
+  assert.equal(env.store.read(CRUCIBLE_PVP_WATCH_KEY).matchNo, '12');
 });
 
 test('a live PvP match is checked once and does not block the Army section', async () => {
