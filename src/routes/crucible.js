@@ -1,6 +1,12 @@
 'use strict';
 
 const { normalizeDamageTarget } = require('../core/numbers');
+const {
+  appendCrucibleDebugLog,
+  clearCrucibleDebugLog,
+  formatCrucibleDebugLog,
+  readCrucibleDebugLog,
+} = require('../core/crucible-debug');
 
 const DEFAULT_DAMAGE = '1m';
 const DEFAULT_ATTACK_COOLDOWN_MS = 100;
@@ -208,6 +214,7 @@ function normalizeSettings(value) {
     : armyShadows.map((shadow) => shadow.id);
   const selectedShadowIds = [...new Set(selectedSource.map(String))].filter((id) => validShadowIds.has(id));
   return {
+    debugLogging: value?.debugLogging === true,
     pveEnabled: value?.pveEnabled !== false,
     skill: SKILL_IDS.has(skill) ? skill : '0',
     attackCooldownMs: normalizeCooldown(value?.attackCooldownMs),
@@ -523,6 +530,103 @@ function renderSettings(ctx) {
     }),
   );
   ctx.container.appendChild(armyGroup);
+
+  ctx.addSectionTitle('Diagnostics');
+  const diagnostics = ctx.make('div', { className: ctx.cls('setting') });
+  ctx.addCheckbox({
+    id: 'debug-logging',
+    label: 'Enable Crucible diagnostic logging',
+    checked: ctx.settings.debugLogging,
+    parent: diagnostics,
+    onChange(checked) {
+      if (!checked) {
+        appendCrucibleDebugLog(ctx.store, 'ui', 'diagnostic logging disabled');
+      }
+      ctx.settings = ctx.updateSettings((settings) => {
+        settings.debugLogging = checked;
+      });
+      if (checked) {
+        appendCrucibleDebugLog(ctx.store, 'ui', 'diagnostic logging enabled', {
+          userAgent: ctx.win?.navigator?.userAgent || '',
+        });
+      }
+    },
+  });
+  diagnostics.appendChild(
+    ctx.make('div', {
+      className: ctx.cls('hint'),
+      text: 'Stores up to 500 sanitized entries locally. Requests, decisions, node states and exact failures are included. Disable it after reproducing the problem.',
+    }),
+  );
+
+  const output = ctx.make('textarea', {
+    id: `${ctx.idPrefix}-debug-output`,
+    className: ctx.cls('input'),
+  });
+  output.readOnly = true;
+  output.rows = 12;
+  output.value = formatCrucibleDebugLog(readCrucibleDebugLog(ctx.store));
+  if (output.style) {
+    output.style.width = '100%';
+    output.style.minHeight = '220px';
+    output.style.resize = 'vertical';
+    output.style.fontFamily = 'ui-monospace, SFMono-Regular, Consolas, monospace';
+    output.style.fontSize = '10px';
+  }
+  diagnostics.appendChild(output);
+
+  const buttons = ctx.make('div');
+  if (buttons.style) {
+    buttons.style.display = 'flex';
+    buttons.style.flexWrap = 'wrap';
+    buttons.style.gap = '8px';
+    buttons.style.marginTop = '8px';
+  }
+  function refreshOutput() {
+    output.value = formatCrucibleDebugLog(readCrucibleDebugLog(ctx.store));
+    output.scrollTop = output.scrollHeight || 0;
+  }
+  const refreshButton = ctx.make('button', {
+    id: `${ctx.idPrefix}-debug-refresh`,
+    className: ctx.cls('primary'),
+    type: 'button',
+    text: 'Refresh log',
+  });
+  const copyButton = ctx.make('button', {
+    id: `${ctx.idPrefix}-debug-copy`,
+    className: ctx.cls('primary'),
+    type: 'button',
+    text: 'Copy log',
+  });
+  const clearButton = ctx.make('button', {
+    id: `${ctx.idPrefix}-debug-clear`,
+    className: ctx.cls('primary'),
+    type: 'button',
+    text: 'Clear log',
+  });
+  for (const button of [refreshButton, copyButton, clearButton]) setTouchSize(button);
+  refreshButton.addEventListener('click', refreshOutput);
+  copyButton.addEventListener('click', async () => {
+    refreshOutput();
+    try {
+      await ctx.win?.navigator?.clipboard?.writeText?.(output.value);
+      copyButton.textContent = 'Copied';
+    } catch {
+      output.focus?.();
+      output.select?.();
+      const copied = ctx.doc?.execCommand?.('copy') === true;
+      copyButton.textContent = copied ? 'Copied' : 'Select and copy';
+    }
+  });
+  clearButton.addEventListener('click', () => {
+    clearCrucibleDebugLog(ctx.store);
+    refreshOutput();
+  });
+  buttons.appendChild(refreshButton);
+  buttons.appendChild(copyButton);
+  buttons.appendChild(clearButton);
+  diagnostics.appendChild(buttons);
+  ctx.container.appendChild(diagnostics);
 }
 
 module.exports = Object.freeze({

@@ -144,7 +144,7 @@ function countdownText(routeId, config, runtime, now) {
 
 // featureGroups: [{ title, settings: [definition] }] from features/runner.js
 // featureSettings: core/settings.js store used to read and save them
-function createSchedulerUi({ doc, win, featureGroups = [], featureSettings = null }) {
+function createSchedulerUi({ doc, win, store = null, featureGroups = [], featureSettings = null }) {
   const state = {
     actions: null,
     statusText: '',
@@ -268,6 +268,9 @@ function createSchedulerUi({ doc, win, featureGroups = [], featureSettings = nul
     return {
       routeId,
       settings: routeConfig.settings,
+      store,
+      win,
+      doc,
       make,
       cls,
       idPrefix,

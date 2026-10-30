@@ -6,6 +6,7 @@
 // navigates away from the user's current page.
 
 const { finiteTimestamp } = require('../../core/numbers');
+const { appendCrucibleDebugLog, summarizeResponse } = require('../../core/crucible-debug');
 const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
 const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
 const { RUNTIME_KEY, normalizeRuntime } = require('../../scheduler/runtime');
@@ -56,6 +57,7 @@ function writePvpWatch(store, fields, now = Date.now()) {
   });
   if (!watch) return null;
   store.write(CRUCIBLE_PVP_WATCH_KEY, watch);
+  appendCrucibleDebugLog(store, 'pvp-watcher', 'watch scheduled', watch, now);
   return watch;
 }
 
@@ -90,6 +92,11 @@ function wakeCrucible(store, watch, note, now = Date.now()) {
   runtime.nextRunAt.crucible = Math.min(runtime.nextRunAt.crucible, now);
   runtime.notes.crucible = String(note || 'Crucible PvP ready').slice(0, 60);
   store.write(RUNTIME_KEY, runtime);
+  appendCrucibleDebugLog(store, 'pvp-watcher', 'Crucible wake requested', {
+    note,
+    watch,
+    nextRunAt: runtime.nextRunAt.crucible,
+  }, now);
   writePvpWatch(store, { ...watch, nextCheckAt: now + PVP_WAKE_HOLD_MS }, now);
 }
 
@@ -216,6 +223,10 @@ function createCruciblePvpWatcher({
 }) {
   const runtime = { checking: false, stopped: false, interval: null };
 
+  function debug(event, details = null) {
+    appendCrucibleDebugLog(store, 'pvp-watcher', event, details, now());
+  }
+
   function ownsLease() {
     if (ownsSchedulerLease) return ownsSchedulerLease();
     let ownerId = '';
@@ -254,16 +265,22 @@ function createCruciblePvpWatcher({
   }
 
   async function checkMatch(watch) {
-    const response = await fetchJson(pvpStateUrl(win.location.origin, watch));
+    const stateUrl = pvpStateUrl(win.location.origin, watch);
+    debug('match state request', { url: stateUrl, watch });
+    const response = await fetchJson(stateUrl);
+    debug('match state response', { watch, response: summarizeResponse(response) });
     if (!isCurrent(watch)) return;
     const state = logic.parsePvpState(response);
+    debug('match state parsed', { watch, state });
     if (!state.ok) throw new Error(state.error || 'invalid PvP state response');
     if (state.ended) {
       if (state.won) {
         if (!state.roomJoined) throw new Error('won PvP state did not confirm reward eligibility');
         const battleUrl = logic.buildPvpBattleUrl(win.location.origin, watch);
         if (!battleUrl) throw new Error('invalid won PvP match URL');
+        debug('reward page visit started', { battleUrl, watch });
         const rewardPage = await visitRewardPage(battleUrl, watch);
+        debug('reward page visit completed', { watch, rewardPage });
         if (!isCurrent(watch)) return;
         if (!rewardPage.ok) throw new Error('won PvP reward page could not be verified');
       }
@@ -284,9 +301,11 @@ function createCruciblePvpWatcher({
 
   async function checkLobby(watch) {
     const url = pvpLobbyUrl(win.location.origin, watch);
+    debug('lobby document request', { url, watch });
     const lobby = logic.parsePvpLobby(await fetchDocument(url), url);
     if (!isCurrent(watch)) return;
     const action = logic.choosePvpAction(lobby);
+    debug('lobby decision', { watch, lobby, action });
     if (action.kind === 'wait') {
       reschedule(watch, action.waitMs);
       return;
@@ -311,13 +330,16 @@ function createCruciblePvpWatcher({
     const watch = normalizePvpWatch(store.read(CRUCIBLE_PVP_WATCH_KEY));
     if (!watch || watch.nextCheckAt > now()) return;
     runtime.checking = true;
+    debug('watch tick started', { watch });
     try {
       if (watch.mode === 'match') await checkMatch(watch);
       else await checkLobby(watch);
     } catch (error) {
       logger?.warn?.('[Veyra] Crucible PvP background check failed.', error);
+      debug('watch tick failed', { watch, error: String(error?.message || error), stack: String(error?.stack || '') });
       if (isCurrent(watch)) reschedule(watch, PVP_ERROR_RETRY_MS);
     } finally {
+      debug('watch tick finished', { watch });
       runtime.checking = false;
     }
   }

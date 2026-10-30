@@ -5,7 +5,7 @@ const { createSchedulerUi } = require('./ui');
 
 function startScheduler({ win, store, sessionStore, featureGroups = [], featureSettings = null }) {
   const doc = win.document;
-  const ui = createSchedulerUi({ doc, win, featureGroups, featureSettings });
+  const ui = createSchedulerUi({ doc, win, store, featureGroups, featureSettings });
   const engine = createSchedulerEngine({ win, store, sessionStore, ui });
 
   ui.mount(engine);

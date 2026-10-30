@@ -5,6 +5,11 @@
 // sequentially. Every mutation is guarded by the current visit id and lease.
 
 const { parseFraction, parseGameNumber } = require('../../core/numbers');
+const {
+  appendCrucibleDebugLog,
+  sanitize,
+  summarizeResponse,
+} = require('../../core/crucible-debug');
 const { COMMAND_KEY, normalizeVisit, publishWorkerStatus } = require('../../core/protocol');
 const { pickPotion, readPotionInventory, usePotion } = require('../../core/potions');
 const { createJsonStore, getStorage } = require('../../core/storage');
@@ -111,7 +116,73 @@ function createCrucibleWorker({
     attacks: 0,
     targets: 0,
     armyActions: 0,
+    debugSkipSignature: '',
+    debugSkipAt: 0,
   };
+
+  function debug(event, details = null) {
+    appendCrucibleDebugLog(store, 'worker', event, details, now());
+  }
+
+  function documentSummary(document) {
+    return sanitize({
+      title: document?.querySelector?.('title')?.textContent || '',
+      heading: document?.querySelector?.('h1, .h, .title')?.textContent || '',
+      scripts: document?.querySelectorAll?.('script')?.length ?? null,
+    });
+  }
+
+  function debugSkip(signature, details) {
+    const t = now();
+    if (runtime.debugSkipSignature === signature && t - runtime.debugSkipAt < 30_000) return;
+    runtime.debugSkipSignature = signature;
+    runtime.debugSkipAt = t;
+    debug('worker tick skipped', { reason: signature, ...details });
+  }
+
+  const rawFetchDocument = fetchDocument;
+  fetchDocument = async (url, ...args) => {
+    debug('document request', { url: String(url) });
+    try {
+      const result = await rawFetchDocument(url, ...args);
+      debug('document response', { url: String(url), ...documentSummary(result) });
+      return result;
+    } catch (error) {
+      debug('document request failed', { url: String(url), error: String(error?.message || error) });
+      throw error;
+    }
+  };
+
+  const rawPostForm = postForm;
+  postForm = async (url, params, options) => {
+    debug('POST request', { url: String(url), params });
+    try {
+      const response = await rawPostForm(url, params, options);
+      debug('POST response', { url: String(url), response: summarizeResponse(response) });
+      return response;
+    } catch (error) {
+      debug('POST request failed', { url: String(url), error: String(error?.message || error) });
+      throw error;
+    }
+  };
+
+  const rawVisitRewardPage = visitRewardPage;
+  visitRewardPage = async (url, expected) => {
+    debug('reward page visit started', { url: String(url), expected });
+    try {
+      const result = await rawVisitRewardPage(url, expected);
+      debug('reward page visit completed', result);
+      return result;
+    } catch (error) {
+      debug('reward page visit failed', { error: String(error?.message || error), expected });
+      throw error;
+    }
+  };
+
+  debug('worker created', {
+    url: String(win?.location?.href || ''),
+    asterionMultiplier,
+  });
 
   function currentUrl() {
     try {
@@ -171,8 +242,10 @@ function createCrucibleWorker({
   }
 
   function setWorkingMessage(visitId, message) {
+    const changed = runtime.message !== message;
     runtime.message = message;
     publish('working', false, message, visitId);
+    if (changed) debug('working state', { visitId, message });
     log(message);
   }
 
@@ -186,6 +259,7 @@ function createCrucibleWorker({
     };
     runtime.runningVisitId = '';
     publish(state, true, message, visitId, { ...runtime.terminal, force: true });
+    debug('terminal state', runtime.terminal);
     log(message, state === 'error' ? 'warn' : 'info');
   }
 
@@ -242,16 +316,27 @@ function createCrucibleWorker({
   }
 
   async function requestJson(url) {
-    if (fetchJson) return fetchJson(url);
-    const response = await win.fetch(url, { credentials: 'same-origin', cache: 'no-store' });
-    const raw = await response.text();
-    let json = null;
+    debug('JSON request', { url: String(url) });
     try {
-      json = JSON.parse(raw);
-    } catch {
-      // The semantic parser will reject HTML/login/error pages.
+      let result = null;
+      if (fetchJson) result = await fetchJson(url);
+      else {
+        const response = await win.fetch(url, { credentials: 'same-origin', cache: 'no-store' });
+        const raw = await response.text();
+        let json = null;
+        try {
+          json = JSON.parse(raw);
+        } catch {
+          // The semantic parser will reject HTML/login/error pages.
+        }
+        result = { ok: response.ok, status: response.status, text: raw, json };
+      }
+      debug('JSON response', { url: String(url), response: summarizeResponse(result) });
+      return result;
+    } catch (error) {
+      debug('JSON request failed', { url: String(url), error: String(error?.message || error) });
+      throw error;
     }
-    return { ok: response.ok, status: response.status, text: raw, json };
   }
 
   async function readDashboard(visitId) {
@@ -386,6 +471,18 @@ function createCrucibleWorker({
     if (battle.snapshot.dead) return { reason: 'dead', attacks: 0 };
     battle = await joinPveIfNeeded(visitId, target, userId, battle);
     let decision = resolvePveTarget(target, battle.snapshot);
+    debug('PvE damage decision', {
+      visitId,
+      target: {
+        name: target.name,
+        monsterId: target.monsterId,
+        instanceId: target.instanceId,
+        mode: target.target.mode,
+        configuredDamage: target.target.damage,
+      },
+      snapshot: battle.snapshot,
+      decision,
+    });
     if (!decision.ok) throw new Error(`${target.name || 'Crucible PvE target'}: ${decision.error}`);
     if (decision.done) return { reason: 'target', attacks: 0 };
 
@@ -501,6 +598,13 @@ function createCrucibleWorker({
     const locationDoc = await fetchDocument(entered.redirect);
     const monsters = dungeonLogic.parseLocationPage(locationDoc, entered.redirect);
     const discoveries = logic.discoverPveMonsters(definition, monsters);
+    debug('PvE location parsed', {
+      visitId,
+      node: { id: node.id, key: node.key, name: node.name, linkedLocationId: node.linkedLocationId },
+      definition,
+      monsters,
+      discoveries,
+    });
     assertCanMutate(visitId);
     route.settings = saveDiscoveries(discoveries);
     let processed = 0;
@@ -510,6 +614,14 @@ function createCrucibleWorker({
       const key = `${monster.instanceId || cube.instanceId}:${monster.monsterId}`;
       if (monster.dead || runtime.processedPve.has(key)) continue;
       const selected = crucibleRoute.settingsForMonster(route.settings, definition.id, monster.name);
+      debug('PvE target decision', {
+        visitId,
+        monster: { name: monster.name, monsterId: monster.monsterId, dead: monster.dead, joined: monster.joined },
+        settingsId: selected.id,
+        known: selected.known,
+        target: selected.target,
+        skipped: !selected.target?.enabled,
+      });
       if (!selected.target?.enabled) continue;
       const target = {
         ...monster,
@@ -563,6 +675,14 @@ function createCrucibleWorker({
     assertCanMutate(visitId);
     const response = await requestJson(pvpStateUrl(cube.instanceId, node.id, matchNo));
     const state = logic.parsePvpState(response);
+    debug('PvP match state parsed', {
+      visitId,
+      instanceId: cube.instanceId,
+      nodeId: node.id,
+      nodeName: node.name,
+      matchNo,
+      state,
+    });
     if (!state.ok) throw new Error(`PvP match #${matchNo} state failed: ${state.error}`);
     if (state.ended) {
       let rewardCount = 0;
@@ -628,6 +748,12 @@ function createCrucibleWorker({
     let lobbyDoc = await fetchDocument(lobbyUrl);
     let lobby = logic.parsePvpLobby(lobbyDoc, lobbyUrl);
     let action = logic.choosePvpAction(lobby);
+    debug('PvP lobby decision', {
+      visitId,
+      node: { id: node.id, key: node.key, name: node.name, status: node.status },
+      lobby,
+      action,
+    });
 
     if (action.kind === 'existing') {
       return monitorPvpMatch(visitId, cube, node, action.match.matchNo);
@@ -678,6 +804,7 @@ function createCrucibleWorker({
     lobbyDoc = await fetchDocument(lobbyUrl);
     lobby = logic.parsePvpLobby(lobbyDoc, lobbyUrl);
     action = logic.choosePvpAction(lobby);
+    debug('PvP claim confirmation decision', { visitId, lobby, action, expectedMatchNo: payload.match_no });
     if (action.kind !== 'existing' || action.match.matchNo !== Number(payload.match_no)) {
       throw new Error('The PvP lobby did not confirm the claimed slot.');
     }
@@ -777,6 +904,14 @@ function createCrucibleWorker({
     assertCanMutate(visitId);
     const response = await guardedPostForm(visitId, ARMY_LIVE_URL, payload);
     const result = logic.parseArmyActionResponse(response);
+    debug('Army action parsed', {
+      visitId,
+      action,
+      fields,
+      ok: result.ok,
+      message: result.message,
+      summary: result.state ? logic.armySummary(result.state) : null,
+    });
     if (!result.ok) {
       throw new Error(`Army ${action} failed: ${result.message || `HTTP ${response?.status || '?'}`}`);
     }
@@ -953,6 +1088,12 @@ function createCrucibleWorker({
     const pageDoc = await fetchDocument(pageUrl.href);
     const page = logic.parseArmyNodePage(pageDoc);
     const fight = logic.chooseArmyFight(page);
+    debug('Army fight decision', {
+      visitId,
+      node: { id: node.id, key: node.key, name: node.name, status: node.status },
+      page,
+      fight,
+    });
     if (!fight) return { progressed: false, message: `${node.name} has no actionable Army fight.` };
 
     await healArmyIfAvailable(visitId, route);
@@ -970,6 +1111,11 @@ function createCrucibleWorker({
     if (!entered.ok) throw new Error(`Entering the Army fight failed: ${entered.message || 'invalid redirect'}`);
     const liveDoc = await fetchDocument(entered.redirect);
     const live = logic.parseArmyLivePage(liveDoc);
+    debug('Army live page parsed', {
+      visitId,
+      battleId: live.battleId,
+      summary: live.state ? logic.armySummary(live.state) : null,
+    });
     if (!live.battleId || !live.state) throw new Error('The live Army battle state could not be read safely.');
     if (!logic.armySummary(live.state).active) {
       return { progressed: true, message: `${node.name} Army fight already ended.` };
@@ -1007,6 +1153,20 @@ function createCrucibleWorker({
     assertCanMutate(visitId);
     const cubeDoc = await fetchDocument(url);
     const cube = logic.parseCubePage(cubeDoc, url);
+    debug('Crucible cube parsed', {
+      visitId,
+      url,
+      instanceId: cube.instanceId,
+      nodes: cube.nodes.map((node) => ({
+        id: node.id,
+        key: node.key,
+        name: node.name,
+        type: node.type,
+        status: node.status,
+        faceKey: node.faceKey,
+        linkedLocationId: node.linkedLocationId,
+      })),
+    });
     if (!/^\d+$/.test(cube.instanceId)) throw new Error('The Crucible instance id could not be read.');
     if (cube.nodes.length === 0) throw new Error('The Crucible STATE nodes could not be read.');
     return cube;
@@ -1022,6 +1182,17 @@ function createCrucibleWorker({
   async function executeVisit(command) {
     const visitId = command.visitId;
     let route = routeConfig();
+    debug('visit execution started', {
+      visitId,
+      deadlineAt: command.deadlineAt,
+      settings: {
+        pveEnabled: route.settings.pveEnabled,
+        pvpEnabled: route.settings.pvp.enabled,
+        armyEnabled: route.settings.army.enabled,
+        armyMode: route.settings.army.mode,
+        selectedShadowIds: route.settings.army.selectedShadowIds,
+      },
+    });
     if (!route.settings.pveEnabled && !route.settings.pvp.enabled && !route.settings.army.enabled) {
       setTerminal(visitId, 'done', 'Crucible has no enabled automation section.');
       return;
@@ -1038,7 +1209,10 @@ function createCrucibleWorker({
     async function runSection(section, operation) {
       if (failedSections.has(section)) return null;
       try {
-        return await operation();
+        debug('section started', { visitId, section });
+        const result = await operation();
+        debug('section completed', { visitId, section, result });
+        return result;
       } catch (error) {
         // Lease loss, cancellation, scheduler drain and resource stops apply
         // to the whole visit and must retain their existing semantics.
@@ -1046,6 +1220,7 @@ function createCrucibleWorker({
         failedSections.add(section);
         const message = String(error?.message || error || 'unknown error');
         sectionErrors.push(`${section}: ${message}`);
+        debug('section failed', { visitId, section, message, stack: String(error?.stack || '') });
         log(`${section} section failed independently: ${message}`, 'warn');
         return null;
       }
@@ -1054,6 +1229,7 @@ function createCrucibleWorker({
     for (let pass = 0; pass < TIMING.maxVisitPasses; pass += 1) {
       assertCanMutate(visitId);
       const cube = await loadCube(visitId, cubeUrl);
+      debug('visit pass', { visitId, pass: pass + 1, instanceId: cube.instanceId });
       cubeUrl = new URL(`/guild_dungeon_cube.php?instance_id=${encodeURIComponent(cube.instanceId)}`, win.location.origin).href;
       route = routeConfig();
       let progressed = false;
@@ -1144,7 +1320,10 @@ function createCrucibleWorker({
       if (!runtime.runningVisitId) publish('idle', true, 'Crucible is idle on the dungeon page.');
       return;
     }
-    if (!ownsSchedulerLease()) return;
+    if (!ownsSchedulerLease()) {
+      debugSkip('scheduler lease not owned', { visitId: command.visitId });
+      return;
+    }
     if (runtime.terminal?.visitId === command.visitId) {
       publish(runtime.terminal.state, true, runtime.terminal.message, command.visitId, runtime.terminal);
       return;
@@ -1162,6 +1341,7 @@ function createCrucibleWorker({
     runtime.attacks = 0;
     runtime.targets = 0;
     runtime.armyActions = 0;
+    debug('worker tick started visit', { visitId: command.visitId, phase: command.phase, deadlineAt: command.deadlineAt });
     try {
       await executeVisit(command);
     } catch (error) {
