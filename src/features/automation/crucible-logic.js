@@ -204,6 +204,16 @@ function extractAssignedNumber(doc, name) {
   return '';
 }
 
+function extractAssignedTokenString(doc, name) {
+  for (const source of scriptTexts(doc)) {
+    const start = assignmentStart(source, name);
+    if (start < 0) continue;
+    const match = source.slice(start).match(/^\s*(["'])([A-Za-z0-9_-]+)\1/);
+    if (match) return match[2];
+  }
+  return '';
+}
+
 function normalizeNode(raw) {
   const id = String(raw?.id ?? '').trim();
   const key = String(raw?.key || '').trim();
@@ -333,6 +343,20 @@ function buildPvpClaimPayload({ instanceId, nodeId, matchNo, slotIndex } = {}) {
   };
 }
 
+function buildPvpBattleUrl(baseUrl, { instanceId, nodeId, matchNo } = {}) {
+  const instance = cleanInteger(instanceId);
+  const node = cleanInteger(nodeId);
+  const match = cleanInteger(matchNo);
+  const base = resolveUrl(baseUrl);
+  if (!base || !instance || !node || !match) return '';
+  const url = new URL('/pvp_style_battle.php', base);
+  url.searchParams.set('source', 'cube');
+  url.searchParams.set('instance_id', instance);
+  url.searchParams.set('node_id', node);
+  url.searchParams.set('match_no', match);
+  return url.href;
+}
+
 function buildCubeNodeEnterPayload({ instanceId, nodeId, faceKey } = {}) {
   const instance = cleanInteger(instanceId);
   const node = cleanInteger(nodeId);
@@ -398,6 +422,36 @@ function parsePvpState(response) {
     winnerSide,
     roomJoined: json.room_joined === true,
     raw: json,
+  };
+}
+
+function parsePvpBattlePage(doc, expected = {}) {
+  const params = extractAssignedJson(doc, 'SOURCE_PARAMS');
+  const rewardItems = extractAssignedJson(doc, 'PVP_REWARD_ITEMS');
+  const roomStatus = extractAssignedTokenString(doc, 'ROOM_STATUS').toLowerCase();
+  const instanceId = cleanInteger(params?.instance_id);
+  const nodeId = cleanInteger(params?.node_id);
+  const matchNo = cleanInteger(params?.match_no);
+  const expectedInstance = cleanInteger(expected.instanceId);
+  const expectedNode = cleanInteger(expected.nodeId);
+  const expectedMatch = cleanInteger(expected.matchNo);
+  const ok = Boolean(
+    expectedInstance &&
+      expectedNode &&
+      expectedMatch &&
+      instanceId === expectedInstance &&
+      nodeId === expectedNode &&
+      matchNo === expectedMatch &&
+      roomStatus === 'cleared' &&
+      Array.isArray(rewardItems),
+  );
+  return {
+    ok,
+    instanceId,
+    nodeId,
+    matchNo,
+    roomStatus,
+    rewardItems: Array.isArray(rewardItems) ? rewardItems : [],
   };
 }
 
@@ -699,6 +753,7 @@ module.exports = {
   buildArmyFormationPayload,
   buildArmyLivePayload,
   buildCubeNodeEnterPayload,
+  buildPvpBattleUrl,
   buildPvpClaimPayload,
   chooseArmyFight,
   choosePvpAction,
@@ -719,6 +774,7 @@ module.exports = {
   parseCubePage,
   parseHubEntry,
   parsePvpClaimResponse,
+  parsePvpBattlePage,
   parsePvpLobby,
   parsePvpState,
   planArmyActions,

@@ -14,6 +14,14 @@ const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
 const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
 const { staminaCost, staminaMultiplier } = require('../shared/asterion');
 const logic = require('./crucible-logic');
+const {
+  PVP_BACKGROUND_FALLBACK_MS,
+  PVP_BACKGROUND_NAVIGATION_GRACE_MS,
+  PVP_LOBBY_CHECK_MS,
+  PVP_MATCH_CHECK_MS,
+  watchPvpLobby,
+  watchPvpMatch,
+} = require('./crucible-pvp-watch');
 const dungeonLogic = require('./shadowbridge-logic');
 
 const ROUTE_ID = 'crucible';
@@ -555,12 +563,56 @@ function createCrucibleWorker({
     const state = logic.parsePvpState(response);
     if (!state.ok) throw new Error(`PvP match #${matchNo} state failed: ${state.error}`);
     if (state.ended) {
+      let rewardCount = 0;
+      if (state.won) {
+        if (!state.roomJoined) {
+          throw new Error(`Won PvP match #${matchNo} did not confirm this player as a participant.`);
+        }
+        const battleUrl = logic.buildPvpBattleUrl(win.location.origin, {
+          instanceId: cube.instanceId,
+          nodeId: node.id,
+          matchNo,
+        });
+        if (!battleUrl) throw new Error(`Could not build a safe PvP reward URL for match #${matchNo}.`);
+        assertCanMutate(visitId);
+        setWorkingMessage(visitId, `Collecting the reward for won PvP match #${matchNo}.`);
+        const rewardPage = logic.parsePvpBattlePage(await fetchDocument(battleUrl), {
+          instanceId: cube.instanceId,
+          nodeId: node.id,
+          matchNo,
+        });
+        assertCanMutate(visitId);
+        if (!rewardPage.ok) {
+          throw new Error(`The reward page for won PvP match #${matchNo} could not be verified.`);
+        }
+        rewardCount = rewardPage.rewardItems.length;
+      }
+      watchPvpLobby(store, {
+        instanceId: cube.instanceId,
+        nodeId: node.id,
+        nodeKey: node.key,
+        nodeName: node.name,
+        nextCheckAt: now() + PVP_LOBBY_CHECK_MS,
+      }, now());
       runtime.processedPvp.add(node.key);
-      return { progressed: true, message: `PvP match #${matchNo} ${state.won ? 'was won' : 'ended'}.` };
+      return {
+        progressed: true,
+        message: state.won
+          ? `PvP match #${matchNo} was won and its reward page was opened automatically${rewardCount ? ` (${rewardCount} reward type(s))` : ''}.`
+          : `PvP match #${matchNo} ended.`,
+      };
     }
+    watchPvpMatch(store, {
+      instanceId: cube.instanceId,
+      nodeId: node.id,
+      nodeKey: node.key,
+      nodeName: node.name,
+      matchNo,
+      nextCheckAt: now() + PVP_MATCH_CHECK_MS,
+    }, now());
     const live = state.roomStatus === 'live';
     return {
-      waitUntil: cappedRecheck(),
+      waitUntil: now() + PVP_BACKGROUND_FALLBACK_MS,
       note: live ? `${node.name} match in progress` : `${node.name} waiting for players`,
       message: live
         ? `PvP match #${matchNo} is running automatically; checking the Crucible again soon.`
@@ -579,15 +631,29 @@ function createCrucibleWorker({
       return monitorPvpMatch(visitId, cube, node, action.match.matchNo);
     }
     if (action.kind === 'wait') {
+      watchPvpLobby(store, {
+        instanceId: cube.instanceId,
+        nodeId: node.id,
+        nodeKey: node.key,
+        nodeName: node.name,
+        nextCheckAt: now() + action.waitMs,
+      }, now());
       return {
-        waitUntil: cappedRecheck(action.waitMs),
+        waitUntil: now() + action.waitMs + PVP_BACKGROUND_NAVIGATION_GRACE_MS,
         note: `${node.name} binding active`,
         message: `${node.name} is bound for ${Math.ceil(action.waitMs / 1_000)} more seconds; checking node progress regularly.`,
       };
     }
     if (action.kind === 'unavailable') {
+      watchPvpLobby(store, {
+        instanceId: cube.instanceId,
+        nodeId: node.id,
+        nodeKey: node.key,
+        nodeName: node.name,
+        nextCheckAt: now() + PVP_LOBBY_CHECK_MS,
+      }, now());
       return {
-        waitUntil: cappedRecheck(),
+        waitUntil: now() + PVP_BACKGROUND_FALLBACK_MS,
         note: `${node.name} has no free slot`,
         message: `${node.name} has no open slot; checking again soon.`,
       };

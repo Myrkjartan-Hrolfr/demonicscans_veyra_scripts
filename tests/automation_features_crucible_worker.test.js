@@ -6,6 +6,7 @@ const assert = require('node:assert/strict');
 const { COMMAND_KEY, workerStatusKey } = require('../src/core/protocol');
 const { CONFIG_KEY, createDefaultConfig } = require('../src/scheduler/config');
 const { LEASE_KEY, TAB_KEY } = require('../src/scheduler/engine');
+const { CRUCIBLE_PVP_WATCH_KEY } = require('../src/features/automation/crucible-pvp-watch');
 const {
   ARMY_ACTION_URL,
   ARMY_LIVE_URL,
@@ -407,8 +408,19 @@ test('PvP claims the fullest match, confirms its slot and publishes a short node
   });
   const status = env.store.read(workerStatusKey('crucible'));
   assert.equal(status.state, 'done');
-  assert.equal(status.retryAt, NOW + 5 * 60_000);
+  assert.equal(status.retryAt, NOW + 30 * 60_000);
   assert.match(status.note, /waiting for players/i);
+  assert.deepEqual(env.store.read(CRUCIBLE_PVP_WATCH_KEY), {
+    version: 1,
+    mode: 'match',
+    instanceId: '16126',
+    nodeId: '7',
+    nodeKey: 'ring_ward',
+    nodeName: 'Ring Ward',
+    matchNo: '2',
+    nextCheckAt: NOW + 15_000,
+    updatedAt: NOW,
+  });
 });
 
 test('a live PvP match is checked once and does not block the Army section', async () => {
@@ -440,6 +452,42 @@ test('a live PvP match is checked once and does not block the Army section', asy
   const status = env.store.read(workerStatusKey('crucible'));
   assert.equal(status.state, 'done');
   assert.match(status.note, /match in progress/i);
+});
+
+test('a won PvP match is opened in the background so the server grants its reward', async () => {
+  const config = disableSections(createDefaultConfig(), { pvp: true });
+  const cube = cubeDocument([
+    { id: 7, key: 'ring_ward', name: 'Ring Ward', type: 'pvp', status: 'in_progress' },
+  ]);
+  let rewardReads = 0;
+  const env = createEnvironment({
+    config,
+    fetchDocumentImpl: async (url) => {
+      if (/guild_dungeon_(?:enter|cube)\.php/.test(url)) return cube;
+      if (/pvp_style_node\.php/.test(url)) return pvpLobbyDocument(true);
+      if (/pvp_style_battle\.php/.test(url)) {
+        rewardReads += 1;
+        return scriptDocument(
+          `const SOURCE_PARAMS = {"instance_id":"16126","node_id":"7","match_no":"2"};
+           const ROOM_STATUS = "cleared";
+           const PVP_REWARD_ITEMS = [{"item_id":251,"qty":1},{"item_id":337,"qty":50}];`,
+        );
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    },
+    fetchJsonImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: { ok: true, room_status: 'cleared', room_joined: true, match: { ended: true, winner_side: 'ally' } },
+    }),
+  });
+
+  await env.worker.tick();
+
+  assert.equal(rewardReads, 1);
+  assert.equal(env.fetched.some((url) => /pvp_style_battle\.php/.test(url) && /match_no=2/.test(url)), true);
+  assert.equal(env.store.read(workerStatusKey('crucible')).state, 'done');
+  assert.equal(env.store.read(CRUCIBLE_PVP_WATCH_KEY).mode, 'lobby');
 });
 
 test('a PvE section failure does not undo or prevent PvP participation', async () => {

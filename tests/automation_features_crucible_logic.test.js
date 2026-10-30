@@ -216,6 +216,39 @@ test('requires semantic success from PvP responses and identifies a finished all
   assert.equal(logic.parsePvpState({ ok: true, json: { ok: false, error: 'expired' } }).ok, false);
 });
 
+test('builds and verifies the exact won PvP battle page used to collect rewards', () => {
+  const expected = { instanceId: 16126, nodeId: 8, matchNo: 2 };
+  assert.equal(
+    logic.buildPvpBattleUrl('https://demonicscans.org/elsewhere', expected),
+    'https://demonicscans.org/pvp_style_battle.php?source=cube&instance_id=16126&node_id=8&match_no=2',
+  );
+  const doc = documentWith({
+    many: {
+      script: [element({
+        text: `const SOURCE_PARAMS = {"instance_id":"16126","node_id":"8","match_no":"2"};
+          const ROOM_STATUS = "cleared";
+          const PVP_REWARD_ITEMS = [{"item_id":337,"qty":50,"name":"Crucible Sigil"}];`,
+      })],
+    },
+  });
+  const page = logic.parsePvpBattlePage(doc, expected);
+  assert.equal(page.ok, true);
+  assert.equal(page.rewardItems.length, 1);
+  assert.equal(logic.parsePvpBattlePage(doc, { ...expected, matchNo: 3 }).ok, false);
+  assert.equal(logic.buildPvpBattleUrl('https://demonicscans.org', { ...expected, matchNo: 'bad' }), '');
+
+  const waitingDoc = documentWith({
+    many: {
+      script: [element({
+        text: `const SOURCE_PARAMS = {"instance_id":"16126","node_id":"8","match_no":"2"};
+          const ROOM_STATUS = "open";
+          const PVP_REWARD_ITEMS = [{"item_id":337,"qty":35}];`,
+      })],
+    },
+  });
+  assert.equal(logic.parsePvpBattlePage(waitingDoc, expected).ok, false);
+});
+
 test('parses Army fight cards, prioritizes the current live fight and validates its redirect', () => {
   const cards = [
     { match_no: 1, battle_id: 10, status: 'cleared' },
