@@ -8,6 +8,7 @@ const { RUNTIME_KEY, createDefaultRuntime } = require('../src/scheduler/runtime'
 const {
   CRUCIBLE_PVP_WATCH_KEY,
   createCruciblePvpWatcher,
+  visitPvpRewardPage,
   watchPvpLobby,
   watchPvpMatch,
 } = require('../src/features/automation/crucible-pvp-watch');
@@ -78,7 +79,7 @@ function openLobby() {
   return documentWith({ many: { '.grid > .match': [card] } });
 }
 
-function createEnvironment({ fetchDocument, fetchJson } = {}) {
+function createEnvironment({ fetchDocument, fetchJson, visitRewardPage } = {}) {
   const config = createDefaultConfig();
   config.enabled = true;
   config.routes.crucible.enabled = true;
@@ -98,12 +99,70 @@ function createEnvironment({ fetchDocument, fetchJson } = {}) {
     store,
     fetchDocument: fetchDocument || (async () => { throw new Error('Unexpected document fetch'); }),
     fetchJson: fetchJson || (async () => { throw new Error('Unexpected JSON fetch'); }),
+    visitRewardPage: visitRewardPage || (async () => { throw new Error('Unexpected reward page visit'); }),
     now: () => NOW,
     ownsSchedulerLease: () => true,
     logger: null,
   });
   return { store, watcher };
 }
+
+test('reward visit uses a hidden real document and waits for its victory modal', async () => {
+  const scripts = [element({
+    text: `const SOURCE_PARAMS = {"instance_id":"16219","node_id":"7","match_no":"7"};
+      const ROOM_STATUS = "cleared";
+      const PVP_REWARD_ITEMS = [{"item_id":251,"qty":1},{"item_id":337,"qty":35}];`,
+  })];
+  const rewardDoc = documentWith({ many: { script: scripts } });
+  rewardDoc.getElementById = (id) => id === 'rewardsModal' ? {
+    classList: { contains: (name) => name === 'show' },
+    getAttribute: (name) => name === 'aria-hidden' ? 'false' : null,
+  } : null;
+  const listeners = {};
+  let removed = false;
+  const frame = {
+    contentDocument: rewardDoc,
+    hidden: false,
+    style: { setProperty() {} },
+    setAttribute() {},
+    addEventListener(type, callback) {
+      listeners[type] = callback;
+    },
+    remove() {
+      removed = true;
+    },
+  };
+  const doc = {
+    body: {
+      appendChild(candidate) {
+        assert.equal(candidate, frame);
+        queueMicrotask(() => listeners.load());
+      },
+    },
+    createElement(tagName) {
+      assert.equal(tagName, 'iframe');
+      return frame;
+    },
+  };
+  const win = {
+    location: { origin: 'https://demonicscans.org' },
+    setTimeout,
+    clearTimeout,
+  };
+
+  const result = await visitPvpRewardPage(
+    win,
+    doc,
+    'https://demonicscans.org/pvp_style_battle.php?source=cube&instance_id=16219&node_id=7&match_no=7',
+    { instanceId: 16219, nodeId: 7, matchNo: 7 },
+    { timeoutMs: 1_000 },
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.rewardModalShown, true);
+  assert.equal(frame.hidden, true);
+  assert.equal(removed, true);
+});
 
 test('background watcher extends a binding cooldown without waking or navigating', async () => {
   let reads = 0;
@@ -148,17 +207,10 @@ test('background watcher polls a live match and wakes Crucible for its won rewar
   let requested = '';
   let rewardPageRequested = '';
   const env = createEnvironment({
-    fetchDocument: async (url) => {
+    visitRewardPage: async (url, expected) => {
       rewardPageRequested = url;
-      return documentWith({
-        many: {
-          script: [element({
-            text: `const SOURCE_PARAMS = {"instance_id":"16126","node_id":"7","match_no":"2"};
-              const ROOM_STATUS = "cleared";
-              const PVP_REWARD_ITEMS = [{"item_id":337,"qty":50}];`,
-          })],
-        },
-      });
+      assert.equal(expected.matchNo, '2');
+      return { ok: true, rewardItems: [{ item_id: 337, qty: 50 }], rewardModalShown: true };
     },
     fetchJson: async (url) => {
       requested = url;
@@ -190,7 +242,7 @@ test('background watcher polls a live match and wakes Crucible for its won rewar
 test('background watcher never opens the reward page before the joined match has ended', async () => {
   let rewardPageReads = 0;
   const env = createEnvironment({
-    fetchDocument: async () => {
+    visitRewardPage: async () => {
       rewardPageReads += 1;
       throw new Error('The battle page must not be opened while the match is waiting.');
     },

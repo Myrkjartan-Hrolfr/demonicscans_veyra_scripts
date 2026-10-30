@@ -19,6 +19,7 @@ const {
   PVP_BACKGROUND_NAVIGATION_GRACE_MS,
   PVP_LOBBY_CHECK_MS,
   PVP_MATCH_CHECK_MS,
+  visitPvpRewardPage,
   watchPvpLobby,
   watchPvpMatch,
 } = require('./crucible-pvp-watch');
@@ -93,6 +94,7 @@ function createCrucibleWorker({
   sleepImpl = sleep,
   now = () => Date.now(),
   logger = console,
+  visitRewardPage = (url, expected) => visitPvpRewardPage(win, doc, url, expected),
 }) {
   const runtime = {
     stopped: false,
@@ -576,7 +578,7 @@ function createCrucibleWorker({
         if (!battleUrl) throw new Error(`Could not build a safe PvP reward URL for match #${matchNo}.`);
         assertCanMutate(visitId);
         setWorkingMessage(visitId, `Collecting the reward for won PvP match #${matchNo}.`);
-        const rewardPage = logic.parsePvpBattlePage(await fetchDocument(battleUrl), {
+        const rewardPage = await visitRewardPage(battleUrl, {
           instanceId: cube.instanceId,
           nodeId: node.id,
           matchNo,

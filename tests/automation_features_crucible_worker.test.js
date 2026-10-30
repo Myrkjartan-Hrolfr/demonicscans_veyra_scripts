@@ -130,6 +130,7 @@ function createEnvironment({
   fetchDocumentImpl,
   fetchJsonImpl,
   postImpl,
+  visitRewardPageImpl,
   getUserId = async () => 159129,
   asterionMultiplier = 1,
 } = {}) {
@@ -165,6 +166,7 @@ function createEnvironment({
     sleepImpl: async () => {},
     now: () => NOW,
     logger: null,
+    visitRewardPage: visitRewardPageImpl || (async () => { throw new Error('Unexpected reward page visit'); }),
   });
   return { fetched, jsonGets, posts, store, worker };
 }
@@ -465,15 +467,17 @@ test('a won PvP match is opened in the background so the server grants its rewar
     fetchDocumentImpl: async (url) => {
       if (/guild_dungeon_(?:enter|cube)\.php/.test(url)) return cube;
       if (/pvp_style_node\.php/.test(url)) return pvpLobbyDocument(true);
-      if (/pvp_style_battle\.php/.test(url)) {
-        rewardReads += 1;
-        return scriptDocument(
-          `const SOURCE_PARAMS = {"instance_id":"16126","node_id":"7","match_no":"2"};
-           const ROOM_STATUS = "cleared";
-           const PVP_REWARD_ITEMS = [{"item_id":251,"qty":1},{"item_id":337,"qty":50}];`,
-        );
-      }
       throw new Error(`Unexpected GET ${url}`);
+    },
+    visitRewardPageImpl: async (url, expected) => {
+      rewardReads += 1;
+      assert.match(url, /pvp_style_battle\.php/);
+      assert.equal(expected.matchNo, 2);
+      return {
+        ok: true,
+        rewardItems: [{ item_id: 251, qty: 1 }, { item_id: 337, qty: 50 }],
+        rewardModalShown: true,
+      };
     },
     fetchJsonImpl: async () => ({
       ok: true,
@@ -485,7 +489,7 @@ test('a won PvP match is opened in the background so the server grants its rewar
   await env.worker.tick();
 
   assert.equal(rewardReads, 1);
-  assert.equal(env.fetched.some((url) => /pvp_style_battle\.php/.test(url) && /match_no=2/.test(url)), true);
+  assert.equal(env.fetched.some((url) => /pvp_style_battle\.php/.test(url)), false);
   assert.equal(env.store.read(workerStatusKey('crucible')).state, 'done');
   assert.equal(env.store.read(CRUCIBLE_PVP_WATCH_KEY).mode, 'lobby');
 });

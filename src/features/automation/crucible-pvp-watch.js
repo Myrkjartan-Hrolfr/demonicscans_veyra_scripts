@@ -18,6 +18,7 @@ const PVP_MATCH_CHECK_MS = 15_000;
 const PVP_LOBBY_CHECK_MS = 30_000;
 const PVP_ERROR_RETRY_MS = 60_000;
 const PVP_WAKE_HOLD_MS = 5 * 60_000;
+const PVP_REWARD_FRAME_TIMEOUT_MS = 15_000;
 const PVP_BACKGROUND_FALLBACK_MS = 30 * 60_000;
 const PVP_BACKGROUND_NAVIGATION_GRACE_MS = 30_000;
 
@@ -104,11 +105,95 @@ async function defaultFetchJson(win, url) {
   return { ok: response.ok, status: response.status, text, json };
 }
 
+function visitPvpRewardPage(win, doc, url, expected, options = {}) {
+  const timeoutMs = Math.max(1_000, Number(options.timeoutMs) || PVP_REWARD_FRAME_TIMEOUT_MS);
+  const host = doc?.body || doc?.documentElement;
+  const schedule = win?.setTimeout?.bind(win) || globalThis.setTimeout;
+  const cancel = win?.clearTimeout?.bind(win) || globalThis.clearTimeout;
+  let target = null;
+  try {
+    target = new URL(url, win.location.origin);
+  } catch {
+    return Promise.reject(new Error('invalid PvP reward page URL'));
+  }
+  if (
+    !host?.appendChild ||
+    !doc?.createElement ||
+    target.origin !== win.location.origin ||
+    !/\/pvp_style_battle\.php\/?$/i.test(target.pathname)
+  ) {
+    return Promise.reject(new Error('PvP reward page cannot be opened safely'));
+  }
+
+  return new Promise((resolve, reject) => {
+    const frame = doc.createElement('iframe');
+    let timeout = null;
+    let settled = false;
+
+    function finish(error, result = null) {
+      if (settled) return;
+      settled = true;
+      if (timeout !== null) cancel(timeout);
+      try {
+        frame.remove?.();
+      } catch {
+        // Removing the already detached frame is harmless.
+      }
+      if (error) reject(error);
+      else resolve(result);
+    }
+
+    frame.hidden = true;
+    frame.setAttribute?.('aria-hidden', 'true');
+    frame.setAttribute?.('tabindex', '-1');
+    frame.style?.setProperty?.('display', 'none', 'important');
+    frame.addEventListener?.('error', () => finish(new Error('PvP reward page failed to load')), { once: true });
+    frame.addEventListener?.('load', () => {
+      let rewardPage = null;
+      try {
+        rewardPage = logic.parsePvpBattlePage(frame.contentDocument, expected);
+      } catch {
+        // Cross-origin or blocked frame access is not a verified reward visit.
+      }
+      if (!rewardPage?.ok) {
+        finish(new Error('cleared PvP reward page could not be verified'));
+        return;
+      }
+
+      const checkModal = () => {
+        if (settled) return;
+        let shown = false;
+        try {
+          const modal = frame.contentDocument?.getElementById?.('rewardsModal');
+          shown = Boolean(modal?.classList?.contains?.('show') && modal?.getAttribute?.('aria-hidden') !== 'true');
+        } catch {
+          // Keep waiting until the overall timeout reports a useful failure.
+        }
+        if (shown) {
+          finish(null, { ...rewardPage, rewardModalShown: true });
+          return;
+        }
+        schedule(checkModal, 250);
+      };
+      checkModal();
+    }, { once: true });
+
+    timeout = schedule(
+      () => finish(new Error('PvP reward page did not confirm its victory reward in time')),
+      timeoutMs,
+    );
+    frame.src = target.href;
+    host.appendChild(frame);
+  });
+}
+
 function createCruciblePvpWatcher({
   win,
+  doc = win.document,
   store,
   fetchDocument,
   fetchJson = (url) => defaultFetchJson(win, url),
+  visitRewardPage = (url, expected) => visitPvpRewardPage(win, doc, url, expected),
   now = () => Date.now(),
   ownsSchedulerLease = null,
   logger = console,
@@ -162,7 +247,7 @@ function createCruciblePvpWatcher({
         if (!state.roomJoined) throw new Error('won PvP state did not confirm reward eligibility');
         const battleUrl = logic.buildPvpBattleUrl(win.location.origin, watch);
         if (!battleUrl) throw new Error('invalid won PvP match URL');
-        const rewardPage = logic.parsePvpBattlePage(await fetchDocument(battleUrl), watch);
+        const rewardPage = await visitRewardPage(battleUrl, watch);
         if (!isCurrent(watch)) return;
         if (!rewardPage.ok) throw new Error('won PvP reward page could not be verified');
       }
@@ -242,6 +327,7 @@ const cruciblePvpWatcherFeature = Object.freeze({
   run(ctx) {
     const watcher = createCruciblePvpWatcher({
       win: ctx.win,
+      doc: ctx.doc,
       store: ctx.store,
       fetchDocument: ctx.fetchDocument,
       logger: console,
@@ -258,12 +344,14 @@ module.exports = {
   PVP_BACKGROUND_NAVIGATION_GRACE_MS,
   PVP_LOBBY_CHECK_MS,
   PVP_MATCH_CHECK_MS,
+  PVP_REWARD_FRAME_TIMEOUT_MS,
   WATCH_TICK_MS,
   createCruciblePvpWatcher,
   cruciblePvpWatcherFeature,
   normalizePvpWatch,
   pvpLobbyUrl,
   pvpStateUrl,
+  visitPvpRewardPage,
   wakeCrucible,
   watchPvpLobby,
   watchPvpMatch,
