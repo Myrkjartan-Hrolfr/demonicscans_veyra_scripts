@@ -94,7 +94,26 @@ function locationDocument() {
   return documentWith({ many: { '.mon': [card] } });
 }
 
-function battleDocument({ joined, ownDamage = 0 }) {
+function healingPotion({ invId = 'hp-1', quantity = 3 } = {}) {
+  return element({
+    attrs: { 'data-inv-id': invId, 'data-item-id': '108' },
+    one: {
+      '.potion-use-btn': element({
+        attrs: { 'data-name': 'Full HP Potion', 'data-max': String(quantity) },
+      }),
+      '.potion-qty-left': element({ text: String(quantity) }),
+      '.potion-name': element({ text: 'Full HP Potion' }),
+    },
+  });
+}
+
+function battleDocument({
+  joined,
+  ownDamage = 0,
+  playerHp = 10_000,
+  playerMaxHp = 10_000,
+  potions = [],
+}) {
   const row = element({
     one: {
       '.lb-name a': element({ attrs: { href: '/player.php?pid=159129' } }),
@@ -106,14 +125,14 @@ function battleDocument({ joined, ownDamage = 0 }) {
       '#join-battle': joined ? null : element({ text: 'Join battle' }),
       '.battle-actions-card': element({ text: joined ? 'Battle actions' : 'Join this battle' }),
       '#hpText': element({ text: '900 / 1,000' }),
-      '#pHpText': element({ text: '10,000 / 10,000' }),
+      '#pHpText': element({ text: `${playerHp} / ${playerMaxHp}` }),
       '#stamina_span': element({ text: '1,000' }),
     },
     many: {
       '.stat-block': [],
       '.loot-card .chip, .loot-stats .chip': [],
       '.lb-list .lb-row': joined ? [row] : [],
-      '.potion-card[data-inv-id][data-item-id]': [],
+      '.potion-card[data-inv-id][data-item-id]': potions,
     },
   });
 }
@@ -130,10 +149,11 @@ test('Castle plan uses rooms rather than fixed monster or instance ids', () => {
   assert.equal(plan[0].monsterId, 'random-700');
 });
 
-test('Castle worker discovers the current instance, joins and reaches live maximum HP damage', async () => {
+test('Castle worker joins, heals at zero player HP and reaches live maximum HP damage', async () => {
   const config = createDefaultConfig();
   for (const target of Object.values(config.routes.prince.settings.targets)) target.enabled = false;
   config.routes.prince.settings.targets['vizier-hall'].enabled = true;
+  config.routes.prince.potions.heal = [108];
   const store = createStore({
     [COMMAND_KEY]: {
       version: 1,
@@ -169,7 +189,12 @@ test('Castle worker discovers the current instance, joins and reaches live maxim
     fetchDocument: async (url) => {
       if (url === 'https://demonicscans.org/battle.php?dgmid=555001&instance_id=98765') {
         battleReads += 1;
-        return battleDocument({ joined: battleReads > 1, ownDamage: battleReads > 1 ? 200 : 0 });
+        return battleDocument({
+          joined: battleReads > 1,
+          ownDamage: battleReads > 1 ? 200 : 0,
+          playerHp: battleReads > 1 ? 0 : 10_000,
+          potions: battleReads > 1 ? [healingPotion({ invId: 'hp-prince' })] : [],
+        });
       }
       if (docs[url]) return docs[url];
       throw new Error(`Unexpected GET ${url}`);
@@ -178,6 +203,9 @@ test('Castle worker discovers the current instance, joins and reaches live maxim
       posts.push({ url, params });
       if (url === '/dungeon_join_battle.php') {
         return { ok: true, status: 200, text: 'You have successfully joined the battle!', json: null };
+      }
+      if (url === 'user_heal_potion.php') {
+        return { ok: true, status: 200, text: 'success', json: null };
       }
       return {
         ok: true,
@@ -198,6 +226,10 @@ test('Castle worker discovers the current instance, joins and reaches live maxim
     {
       url: '/dungeon_join_battle.php',
       params: { instance_id: '98765', dgmid: '555001', user_id: '159129' },
+    },
+    {
+      url: 'user_heal_potion.php',
+      params: { inv_id: 'hp-prince', qty: undefined },
     },
     {
       url: '/damage.php',

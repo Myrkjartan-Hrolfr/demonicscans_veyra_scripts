@@ -10,6 +10,7 @@
 // so reloads, navigation and mobile tab freezes resume where they left off.
 
 const { formatGameNumber } = require('../../core/numbers');
+const { pickPotion, readPotionInventory, usePotion } = require('../../core/potions');
 const { COMMAND_KEY, publishWorkerStatus } = require('../../core/protocol');
 const { createJsonStore, getStorage } = require('../../core/storage');
 const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
@@ -603,6 +604,8 @@ function createBossWorker({
           return;
         }
 
+        if (await healBeforeFight(run)) return;
+
         let latest = validateBattleRun(visitId, monsterId, now());
         if (!latest) return;
         if (logic.actionExhausted(latest, 'controller')) {
@@ -630,6 +633,62 @@ function createBossWorker({
         rt.fightStarting = false;
       }
     })();
+  }
+
+  async function healBeforeFight(run) {
+    const health = dom.readPlayerHealth(doc);
+    if (health?.current !== 0) return false;
+
+    let t = now();
+    let latest = validateBattleRun(run.visitId, run.target.monsterId, t);
+    if (!latest) return true;
+
+    const selected = loadRouteConfig(latest.routeId)?.potions?.heal || [];
+    if (selected.length === 0) {
+      finish(
+        latest,
+        'done',
+        `${logic.routeLabel(latest.routeId)}: player HP is 0 and no healing potion is selected; the visit ends here.`,
+        t,
+      );
+      return true;
+    }
+
+    const potion = pickPotion(readPotionInventory(doc), selected);
+    if (!potion) {
+      finish(
+        latest,
+        'done',
+        `${logic.routeLabel(latest.routeId)}: player HP is 0 and no selected healing potion is in stock; the visit ends here.`,
+        t,
+      );
+      return true;
+    }
+
+    if (latest.action.kind === 'heal-player' && !logic.actionReady(latest, 'heal-player', t)) {
+      log(`Waiting for ${potion.name || 'the healing potion'} to restore player HP.`);
+      return true;
+    }
+    if (logic.actionExhausted(latest, 'heal-player')) {
+      finish(latest, 'error', 'The selected healing potion could not restore player HP.', t);
+      return true;
+    }
+
+    latest = saveRun(logic.recordAction(latest, 'heal-player', t));
+    log(`Player HP is 0; using ${potion.name || 'the selected healing potion'} before attacking.`);
+    const result = await usePotion(potion, { post: postForm });
+
+    t = now();
+    const current = validateBattleRun(run.visitId, run.target.monsterId, t);
+    if (!current) return true;
+    if (!result.ok) {
+      log(`The healing potion failed${result.message ? `: ${result.message}` : '.'}`, 'warn');
+      return true;
+    }
+
+    log('Player HP was restored; reloading the battle before starting Monster Auto Battle.');
+    reloadPage();
+    return true;
   }
 
   async function joinOnBattlePage(run, control) {

@@ -398,7 +398,6 @@ function createCrucibleWorker({
       if (!Number.isFinite(snapshot.playerHp) || !Number.isFinite(snapshot.playerMaxHp) || snapshot.playerMaxHp <= 0) {
         return true;
       }
-      if (snapshot.playerHp <= 0) throw new VisitStop('resource', 'Player HP reached zero; Crucible PvE stopped.');
       if (snapshot.playerHp / snapshot.playerMaxHp > TIMING.lowHpFraction) return true;
       await ensureInventory();
       const potion = pickPotion(inventory, route.potions.heal);

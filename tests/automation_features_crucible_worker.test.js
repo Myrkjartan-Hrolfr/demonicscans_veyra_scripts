@@ -236,7 +236,26 @@ function pveLocationDocument(name = 'Prismblade Reaver', monsterId = '7001') {
   return documentWith({ many: { '.mon': [card] } });
 }
 
-function pveBattleDocument({ ownDamage = 0, includeOwnRow = true } = {}) {
+function healingPotion({ invId = 'hp-1', quantity = 3 } = {}) {
+  return element({
+    attrs: { 'data-inv-id': invId, 'data-item-id': '108' },
+    one: {
+      '.potion-use-btn': element({
+        attrs: { 'data-name': 'Full HP Potion', 'data-max': String(quantity) },
+      }),
+      '.potion-qty-left': element({ text: String(quantity) }),
+      '.potion-name': element({ text: 'Full HP Potion' }),
+    },
+  });
+}
+
+function pveBattleDocument({
+  ownDamage = 0,
+  includeOwnRow = true,
+  playerHp = 12_000,
+  playerMaxHp = 12_000,
+  potions = [],
+} = {}) {
   const row = element({
     one: {
       '.lb-name a': element({ text: 'Player', attrs: { href: '/player.php?pid=159129' } }),
@@ -247,7 +266,7 @@ function pveBattleDocument({ ownDamage = 0, includeOwnRow = true } = {}) {
     one: {
       '.battle-actions-card': element({ text: 'Battle actions' }),
       '#hpText': element({ text: '10,000 / 10,000' }),
-      '#pHpText': element({ text: '12,000 / 12,000' }),
+      '#pHpText': element({ text: `${playerHp} / ${playerMaxHp}` }),
       '#stamina_span': element({ text: '1,000' }),
     },
     many: {
@@ -257,17 +276,18 @@ function pveBattleDocument({ ownDamage = 0, includeOwnRow = true } = {}) {
       ],
       '.loot-card .chip, .loot-stats .chip': [element({ text: 'DMG req: 50' })],
       '.lb-list .lb-row': includeOwnRow ? [row] : [],
-      '.potion-card[data-inv-id][data-item-id]': [],
+      '.potion-card[data-inv-id][data-item-id]': potions,
     },
   });
 }
 
-test('PvE reads max EXP live, attacks to it and sends the base stamina cost with Asterion', async () => {
+test('PvE heals at zero player HP, reads max EXP live and sends the base stamina cost with Asterion', async () => {
   const config = disableSections(createDefaultConfig(), { pve: true });
   const settings = config.routes.crucible.settings;
   for (const target of Object.values(settings.targets)) target.enabled = false;
   settings.targets['gate_prism:prismblade-reaver'] = { enabled: true, mode: 'max-exp', damage: '1m' };
   settings.skill = '-1';
+  config.routes.crucible.potions.heal = [108];
   const nodes = [
     { id: 2, face_key: 'front', key: 'gate_prism', name: 'Gate Prism', type: 'pve', status: 'available', linked_location_id: 11 },
   ];
@@ -278,12 +298,20 @@ test('PvE reads max EXP live, attacks to it and sends the base stamina cost with
     fetchDocumentImpl: async (url) => {
       if (/guild_dungeon_(?:enter|cube)\.php/.test(url)) return cube;
       if (/guild_dungeon_location\.php/.test(url)) return pveLocationDocument();
-      if (/battle\.php/.test(url)) return pveBattleDocument();
+      if (/battle\.php/.test(url)) {
+        return pveBattleDocument({
+          playerHp: 0,
+          potions: [healingPotion({ invId: 'hp-crucible', quantity: 2 })],
+        });
+      }
       throw new Error(`Unexpected GET ${url}`);
     },
     postImpl: async (url) => {
       if (url === CUBE_ACTION_URL) {
         return { ok: true, status: 200, json: { ok: true, redirect: '/guild_dungeon_location.php?instance_id=16126&location_id=11' }, text: '' };
+      }
+      if (url === 'user_heal_potion.php') {
+        return { ok: true, status: 200, json: null, text: 'success' };
       }
       if (url === DAMAGE_URL) {
         return { ok: true, status: 200, json: { status: 'success', damage: 100, hp: { value: 9_900 } }, text: '' };
@@ -292,6 +320,11 @@ test('PvE reads max EXP live, attacks to it and sends the base stamina cost with
     },
   });
   await env.worker.tick();
+  const combatPosts = env.posts.filter((entry) =>
+    ['user_heal_potion.php', DAMAGE_URL].includes(entry.url),
+  );
+  assert.deepEqual(combatPosts.map((entry) => entry.url), ['user_heal_potion.php', DAMAGE_URL]);
+  assert.deepEqual(combatPosts[0].params, { inv_id: 'hp-crucible', qty: undefined });
   assert.equal(env.posts.filter((entry) => entry.url === DAMAGE_URL).length, 1);
   const damagePost = env.posts.find((entry) => entry.url === DAMAGE_URL);
   assert.deepEqual(damagePost.params, {

@@ -155,7 +155,29 @@ function locationDocument() {
   return documentWith({ many: { '.mon': [card] } });
 }
 
-function battleDocument({ joined = true, ownDamage = 0, includeOwnRow = true, loot = 100, stamina = 1_000 } = {}) {
+function healingPotion({ invId = 'hp-1', quantity = 3 } = {}) {
+  return element({
+    attrs: { 'data-inv-id': invId, 'data-item-id': '108' },
+    one: {
+      '.potion-use-btn': element({
+        attrs: { 'data-name': 'Full HP Potion', 'data-max': String(quantity) },
+      }),
+      '.potion-qty-left': element({ text: String(quantity) }),
+      '.potion-name': element({ text: 'Full HP Potion' }),
+    },
+  });
+}
+
+function battleDocument({
+  joined = true,
+  ownDamage = 0,
+  includeOwnRow = true,
+  loot = 100,
+  stamina = 1_000,
+  playerHp = 12_000,
+  playerMaxHp = 12_000,
+  potions = [],
+} = {}) {
   const lootChip = element({ text: `DMG req: ${loot}` });
   const playerRow = element({
     one: {
@@ -168,14 +190,14 @@ function battleDocument({ joined = true, ownDamage = 0, includeOwnRow = true, lo
       '#join-battle': joined ? null : element({ text: 'Join Battle' }),
       '.battle-actions-card': element({ text: joined ? 'Battle actions' : 'Join this battle' }),
       '#hpText': element({ text: '10,000 / 10,000' }),
-      '#pHpText': element({ text: '12,000 / 12,000' }),
+      '#pHpText': element({ text: `${playerHp} / ${playerMaxHp}` }),
       '#stamina_span': element({ text: String(stamina) }),
     },
     many: {
       '.stat-block': [statBlock('Monster HP', '10,000')],
       '.loot-card .chip, .loot-stats .chip': [lootChip],
       '.lb-list .lb-row': includeOwnRow ? [playerRow] : [],
-      '.potion-card[data-inv-id][data-item-id]': [],
+      '.potion-card[data-inv-id][data-item-id]': potions,
     },
   });
 }
@@ -353,6 +375,40 @@ test('joins, attacks to the live loot limit and sends the base skill cost despit
       percent: 100,
     },
   );
+});
+
+test('heals at zero player HP before attacking a Shadowbridge monster', async () => {
+  const config = shadowConfig();
+  config.routes.shadowbridge.potions.heal = [108];
+  const env = createEnvironment({
+    config,
+    battleDocuments: [
+      battleDocument({
+        playerHp: 0,
+        potions: [healingPotion({ invId: 'hp-shadow', quantity: 2 })],
+      }),
+    ],
+    post(url) {
+      if (url === 'user_heal_potion.php') {
+        return { ok: true, status: 200, text: 'success', json: null };
+      }
+      if (url === DAMAGE_URL) {
+        return {
+          ok: true,
+          status: 200,
+          text: '',
+          json: { status: 'success', damage: 100, hp: { value: 9_900, max: 10_000 } },
+        };
+      }
+      throw new Error(`Unexpected POST ${url}`);
+    },
+  });
+
+  await env.worker.tick();
+
+  assert.deepEqual(env.posts.map((entry) => entry.url), ['user_heal_potion.php', DAMAGE_URL]);
+  assert.deepEqual(env.posts[0].params, { inv_id: 'hp-shadow', qty: undefined });
+  assert.equal(env.store.read(workerStatusKey('shadowbridge')).state, 'done');
 });
 
 test('fails closed after join when current personal damage is absent from the leaderboard', async () => {

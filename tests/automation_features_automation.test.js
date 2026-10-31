@@ -66,6 +66,19 @@ function summonCard({ name, alive = true, id = '' }) {
   });
 }
 
+function healingPotion({ invId = 'hp-1', quantity = 3 } = {}) {
+  return el({
+    attrs: { 'data-inv-id': invId, 'data-item-id': '108' },
+    children: {
+      '.potion-use-btn': el({
+        attrs: { 'data-name': 'Full HP Potion', 'data-max': String(quantity) },
+      }),
+      '.potion-qty-left': el({ text: String(quantity) }),
+      '.potion-name': el({ text: 'Full HP Potion' }),
+    },
+  });
+}
+
 const GOOD_COOKIES = { hide_dead_monsters: '1', show_dead_bosses_only: '0' };
 
 function fakeDoc({ selectors = {}, cookies = GOOD_COOKIES } = {}) {
@@ -803,6 +816,73 @@ test('the battle page drives Monster Auto Battle and returns to the domain hub',
   const run = env.run();
   assert.deepEqual(run.processed, ['557125237']);
   assert.equal(run.target, null);
+});
+
+test('a zero-HP boss battle uses the selected healing potion before Monster Auto Battle', async () => {
+  const env = createEnv({ configure: (config) => enableOlympus(config, ['hera']) });
+  battleRun(env);
+  env.controller = stubController();
+  const doc = fakeDoc({
+    selectors: {
+      [dom.SELECTORS.playerHp]: el({ text: '💚 0 / 968,450 HP' }),
+      '.potion-card[data-inv-id][data-item-id]': [
+        healingPotion({ invId: '823978883', quantity: 2 }),
+      ],
+    },
+  });
+  const { win, worker } = env.page(
+    'https://demonicscans.org/battle.php?id=557125237&veyra_visit=v1',
+    doc,
+  );
+
+  worker.tick();
+  await flush();
+
+  assert.deepEqual(env.posts, [
+    {
+      url: 'user_heal_potion.php',
+      params: { inv_id: '823978883', qty: undefined },
+    },
+  ]);
+  assert.deepEqual(env.controller.calls, []);
+  assert.deepEqual(win.replaced, [
+    'https://demonicscans.org/battle.php?id=557125237&veyra_visit=v1',
+  ]);
+
+  worker.tick();
+  await flush();
+  assert.equal(env.posts.length, 1, 'the same page never consumes a second healing potion');
+});
+
+test('a zero-HP boss battle stops safely when no healing potion is selected', async () => {
+  const env = createEnv({
+    configure: (config) => {
+      enableOlympus(config, ['hera']);
+      config.routes.olympus.potions.heal = [];
+    },
+  });
+  battleRun(env);
+  env.controller = stubController();
+  const doc = fakeDoc({
+    selectors: {
+      [dom.SELECTORS.playerHp]: el({ text: '💚 0 / 968,450 HP' }),
+      '.potion-card[data-inv-id][data-item-id]': [healingPotion()],
+    },
+  });
+  const { win, worker } = env.page(
+    'https://demonicscans.org/battle.php?id=557125237&veyra_visit=v1',
+    doc,
+  );
+
+  worker.tick();
+  await flush();
+
+  assert.deepEqual(env.posts, []);
+  assert.deepEqual(env.controller.calls, []);
+  assert.deepEqual(win.replaced, []);
+  assert.equal(env.status('olympus').state, 'done');
+  assert.equal(env.status('olympus').safeToLeave, true);
+  assert.match(env.status('olympus').message, /no healing potion is selected/i);
 });
 
 test('a phased Olympus battle opens its matching Phase 2 duel with the visit marker', () => {

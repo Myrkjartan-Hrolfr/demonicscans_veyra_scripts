@@ -176,6 +176,18 @@ test('usePotion posts to the right endpoint and checks for success', async () =>
   );
   assert.deepEqual(posted, [{ url: 'use_item.php', params: { inv_id: '77', qty: 3 } }]);
   assert.equal(result.ok, true);
+
+  const failed = await usePotion(
+    { invId: '88', itemId: 108 },
+    {
+      post: async () => ({
+        ok: true,
+        text: '{"status":"error","message":"Unsuccessful."}',
+        json: { status: 'error', message: 'Unsuccessful.' },
+      }),
+    },
+  );
+  assert.equal(failed.ok, false);
 });
 
 test('json store survives broken storage and bad JSON', () => {

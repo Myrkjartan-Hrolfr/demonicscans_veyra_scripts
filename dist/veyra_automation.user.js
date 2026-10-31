@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.8.0
+// @version      0.8.1
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -697,9 +697,18 @@
         inv_id: entry.invId,
         qty: qty > 1 ? qty : undefined,
       });
+      const data = response?.json;
+      let succeeded;
+      if (data && typeof data === 'object' && Object.prototype.hasOwnProperty.call(data, 'status')) {
+        succeeded = String(data.status || '').trim().toLowerCase() === 'success';
+      } else if (data && typeof data === 'object' && Object.prototype.hasOwnProperty.call(data, 'success')) {
+        succeeded = data.success === true;
+      } else {
+        succeeded = /\bsuccess(?:fully)?\b/i.test(String(response?.text || ''));
+      }
       return {
-        ok: response.ok && String(response.text || '').toLowerCase().includes('success'),
-        message: String(response.text || '').trim(),
+        ok: Boolean(response?.ok && succeeded),
+        message: String(response?.text || data?.message || '').trim(),
       };
     }
 
@@ -1934,7 +1943,7 @@
     // Reads the boss hub (active_wave.php) and battle page (battle.php) into the
     // plain objects boss-logic.js works with. Null safe throughout.
 
-    const { parseGameNumber } = require('../../core/numbers');
+    const { parseFraction, parseGameNumber } = require('../../core/numbers');
 
     const SELECTORS = Object.freeze({
       summonCard: '.auto-summon-card',
@@ -1946,6 +1955,7 @@
       battleCard: '.battle-card.monster-card[data-monster-id]',
       battleTitle: '.battle-card.monster-card .card-title',
       monsterImage: '#monsterImage',
+      playerHp: '#pHpText',
       phaseDuel: 'a[href*="pvp_style_battle.php"][href*="source=monster_phase"]',
     });
 
@@ -2026,6 +2036,10 @@
       return doc?.querySelector?.(SELECTORS.battleJoin) || null;
     }
 
+    function readPlayerHealth(doc) {
+      return parseFraction(doc?.querySelector?.(SELECTORS.playerHp)?.textContent);
+    }
+
     function findPhaseDuelControl(doc, base = 'https://demonicscans.org') {
       const element = doc?.querySelector?.(SELECTORS.phaseDuel) || null;
       const href = attr(element, 'href');
@@ -2079,6 +2093,7 @@
       monsterIdFromHref,
       readCookieText,
       readMonsterCards,
+      readPlayerHealth,
       readSummons,
       setCookie,
     };
@@ -2803,6 +2818,7 @@
     // so reloads, navigation and mobile tab freezes resume where they left off.
 
     const { formatGameNumber } = require('../../core/numbers');
+    const { pickPotion, readPotionInventory, usePotion } = require('../../core/potions');
     const { COMMAND_KEY, publishWorkerStatus } = require('../../core/protocol');
     const { createJsonStore, getStorage } = require('../../core/storage');
     const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
@@ -3396,6 +3412,8 @@
               return;
             }
 
+            if (await healBeforeFight(run)) return;
+
             let latest = validateBattleRun(visitId, monsterId, now());
             if (!latest) return;
             if (logic.actionExhausted(latest, 'controller')) {
@@ -3423,6 +3441,62 @@
             rt.fightStarting = false;
           }
         })();
+      }
+
+      async function healBeforeFight(run) {
+        const health = dom.readPlayerHealth(doc);
+        if (health?.current !== 0) return false;
+
+        let t = now();
+        let latest = validateBattleRun(run.visitId, run.target.monsterId, t);
+        if (!latest) return true;
+
+        const selected = loadRouteConfig(latest.routeId)?.potions?.heal || [];
+        if (selected.length === 0) {
+          finish(
+            latest,
+            'done',
+            `${logic.routeLabel(latest.routeId)}: player HP is 0 and no healing potion is selected; the visit ends here.`,
+            t,
+          );
+          return true;
+        }
+
+        const potion = pickPotion(readPotionInventory(doc), selected);
+        if (!potion) {
+          finish(
+            latest,
+            'done',
+            `${logic.routeLabel(latest.routeId)}: player HP is 0 and no selected healing potion is in stock; the visit ends here.`,
+            t,
+          );
+          return true;
+        }
+
+        if (latest.action.kind === 'heal-player' && !logic.actionReady(latest, 'heal-player', t)) {
+          log(`Waiting for ${potion.name || 'the healing potion'} to restore player HP.`);
+          return true;
+        }
+        if (logic.actionExhausted(latest, 'heal-player')) {
+          finish(latest, 'error', 'The selected healing potion could not restore player HP.', t);
+          return true;
+        }
+
+        latest = saveRun(logic.recordAction(latest, 'heal-player', t));
+        log(`Player HP is 0; using ${potion.name || 'the selected healing potion'} before attacking.`);
+        const result = await usePotion(potion, { post: postForm });
+
+        t = now();
+        const current = validateBattleRun(run.visitId, run.target.monsterId, t);
+        if (!current) return true;
+        if (!result.ok) {
+          log(`The healing potion failed${result.message ? `: ${result.message}` : '.'}`, 'warn');
+          return true;
+        }
+
+        log('Player HP was restored; reloading the battle before starting Monster Auto Battle.');
+        reloadPage();
+        return true;
       }
 
       async function joinOnBattlePage(run, control) {
@@ -5416,7 +5490,6 @@
           if (!Number.isFinite(snapshot.playerHp) || !Number.isFinite(snapshot.playerMaxHp) || snapshot.playerMaxHp <= 0) {
             return true;
           }
-          if (snapshot.playerHp <= 0) throw new VisitStop('resource', 'Player HP reached zero; Crucible PvE stopped.');
           if (snapshot.playerHp / snapshot.playerMaxHp > TIMING.lowHpFraction) return true;
           await ensureInventory();
           const potion = pickPotion(inventory, route.potions.heal);
@@ -8681,7 +8754,6 @@
           if (!Number.isFinite(snapshot.playerHp) || !Number.isFinite(snapshot.playerMaxHp) || snapshot.playerMaxHp <= 0) {
             return true;
           }
-          if (snapshot.playerHp <= 0) throw new VisitStop('resource', `Player HP reached zero; ${workerName} stopped.`);
           if (snapshot.playerHp / snapshot.playerMaxHp > TIMING.lowHpFraction) return true;
           await ensureInventory();
           const potion = pickPotion(inventory, route.potions.heal);

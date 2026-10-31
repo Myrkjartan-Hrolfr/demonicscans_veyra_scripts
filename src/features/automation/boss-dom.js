@@ -3,7 +3,7 @@
 // Reads the boss hub (active_wave.php) and battle page (battle.php) into the
 // plain objects boss-logic.js works with. Null safe throughout.
 
-const { parseGameNumber } = require('../../core/numbers');
+const { parseFraction, parseGameNumber } = require('../../core/numbers');
 
 const SELECTORS = Object.freeze({
   summonCard: '.auto-summon-card',
@@ -15,6 +15,7 @@ const SELECTORS = Object.freeze({
   battleCard: '.battle-card.monster-card[data-monster-id]',
   battleTitle: '.battle-card.monster-card .card-title',
   monsterImage: '#monsterImage',
+  playerHp: '#pHpText',
   phaseDuel: 'a[href*="pvp_style_battle.php"][href*="source=monster_phase"]',
 });
 
@@ -95,6 +96,10 @@ function findBattleJoinControl(doc) {
   return doc?.querySelector?.(SELECTORS.battleJoin) || null;
 }
 
+function readPlayerHealth(doc) {
+  return parseFraction(doc?.querySelector?.(SELECTORS.playerHp)?.textContent);
+}
+
 function findPhaseDuelControl(doc, base = 'https://demonicscans.org') {
   const element = doc?.querySelector?.(SELECTORS.phaseDuel) || null;
   const href = attr(element, 'href');
@@ -148,6 +153,7 @@ module.exports = {
   monsterIdFromHref,
   readCookieText,
   readMonsterCards,
+  readPlayerHealth,
   readSummons,
   setCookie,
 };

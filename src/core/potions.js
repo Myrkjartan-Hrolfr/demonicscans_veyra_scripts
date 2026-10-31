@@ -82,9 +82,18 @@ async function usePotion(entry, options = {}) {
     inv_id: entry.invId,
     qty: qty > 1 ? qty : undefined,
   });
+  const data = response?.json;
+  let succeeded;
+  if (data && typeof data === 'object' && Object.prototype.hasOwnProperty.call(data, 'status')) {
+    succeeded = String(data.status || '').trim().toLowerCase() === 'success';
+  } else if (data && typeof data === 'object' && Object.prototype.hasOwnProperty.call(data, 'success')) {
+    succeeded = data.success === true;
+  } else {
+    succeeded = /\bsuccess(?:fully)?\b/i.test(String(response?.text || ''));
+  }
   return {
-    ok: response.ok && String(response.text || '').toLowerCase().includes('success'),
-    message: String(response.text || '').trim(),
+    ok: Boolean(response?.ok && succeeded),
+    message: String(response?.text || data?.message || '').trim(),
   };
 }
 
