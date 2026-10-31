@@ -76,6 +76,7 @@ URLs: Wave 3 `active_wave.php?gate=3&wave=8`. Olympus `gate=5`: außen wave=9, H
 | 4.1.4 | Modus pro Monster: Max Loot / Kill / individueller Schaden mit eigenem Feld (kein Max EXP bei normalen Mobs) | [vorh.] | |
 | 4.1.5 | Schnelleinstellung „Clean dungeon“: alle Monster aktiv und auf Kill | [vorh.] | |
 | 4.1.6 | Skill-Auswahl, Standard Slash | [vorh.] | |
+| 4.1.6a | Alternativer Skill für gefährdete Max-Loot-Ziele | [vorh.] | Vor jedem Angriff wird der noch benötigte persönliche Schaden mit den verbleibenden Monster-HP verglichen. Bei `HP <= Restschaden` verwendet der Worker den separat ausgewählten alternativen Skill; ohne Auswahl bleibt das bisherige Verhalten unverändert. |
 | 4.1.7 | Attack-Cooldown 100–2000 ms, Standard 100 ms | [vorh.] | Bei HTTP 429/503 bremst das Skript automatisch ab und prüft vor jedem Retry erneut Scheduler-Lease und Deadline. |
 | 4.1.8 | Skript wie `dungeon_auto_damage_fast`, aber eigenständig | [vorh.] | Keine Abhängigkeit vom externen UI-Improvements-Skript. |
 | 4.1.9 | Mehrere Locations (1–4) durchlaufen | [vorh.] | |

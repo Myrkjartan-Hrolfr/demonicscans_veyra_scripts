@@ -94,11 +94,13 @@ function normalizeSettings(value) {
   }
 
   const skill = String(value?.skill ?? '0');
+  const alternativeSkill = String(value?.alternativeSkill ?? '');
   return {
     order: normalizeOrder(value?.order),
     monsters,
     bossRoom: normalizeTarget(value?.bossRoom, BOSS_MODES),
     skill: SKILL_ID_SET.has(skill) ? skill : '0',
+    alternativeSkill: SKILL_ID_SET.has(alternativeSkill) ? alternativeSkill : '',
     attackCooldownMs: normalizeCooldown(value?.attackCooldownMs),
   };
 }
@@ -149,6 +151,42 @@ function renderSettings(ctx) {
     }),
   );
   ctx.container.appendChild(skillGroup);
+
+  const alternativeSkillGroup = ctx.make('div', { className: ctx.cls('setting') });
+  const alternativeSkillLabel = ctx.make('label', { text: 'Alternative Max Loot skill' });
+  const alternativeSkillId = `${ctx.idPrefix}-alternative-skill`;
+  alternativeSkillLabel.setAttribute?.('for', alternativeSkillId);
+  const alternativeSkillSelect = ctx.make('select', {
+    id: alternativeSkillId,
+    className: ctx.cls('select'),
+  });
+  const disabledAlternative = ctx.make('option', { text: 'Disabled (use normal attack)' });
+  disabledAlternative.value = '';
+  alternativeSkillSelect.appendChild(disabledAlternative);
+  for (const skill of SHADOWBRIDGE_SKILLS) {
+    const option = ctx.make('option', { text: `${skill.name} (${skill.cost} stamina)` });
+    option.value = skill.id;
+    alternativeSkillSelect.appendChild(option);
+  }
+  alternativeSkillSelect.value = ctx.settings.alternativeSkill;
+  setTouchSize(alternativeSkillSelect);
+  alternativeSkillSelect.addEventListener('change', () => {
+    ctx.settings = ctx.updateSettings((settings) => {
+      settings.alternativeSkill = alternativeSkillSelect.value;
+    });
+    alternativeSkillSelect.value = ctx.settings.alternativeSkill;
+  });
+  alternativeSkillGroup.appendChild(alternativeSkillLabel);
+  alternativeSkillGroup.appendChild(alternativeSkillSelect);
+  alternativeSkillGroup.appendChild(
+    ctx.make('div', {
+      className: ctx.cls('hint'),
+      text:
+        'Only for Max loot: this skill is used when the monster\'s remaining HP are less than or equal ' +
+        'to the personal damage still needed for the loot target.',
+    }),
+  );
+  ctx.container.appendChild(alternativeSkillGroup);
 
   const cooldownInput = ctx.addTextInput({
     id: 'attack-cooldown-ms',

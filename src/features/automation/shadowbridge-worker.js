@@ -370,14 +370,9 @@ function createShadowbridgeWorker({
       return { reason: 'target', attacks: 0 };
     }
 
-    const skill = logic.skillForId(route.settings.skill);
-    const payload = logic.buildDamagePayload({
-      instanceId: target.instanceId,
-      monsterId: target.monsterId,
-      skillId: route.settings.skill,
-    });
-    if (!skill || !payload) throw new Error(`The selected ${workerName} skill is invalid.`);
-    const effectiveStaminaCost = staminaCost(skill.cost, asterionMultiplier);
+    if (!logic.skillForId(route.settings.skill)) {
+      throw new Error(`The selected ${workerName} skill is invalid.`);
+    }
     const resources = createResourceManager(visitId, route, battle.doc);
     let ownDamage = battle.snapshot.ownDamage;
     let attempts = 0;
@@ -389,15 +384,34 @@ function createShadowbridgeWorker({
         statusView.updateTarget(target.key, { status: 'completed', result: 'Damage target reached' });
         return { reason: 'target', attacks: attempts };
       }
+      const skillChoice = logic.selectAttackSkill({
+        mode: target.target.mode,
+        primarySkillId: route.settings.skill,
+        alternativeSkillId: route.settings.alternativeSkill,
+        currentHp: battle.snapshot.currentHp,
+        targetDamage: decision.targetDamage,
+        ownDamage,
+      });
+      const skill = skillChoice?.skill || null;
+      const payload = logic.buildDamagePayload({
+        instanceId: target.instanceId,
+        monsterId: target.monsterId,
+        skillId: skill?.id,
+      });
+      if (!skill || !payload) throw new Error(`The selected ${workerName} skill is invalid.`);
+      const effectiveStaminaCost = staminaCost(skill.cost, asterionMultiplier);
       await resources.ensureHealth(battle.snapshot);
       await resources.ensureStamina(effectiveStaminaCost);
       assertCanMutate(visitId);
 
+      const alternativeNote = skillChoice.usedAlternative
+        ? `, alternative ${skill.name}: ${battle.snapshot.currentHp} HP <= ${skillChoice.remainingDamage} needed damage`
+        : '';
       setWorkingMessage(
         visitId,
         `Attacking ${target.name || `${workerName} monster`} (${attempts + 1}${
           decision.untilDead ? ', until defeated' : `, ${Math.max(0, decision.targetDamage - ownDamage)} damage remaining`
-        }).`,
+        }${alternativeNote}).`,
       );
       const response = await guardedPostForm(visitId, DAMAGE_URL, payload, {
         onRateLimit({ waitMs }) {

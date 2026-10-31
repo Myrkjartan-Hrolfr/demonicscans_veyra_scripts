@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.8.1
+// @version      0.8.2
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -8087,6 +8087,43 @@
       return SKILL_BY_ID.get(String(skillId)) || null;
     }
 
+    // Max Loot can become impossible when other players reduce the monster's HP
+    // faster than this player reaches the personal loot requirement. In that
+    // last-chance situation an explicitly configured alternative skill is used.
+    function selectAttackSkill({
+      mode,
+      primarySkillId,
+      alternativeSkillId,
+      currentHp,
+      targetDamage,
+      ownDamage,
+    } = {}) {
+      const primary = skillForId(primarySkillId);
+      if (!primary) return null;
+
+      const remainingDamage =
+        Number.isFinite(targetDamage) && Number.isFinite(ownDamage)
+          ? Math.max(0, targetDamage - ownDamage)
+          : null;
+      const alternative = skillForId(alternativeSkillId);
+      const usedAlternative = Boolean(
+        mode === 'max-loot' &&
+          alternative &&
+          alternative.id !== primary.id &&
+          Number.isFinite(currentHp) &&
+          currentHp > 0 &&
+          Number.isFinite(remainingDamage) &&
+          remainingDamage > 0 &&
+          currentHp <= remainingDamage,
+      );
+
+      return {
+        skill: usedAlternative ? alternative : primary,
+        usedAlternative,
+        remainingDamage,
+      };
+    }
+
     function buildDamagePayload({ instanceId, monsterId, skillId } = {}) {
       const instance = cleanIdentifier(instanceId);
       const monster = cleanIdentifier(monsterId);
@@ -8182,6 +8219,7 @@
       parseJoinResponse,
       parseLocationPage,
       resolveDamageTarget,
+      selectAttackSkill,
       skillForId,
     };
   },
@@ -8857,14 +8895,9 @@
           return { reason: 'target', attacks: 0 };
         }
 
-        const skill = logic.skillForId(route.settings.skill);
-        const payload = logic.buildDamagePayload({
-          instanceId: target.instanceId,
-          monsterId: target.monsterId,
-          skillId: route.settings.skill,
-        });
-        if (!skill || !payload) throw new Error(`The selected ${workerName} skill is invalid.`);
-        const effectiveStaminaCost = staminaCost(skill.cost, asterionMultiplier);
+        if (!logic.skillForId(route.settings.skill)) {
+          throw new Error(`The selected ${workerName} skill is invalid.`);
+        }
         const resources = createResourceManager(visitId, route, battle.doc);
         let ownDamage = battle.snapshot.ownDamage;
         let attempts = 0;
@@ -8876,15 +8909,34 @@
             statusView.updateTarget(target.key, { status: 'completed', result: 'Damage target reached' });
             return { reason: 'target', attacks: attempts };
           }
+          const skillChoice = logic.selectAttackSkill({
+            mode: target.target.mode,
+            primarySkillId: route.settings.skill,
+            alternativeSkillId: route.settings.alternativeSkill,
+            currentHp: battle.snapshot.currentHp,
+            targetDamage: decision.targetDamage,
+            ownDamage,
+          });
+          const skill = skillChoice?.skill || null;
+          const payload = logic.buildDamagePayload({
+            instanceId: target.instanceId,
+            monsterId: target.monsterId,
+            skillId: skill?.id,
+          });
+          if (!skill || !payload) throw new Error(`The selected ${workerName} skill is invalid.`);
+          const effectiveStaminaCost = staminaCost(skill.cost, asterionMultiplier);
           await resources.ensureHealth(battle.snapshot);
           await resources.ensureStamina(effectiveStaminaCost);
           assertCanMutate(visitId);
 
+          const alternativeNote = skillChoice.usedAlternative
+            ? `, alternative ${skill.name}: ${battle.snapshot.currentHp} HP <= ${skillChoice.remainingDamage} needed damage`
+            : '';
           setWorkingMessage(
             visitId,
             `Attacking ${target.name || `${workerName} monster`} (${attempts + 1}${
               decision.untilDead ? ', until defeated' : `, ${Math.max(0, decision.targetDamage - ownDamage)} damage remaining`
-            }).`,
+            }${alternativeNote}).`,
           );
           const response = await guardedPostForm(visitId, DAMAGE_URL, payload, {
             onRateLimit({ waitMs }) {
@@ -23742,11 +23794,13 @@
       }
 
       const skill = String(value?.skill ?? '0');
+      const alternativeSkill = String(value?.alternativeSkill ?? '');
       return {
         order: normalizeOrder(value?.order),
         monsters,
         bossRoom: normalizeTarget(value?.bossRoom, BOSS_MODES),
         skill: SKILL_ID_SET.has(skill) ? skill : '0',
+        alternativeSkill: SKILL_ID_SET.has(alternativeSkill) ? alternativeSkill : '',
         attackCooldownMs: normalizeCooldown(value?.attackCooldownMs),
       };
     }
@@ -23797,6 +23851,42 @@
         }),
       );
       ctx.container.appendChild(skillGroup);
+
+      const alternativeSkillGroup = ctx.make('div', { className: ctx.cls('setting') });
+      const alternativeSkillLabel = ctx.make('label', { text: 'Alternative Max Loot skill' });
+      const alternativeSkillId = `${ctx.idPrefix}-alternative-skill`;
+      alternativeSkillLabel.setAttribute?.('for', alternativeSkillId);
+      const alternativeSkillSelect = ctx.make('select', {
+        id: alternativeSkillId,
+        className: ctx.cls('select'),
+      });
+      const disabledAlternative = ctx.make('option', { text: 'Disabled (use normal attack)' });
+      disabledAlternative.value = '';
+      alternativeSkillSelect.appendChild(disabledAlternative);
+      for (const skill of SHADOWBRIDGE_SKILLS) {
+        const option = ctx.make('option', { text: `${skill.name} (${skill.cost} stamina)` });
+        option.value = skill.id;
+        alternativeSkillSelect.appendChild(option);
+      }
+      alternativeSkillSelect.value = ctx.settings.alternativeSkill;
+      setTouchSize(alternativeSkillSelect);
+      alternativeSkillSelect.addEventListener('change', () => {
+        ctx.settings = ctx.updateSettings((settings) => {
+          settings.alternativeSkill = alternativeSkillSelect.value;
+        });
+        alternativeSkillSelect.value = ctx.settings.alternativeSkill;
+      });
+      alternativeSkillGroup.appendChild(alternativeSkillLabel);
+      alternativeSkillGroup.appendChild(alternativeSkillSelect);
+      alternativeSkillGroup.appendChild(
+        ctx.make('div', {
+          className: ctx.cls('hint'),
+          text:
+            'Only for Max loot: this skill is used when the monster\'s remaining HP are less than or equal ' +
+            'to the personal damage still needed for the loot target.',
+        }),
+      );
+      ctx.container.appendChild(alternativeSkillGroup);
 
       const cooldownInput = ctx.addTextInput({
         id: 'attack-cooldown-ms',

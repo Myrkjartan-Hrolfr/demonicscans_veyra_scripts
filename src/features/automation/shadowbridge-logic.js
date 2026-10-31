@@ -401,6 +401,43 @@ function skillForId(skillId) {
   return SKILL_BY_ID.get(String(skillId)) || null;
 }
 
+// Max Loot can become impossible when other players reduce the monster's HP
+// faster than this player reaches the personal loot requirement. In that
+// last-chance situation an explicitly configured alternative skill is used.
+function selectAttackSkill({
+  mode,
+  primarySkillId,
+  alternativeSkillId,
+  currentHp,
+  targetDamage,
+  ownDamage,
+} = {}) {
+  const primary = skillForId(primarySkillId);
+  if (!primary) return null;
+
+  const remainingDamage =
+    Number.isFinite(targetDamage) && Number.isFinite(ownDamage)
+      ? Math.max(0, targetDamage - ownDamage)
+      : null;
+  const alternative = skillForId(alternativeSkillId);
+  const usedAlternative = Boolean(
+    mode === 'max-loot' &&
+      alternative &&
+      alternative.id !== primary.id &&
+      Number.isFinite(currentHp) &&
+      currentHp > 0 &&
+      Number.isFinite(remainingDamage) &&
+      remainingDamage > 0 &&
+      currentHp <= remainingDamage,
+  );
+
+  return {
+    skill: usedAlternative ? alternative : primary,
+    usedAlternative,
+    remainingDamage,
+  };
+}
+
 function buildDamagePayload({ instanceId, monsterId, skillId } = {}) {
   const instance = cleanIdentifier(instanceId);
   const monster = cleanIdentifier(monsterId);
@@ -496,5 +533,6 @@ module.exports = {
   parseJoinResponse,
   parseLocationPage,
   resolveDamageTarget,
+  selectAttackSkill,
   skillForId,
 };

@@ -309,6 +309,29 @@ test('builds exact API payloads and always uses base stamina costs', () => {
   assert.equal(logic.buildDamagePayload({ instanceId: 16137, monsterId: 7001, skillId: '-99' }), null);
 });
 
+test('selects the alternative Max Loot skill only at the remaining-HP threshold', () => {
+  const base = {
+    mode: 'max-loot',
+    primarySkillId: '0',
+    alternativeSkillId: '-4',
+    targetDamage: 2_000_000,
+    ownDamage: 1_250_000,
+  };
+
+  const threshold = logic.selectAttackSkill({ ...base, currentHp: 750_000 });
+  assert.equal(threshold.skill.id, '-4');
+  assert.equal(threshold.usedAlternative, true);
+  assert.equal(threshold.remainingDamage, 750_000);
+
+  const aboveThreshold = logic.selectAttackSkill({ ...base, currentHp: 750_001 });
+  assert.equal(aboveThreshold.skill.id, '0');
+  assert.equal(aboveThreshold.usedAlternative, false);
+
+  assert.equal(logic.selectAttackSkill({ ...base, mode: 'kill', currentHp: 1 }).skill.id, '0');
+  assert.equal(logic.selectAttackSkill({ ...base, alternativeSkillId: '', currentHp: 1 }).skill.id, '0');
+  assert.equal(logic.selectAttackSkill({ ...base, currentHp: null }).skill.id, '0');
+});
+
 test('requires semantic success from join and damage responses', () => {
   assert.equal(
     logic.parseJoinResponse({ ok: true, json: null, text: 'You have successfully joined the battle!' }).ok,

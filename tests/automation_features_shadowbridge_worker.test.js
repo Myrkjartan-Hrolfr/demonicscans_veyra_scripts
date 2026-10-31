@@ -93,13 +93,14 @@ function command(overrides = {}) {
   };
 }
 
-function shadowConfig({ skill = '0', mode = 'max-loot', damage = '1m' } = {}) {
+function shadowConfig({ skill = '0', alternativeSkill = '', mode = 'max-loot', damage = '1m' } = {}) {
   const config = createDefaultConfig();
   const route = config.routes.shadowbridge;
   for (const target of Object.values(route.settings.monsters)) target.enabled = false;
   route.settings.monsters['talla-flint-stem'] = { enabled: true, mode, damage };
   route.settings.bossRoom.enabled = false;
   route.settings.skill = skill;
+  route.settings.alternativeSkill = alternativeSkill;
   route.settings.attackCooldownMs = 100;
   return config;
 }
@@ -174,6 +175,8 @@ function battleDocument({
   includeOwnRow = true,
   loot = 100,
   stamina = 1_000,
+  monsterHp = 10_000,
+  monsterMaxHp = 10_000,
   playerHp = 12_000,
   playerMaxHp = 12_000,
   potions = [],
@@ -189,12 +192,12 @@ function battleDocument({
     one: {
       '#join-battle': joined ? null : element({ text: 'Join Battle' }),
       '.battle-actions-card': element({ text: joined ? 'Battle actions' : 'Join this battle' }),
-      '#hpText': element({ text: '10,000 / 10,000' }),
+      '#hpText': element({ text: `${monsterHp} / ${monsterMaxHp}` }),
       '#pHpText': element({ text: `${playerHp} / ${playerMaxHp}` }),
       '#stamina_span': element({ text: String(stamina) }),
     },
     many: {
-      '.stat-block': [statBlock('Monster HP', '10,000')],
+      '.stat-block': [statBlock('Monster HP', String(monsterMaxHp))],
       '.loot-card .chip, .loot-stats .chip': [lootChip],
       '.lb-list .lb-row': includeOwnRow ? [playerRow] : [],
       '.potion-card[data-inv-id][data-item-id]': potions,
@@ -375,6 +378,50 @@ test('joins, attacks to the live loot limit and sends the base skill cost despit
       percent: 100,
     },
   );
+});
+
+test('switches to the alternative skill when remaining monster HP reach the missing Max Loot damage', async () => {
+  const config = shadowConfig({ skill: '0', alternativeSkill: '-4' });
+  let damageCalls = 0;
+  const env = createEnvironment({
+    config,
+    asterionMultiplier: 2,
+    battleDocuments: [
+      battleDocument({
+        ownDamage: 0,
+        loot: 200,
+        monsterHp: 300,
+        monsterMaxHp: 300,
+        stamina: 1_000,
+      }),
+    ],
+    post(url) {
+      if (url !== DAMAGE_URL) throw new Error(`Unexpected POST ${url}`);
+      damageCalls += 1;
+      return damageCalls === 1
+        ? {
+            ok: true,
+            status: 200,
+            text: '',
+            json: { status: 'success', damage: 100, hp: { value: 100, max: 300 } },
+          }
+        : {
+            ok: true,
+            status: 200,
+            text: '',
+            json: { status: 'success', damage: 100, hp: { value: 0, max: 300 } },
+          };
+    },
+  });
+
+  await env.worker.tick();
+
+  const damagePosts = env.posts.filter((entry) => entry.url === DAMAGE_URL);
+  assert.deepEqual(damagePosts.map((entry) => entry.params), [
+    { instance_id: '16137', dgmid: '7001', skill_id: '0', stamina_cost: 1 },
+    { instance_id: '16137', dgmid: '7001', skill_id: '-4', stamina_cost: 200 },
+  ]);
+  assert.equal(env.store.read(workerStatusKey('shadowbridge')).state, 'done');
 });
 
 test('heals at zero player HP before attacking a Shadowbridge monster', async () => {

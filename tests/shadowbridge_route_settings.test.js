@@ -126,6 +126,7 @@ test('Shadowbridge settings normalize order, targets, skill, damage and cooldown
   const canonicalOrder = shadowbridge.SHADOWBRIDGE_MONSTERS.map((monster) => monster.id);
   assert.deepEqual(defaults.order, canonicalOrder);
   assert.equal(defaults.skill, '0');
+  assert.equal(defaults.alternativeSkill, '');
   assert.equal(defaults.attackCooldownMs, 100);
   assert.equal(Object.values(defaults.monsters).every((target) => target.enabled && target.mode === 'max-loot'), true);
   assert.deepEqual(defaults.bossRoom, { enabled: true, mode: 'max-loot', damage: '1m' });
@@ -142,6 +143,7 @@ test('Shadowbridge settings normalize order, targets, skill, damage and cooldown
           },
           bossRoom: { enabled: false, mode: 'max-exp', damage: '750m' },
           skill: '-3',
+          alternativeSkill: '-2',
           attackCooldownMs: 9_999,
         },
       },
@@ -162,10 +164,16 @@ test('Shadowbridge settings normalize order, targets, skill, damage and cooldown
   });
   assert.deepEqual(saved.bossRoom, { enabled: false, mode: 'max-exp', damage: '750m' });
   assert.equal(saved.skill, '-3');
+  assert.equal(saved.alternativeSkill, '-2');
   assert.equal(saved.attackCooldownMs, 2_000);
 
-  const invalid = shadowbridge.normalizeSettings({ skill: 'unknown', attackCooldownMs: 5 });
+  const invalid = shadowbridge.normalizeSettings({
+    skill: 'unknown',
+    alternativeSkill: 'unknown',
+    attackCooldownMs: 5,
+  });
   assert.equal(invalid.skill, '0');
+  assert.equal(invalid.alternativeSkill, '');
   assert.equal(invalid.attackCooldownMs, 100);
 });
 
@@ -173,6 +181,7 @@ test('Clean Dungeon enables every target in kill mode without discarding other s
   const custom = shadowbridge.normalizeSettings({
     order: ['zorgra-frost-vein'],
     skill: '-2',
+    alternativeSkill: '-4',
     attackCooldownMs: 450,
     monsters: { 'talla-flint-stem': { enabled: false, mode: 'custom', damage: '9m' } },
     bossRoom: { enabled: false, mode: 'max-exp', damage: '20m' },
@@ -184,6 +193,7 @@ test('Clean Dungeon enables every target in kill mode without discarding other s
   assert.equal(cleaned.monsters['talla-flint-stem'].damage, '9m');
   assert.equal(cleaned.bossRoom.damage, '20m');
   assert.equal(cleaned.skill, '-2');
+  assert.equal(cleaned.alternativeSkill, '-4');
   assert.equal(cleaned.attackCooldownMs, 450);
   assert.deepEqual(cleaned.order, custom.order);
 });
@@ -193,6 +203,7 @@ test('Shadowbridge menu exposes English touch controls, live modes, ordering and
   const prefix = 'veyra-automation-shadowbridge';
   const cleanButton = harness.byId(`${prefix}-clean-dungeon`);
   const skill = harness.byId(`${prefix}-skill`);
+  const alternativeSkill = harness.byId(`${prefix}-alternative-skill`);
   const cooldown = harness.byId(`${prefix}-attack-cooldown-ms`);
   const firstUp = harness.byId(`${prefix}-target-talla-flint-stem-up`);
   const firstDown = harness.byId(`${prefix}-target-talla-flint-stem-down`);
@@ -205,6 +216,7 @@ test('Shadowbridge menu exposes English touch controls, live modes, ordering and
   assert.equal(firstDown.style.minHeight, '44px');
   assert.equal(firstUp.disabled, true);
   assert.equal(skill.children[0].textContent, 'Slash (1 stamina)');
+  assert.deepEqual(alternativeSkill.children.map((option) => option.value), ['', '0', '-1', '-2', '-3', '-4']);
   assert.equal(cooldown.min, '100');
   assert.equal(cooldown.max, '2000');
   assert.deepEqual(normalMode.children.map((option) => option.value), ['max-loot', 'kill', 'custom']);
@@ -216,6 +228,10 @@ test('Shadowbridge menu exposes English touch controls, live modes, ordering and
 
   firstDown.dispatch('click');
   assert.deepEqual(harness.getSettings().order.slice(0, 2), ['gribble-junk-magus', 'talla-flint-stem']);
+
+  alternativeSkill.value = '-4';
+  alternativeSkill.dispatch('change');
+  assert.equal(harness.getSettings().alternativeSkill, '-4');
 
   normalMode.value = 'custom';
   normalMode.dispatch('change');
