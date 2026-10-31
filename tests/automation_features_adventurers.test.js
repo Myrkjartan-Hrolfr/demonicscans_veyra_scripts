@@ -6,6 +6,7 @@ const assert = require('node:assert/strict');
 const { LOOT_GUARD_KEY } = require('../src/core/loot-guard');
 const { COMMAND_KEY, workerStatusKey } = require('../src/core/protocol');
 const { CONFIG_KEY, createDefaultConfig } = require('../src/scheduler/config');
+const { LEASE_KEY, TAB_KEY } = require('../src/scheduler/engine');
 const { routeIdForUrl } = require('../src/scheduler/runtime');
 const adventurersRoute = require('../src/routes/adventurers');
 const { ROUTES } = require('../src/routes');
@@ -15,6 +16,7 @@ const {
   AUTOFARM_SNAPSHOT_KEY,
   AUTO_FARM_PATH,
   FINISH_PATH,
+  GUILD_PATH,
   LOOT_PATH,
   createAdventurersWorker,
 } = require('../src/features/automation/adventurers-worker');
@@ -61,6 +63,39 @@ function documentWith({ text = '', one = {}, many = {} } = {}) {
     addEventListener() {},
     removeEventListener() {},
   };
+}
+
+function documentWithCookies(doc, initial, events = []) {
+  const values = new Map(Object.entries(initial).map(([name, value]) => [String(name), String(value)]));
+  Object.defineProperty(doc, 'cookie', {
+    configurable: true,
+    get() {
+      return [...values].map(([name, value]) => `${name}=${encodeURIComponent(value)}`).join('; ');
+    },
+    set(text) {
+      const parts = String(text || '').split(';');
+      const pair = parts.shift() || '';
+      const separator = pair.indexOf('=');
+      if (separator < 1) return;
+      const name = pair.slice(0, separator).trim();
+      const encoded = pair.slice(separator + 1).trim();
+      let value = encoded;
+      try {
+        value = decodeURIComponent(encoded);
+      } catch {
+        // Keep malformed values observable instead of making the fake jar throw.
+      }
+      const maxAge = parts
+        .map((part) => part.trim().match(/^Max-Age=(-?\d+)$/i))
+        .find(Boolean);
+      if (maxAge && Number(maxAge[1]) <= 0) values.delete(name);
+      else values.set(name, value);
+      events.push({ type: 'cookie-write', name, value, raw: String(text) });
+    },
+  });
+  doc.cookieValues = values;
+  doc.cookieEvents = events;
+  return doc;
 }
 
 function questRow({ id = '31', state = 'available', current = 0, count = 10, cooldownAt = 0 } = {}) {
@@ -132,10 +167,60 @@ function createStore(initial = {}) {
   };
 }
 
+function runningAdventurersCommand(visitId) {
+  return {
+    version: 1,
+    visitId,
+    taskId: 'adventurers',
+    phase: 'running',
+    returnPath: '/pvp.php',
+    issuedAt: NOW - 1_000,
+    deadlineAt: NOW + 60_000,
+  };
+}
+
+function adventurersWindow(doc) {
+  return {
+    document: doc,
+    location: {
+      href: 'https://demonicscans.org/adventurers_guild.php?veyra_route=adventurers',
+      origin: 'https://demonicscans.org',
+    },
+    setInterval: () => 1,
+    clearInterval() {},
+    addEventListener() {},
+    removeEventListener() {},
+  };
+}
+
+function cookieSnapshot(doc) {
+  return Object.fromEntries(doc.cookieValues);
+}
+
+function assertDeadPoolCookiesRestored(doc, events, afterEventIndex) {
+  assert.deepEqual(cookieSnapshot(doc), {
+    hide_dead_monsters: '1',
+    show_dead_bosses_only: '0',
+  });
+  const cleanupWrites = events.slice(afterEventIndex + 1).filter((event) => event.type === 'cookie-write');
+  assert.equal(
+    cleanupWrites.some(
+      (event) => event.name === 'hide_dead_monsters' && event.value === '1',
+    ),
+    true,
+  );
+  assert.equal(
+    cleanupWrites.some(
+      (event) => event.name === 'show_dead_bosses_only' && event.value === '0',
+    ),
+    true,
+  );
+}
+
 test("Adventurer's Guild route is distinct and disabled by default", () => {
   assert.equal(ROUTES.adventurers, adventurersRoute);
   assert.equal(routeIdForUrl('/adventurers_guild.php?veyra_route=adventurers'), 'adventurers');
-  assert.equal(routeIdForUrl('/adventurers_guild.php'), null);
+  assert.equal(routeIdForUrl('/adventurers_guild.php'), 'adventurers');
   assert.equal(createDefaultConfig().routes.adventurers.enabled, false);
 });
 
@@ -171,6 +256,174 @@ test('dead monster selection requires eligibility, damage and a future expiry', 
   assert.equal(expired, null);
   assert.deepEqual(logic.eligibleForRequirement([valid, weak], requirement).map((monster) => monster.id), ['1']);
   assert.equal(logic.requirementsSatisfied([requirement], [valid]), false);
+});
+
+test('worker reveals the dead pool before Wave fetches and restores both filter cookies after success', async () => {
+  let state = 'available';
+  let progress = 0;
+  const events = [];
+  const pageDoc = documentWithCookies(
+    guildDocument('available', 0, 1),
+    { hide_dead_monsters: '1', show_dead_bosses_only: '0' },
+    events,
+  );
+  const store = createStore({ [COMMAND_KEY]: runningAdventurersCommand('adv-cookies-success') });
+  const worker = createAdventurersWorker({
+    win: adventurersWindow(pageDoc),
+    doc: pageDoc,
+    store,
+    fetchDocument: async (url) => {
+      if (String(url).includes('active_wave.php')) {
+        events.push({ type: 'wave-fetch', cookies: cookieSnapshot(pageDoc) });
+        return waveDocument();
+      }
+      return guildDocument(state, progress, 1);
+    },
+    postForm: async (url) => {
+      if (url === ACCEPT_PATH) state = 'active';
+      if (url === LOOT_PATH) progress = 1;
+      if (url === FINISH_PATH) state = 'cooldown';
+      return { ok: true, status: 200, json: { status: url === LOOT_PATH ? 'success' : 'ok' }, text: '' };
+    },
+    getUserId: async () => '7',
+    sleepImpl: async () => {},
+    now: () => NOW,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await worker.tick();
+
+  const waveFetches = events.filter((event) => event.type === 'wave-fetch');
+  assert.ok(waveFetches.length >= 1);
+  for (const event of waveFetches) {
+    assert.equal(event.cookies.hide_dead_monsters, '0');
+    assert.equal(event.cookies.show_dead_bosses_only, '0');
+  }
+  assertDeadPoolCookiesRestored(pageDoc, events, events.lastIndexOf(waveFetches.at(-1)));
+  assert.equal(store.read(workerStatusKey('adventurers')).state, 'done');
+});
+
+test('worker restores the dead-pool filter cookies when a Wave fetch fails', async () => {
+  const events = [];
+  const pageDoc = documentWithCookies(
+    guildDocument('available', 0, 1),
+    { hide_dead_monsters: '1', show_dead_bosses_only: '0' },
+    events,
+  );
+  const store = createStore({ [COMMAND_KEY]: runningAdventurersCommand('adv-cookies-error') });
+  const worker = createAdventurersWorker({
+    win: adventurersWindow(pageDoc),
+    doc: pageDoc,
+    store,
+    fetchDocument: async (url) => {
+      if (String(url).includes('active_wave.php')) {
+        events.push({ type: 'wave-fetch', cookies: cookieSnapshot(pageDoc) });
+        throw new Error('Wave request failed');
+      }
+      return guildDocument('available', 0, 1);
+    },
+    postForm: async () => {
+      throw new Error('No mutation is expected before the failed Wave fetch.');
+    },
+    getUserId: async () => '7',
+    sleepImpl: async () => {},
+    now: () => NOW,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await worker.tick();
+
+  const waveIndex = events.findIndex((event) => event.type === 'wave-fetch');
+  assert.notEqual(waveIndex, -1);
+  assert.equal(events[waveIndex].cookies.hide_dead_monsters, '0');
+  assert.equal(events[waveIndex].cookies.show_dead_bosses_only, '0');
+  assertDeadPoolCookiesRestored(pageDoc, events, waveIndex);
+  assert.equal(store.read(workerStatusKey('adventurers')).state, 'error');
+});
+
+test('worker restores the dead-pool filter cookies when its visit starts draining mid-scan', async () => {
+  const events = [];
+  const pageDoc = documentWithCookies(
+    guildDocument('available', 0, 1),
+    { hide_dead_monsters: '1', show_dead_bosses_only: '0' },
+    events,
+  );
+  const store = createStore({ [COMMAND_KEY]: runningAdventurersCommand('adv-cookies-drain') });
+  const worker = createAdventurersWorker({
+    win: adventurersWindow(pageDoc),
+    doc: pageDoc,
+    store,
+    fetchDocument: async (url) => {
+      if (String(url).includes('active_wave.php')) {
+        events.push({ type: 'wave-fetch', cookies: cookieSnapshot(pageDoc) });
+        store.write(COMMAND_KEY, { ...store.read(COMMAND_KEY), phase: 'draining' });
+        return waveDocument();
+      }
+      return guildDocument('available', 0, 1);
+    },
+    postForm: async () => ({ ok: true, status: 200, json: { ok: true }, text: '' }),
+    getUserId: async () => '7',
+    sleepImpl: async () => {},
+    now: () => NOW,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await worker.tick();
+
+  const waveIndex = events.findIndex((event) => event.type === 'wave-fetch');
+  assert.notEqual(waveIndex, -1);
+  assert.equal(events[waveIndex].cookies.hide_dead_monsters, '0');
+  assertDeadPoolCookiesRestored(pageDoc, events, waveIndex);
+  assert.equal(store.read(workerStatusKey('adventurers')).state, 'done');
+});
+
+test('stopping the worker restores dead-pool filter cookies while a Wave fetch is still pending', async () => {
+  const events = [];
+  const pageDoc = documentWithCookies(
+    guildDocument('available', 0, 1),
+    { hide_dead_monsters: '1', show_dead_bosses_only: '0' },
+    events,
+  );
+  const store = createStore({ [COMMAND_KEY]: runningAdventurersCommand('adv-cookies-stop') });
+  let signalWaveStarted;
+  let releaseWave;
+  const waveStarted = new Promise((resolve) => {
+    signalWaveStarted = resolve;
+  });
+  const pendingWave = new Promise((resolve) => {
+    releaseWave = resolve;
+  });
+  const worker = createAdventurersWorker({
+    win: adventurersWindow(pageDoc),
+    doc: pageDoc,
+    store,
+    fetchDocument: async (url) => {
+      if (String(url).includes('active_wave.php')) {
+        events.push({ type: 'wave-fetch', cookies: cookieSnapshot(pageDoc) });
+        signalWaveStarted();
+        return pendingWave;
+      }
+      return guildDocument('available', 0, 1);
+    },
+    postForm: async () => ({ ok: true, status: 200, json: { ok: true }, text: '' }),
+    getUserId: async () => '7',
+    sleepImpl: async () => {},
+    now: () => NOW,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  const tickPromise = worker.tick();
+  await waveStarted;
+  const waveIndex = events.findIndex((event) => event.type === 'wave-fetch');
+  try {
+    assert.equal(events[waveIndex].cookies.hide_dead_monsters, '0');
+    worker.stop();
+    assertDeadPoolCookiesRestored(pageDoc, events, waveIndex);
+  } finally {
+    worker.stop();
+    releaseWave(waveDocument());
+    await tickPromise;
+  }
 });
 
 test('worker accepts, loots and finishes a ready quest without ever giving it up', async () => {
@@ -227,6 +480,70 @@ test('worker accepts, loots and finishes a ready quest without ever giving it up
   assert.equal(posts.some((entry) => /giveup/i.test(entry.url)), false);
   assert.deepEqual(store.read(LOOT_GUARD_KEY), { names: [] });
   const status = store.read(workerStatusKey('adventurers'));
+  assert.equal(status.state, 'done');
+  assert.equal(status.safeToLeave, true);
+  assert.equal(status.retryAt, NOW + 48 * 60 * 60_000);
+});
+
+test('worker continues a leased visit when the server removes the Adventurers route marker', async () => {
+  const ownerId = 'tab-adventurers';
+  const fetches = [];
+  const store = createStore({
+    [LEASE_KEY]: {
+      version: 1,
+      ownerId,
+      leaseUntil: NOW + 60_000,
+    },
+    [COMMAND_KEY]: {
+      version: 1,
+      visitId: 'adv-canonical',
+      taskId: 'adventurers',
+      phase: 'running',
+      returnPath: '/pvp.php',
+      issuedAt: NOW - 1_000,
+      deadlineAt: NOW + 60_000,
+    },
+  });
+  const sessionStore = {
+    available: true,
+    readRaw(key) {
+      return key === TAB_KEY ? ownerId : null;
+    },
+  };
+  const win = {
+    location: {
+      href: 'https://demonicscans.org/adventurers_guild.php',
+      origin: 'https://demonicscans.org',
+    },
+    setInterval: () => 1,
+    clearInterval() {},
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  const worker = createAdventurersWorker({
+    win,
+    doc: guildDocument('cooldown'),
+    store,
+    sessionStore,
+    fetchDocument: async (url) => {
+      fetches.push(String(url));
+      return guildDocument('cooldown');
+    },
+    postForm: async () => {
+      throw new Error('A cooldown-only visit must not mutate game state.');
+    },
+    getUserId: async () => '7',
+    sleepImpl: async () => {},
+    now: () => NOW,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await worker.tick();
+
+  assert.equal(fetches.length, 1);
+  assert.equal(fetches[0].startsWith(`${GUILD_PATH}?_veyra_quest=`), true);
+  const status = store.read(workerStatusKey('adventurers'));
+  assert.equal(status.visitId, 'adv-canonical');
   assert.equal(status.state, 'done');
   assert.equal(status.safeToLeave, true);
   assert.equal(status.retryAt, NOW + 48 * 60 * 60_000);

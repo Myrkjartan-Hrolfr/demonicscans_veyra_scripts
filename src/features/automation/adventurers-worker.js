@@ -12,6 +12,7 @@ const { sleep } = require('../../core/time');
 const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
 const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
 const logic = require('./adventurers-logic');
+const { createShadowbridgeStatusView } = require('./shadowbridge-status');
 
 const ROUTE_ID = 'adventurers';
 const GUILD_PATH = '/adventurers_guild.php';
@@ -25,6 +26,7 @@ const MAX_QUEST_STEPS = 100;
 const FARM_POLL_MS = 10_000;
 const ACTION_DELAY_MS = 150;
 const POTION_LIMIT = 1_000;
+const WAVE_FILTER_COOKIE_NAMES = Object.freeze(['hide_dead_monsters', 'show_dead_bosses_only']);
 
 const TIMING = Object.freeze({
   tickMs: 1_000,
@@ -53,6 +55,11 @@ function createAdventurersWorker({
   sleepImpl = sleep,
   now = () => Date.now(),
   logger = console,
+  statusView = createShadowbridgeStatusView(doc, {
+    title: "Adventurer's Guild progress",
+    idleText: 'Preparing quest automation…',
+    workingText: "Adventurer's Guild automation is working…",
+  }),
 }) {
   const runtime = {
     stopped: false,
@@ -64,6 +71,7 @@ function createAdventurersWorker({
     message: '',
     publishSignature: '',
     publishAt: 0,
+    waveFilterSnapshot: null,
   };
 
   function currentUrl() {
@@ -74,12 +82,68 @@ function createAdventurersWorker({
     }
   }
 
-  function isMarkedHub(url = currentUrl()) {
-    return Boolean(
-      url &&
-        /\/adventurers_guild\.php\/?$/i.test(url.pathname) &&
-        url.searchParams.get('veyra_route') === ROUTE_ID,
-    );
+  function isGuildPage(url = currentUrl()) {
+    // Unlike the shared guild-dungeon hub, Adventurer's Guild has an
+    // exclusive pathname. This remains stable even if a response canonicalizes
+    // the URL and drops the scheduler marker. The matching command and lease
+    // below still provide the ownership boundary for all mutations.
+    return Boolean(url && /\/adventurers_guild\.php\/?$/i.test(url.pathname));
+  }
+
+  function readCookies() {
+    const values = {};
+    let source = '';
+    try {
+      source = String(doc?.cookie || '');
+    } catch {
+      return values;
+    }
+    for (const part of source.split(';')) {
+      const separator = part.indexOf('=');
+      if (separator < 0) continue;
+      const name = part.slice(0, separator).trim();
+      if (!name) continue;
+      const rawValue = part.slice(separator + 1).trim();
+      try {
+        values[name] = decodeURIComponent(rawValue);
+      } catch {
+        values[name] = rawValue;
+      }
+    }
+    return values;
+  }
+
+  function setCookie(name, value) {
+    try {
+      doc.cookie = `${name}=${encodeURIComponent(value)}; Max-Age=${30 * 86_400}; Path=/; SameSite=Lax`;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function showDeadMonstersForQuestPool() {
+    if (!runtime.waveFilterSnapshot) {
+      const current = readCookies();
+      runtime.waveFilterSnapshot = Object.fromEntries(
+        WAVE_FILTER_COOKIE_NAMES.map((name) => [name, current[name] === '1' ? '1' : '0']),
+      );
+    }
+    setCookie('hide_dead_monsters', '0');
+    setCookie('show_dead_bosses_only', '0');
+  }
+
+  function restoreWaveFilter() {
+    const snapshot = runtime.waveFilterSnapshot;
+    runtime.waveFilterSnapshot = null;
+    if (!snapshot) return;
+    const current = readCookies();
+    for (const name of WAVE_FILTER_COOKIE_NAMES) {
+      // Do not overwrite a filter change made by the player or another tab
+      // while this background visit was running.
+      if (current[name] !== '0') continue;
+      setCookie(name, snapshot[name] === '1' ? '1' : '0');
+    }
   }
 
   function readCommand() {
@@ -120,6 +184,7 @@ function createAdventurersWorker({
 
   function setWorkingMessage(visitId, message) {
     runtime.message = message;
+    statusView.begin(message);
     publish('working', false, message, visitId);
     log(message);
   }
@@ -133,6 +198,7 @@ function createAdventurersWorker({
       note: String(options.note || ''),
     };
     runtime.runningVisitId = '';
+    statusView.finish(message, state);
     publish(state, true, message, visitId, { ...runtime.terminal, force: true });
     log(message, state === 'error' ? 'warn' : 'info');
   }
@@ -381,6 +447,10 @@ function createAdventurersWorker({
   }
 
   async function readDeadPool(visitId, requirements) {
+    // The boss worker intentionally leaves the live-monster filter enabled.
+    // Quest turn-ins need the opposite view because only eligible dead cards
+    // carry the monster IDs that can be looted.
+    showDeadMonstersForQuestPool();
     const first = await fetchFresh(visitId, logic.WAVE_PATH);
     const documents = [first];
     let totalPages = Math.min(MAX_DEAD_PAGES, logic.deadPageCount(first));
@@ -404,6 +474,7 @@ function createAdventurersWorker({
     for (let page = 2; page <= totalPages; page += 1) {
       if (logic.requirementsSatisfied(requirements, monsters)) break;
       await waitWithGuard(visitId, ACTION_DELAY_MS);
+      showDeadMonstersForQuestPool();
       const pageDoc = await fetchFresh(visitId, `${logic.WAVE_PATH}&dead_page=${page}`);
       documents.push(pageDoc);
       const cards = (pageDoc.querySelectorAll?.('.monster-card[data-dead="1"]') || []).length;
@@ -555,7 +626,7 @@ function createAdventurersWorker({
   }
 
   async function tick() {
-    if (runtime.stopped || runtime.ticking || !isMarkedHub()) return;
+    if (runtime.stopped || runtime.ticking || !isGuildPage()) return;
     const command = readCommand();
     if (!command) {
       publish('idle', true, "Adventurer's Guild worker is idle.");
@@ -601,6 +672,8 @@ function createAdventurersWorker({
     } finally {
       runtime.ticking = false;
       if (!runtime.terminal) runtime.runningVisitId = '';
+      if (ownsSchedulerLease()) restoreWaveFilter();
+      else runtime.waveFilterSnapshot = null;
     }
   }
 
@@ -634,6 +707,9 @@ function createAdventurersWorker({
 
   function stop() {
     runtime.stopped = true;
+    if (ownsSchedulerLease()) restoreWaveFilter();
+    else runtime.waveFilterSnapshot = null;
+    statusView.destroy();
     if (runtime.interval !== null) win.clearInterval?.(runtime.interval);
     if (runtime.heartbeat !== null) win.clearInterval?.(runtime.heartbeat);
     runtime.interval = null;

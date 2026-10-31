@@ -159,7 +159,7 @@ test('routes are recognised from URLs', () => {
   assert.equal(routeIdForUrl('/active_wave.php?gate=5&wave=17'), 'olympus');
   assert.equal(routeIdForUrl('/active_wave.php?gate=5&wave=18'), null);
   assert.equal(routeIdForUrl('/adventurers_guild.php?veyra_route=adventurers'), 'adventurers');
-  assert.equal(routeIdForUrl('/adventurers_guild.php'), null);
+  assert.equal(routeIdForUrl('/adventurers_guild.php'), 'adventurers');
   assert.equal(routeIdForUrl('/active_wave.php?gate=3&wave=5'), null);
   assert.equal(routeIdForUrl('/game_dash.php'), null);
 });
@@ -220,6 +220,37 @@ test('engine starts a due visit and navigates to the page', () => {
   engine.tick();
   assert.deepEqual(win.navigations, ['https://demonicscans.org/pvp.php']);
   assert.equal(store.read(COMMAND_KEY).phase, 'running');
+});
+
+test('engine keeps a running Adventurers visit on the canonical URL when the server removes its marker', () => {
+  const now = Date.now();
+  const config = createDefaultConfig();
+  config.routes.adventurers.enabled = true;
+  const runtime = createDefaultRuntime(now);
+  runtime.activeVisit = {
+    version: 1,
+    visitId: 'adv-canonical',
+    taskId: 'adventurers',
+    phase: 'running',
+    returnPath: '/pvp.php',
+    issuedAt: now - 1_000,
+    deadlineAt: now + 60_000,
+  };
+  const { engine, store, win, statuses } = createEngine(
+    'https://demonicscans.org/adventurers_guild.php',
+    {
+      [CONFIG_KEY]: JSON.stringify(config),
+      [RUNTIME_KEY]: JSON.stringify(runtime),
+      [COMMAND_KEY]: JSON.stringify(runtime.activeVisit),
+    },
+  );
+
+  engine.start();
+
+  assert.deepEqual(win.navigations, []);
+  assert.equal(store.read(RUNTIME_KEY).activeVisit.visitId, 'adv-canonical');
+  assert.equal(store.read(COMMAND_KEY).phase, 'running');
+  assert.equal(statuses.at(-1), "Adventurer's Guild is working …");
 });
 
 test('engine finishes a visit when the worker reports done and schedules by loop length', () => {

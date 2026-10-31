@@ -14,10 +14,9 @@ module.exports = Object.freeze({
   initialDelayMs: 10 * 60_000,
 
   matchesUrl(url) {
-    return (
-      /\/adventurers_guild\.php\/?$/i.test(url.pathname) &&
-      url.searchParams.get('veyra_route') === 'adventurers'
-    );
+    // This page has its own unambiguous pathname. Keep recognizing it if a
+    // response canonicalizes the scheduler URL and removes veyra_route.
+    return /\/adventurers_guild\.php\/?$/i.test(url.pathname);
   },
 
   createDefaultSettings: normalizeSettings,
