@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 
 const GENERAL = require('../src/features/general');
 const autoBattleExtras = require('../src/features/general/auto-battle-extras');
+const autoFarmActivate = require('../src/features/general/auto-farm-activate-buttons');
 const navigation = require('../src/features/general/custom-navigation');
 const attackButtons = require('../src/features/general/better-attack-buttons');
 const asterion = require('../src/features/general/asterion-detect');
@@ -65,8 +66,10 @@ test('general features keep veyra-hud keys and defaults', () => {
   assert.equal(defaults['inventory-filter:enableInventoryFilter'], true);
   assert.equal(defaults['ui-improvements:enableBuyAllButtons'], true);
   assert.equal(defaults['veyra:shops:damonBulkBuy'], true);
+  assert.equal(defaults['veyra:autoFarm:showTargetActivateButtons'], true);
   assert.equal(GENERAL[0].id, 'adventurers-guild-layout');
   assert.equal(GENERAL[1].id, 'auto-battle-extras');
+  assert.equal(GENERAL[2].id, 'auto-farm-activate-buttons');
 });
 
 test('features only match their pages', () => {
@@ -82,6 +85,33 @@ test('features only match their pages', () => {
   assert.equal(asterion.matches(url('/pets_shop.php')), false);
   assert.equal(autoBattleExtras.matches(url('/occurrence_castle.php?floor=3')), true);
   assert.equal(autoBattleExtras.matches(url('/game_dash.php')), false);
+  assert.equal(autoFarmActivate.matches(url('/active_wave.php?gate=5&wave=9')), true);
+  assert.equal(autoFarmActivate.matches(url('/adventurers_guild.php')), false);
+});
+
+test('Auto Farm Activate enables one target and disables the others', () => {
+  function row(enabledValue) {
+    const enabled = {
+      value: enabledValue,
+      dispatchEvent() {},
+    };
+    const save = { clicks: 0, click() { this.clicks += 1; } };
+    return {
+      enabled,
+      save,
+      querySelector(selector) {
+        if (selector === '.grp-enabled') return enabled;
+        if (selector === '.grp-save') return save;
+        return null;
+      },
+    };
+  }
+  const rows = [row('1'), row('0'), row('1')];
+  const doc = { querySelectorAll: () => rows };
+  const saved = autoFarmActivate.activateExclusiveGroup(doc, { Event }, rows[1]);
+  assert.deepEqual(rows.map((entry) => entry.enabled.value), ['0', '1', '0']);
+  assert.equal(saved, 3);
+  assert.deepEqual(rows.map((entry) => entry.save.clicks), [1, 1, 1]);
 });
 
 test('every general feature tolerates a page without its elements', async () => {

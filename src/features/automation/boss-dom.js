@@ -16,6 +16,8 @@ const SELECTORS = Object.freeze({
   battleTitle: '.battle-card.monster-card .card-title',
   monsterImage: '#monsterImage',
   playerHp: '#pHpText',
+  playerDamage: '#yourDamageValue',
+  phaseDamageChip: '.phase-loot-section .chip',
   phaseDuel: 'a[href*="pvp_style_battle.php"][href*="source=monster_phase"]',
 });
 
@@ -100,6 +102,28 @@ function readPlayerHealth(doc) {
   return parseFraction(doc?.querySelector?.(SELECTORS.playerHp)?.textContent);
 }
 
+function readPlayerDamage(doc) {
+  return parseGameNumber(doc?.querySelector?.(SELECTORS.playerDamage)?.textContent);
+}
+
+function readPhaseThreeDamage(doc) {
+  const values = [];
+  for (const chip of doc?.querySelectorAll?.(SELECTORS.phaseDamageChip) || []) {
+    const match = String(chip?.textContent || '').match(/Phase\s*DMG\s*:\s*([\d.,]+\s*[kmbtq]?)/i);
+    const value = parseGameNumber(match?.[1]);
+    if (value !== null && value >= 0) values.push(value);
+  }
+  return values.length ? Math.max(...values) : null;
+}
+
+function readActualPhaseOneDamage(doc, { requirePhaseThree = false } = {}) {
+  const total = readPlayerDamage(doc);
+  if (total === null || total <= 0) return null;
+  const phaseThree = readPhaseThreeDamage(doc);
+  if (requirePhaseThree && phaseThree === null) return null;
+  return Math.max(0, total - (phaseThree || 0));
+}
+
 function findPhaseDuelControl(doc, base = 'https://demonicscans.org') {
   const element = doc?.querySelector?.(SELECTORS.phaseDuel) || null;
   const href = attr(element, 'href');
@@ -152,7 +176,10 @@ module.exports = {
   isAscendedBattle,
   monsterIdFromHref,
   readCookieText,
+  readActualPhaseOneDamage,
   readMonsterCards,
+  readPhaseThreeDamage,
+  readPlayerDamage,
   readPlayerHealth,
   readSummons,
   setCookie,

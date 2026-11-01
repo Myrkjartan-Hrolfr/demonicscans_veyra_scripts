@@ -110,15 +110,32 @@ function battlePath(monsterId) {
 
 function battleDamageTarget(target, ascended = false) {
   const useCombined = target?.phased === true && ascended === true;
+  const phaseOneActual = Number(target?.phase1ActualDamageValue);
+  const phaseOneBase = Number.isFinite(phaseOneActual) && phaseOneActual > 0
+    ? phaseOneActual
+    : Number(target?.phase1DamageValue);
   const value = useCombined
-    ? Number(target.damageValue)
+    ? phaseOneBase + Number(target?.phase3DamageValue || 0)
     : Number(target?.phase1DamageValue ?? target?.damageValue);
   const fallback = Number(target?.damageValue) || 0;
   const damageValue = Number.isFinite(value) && value > 0 ? value : fallback;
   const damage = useCombined
-    ? String(target.damage || formatGameNumber(damageValue))
+    ? formatGameNumber(damageValue)
     : String(target?.phase1Damage || target?.damage || formatGameNumber(damageValue));
   return { phase: useCombined ? 3 : 1, damage, damageValue };
+}
+
+function withActualPhaseOneDamage(target, actualDamage) {
+  const actual = Number(actualDamage);
+  if (!target || target.phased !== true || !Number.isFinite(actual) || actual <= 0) return target;
+  const phase3 = Math.max(0, Number(target.phase3DamageValue) || 0);
+  const damageValue = actual + phase3;
+  return {
+    ...target,
+    phase1ActualDamageValue: actual,
+    damageValue,
+    damage: formatGameNumber(damageValue),
+  };
 }
 
 // Enabled bosses per domain, in visit order. Domains without an enabled boss
@@ -432,18 +449,26 @@ function normalizeTarget(value) {
     ? phase3DamageValue
     : 0;
   const combinedValue = phased ? normalizedPhase1 + normalizedPhase3 : damageValue;
+  const actualPhase1 = Number(value.phase1ActualDamageValue);
+  const normalizedActualPhase1 = phased && Number.isFinite(actualPhase1) && actualPhase1 > 0
+    ? actualPhase1
+    : null;
+  const effectiveCombinedValue = phased && normalizedActualPhase1 !== null
+    ? normalizedActualPhase1 + normalizedPhase3
+    : combinedValue;
   return {
     monsterId,
     bossId: String(value.bossId || ''),
     name: String(value.name || ''),
     domainId: String(value.domainId || ''),
     phased,
-    damage: String(value.damage || formatGameNumber(combinedValue)),
-    damageValue: combinedValue,
+    damage: formatGameNumber(effectiveCombinedValue),
+    damageValue: effectiveCombinedValue,
     phase1Damage: String(value.phase1Damage || value.damage || formatGameNumber(normalizedPhase1)),
     phase1DamageValue: normalizedPhase1,
     phase3Damage: String(value.phase3Damage ?? '0'),
     phase3DamageValue: normalizedPhase3,
+    phase1ActualDamageValue: normalizedActualPhase1,
   };
 }
 
@@ -701,5 +726,6 @@ module.exports = {
   settleOnHub,
   summaryMessage,
   withLease,
+  withActualPhaseOneDamage,
   withVisit,
 };

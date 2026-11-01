@@ -23,6 +23,9 @@ const LOG_PREFIX = '[Veyra:boss-worker]';
 const JOIN_URL = 'user_join_battle.php';
 const PHASE_DUEL_STATE_URL = '/pvp_style_state.php';
 const PHASE_DUEL_ACTION_URL = '/pvp_style_action.php';
+const PHASE1_DAMAGE_KEY = 'veyra:bossworker:phase1-actual:v1';
+const PHASE1_DAMAGE_TTL_MS = 7 * 24 * 60 * 60_000;
+const PHASE1_DAMAGE_MAX_RECORDS = 100;
 
 function createBossWorker({
   win,
@@ -130,6 +133,46 @@ function createBossWorker({
   function saveRun(run) {
     store.write(logic.RUN_KEY, run);
     return run;
+  }
+
+  function phaseOneDamageRecords(t = now()) {
+    const source = store.read(PHASE1_DAMAGE_KEY);
+    const records = {};
+    for (const [monsterId, entry] of Object.entries(source || {})) {
+      const damage = Number(entry?.damage);
+      const at = Number(entry?.at);
+      if (!/^\d+$/.test(monsterId) || !Number.isFinite(damage) || damage <= 0) continue;
+      if (!Number.isFinite(at) || at <= 0 || t - at > PHASE1_DAMAGE_TTL_MS) continue;
+      records[monsterId] = { damage, at };
+    }
+    return records;
+  }
+
+  function rememberPhaseOneDamage(monsterId, damage, t = now()) {
+    const id = String(monsterId || '');
+    const value = Number(damage);
+    if (!/^\d+$/.test(id) || !Number.isFinite(value) || value <= 0) return;
+    const records = phaseOneDamageRecords(t);
+    records[id] = { damage: value, at: t };
+    const trimmed = Object.fromEntries(
+      Object.entries(records)
+        .sort((left, right) => right[1].at - left[1].at)
+        .slice(0, PHASE1_DAMAGE_MAX_RECORDS),
+    );
+    store.write(PHASE1_DAMAGE_KEY, trimmed);
+  }
+
+  function withKnownPhaseOneDamage(match, records) {
+    return logic.withActualPhaseOneDamage(match, records?.[match?.monsterId]?.damage);
+  }
+
+  function captureActualPhaseOneDamage(run, t = now(), requirePhaseThree = false) {
+    const actual = dom.readActualPhaseOneDamage(doc, { requirePhaseThree });
+    if (!Number.isFinite(actual) || actual <= 0 || !run.target?.phased) return run;
+    const remembered = phaseOneDamageRecords(t)?.[run.target.monsterId]?.damage;
+    if (remembered !== actual) rememberPhaseOneDamage(run.target.monsterId, actual, t);
+    if (Number(run.target.phase1ActualDamageValue) === actual) return run;
+    return saveRun({ ...run, target: logic.withActualPhaseOneDamage(run.target, actual) });
   }
 
   function loadRouteConfig(routeId) {
@@ -348,11 +391,12 @@ function createBossWorker({
     }
     if (run.action.kind === 'reload-hub') run = saveRun(logic.clearAction(run));
 
+    const phaseOneRecords = phaseOneDamageRecords(t);
     const matches = logic.matchHubBosses({
       bosses: domain.bosses,
       summons: dom.readSummons(doc),
       cards: dom.readMonsterCards(doc),
-    });
+    }).map((match) => withKnownPhaseOneDamage(match, phaseOneRecords));
     const next = logic.chooseNextBoss(matches, run);
     if (!next) {
       advanceDomain(run, plan, t);
@@ -554,6 +598,15 @@ function createBossWorker({
     }
 
     const phaseDuel = dom.findPhaseDuelControl(doc, win.location.origin);
+    const ascended = dom.isAscendedBattle(doc);
+    if (run.routeId === 'olympus' && run.target.phased && phaseDuel) {
+      run = captureActualPhaseOneDamage(run, t);
+    } else if (run.routeId === 'olympus' && run.target.phased && ascended) {
+      // On an already-running Phase 3 page, total damage alone is ambiguous.
+      // Subtract the live "Phase DMG" value so the stored Phase 1 base never
+      // grows with every Phase 3 attack.
+      run = captureActualPhaseOneDamage(run, t, true);
+    }
     if (phaseDuel && run.routeId === 'olympus' && run.target.phased) {
       if (phaseDuel.activeId !== run.target.monsterId) {
         saveRun(
@@ -582,7 +635,7 @@ function createBossWorker({
 
     if (run.phase !== 'battle') run = saveRun(logic.setPhase(run, 'battle', t));
 
-    const damageTarget = logic.battleDamageTarget(run.target, dom.isAscendedBattle(doc));
+    const damageTarget = logic.battleDamageTarget(run.target, ascended);
 
     if (rt.fight) {
       checkFight();

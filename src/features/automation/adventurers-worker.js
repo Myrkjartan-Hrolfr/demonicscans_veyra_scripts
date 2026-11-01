@@ -281,19 +281,16 @@ function createAdventurersWorker({
   }
 
   function potionSettings(base) {
-    const selected = routeConfig()?.potions || { stamina: [], heal: [] };
-    const stamina = new Set((selected.stamina || []).map(Number));
-    const heal = new Set((selected.heal || []).map(Number));
-    const priority = [30, 251, 35, 359].find((itemId) => stamina.has(itemId)) || 0;
+    const count = Math.max(1, Math.round(Number(routeConfig()?.settings?.farmMonsterCount) || 90));
     return {
       ...base,
-      TOTAL_MONSTERS_TO_KILL: '0',
-      HP_POTIONS_MAX_TO_USE: heal.has(108) ? String(POTION_LIMIT) : '0',
-      STAM_POT_SMALL_ITEM_MAX_TO_USE: stamina.has(30) ? String(POTION_LIMIT) : '0',
-      STAM_POT_HALF_ITEM_ID_MAX_TO_USE: stamina.has(251) ? String(POTION_LIMIT) : '0',
-      STAM_POT_FULL_ITEM_ID_MAX_TO_USE: stamina.has(35) ? String(POTION_LIMIT) : '0',
-      STAM_POT_ADV_ITEM_MAX_TO_USE: stamina.has(359) ? String(POTION_LIMIT) : '0',
-      STAM_POT_PRIORITY_ITEM_ID: String(priority),
+      TOTAL_MONSTERS_TO_KILL: String(count),
+      HP_POTIONS_MAX_TO_USE: String(POTION_LIMIT),
+      STAM_POT_SMALL_ITEM_MAX_TO_USE: '0',
+      STAM_POT_HALF_ITEM_ID_MAX_TO_USE: '1',
+      STAM_POT_FULL_ITEM_ID_MAX_TO_USE: '0',
+      STAM_POT_ADV_ITEM_MAX_TO_USE: '0',
+      STAM_POT_PRIORITY_ITEM_ID: '251',
       AUTO_LOOT_TO_LEVEL: '0',
     };
   }
@@ -317,8 +314,18 @@ function createAdventurersWorker({
       store.write(AUTOFARM_SNAPSHOT_KEY, snapshot);
     }
 
-    requireSuccess(await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: 0 }), 'Pausing Auto Farm');
-    await waitWithGuard(visitId, ACTION_DELAY_MS);
+    const initialState = logic.autoFarmState(waveDoc);
+    if (initialState === 'running') {
+      requireSuccess(
+        await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: 0 }),
+        'Pausing Auto Farm',
+      );
+      await waitWithGuard(visitId, ACTION_DELAY_MS);
+    }
+    if (initialState === 'finished') {
+      requireSuccess(await guardedPost(visitId, AUTO_FARM_PATH, { action: 'reset' }), 'Resetting Auto Farm');
+      await waitWithGuard(visitId, ACTION_DELAY_MS);
+    }
 
     const requiredByName = new Map(requirements.map((requirement) => [requirement.normalizedName, requirement]));
     const targets = logic.readAutoFarmTargets(waveDoc);
@@ -373,11 +380,6 @@ function createAdventurersWorker({
     store.write(AUTOFARM_SNAPSHOT_KEY, snapshot);
   }
 
-  async function pauseOwnedAutoFarm(visitId) {
-    if (!store.read(AUTOFARM_SNAPSHOT_KEY)) return;
-    requireSuccess(await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: 0 }), 'Pausing quest Auto Farm');
-  }
-
   // A draining command forbids ordinary mutations, but leaving the game's
   // server-side Auto Farm running would not be a safe withdrawal. This one
   // cleanup mutation is allowed only for the same visit while this tab still
@@ -406,8 +408,19 @@ function createAdventurersWorker({
     const snapshot = store.read(AUTOFARM_SNAPSHOT_KEY);
     if (!snapshot?.version || !Array.isArray(snapshot.targets)) return;
     setWorkingMessage(visitId, 'Restoring the previous Auto Farm configuration.');
-    requireSuccess(await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: 0 }), 'Pausing Auto Farm');
     const currentDoc = await fetchFresh(visitId, logic.WAVE_PATH);
+    const currentState = logic.autoFarmState(currentDoc);
+    if (currentState === 'running') {
+      requireSuccess(
+        await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: 0 }),
+        'Pausing Auto Farm',
+      );
+    } else if (currentState === 'finished') {
+      requireSuccess(
+        await guardedPost(visitId, AUTO_FARM_PATH, { action: 'reset' }),
+        'Resetting completed quest Auto Farm',
+      );
+    }
     const originalIds = new Set(snapshot.targets.map((target) => String(target.targetId)));
     const questNames = new Set(snapshot.questNames || []);
 
@@ -486,32 +499,30 @@ function createAdventurersWorker({
     return { monsters, waveDoc: first, documents };
   }
 
-  function countsMessage(requirements, monsters) {
-    return logic
-      .requirementCounts(requirements, monsters)
-      .map(({ requirement, count }) => `${requirement.name} ${Math.min(count, requirement.count)}/${requirement.count}`)
-      .join(', ');
-  }
-
   async function ensurePrefarmed(visitId, requirements) {
-    let pool = await readDeadPool(visitId, requirements);
-    if (logic.requirementsSatisfied(requirements, pool.monsters)) {
-      await pauseOwnedAutoFarm(visitId);
-      return pool;
-    }
+    showDeadMonstersForQuestPool();
+    let waveDoc = await fetchFresh(visitId, logic.WAVE_PATH);
+    setWorkingMessage(visitId, `Preparing Auto Farm for all ${requirements.length} Olympus quest monsters.`);
+    await configureAutoFarm(visitId, requirements, waveDoc);
 
-    setWorkingMessage(visitId, `Preparing Auto Farm: ${countsMessage(requirements, pool.monsters)}.`);
-    await configureAutoFarm(visitId, requirements, pool.waveDoc);
-
+    let pausedPolls = 0;
     while (true) {
       await waitWithGuard(visitId, FARM_POLL_MS);
-      pool = await readDeadPool(visitId, requirements);
-      if (logic.requirementsSatisfied(requirements, pool.monsters)) {
-        await pauseOwnedAutoFarm(visitId);
-        setWorkingMessage(visitId, 'Every quest monster has been pre-farmed; starting quest turn-ins.');
-        return pool;
+      waveDoc = await fetchFresh(visitId, logic.WAVE_PATH);
+      const progress = logic.readAutoFarmProgress(waveDoc);
+      if (progress.state === 'finished') {
+        setWorkingMessage(visitId, 'Auto Farm finished; starting quest turn-ins.');
+        return waveDoc;
       }
-      setWorkingMessage(visitId, `Pre-farming quest monsters: ${countsMessage(requirements, pool.monsters)}.`);
+      pausedPolls = progress.state === 'paused' ? pausedPolls + 1 : 0;
+      if (pausedPolls >= 3) {
+        throw new Error('Auto Farm stopped before reaching its configured monster total.');
+      }
+      const target = progress.target || Number(routeConfig()?.settings?.farmMonsterCount) || 90;
+      setWorkingMessage(
+        visitId,
+        `Auto Farm is hunting Olympus quest monsters: ${progress.killed.toLocaleString()} / ${target.toLocaleString()}.`,
+      );
     }
   }
 
@@ -547,7 +558,7 @@ function createAdventurersWorker({
         `Looting ${current.requirement.name} for ${current.title} (${current.progress.current}/${current.requirement.count}).`,
       );
       const response = await guardedPost(visitId, LOOT_PATH, { monster_id: monster.id, user_id: userId });
-      if (logic.responseSucceeded(response)) successes += 1;
+      if (logic.responseSucceeded(response)) successes += Math.max(1, Number(monster.quantity) || 1);
       await waitWithGuard(visitId, ACTION_DELAY_MS);
 
       const guildDoc = await fetchFresh(visitId, GUILD_PATH);
@@ -615,7 +626,7 @@ function createAdventurersWorker({
       return { quests, earliestCooldown: logic.earliestCooldown(quests, now()) };
     }
 
-    const requirements = logic.aggregateRequirements(actionable.map((quest) => quest.requirement));
+    const requirements = logic.questFarmRequirements(quests);
     setProtectedNames(store, requirements.map((requirement) => requirement.name));
     setWorkingMessage(visitId, `Checking ${requirements.length} quest monster target(s) before accepting a quest.`);
     await ensurePrefarmed(visitId, requirements);

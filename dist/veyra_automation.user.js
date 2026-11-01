@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.8.3
+// @version      0.8.4
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -1103,6 +1103,10 @@
       return [...merged.values()];
     }
 
+    function questFarmRequirements(quests) {
+      return aggregateRequirements((quests || []).map((quest) => quest?.requirement).filter(Boolean));
+    }
+
     function earliestCooldown(quests, nowMs = Date.now()) {
       const values = (quests || [])
         .map((quest) => Number(quest?.cooldownAt) || 0)
@@ -1118,7 +1122,33 @@
       const expiresAt = Math.max(0, Number(data.expire || 0) * 1_000);
       if (!id || !name || data.dead !== '1' || data.eligible !== '1') return null;
       if (expiresAt > 0 && expiresAt <= nowMs) return null;
-      return { id, name, damage, expiresAt };
+      const quantity = deadMonsterQuantity(card);
+      return { id, name, damage, expiresAt, quantity };
+    }
+
+    function positiveInteger(value) {
+      const number = Number.parseInt(String(value ?? '').replace(/[^\d]/g, ''), 10);
+      return Number.isFinite(number) && number > 0 ? number : 0;
+    }
+
+    // Veyra normally renders one dead monster per card, but stacked/batched cards
+    // use a quantity field or a dedicated count badge. Keep this deliberately
+    // conservative: generic item/drop counts inside the card must not be mistaken
+    // for the number of monsters represented by it.
+    function deadMonsterQuantity(card) {
+      const data = card?.dataset || {};
+      for (const key of ['quantity', 'count', 'stack', 'amount', 'batch', 'qty', 'monsterCount']) {
+        const count = positiveInteger(data[key]);
+        if (count) return count;
+      }
+      const badge = card?.querySelector?.(
+        '[data-monster-count], .monster-count, .monster-stack-count, .dead-monster-count, .batch-count',
+      );
+      const attributeCount = positiveInteger(badge?.getAttribute?.('data-monster-count'));
+      if (attributeCount) return attributeCount;
+      const text = String(badge?.textContent || '');
+      const match = text.match(/(?:^|\s)[x×]?\s*(\d+)\s*(?:x|×|monsters?|kills?)?(?:\s|$)/i);
+      return positiveInteger(match?.[1]) || 1;
     }
 
     function readDeadMonsters(root, nowMs = Date.now()) {
@@ -1140,7 +1170,10 @@
     function requirementCounts(requirements, monsters) {
       return (requirements || []).map((requirement) => ({
         requirement,
-        count: eligibleForRequirement(monsters, requirement).length,
+        count: eligibleForRequirement(monsters, requirement).reduce(
+          (total, monster) => total + Math.max(1, Number(monster.quantity) || 1),
+          0,
+        ),
       }));
     }
 
@@ -1208,9 +1241,23 @@
     }
 
     function autoFarmIsActive(root) {
+      return autoFarmState(root) === 'running';
+    }
+
+    function autoFarmState(root) {
       const badge = root?.querySelector?.('#afStateBadge');
       const text = String(badge?.textContent || '').trim();
-      return /\b(?:active|running|on)\b/i.test(text) || badge?.classList?.contains?.('on') === true;
+      if (/\bfinished\b/i.test(text) || badge?.classList?.contains?.('fin') === true) return 'finished';
+      if (/\b(?:active|running|on)\b/i.test(text) || badge?.classList?.contains?.('on') === true) {
+        return 'running';
+      }
+      return 'paused';
+    }
+
+    function readAutoFarmProgress(root) {
+      const killed = parseGameNumber(root?.querySelector?.('#afTotalKilledText')?.textContent) || 0;
+      const target = parseGameNumber(root?.querySelector?.('#afTotalToKill')?.value) || 0;
+      return { killed, target, state: autoFarmState(root) };
     }
 
     function deadPageCount(root) {
@@ -1235,14 +1282,18 @@
       actionableQuests,
       aggregateRequirements,
       autoFarmIsActive,
+      autoFarmState,
       deadMonsterFromCard,
+      deadMonsterQuantity,
       deadPageCount,
       earliestCooldown,
       eligibleForRequirement,
       normalizeName,
       parseQuestRequirement,
       parseQuests,
+      questFarmRequirements,
       readAutoFarmSettings,
+      readAutoFarmProgress,
       readAutoFarmTargets,
       readDeadMonsters,
       readMonsterOptions,
@@ -1536,19 +1587,16 @@
       }
 
       function potionSettings(base) {
-        const selected = routeConfig()?.potions || { stamina: [], heal: [] };
-        const stamina = new Set((selected.stamina || []).map(Number));
-        const heal = new Set((selected.heal || []).map(Number));
-        const priority = [30, 251, 35, 359].find((itemId) => stamina.has(itemId)) || 0;
+        const count = Math.max(1, Math.round(Number(routeConfig()?.settings?.farmMonsterCount) || 90));
         return {
           ...base,
-          TOTAL_MONSTERS_TO_KILL: '0',
-          HP_POTIONS_MAX_TO_USE: heal.has(108) ? String(POTION_LIMIT) : '0',
-          STAM_POT_SMALL_ITEM_MAX_TO_USE: stamina.has(30) ? String(POTION_LIMIT) : '0',
-          STAM_POT_HALF_ITEM_ID_MAX_TO_USE: stamina.has(251) ? String(POTION_LIMIT) : '0',
-          STAM_POT_FULL_ITEM_ID_MAX_TO_USE: stamina.has(35) ? String(POTION_LIMIT) : '0',
-          STAM_POT_ADV_ITEM_MAX_TO_USE: stamina.has(359) ? String(POTION_LIMIT) : '0',
-          STAM_POT_PRIORITY_ITEM_ID: String(priority),
+          TOTAL_MONSTERS_TO_KILL: String(count),
+          HP_POTIONS_MAX_TO_USE: String(POTION_LIMIT),
+          STAM_POT_SMALL_ITEM_MAX_TO_USE: '0',
+          STAM_POT_HALF_ITEM_ID_MAX_TO_USE: '1',
+          STAM_POT_FULL_ITEM_ID_MAX_TO_USE: '0',
+          STAM_POT_ADV_ITEM_MAX_TO_USE: '0',
+          STAM_POT_PRIORITY_ITEM_ID: '251',
           AUTO_LOOT_TO_LEVEL: '0',
         };
       }
@@ -1572,8 +1620,18 @@
           store.write(AUTOFARM_SNAPSHOT_KEY, snapshot);
         }
 
-        requireSuccess(await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: 0 }), 'Pausing Auto Farm');
-        await waitWithGuard(visitId, ACTION_DELAY_MS);
+        const initialState = logic.autoFarmState(waveDoc);
+        if (initialState === 'running') {
+          requireSuccess(
+            await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: 0 }),
+            'Pausing Auto Farm',
+          );
+          await waitWithGuard(visitId, ACTION_DELAY_MS);
+        }
+        if (initialState === 'finished') {
+          requireSuccess(await guardedPost(visitId, AUTO_FARM_PATH, { action: 'reset' }), 'Resetting Auto Farm');
+          await waitWithGuard(visitId, ACTION_DELAY_MS);
+        }
 
         const requiredByName = new Map(requirements.map((requirement) => [requirement.normalizedName, requirement]));
         const targets = logic.readAutoFarmTargets(waveDoc);
@@ -1628,11 +1686,6 @@
         store.write(AUTOFARM_SNAPSHOT_KEY, snapshot);
       }
 
-      async function pauseOwnedAutoFarm(visitId) {
-        if (!store.read(AUTOFARM_SNAPSHOT_KEY)) return;
-        requireSuccess(await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: 0 }), 'Pausing quest Auto Farm');
-      }
-
       // A draining command forbids ordinary mutations, but leaving the game's
       // server-side Auto Farm running would not be a safe withdrawal. This one
       // cleanup mutation is allowed only for the same visit while this tab still
@@ -1661,8 +1714,19 @@
         const snapshot = store.read(AUTOFARM_SNAPSHOT_KEY);
         if (!snapshot?.version || !Array.isArray(snapshot.targets)) return;
         setWorkingMessage(visitId, 'Restoring the previous Auto Farm configuration.');
-        requireSuccess(await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: 0 }), 'Pausing Auto Farm');
         const currentDoc = await fetchFresh(visitId, logic.WAVE_PATH);
+        const currentState = logic.autoFarmState(currentDoc);
+        if (currentState === 'running') {
+          requireSuccess(
+            await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: 0 }),
+            'Pausing Auto Farm',
+          );
+        } else if (currentState === 'finished') {
+          requireSuccess(
+            await guardedPost(visitId, AUTO_FARM_PATH, { action: 'reset' }),
+            'Resetting completed quest Auto Farm',
+          );
+        }
         const originalIds = new Set(snapshot.targets.map((target) => String(target.targetId)));
         const questNames = new Set(snapshot.questNames || []);
 
@@ -1741,32 +1805,30 @@
         return { monsters, waveDoc: first, documents };
       }
 
-      function countsMessage(requirements, monsters) {
-        return logic
-          .requirementCounts(requirements, monsters)
-          .map(({ requirement, count }) => `${requirement.name} ${Math.min(count, requirement.count)}/${requirement.count}`)
-          .join(', ');
-      }
-
       async function ensurePrefarmed(visitId, requirements) {
-        let pool = await readDeadPool(visitId, requirements);
-        if (logic.requirementsSatisfied(requirements, pool.monsters)) {
-          await pauseOwnedAutoFarm(visitId);
-          return pool;
-        }
+        showDeadMonstersForQuestPool();
+        let waveDoc = await fetchFresh(visitId, logic.WAVE_PATH);
+        setWorkingMessage(visitId, `Preparing Auto Farm for all ${requirements.length} Olympus quest monsters.`);
+        await configureAutoFarm(visitId, requirements, waveDoc);
 
-        setWorkingMessage(visitId, `Preparing Auto Farm: ${countsMessage(requirements, pool.monsters)}.`);
-        await configureAutoFarm(visitId, requirements, pool.waveDoc);
-
+        let pausedPolls = 0;
         while (true) {
           await waitWithGuard(visitId, FARM_POLL_MS);
-          pool = await readDeadPool(visitId, requirements);
-          if (logic.requirementsSatisfied(requirements, pool.monsters)) {
-            await pauseOwnedAutoFarm(visitId);
-            setWorkingMessage(visitId, 'Every quest monster has been pre-farmed; starting quest turn-ins.');
-            return pool;
+          waveDoc = await fetchFresh(visitId, logic.WAVE_PATH);
+          const progress = logic.readAutoFarmProgress(waveDoc);
+          if (progress.state === 'finished') {
+            setWorkingMessage(visitId, 'Auto Farm finished; starting quest turn-ins.');
+            return waveDoc;
           }
-          setWorkingMessage(visitId, `Pre-farming quest monsters: ${countsMessage(requirements, pool.monsters)}.`);
+          pausedPolls = progress.state === 'paused' ? pausedPolls + 1 : 0;
+          if (pausedPolls >= 3) {
+            throw new Error('Auto Farm stopped before reaching its configured monster total.');
+          }
+          const target = progress.target || Number(routeConfig()?.settings?.farmMonsterCount) || 90;
+          setWorkingMessage(
+            visitId,
+            `Auto Farm is hunting Olympus quest monsters: ${progress.killed.toLocaleString()} / ${target.toLocaleString()}.`,
+          );
         }
       }
 
@@ -1802,7 +1864,7 @@
             `Looting ${current.requirement.name} for ${current.title} (${current.progress.current}/${current.requirement.count}).`,
           );
           const response = await guardedPost(visitId, LOOT_PATH, { monster_id: monster.id, user_id: userId });
-          if (logic.responseSucceeded(response)) successes += 1;
+          if (logic.responseSucceeded(response)) successes += Math.max(1, Number(monster.quantity) || 1);
           await waitWithGuard(visitId, ACTION_DELAY_MS);
 
           const guildDoc = await fetchFresh(visitId, GUILD_PATH);
@@ -1870,7 +1932,7 @@
           return { quests, earliestCooldown: logic.earliestCooldown(quests, now()) };
         }
 
-        const requirements = logic.aggregateRequirements(actionable.map((quest) => quest.requirement));
+        const requirements = logic.questFarmRequirements(quests);
         setProtectedNames(store, requirements.map((requirement) => requirement.name));
         setWorkingMessage(visitId, `Checking ${requirements.length} quest monster target(s) before accepting a quest.`);
         await ensurePrefarmed(visitId, requirements);
@@ -2032,6 +2094,8 @@
       battleTitle: '.battle-card.monster-card .card-title',
       monsterImage: '#monsterImage',
       playerHp: '#pHpText',
+      playerDamage: '#yourDamageValue',
+      phaseDamageChip: '.phase-loot-section .chip',
       phaseDuel: 'a[href*="pvp_style_battle.php"][href*="source=monster_phase"]',
     });
 
@@ -2116,6 +2180,28 @@
       return parseFraction(doc?.querySelector?.(SELECTORS.playerHp)?.textContent);
     }
 
+    function readPlayerDamage(doc) {
+      return parseGameNumber(doc?.querySelector?.(SELECTORS.playerDamage)?.textContent);
+    }
+
+    function readPhaseThreeDamage(doc) {
+      const values = [];
+      for (const chip of doc?.querySelectorAll?.(SELECTORS.phaseDamageChip) || []) {
+        const match = String(chip?.textContent || '').match(/Phase\s*DMG\s*:\s*([\d.,]+\s*[kmbtq]?)/i);
+        const value = parseGameNumber(match?.[1]);
+        if (value !== null && value >= 0) values.push(value);
+      }
+      return values.length ? Math.max(...values) : null;
+    }
+
+    function readActualPhaseOneDamage(doc, { requirePhaseThree = false } = {}) {
+      const total = readPlayerDamage(doc);
+      if (total === null || total <= 0) return null;
+      const phaseThree = readPhaseThreeDamage(doc);
+      if (requirePhaseThree && phaseThree === null) return null;
+      return Math.max(0, total - (phaseThree || 0));
+    }
+
     function findPhaseDuelControl(doc, base = 'https://demonicscans.org') {
       const element = doc?.querySelector?.(SELECTORS.phaseDuel) || null;
       const href = attr(element, 'href');
@@ -2168,7 +2254,10 @@
       isAscendedBattle,
       monsterIdFromHref,
       readCookieText,
+      readActualPhaseOneDamage,
       readMonsterCards,
+      readPhaseThreeDamage,
+      readPlayerDamage,
       readPlayerHealth,
       readSummons,
       setCookie,
@@ -2287,15 +2376,32 @@
 
     function battleDamageTarget(target, ascended = false) {
       const useCombined = target?.phased === true && ascended === true;
+      const phaseOneActual = Number(target?.phase1ActualDamageValue);
+      const phaseOneBase = Number.isFinite(phaseOneActual) && phaseOneActual > 0
+        ? phaseOneActual
+        : Number(target?.phase1DamageValue);
       const value = useCombined
-        ? Number(target.damageValue)
+        ? phaseOneBase + Number(target?.phase3DamageValue || 0)
         : Number(target?.phase1DamageValue ?? target?.damageValue);
       const fallback = Number(target?.damageValue) || 0;
       const damageValue = Number.isFinite(value) && value > 0 ? value : fallback;
       const damage = useCombined
-        ? String(target.damage || formatGameNumber(damageValue))
+        ? formatGameNumber(damageValue)
         : String(target?.phase1Damage || target?.damage || formatGameNumber(damageValue));
       return { phase: useCombined ? 3 : 1, damage, damageValue };
+    }
+
+    function withActualPhaseOneDamage(target, actualDamage) {
+      const actual = Number(actualDamage);
+      if (!target || target.phased !== true || !Number.isFinite(actual) || actual <= 0) return target;
+      const phase3 = Math.max(0, Number(target.phase3DamageValue) || 0);
+      const damageValue = actual + phase3;
+      return {
+        ...target,
+        phase1ActualDamageValue: actual,
+        damageValue,
+        damage: formatGameNumber(damageValue),
+      };
     }
 
     // Enabled bosses per domain, in visit order. Domains without an enabled boss
@@ -2609,18 +2715,26 @@
         ? phase3DamageValue
         : 0;
       const combinedValue = phased ? normalizedPhase1 + normalizedPhase3 : damageValue;
+      const actualPhase1 = Number(value.phase1ActualDamageValue);
+      const normalizedActualPhase1 = phased && Number.isFinite(actualPhase1) && actualPhase1 > 0
+        ? actualPhase1
+        : null;
+      const effectiveCombinedValue = phased && normalizedActualPhase1 !== null
+        ? normalizedActualPhase1 + normalizedPhase3
+        : combinedValue;
       return {
         monsterId,
         bossId: String(value.bossId || ''),
         name: String(value.name || ''),
         domainId: String(value.domainId || ''),
         phased,
-        damage: String(value.damage || formatGameNumber(combinedValue)),
-        damageValue: combinedValue,
+        damage: formatGameNumber(effectiveCombinedValue),
+        damageValue: effectiveCombinedValue,
         phase1Damage: String(value.phase1Damage || value.damage || formatGameNumber(normalizedPhase1)),
         phase1DamageValue: normalizedPhase1,
         phase3Damage: String(value.phase3Damage ?? '0'),
         phase3DamageValue: normalizedPhase3,
+        phase1ActualDamageValue: normalizedActualPhase1,
       };
     }
 
@@ -2878,6 +2992,7 @@
       settleOnHub,
       summaryMessage,
       withLease,
+      withActualPhaseOneDamage,
       withVisit,
     };
   },
@@ -2907,6 +3022,9 @@
     const JOIN_URL = 'user_join_battle.php';
     const PHASE_DUEL_STATE_URL = '/pvp_style_state.php';
     const PHASE_DUEL_ACTION_URL = '/pvp_style_action.php';
+    const PHASE1_DAMAGE_KEY = 'veyra:bossworker:phase1-actual:v1';
+    const PHASE1_DAMAGE_TTL_MS = 7 * 24 * 60 * 60_000;
+    const PHASE1_DAMAGE_MAX_RECORDS = 100;
 
     function createBossWorker({
       win,
@@ -3014,6 +3132,46 @@
       function saveRun(run) {
         store.write(logic.RUN_KEY, run);
         return run;
+      }
+
+      function phaseOneDamageRecords(t = now()) {
+        const source = store.read(PHASE1_DAMAGE_KEY);
+        const records = {};
+        for (const [monsterId, entry] of Object.entries(source || {})) {
+          const damage = Number(entry?.damage);
+          const at = Number(entry?.at);
+          if (!/^\d+$/.test(monsterId) || !Number.isFinite(damage) || damage <= 0) continue;
+          if (!Number.isFinite(at) || at <= 0 || t - at > PHASE1_DAMAGE_TTL_MS) continue;
+          records[monsterId] = { damage, at };
+        }
+        return records;
+      }
+
+      function rememberPhaseOneDamage(monsterId, damage, t = now()) {
+        const id = String(monsterId || '');
+        const value = Number(damage);
+        if (!/^\d+$/.test(id) || !Number.isFinite(value) || value <= 0) return;
+        const records = phaseOneDamageRecords(t);
+        records[id] = { damage: value, at: t };
+        const trimmed = Object.fromEntries(
+          Object.entries(records)
+            .sort((left, right) => right[1].at - left[1].at)
+            .slice(0, PHASE1_DAMAGE_MAX_RECORDS),
+        );
+        store.write(PHASE1_DAMAGE_KEY, trimmed);
+      }
+
+      function withKnownPhaseOneDamage(match, records) {
+        return logic.withActualPhaseOneDamage(match, records?.[match?.monsterId]?.damage);
+      }
+
+      function captureActualPhaseOneDamage(run, t = now(), requirePhaseThree = false) {
+        const actual = dom.readActualPhaseOneDamage(doc, { requirePhaseThree });
+        if (!Number.isFinite(actual) || actual <= 0 || !run.target?.phased) return run;
+        const remembered = phaseOneDamageRecords(t)?.[run.target.monsterId]?.damage;
+        if (remembered !== actual) rememberPhaseOneDamage(run.target.monsterId, actual, t);
+        if (Number(run.target.phase1ActualDamageValue) === actual) return run;
+        return saveRun({ ...run, target: logic.withActualPhaseOneDamage(run.target, actual) });
       }
 
       function loadRouteConfig(routeId) {
@@ -3232,11 +3390,12 @@
         }
         if (run.action.kind === 'reload-hub') run = saveRun(logic.clearAction(run));
 
+        const phaseOneRecords = phaseOneDamageRecords(t);
         const matches = logic.matchHubBosses({
           bosses: domain.bosses,
           summons: dom.readSummons(doc),
           cards: dom.readMonsterCards(doc),
-        });
+        }).map((match) => withKnownPhaseOneDamage(match, phaseOneRecords));
         const next = logic.chooseNextBoss(matches, run);
         if (!next) {
           advanceDomain(run, plan, t);
@@ -3438,6 +3597,15 @@
         }
 
         const phaseDuel = dom.findPhaseDuelControl(doc, win.location.origin);
+        const ascended = dom.isAscendedBattle(doc);
+        if (run.routeId === 'olympus' && run.target.phased && phaseDuel) {
+          run = captureActualPhaseOneDamage(run, t);
+        } else if (run.routeId === 'olympus' && run.target.phased && ascended) {
+          // On an already-running Phase 3 page, total damage alone is ambiguous.
+          // Subtract the live "Phase DMG" value so the stored Phase 1 base never
+          // grows with every Phase 3 attack.
+          run = captureActualPhaseOneDamage(run, t, true);
+        }
         if (phaseDuel && run.routeId === 'olympus' && run.target.phased) {
           if (phaseDuel.activeId !== run.target.monsterId) {
             saveRun(
@@ -3466,7 +3634,7 @@
 
         if (run.phase !== 'battle') run = saveRun(logic.setPhase(run, 'battle', t));
 
-        const damageTarget = logic.battleDamageTarget(run.target, dom.isAscendedBattle(doc));
+        const damageTarget = logic.battleDamageTarget(run.target, ascended);
 
         if (rt.fight) {
           checkFight();
@@ -16745,6 +16913,188 @@
       },
     });
   },
+  "features/general/auto-farm-activate-buttons.js": function (module, exports, require) {
+    'use strict';
+
+    const SETTING = Object.freeze({
+      key: 'veyra:autoFarm:showTargetActivateButtons',
+      label: 'Show Auto Farm target Activate buttons',
+      type: 'checkbox',
+      default: true,
+      hint: 'Adds an Activate button that enables the selected target group and disables every other group.',
+    });
+
+    const SELECTORS = Object.freeze({
+      targets: '.af-targets',
+      row: '.af-group-row',
+      enabled: '.grp-enabled',
+      actions: '.btn-group-actions',
+      save: '.grp-save',
+      delete: '.grp-del-all',
+    });
+
+    const BUTTON_CLASS = 'af-exclusive-activate-btn';
+    const PROCESSING_CLASS = 'af-exclusive-processing';
+    const STYLE_ID = 'veyra-automation-auto-farm-activate-style';
+    const LOADED_FLAG = '__veyraAutoFarmActivateButtonsLoaded';
+
+    function groupRows(doc) {
+      return Array.from(doc?.querySelectorAll?.(`${SELECTORS.targets} ${SELECTORS.row}`) || []);
+    }
+
+    function setEnabled(win, select, value) {
+      if (!select || String(select.value) === value) return false;
+      select.value = value;
+      const EventConstructor = win?.Event || globalThis.Event;
+      if (typeof select.dispatchEvent === 'function' && typeof EventConstructor === 'function') {
+        select.dispatchEvent(new EventConstructor('input', { bubbles: true }));
+        select.dispatchEvent(new EventConstructor('change', { bubbles: true }));
+      }
+      return true;
+    }
+
+    function activateExclusiveGroup(doc, win, targetRow) {
+      const rows = groupRows(doc);
+      if (!targetRow || !rows.includes(targetRow) || !targetRow.querySelector?.(SELECTORS.enabled)) return 0;
+
+      const changedRows = [];
+      for (const row of rows) {
+        const desired = row === targetRow ? '1' : '0';
+        if (setEnabled(win, row.querySelector?.(SELECTORS.enabled), desired)) changedRows.push(row);
+      }
+      if (!changedRows.includes(targetRow)) changedRows.push(targetRow);
+
+      // Collect first: a native Save handler may rebuild and detach all rows.
+      const buttons = changedRows
+        .map((row) => row.querySelector?.(SELECTORS.save))
+        .filter((button) => typeof button?.click === 'function');
+      for (const button of buttons) button.click();
+      return buttons.length;
+    }
+
+    function injectStyle(doc) {
+      if (!doc?.head || doc.getElementById?.(STYLE_ID) || typeof doc.createElement !== 'function') return;
+      const style = doc.createElement('style');
+      style.id = STYLE_ID;
+      style.textContent = `
+        .${BUTTON_CLASS}{border-color:#5dce8a!important;background:rgba(44,160,90,.16)!important;color:#bfffd5!important;white-space:nowrap}
+        .${BUTTON_CLASS}:hover:not(:disabled){background:rgba(44,160,90,.3)!important;box-shadow:0 0 10px rgba(93,206,138,.25)}
+        .${BUTTON_CLASS}:disabled,.${BUTTON_CLASS}.${PROCESSING_CLASS}{cursor:progress;opacity:.75}
+      `;
+      doc.head.appendChild(style);
+    }
+
+    function decorate(doc) {
+      let added = 0;
+      for (const row of groupRows(doc)) {
+        if (row.querySelector?.(`.${BUTTON_CLASS}`)) continue;
+        const actions = row.querySelector?.(SELECTORS.actions);
+        if (!actions || !row.querySelector?.(SELECTORS.enabled) || !row.querySelector?.(SELECTORS.save)) continue;
+        const button = doc.createElement?.('button');
+        if (!button) continue;
+        button.type = 'button';
+        button.className = `btn ${BUTTON_CLASS}`;
+        button.textContent = '⚡ Activate';
+        button.title = 'Activate this target group and disable all other groups';
+        const deleteButton = actions.querySelector?.(SELECTORS.delete);
+        if (deleteButton && typeof actions.insertBefore === 'function') actions.insertBefore(button, deleteButton);
+        else actions.appendChild?.(button);
+        added += 1;
+      }
+      return added;
+    }
+
+    module.exports = Object.freeze({
+      id: 'auto-farm-activate-buttons',
+      group: 'General',
+      settings: [SETTING],
+      enabledBy: SETTING.key,
+      SETTING,
+      activateExclusiveGroup,
+      decorate,
+
+      matches(url) {
+        return /\/active_wave\.php\/?$/i.test(url.pathname);
+      },
+
+      run({ win, doc, log, warn }) {
+        if (!win || !doc || win[LOADED_FLAG]) return;
+        win[LOADED_FLAG] = true;
+        injectStyle(doc);
+
+        let activationRunning = false;
+        let observer = null;
+        let scanPending = false;
+        let stopped = false;
+        const timers = new Set();
+
+        const later = (callback, delay) => {
+          const timer = win.setTimeout?.(() => {
+            timers.delete(timer);
+            if (!stopped) callback();
+          }, delay);
+          if (timer !== undefined && timer !== null) timers.add(timer);
+        };
+        const scheduleDecorate = () => {
+          if (stopped || scanPending) return;
+          scanPending = true;
+          later(() => {
+            scanPending = false;
+            decorate(doc);
+          }, 0);
+        };
+        const showStatus = (button, text) => {
+          button.textContent = text;
+          later(() => {
+            if (button.isConnected === false) return;
+            button.textContent = '⚡ Activate';
+            button.disabled = false;
+            button.classList?.remove(PROCESSING_CLASS);
+          }, 1_200);
+        };
+        const onClick = (event) => {
+          const button = event.target?.closest?.(`.${BUTTON_CLASS}`);
+          if (!button || activationRunning || stopped) return;
+          const row = button.closest?.(SELECTORS.row);
+          if (!row || !button.closest?.(SELECTORS.targets)) return;
+          event.preventDefault?.();
+          event.stopPropagation?.();
+          activationRunning = true;
+          button.disabled = true;
+          button.classList?.add(PROCESSING_CLASS);
+          button.textContent = '⏳ Activating…';
+          try {
+            const saved = activateExclusiveGroup(doc, win, row);
+            showStatus(button, saved ? '✅ Active' : '⚠️ No Save');
+            if (saved) log?.(`Activated an Auto Farm target group; saved ${saved} target(s).`);
+          } catch (error) {
+            warn?.('Auto Farm target activation failed.', error);
+            showStatus(button, '❌ Error');
+          } finally {
+            later(() => { activationRunning = false; }, 300);
+          }
+        };
+        const cleanup = (event) => {
+          if (event?.persisted) return;
+          stopped = true;
+          doc.removeEventListener?.('click', onClick, true);
+          observer?.disconnect?.();
+          for (const timer of timers) win.clearTimeout?.(timer);
+          timers.clear();
+          win[LOADED_FLAG] = false;
+        };
+
+        decorate(doc);
+        doc.addEventListener?.('click', onClick, true);
+        const Observer = win.MutationObserver || globalThis.MutationObserver;
+        if (typeof Observer === 'function' && doc.documentElement) {
+          observer = new Observer(scheduleDecorate);
+          observer.observe(doc.documentElement, { childList: true, subtree: true });
+        }
+        win.addEventListener?.('pagehide', cleanup);
+      },
+    });
+  },
   "features/general/battle-drawer-scroll.js": function (module, exports, require) {
     'use strict';
 
@@ -17547,6 +17897,7 @@
     module.exports = [
       require('./adventurers-guild-layout'),
       require('./auto-battle-extras'),
+      require('./auto-farm-activate-buttons'),
       require('./better-header'),
       require('./custom-navigation'),
       require('./battle-drawer-scroll'),
@@ -22367,11 +22718,24 @@
   "routes/adventurers.js": function (module, exports, require) {
     'use strict';
 
-    function normalizeSettings() {
-      return {};
+    const DEFAULT_FARM_MONSTERS = 90;
+    const MIN_FARM_MONSTERS = 1;
+    const MAX_FARM_MONSTERS = 100_000;
+
+    function normalizeFarmMonsterCount(value) {
+      const number = Math.round(Number(value));
+      if (!Number.isFinite(number)) return DEFAULT_FARM_MONSTERS;
+      return Math.min(MAX_FARM_MONSTERS, Math.max(MIN_FARM_MONSTERS, number));
+    }
+
+    function normalizeSettings(value) {
+      return {
+        farmMonsterCount: normalizeFarmMonsterCount(value?.farmMonsterCount),
+      };
     }
 
     module.exports = Object.freeze({
+      DEFAULT_FARM_MONSTERS,
       id: 'adventurers',
       label: "Adventurer's Guild",
       path: '/adventurers_guild.php?veyra_route=adventurers',
@@ -22387,16 +22751,34 @@
       },
 
       createDefaultSettings: normalizeSettings,
+      normalizeFarmMonsterCount,
       normalizeSettings,
 
       renderSettings(ctx) {
         ctx.addSectionTitle('Quest automation');
+        const countInput = ctx.addTextInput({
+          id: 'farm-monster-count',
+          label: 'Monsters to farm before quest turn-ins',
+          value: ctx.settings.farmMonsterCount,
+          type: 'number',
+          inputMode: 'numeric',
+          onChange(value) {
+            ctx.settings = ctx.updateSettings((settings) => {
+              settings.farmMonsterCount = value;
+            });
+            return ctx.settings.farmMonsterCount;
+          },
+        });
+        countInput.min = String(MIN_FARM_MONSTERS);
+        countInput.max = String(MAX_FARM_MONSTERS);
+        countInput.step = '1';
+
         const group = ctx.make('div', { className: ctx.cls('setting') });
         group.appendChild(
           ctx.make('div', {
             className: ctx.cls('hint'),
             text:
-              'The worker first farms every currently available Olympus quest target, then accepts, loots and turns in one quest at a time. Quest monsters stay protected from every bulk-loot feature until the run is complete. Auto Farm settings are restored afterwards.',
+              'When quests are available, the worker resets a finished Auto Farm, enables all nine Olympus quest monsters, farms the configured total and then accepts, loots and turns in one quest at a time. It uses 1,000 HP potions and one Large Stamina Potion; other stamina potions and loot-to-level are disabled. Quest monsters stay protected from bulk looting until the run is complete, then the previous Auto Farm configuration is restored.',
           }),
         );
         ctx.container.appendChild(group);
@@ -22541,7 +22923,9 @@
             updateCombinedHint = (settings) => {
               const phase1 = parseGameNumber(settings?.damage) || 0;
               const phase3 = parseGameNumber(settings?.phase3Damage) || 0;
-              combinedHint.textContent = `Overall target after Phase 3: ${formatGameNumber(phase1 + phase3)} (Phase 1 + Phase 3).`;
+              combinedHint.textContent =
+                `Phase 1 stops at about ${formatGameNumber(phase1)}. Phase 3 then adds ` +
+                `${formatGameNumber(phase3)} to the damage actually dealt in Phase 1.`;
             };
             updateCombinedHint(bossSettings);
             ctx.container.appendChild(combinedHint);

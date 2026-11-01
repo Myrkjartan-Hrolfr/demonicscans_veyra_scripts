@@ -135,7 +135,9 @@ function renderBossSettings(ctx, sections) {
         updateCombinedHint = (settings) => {
           const phase1 = parseGameNumber(settings?.damage) || 0;
           const phase3 = parseGameNumber(settings?.phase3Damage) || 0;
-          combinedHint.textContent = `Overall target after Phase 3: ${formatGameNumber(phase1 + phase3)} (Phase 1 + Phase 3).`;
+          combinedHint.textContent =
+            `Phase 1 stops at about ${formatGameNumber(phase1)}. Phase 3 then adds ` +
+            `${formatGameNumber(phase3)} to the damage actually dealt in Phase 1.`;
         };
         updateCombinedHint(bossSettings);
         ctx.container.appendChild(combinedHint);

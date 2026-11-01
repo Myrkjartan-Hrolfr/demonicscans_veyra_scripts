@@ -23,14 +23,14 @@ const {
 
 const NOW = 1_800_000_000_000;
 
-function element({ text = '', attrs = {}, dataset = {}, value = '', selected = false, disabled = false, one = {}, many = {} } = {}) {
+function element({ text = '', attrs = {}, dataset = {}, value = '', selected = false, disabled = false, classes = [], one = {}, many = {} } = {}) {
   return {
     textContent: text,
     dataset,
     value,
     selected,
     disabled,
-    classList: { contains: () => false },
+    classList: { contains: (name) => classes.includes(name) },
     getAttribute(name) {
       if (Object.prototype.hasOwnProperty.call(attrs, name)) return String(attrs[name]);
       if (name === 'data-target-id' && dataset.targetId !== undefined) return String(dataset.targetId);
@@ -133,7 +133,7 @@ function guildDocument(state, current = 0, count = 1) {
   });
 }
 
-function deadCard({ id = '1001', damage = '5000000', expiresAt = NOW + 60_000 } = {}) {
+function deadCard({ id = '1001', damage = '5000000', expiresAt = NOW + 60_000, quantity = 1 } = {}) {
   return element({
     dataset: {
       monsterId: id,
@@ -142,12 +142,49 @@ function deadCard({ id = '1001', damage = '5000000', expiresAt = NOW + 60_000 } 
       dead: '1',
       eligible: '1',
       expire: String(Math.floor(expiresAt / 1_000)),
+      quantity: String(quantity),
     },
   });
 }
 
-function waveDocument(cards = [deadCard()]) {
-  return documentWith({ many: { '.monster-card[data-dead="1"]': cards, '.unclaimed-pill': [] } });
+function waveDocument(cards = [deadCard()], { farmState = 'finished', killed = 90, target = 90 } = {}) {
+  const option = element({ text: 'Kraken', value: '501', selected: true });
+  const monsterSelect = element({ value: '501', many: { option: [option] } });
+  const targetRow = element({
+    dataset: { targetId: '41' },
+    one: {
+      '.afTMonster': monsterSelect,
+      '.afTEnabled': element({ value: '0' }),
+      '.afTMode': element({ value: '0' }),
+      '.afTMin': element({ value: '1000000' }),
+      '.afTStack': element({ value: '1' }),
+    },
+  });
+  const badge = element({
+    text: farmState === 'finished' ? 'FINISHED' : farmState === 'running' ? 'RUNNING' : 'PAUSED',
+    classes: [farmState === 'finished' ? 'fin' : farmState === 'running' ? 'on' : 'off'],
+  });
+  return documentWith({
+    one: {
+      '#afStateBadge': badge,
+      '#afTotalKilledText': element({ text: String(killed) }),
+      '#afTotalToKill': element({ value: String(target) }),
+      '#afHpMax': element({ value: '3000' }),
+      '#afSt20Max': element({ value: '10' }),
+      '#afStHalfMax': element({ value: '10' }),
+      '#afStFullMax': element({ value: '10' }),
+      '#afStAdvMax': element({ value: '10' }),
+      '#afStPriority': element({ value: '30' }),
+      '#afAutoLootToLevel': element({ value: '1' }),
+      '#afPrcExpLeft': element({ value: '100' }),
+    },
+    many: {
+      '.monster-card[data-dead="1"]': cards,
+      '.unclaimed-pill': [],
+      '.af-row[data-target-id]': [targetRow],
+      '.afTMonster option, #afAddMonster option': [option],
+    },
+  });
 }
 
 function createStore(initial = {}) {
@@ -222,6 +259,7 @@ test("Adventurer's Guild route is distinct and disabled by default", () => {
   assert.equal(routeIdForUrl('/adventurers_guild.php?veyra_route=adventurers'), 'adventurers');
   assert.equal(routeIdForUrl('/adventurers_guild.php'), 'adventurers');
   assert.equal(createDefaultConfig().routes.adventurers.enabled, false);
+  assert.equal(createDefaultConfig().routes.adventurers.settings.farmMonsterCount, 90);
 });
 
 test('quest requirements parse names with commas and compact damage values', () => {
@@ -247,6 +285,30 @@ test('duplicate quest targets are aggregated so enough monsters are farmed for e
   ]);
 });
 
+test('Auto Farm targets include cooldown quests, not only the currently available quest', () => {
+  const names = [
+    'Charybdis, Living Maelstrom',
+    'The Crab King',
+    'Dark Siren',
+    'Scylla, Devourer of Sailors',
+    'Kraken',
+    'Merfolk',
+    'Deep Sea Beast',
+    'Triton Warrior',
+    'Water Nymph',
+  ];
+  const quests = names.map((name, index) => ({
+    state: index === 0 ? 'available' : 'cooldown',
+    requirement: logic.parseQuestRequirement(
+      `Kill 10 monster(s) · Monster: ${name} · min 5m dmg`,
+    ),
+  }));
+  assert.deepEqual(
+    logic.questFarmRequirements(quests).map((requirement) => requirement.name),
+    names,
+  );
+});
+
 test('dead monster selection requires eligibility, damage and a future expiry', () => {
   const requirement = logic.parseQuestRequirement('Kill 2 monster(s) · Monster: Kraken · min 5m dmg');
   const valid = logic.deadMonsterFromCard(deadCard({ id: '1' }), NOW);
@@ -256,6 +318,14 @@ test('dead monster selection requires eligibility, damage and a future expiry', 
   assert.equal(expired, null);
   assert.deepEqual(logic.eligibleForRequirement([valid, weak], requirement).map((monster) => monster.id), ['1']);
   assert.equal(logic.requirementsSatisfied([requirement], [valid]), false);
+});
+
+test('stacked dead-monster cards contribute their full quantity', () => {
+  const requirement = logic.parseQuestRequirement('Kill 10 monster(s) · Monster: Kraken · min 5m dmg');
+  const stack = logic.deadMonsterFromCard(deadCard({ id: '9', quantity: 10 }), NOW);
+  assert.equal(stack.quantity, 10);
+  assert.equal(logic.requirementCounts([requirement], [stack])[0].count, 10);
+  assert.equal(logic.requirementsSatisfied([requirement], [stack]), true);
 });
 
 test('worker reveals the dead pool before Wave fetches and restores both filter cookies after success', async () => {
@@ -432,6 +502,7 @@ test('worker accepts, loots and finishes a ready quest without ever giving it up
   const posts = [];
   const config = createDefaultConfig();
   config.routes.adventurers.enabled = true;
+  config.routes.adventurers.settings.farmMonsterCount = 123;
   const store = createStore({
     [CONFIG_KEY]: config,
     [COMMAND_KEY]: {
@@ -476,7 +547,36 @@ test('worker accepts, loots and finishes a ready quest without ever giving it up
 
   await worker.tick();
 
-  assert.deepEqual(posts.map((entry) => entry.url), [ACCEPT_PATH, LOOT_PATH, FINISH_PATH]);
+  assert.deepEqual(
+    posts.filter((entry) => [ACCEPT_PATH, LOOT_PATH, FINISH_PATH].includes(entry.url)).map((entry) => entry.url),
+    [ACCEPT_PATH, LOOT_PATH, FINISH_PATH],
+  );
+  assert.equal(posts.some((entry) => entry.url === AUTO_FARM_PATH && entry.params.action === 'reset'), true);
+  const questFarmSettings = posts.find(
+    (entry) => entry.url === AUTO_FARM_PATH && entry.params.action === 'save_settings' && entry.params.TOTAL_MONSTERS_TO_KILL === '123',
+  );
+  assert.deepEqual(
+    {
+      total: questFarmSettings?.params.TOTAL_MONSTERS_TO_KILL,
+      hp: questFarmSettings?.params.HP_POTIONS_MAX_TO_USE,
+      small: questFarmSettings?.params.STAM_POT_SMALL_ITEM_MAX_TO_USE,
+      large: questFarmSettings?.params.STAM_POT_HALF_ITEM_ID_MAX_TO_USE,
+      full: questFarmSettings?.params.STAM_POT_FULL_ITEM_ID_MAX_TO_USE,
+      adventurer: questFarmSettings?.params.STAM_POT_ADV_ITEM_MAX_TO_USE,
+      priority: questFarmSettings?.params.STAM_POT_PRIORITY_ITEM_ID,
+      lootToLevel: questFarmSettings?.params.AUTO_LOOT_TO_LEVEL,
+    },
+    {
+      total: '123',
+      hp: '1000',
+      small: '0',
+      large: '1',
+      full: '0',
+      adventurer: '0',
+      priority: '251',
+      lootToLevel: '0',
+    },
+  );
   assert.equal(posts.some((entry) => /giveup/i.test(entry.url)), false);
   assert.deepEqual(store.read(LOOT_GUARD_KEY), { names: [] });
   const status = store.read(workerStatusKey('adventurers'));

@@ -96,6 +96,10 @@ function aggregateRequirements(requirements) {
   return [...merged.values()];
 }
 
+function questFarmRequirements(quests) {
+  return aggregateRequirements((quests || []).map((quest) => quest?.requirement).filter(Boolean));
+}
+
 function earliestCooldown(quests, nowMs = Date.now()) {
   const values = (quests || [])
     .map((quest) => Number(quest?.cooldownAt) || 0)
@@ -111,7 +115,33 @@ function deadMonsterFromCard(card, nowMs = Date.now()) {
   const expiresAt = Math.max(0, Number(data.expire || 0) * 1_000);
   if (!id || !name || data.dead !== '1' || data.eligible !== '1') return null;
   if (expiresAt > 0 && expiresAt <= nowMs) return null;
-  return { id, name, damage, expiresAt };
+  const quantity = deadMonsterQuantity(card);
+  return { id, name, damage, expiresAt, quantity };
+}
+
+function positiveInteger(value) {
+  const number = Number.parseInt(String(value ?? '').replace(/[^\d]/g, ''), 10);
+  return Number.isFinite(number) && number > 0 ? number : 0;
+}
+
+// Veyra normally renders one dead monster per card, but stacked/batched cards
+// use a quantity field or a dedicated count badge. Keep this deliberately
+// conservative: generic item/drop counts inside the card must not be mistaken
+// for the number of monsters represented by it.
+function deadMonsterQuantity(card) {
+  const data = card?.dataset || {};
+  for (const key of ['quantity', 'count', 'stack', 'amount', 'batch', 'qty', 'monsterCount']) {
+    const count = positiveInteger(data[key]);
+    if (count) return count;
+  }
+  const badge = card?.querySelector?.(
+    '[data-monster-count], .monster-count, .monster-stack-count, .dead-monster-count, .batch-count',
+  );
+  const attributeCount = positiveInteger(badge?.getAttribute?.('data-monster-count'));
+  if (attributeCount) return attributeCount;
+  const text = String(badge?.textContent || '');
+  const match = text.match(/(?:^|\s)[x×]?\s*(\d+)\s*(?:x|×|monsters?|kills?)?(?:\s|$)/i);
+  return positiveInteger(match?.[1]) || 1;
 }
 
 function readDeadMonsters(root, nowMs = Date.now()) {
@@ -133,7 +163,10 @@ function eligibleForRequirement(monsters, requirement) {
 function requirementCounts(requirements, monsters) {
   return (requirements || []).map((requirement) => ({
     requirement,
-    count: eligibleForRequirement(monsters, requirement).length,
+    count: eligibleForRequirement(monsters, requirement).reduce(
+      (total, monster) => total + Math.max(1, Number(monster.quantity) || 1),
+      0,
+    ),
   }));
 }
 
@@ -201,9 +234,23 @@ function readAutoFarmSettings(root) {
 }
 
 function autoFarmIsActive(root) {
+  return autoFarmState(root) === 'running';
+}
+
+function autoFarmState(root) {
   const badge = root?.querySelector?.('#afStateBadge');
   const text = String(badge?.textContent || '').trim();
-  return /\b(?:active|running|on)\b/i.test(text) || badge?.classList?.contains?.('on') === true;
+  if (/\bfinished\b/i.test(text) || badge?.classList?.contains?.('fin') === true) return 'finished';
+  if (/\b(?:active|running|on)\b/i.test(text) || badge?.classList?.contains?.('on') === true) {
+    return 'running';
+  }
+  return 'paused';
+}
+
+function readAutoFarmProgress(root) {
+  const killed = parseGameNumber(root?.querySelector?.('#afTotalKilledText')?.textContent) || 0;
+  const target = parseGameNumber(root?.querySelector?.('#afTotalToKill')?.value) || 0;
+  return { killed, target, state: autoFarmState(root) };
 }
 
 function deadPageCount(root) {
@@ -228,14 +275,18 @@ module.exports = {
   actionableQuests,
   aggregateRequirements,
   autoFarmIsActive,
+  autoFarmState,
   deadMonsterFromCard,
+  deadMonsterQuantity,
   deadPageCount,
   earliestCooldown,
   eligibleForRequirement,
   normalizeName,
   parseQuestRequirement,
   parseQuests,
+  questFarmRequirements,
   readAutoFarmSettings,
+  readAutoFarmProgress,
   readAutoFarmTargets,
   readDeadMonsters,
   readMonsterOptions,

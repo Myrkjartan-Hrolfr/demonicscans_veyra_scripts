@@ -1,4 +1,6 @@
-1. Für Addventurer Guild muss folgender ablauf erfolgen
+Stand: in Version 0.8.4 umgesetzt.
+
+1. Für Addventurer Guild muss folgender ablauf erfolgen [erledigt]
 - überprüfen ob quests verfügbar sind
 - wenn nein -> beenden
 - wenn ja 
@@ -18,5 +20,5 @@
         -> wieder zur quest belohnung einsammeln (aktive quest bestätigen)
     -> wenn alle Quests beendet sind ist der vorgang fertig
 
-2. Bei Phase 3 der Olympus Bosse braucht es eine Korektur. Die Schadenshöhe für Phase 3 muss nicht zu der voreingestellten von Phase 1 addiert werden, sondern zu dem tatsächlich in Phase 1 angerichteten Schaden.
-3. Der Activate Button für Targets beim Auto Farm fehlt. Baue in die allgemeinen einstellungen ein, dass ich den ein oder ausblenden kann.
+2. Bei Phase 3 der Olympus Bosse braucht es eine Korektur. Die Schadenshöhe für Phase 3 muss nicht zu der voreingestellten von Phase 1 addiert werden, sondern zu dem tatsächlich in Phase 1 angerichteten Schaden. [erledigt]
+3. Der Activate Button für Targets beim Auto Farm fehlt. Baue in die allgemeinen einstellungen ein, dass ich den ein oder ausblenden kann. [erledigt]

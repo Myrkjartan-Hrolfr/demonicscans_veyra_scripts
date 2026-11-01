@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Auto Farm Activate Buttons
 // @namespace    local.veyra.auto-farm-activate-buttons
-// @version      1.0.0
+// @version      1.1.0
 // @description  Adds an exclusive Activate button to each grouped Auto-Farm target.
 // @match        https://demonicscans.org/active_wave.php*
 // @match        https://www.demonicscans.org/active_wave.php*
@@ -12,6 +12,16 @@
 
 (() => {
   'use strict';
+
+  const SETTING_KEY = 'veyra:autoFarm:showTargetActivateButtons';
+  const LOADED_FLAG = '__veyraAutoFarmActivateButtonsLoaded';
+  try {
+    if (JSON.parse(localStorage.getItem(SETTING_KEY)) === false) return;
+  } catch {
+    // Missing/legacy values keep the default (visible).
+  }
+  if (window[LOADED_FLAG]) return;
+  window[LOADED_FLAG] = true;
 
   const SELECTORS = Object.freeze({
     targets: '.af-targets',
@@ -263,6 +273,7 @@
 
     for (const timer of runtime.timers) window.clearTimeout(timer);
     runtime.timers.clear();
+    window[LOADED_FLAG] = false;
   }
 
   decorateGroupRows();

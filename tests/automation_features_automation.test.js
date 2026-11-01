@@ -396,6 +396,13 @@ test('phased Olympus gods keep Phase 1 and Phase 3 separate but use their sum on
   assert.equal(zeus.damage, '7b');
   assert.deepEqual(logic.battleDamageTarget(zeus, false), { phase: 1, damage: '3b', damageValue: 3e9 });
   assert.deepEqual(logic.battleDamageTarget(zeus, true), { phase: 3, damage: '7b', damageValue: 7e9 });
+  const actual = logic.withActualPhaseOneDamage(zeus, 3_509_177_599);
+  assert.equal(actual.damageValue, 7_509_177_599);
+  assert.deepEqual(logic.battleDamageTarget(actual, true), {
+    phase: 3,
+    damage: '7.51b',
+    damageValue: 7_509_177_599,
+  });
 });
 
 test('Olympus duel logic prefers affordable Power Slash and falls back to Slash', () => {
@@ -584,6 +591,22 @@ test('DOM readers recognize the Olympus phase-duel link and Ascended PvE form', 
   assert.equal(
     dom.isAscendedBattle(fakeDoc({ selectors: { [dom.SELECTORS.battleTitle]: el({ text: 'Zeus, Ascended Sovereign' }) } })),
     true,
+  );
+  const ascended = fakeDoc({
+    selectors: {
+      [dom.SELECTORS.playerDamage]: el({ text: '3,759,177,599' }),
+      [dom.SELECTORS.phaseDamageChip]: [el({ text: 'Phase DMG: 250,000,000' })],
+    },
+  });
+  assert.equal(dom.readPlayerDamage(ascended), 3_759_177_599);
+  assert.equal(dom.readPhaseThreeDamage(ascended), 250_000_000);
+  assert.equal(dom.readActualPhaseOneDamage(ascended), 3_509_177_599);
+  assert.equal(
+    dom.readActualPhaseOneDamage(
+      fakeDoc({ selectors: { [dom.SELECTORS.playerDamage]: el({ text: '3,759,177,599' }) } }),
+      { requirePhaseThree: true },
+    ),
+    null,
   );
 });
 
@@ -885,11 +908,16 @@ test('a zero-HP boss battle stops safely when no healing potion is selected', as
   assert.match(env.status('olympus').message, /no healing potion is selected/i);
 });
 
-test('a phased Olympus battle opens its matching Phase 2 duel with the visit marker', () => {
+test('a phased Olympus battle records actual Phase 1 damage before opening Phase 2', () => {
   const env = createEnv({ configure: (config) => enableOlympus(config, ['zeus'], '3b', '4b') });
   phasedBattleRun(env);
   const phaseLink = el({ attrs: { href: 'pvp_style_battle.php?source=monster_phase&active_id=557845671' } });
-  const doc = fakeDoc({ selectors: { [dom.SELECTORS.phaseDuel]: phaseLink } });
+  const doc = fakeDoc({
+    selectors: {
+      [dom.SELECTORS.phaseDuel]: phaseLink,
+      [dom.SELECTORS.playerDamage]: el({ text: '3,509,177,599' }),
+    },
+  });
   const { win, worker } = env.page(
     'https://demonicscans.org/battle.php?id=557845671&veyra_visit=v1',
     doc,
@@ -899,6 +927,51 @@ test('a phased Olympus battle opens its matching Phase 2 duel with the visit mar
     'https://demonicscans.org/pvp_style_battle.php?source=monster_phase&active_id=557845671&veyra_visit=v1',
   ]);
   assert.equal(env.run().phase, 'duel');
+  assert.equal(env.run().target.phase1ActualDamageValue, 3_509_177_599);
+  assert.equal(env.run().target.damageValue, 7_509_177_599);
+});
+
+test('a later visit reuses recorded Phase 1 damage when deciding whether Phase 3 is complete', () => {
+  const env = createEnv({ configure: (config) => enableOlympus(config, ['zeus'], '3b', '4b') });
+  phasedBattleRun(env);
+  const phaseLink = el({ attrs: { href: 'pvp_style_battle.php?source=monster_phase&active_id=557845671' } });
+  let page = env.page(
+    'https://demonicscans.org/battle.php?id=557845671&veyra_visit=v1',
+    fakeDoc({
+      selectors: {
+        [dom.SELECTORS.phaseDuel]: phaseLink,
+        [dom.SELECTORS.playerDamage]: el({ text: '3,509,177,599' }),
+      },
+    }),
+  );
+  page.worker.tick();
+
+  env.store.write(COMMAND_KEY, {
+    ...env.store.read(COMMAND_KEY),
+    visitId: 'v2',
+    issuedAt: env.clock.time,
+    deadlineAt: env.clock.time + 45 * 60_000,
+  });
+  page = env.page(
+    `${HUB}?gate=5&wave=17&veyra_visit=v2`,
+    hubDoc({
+      summons: [summonCard({ name: 'Zeus, Sovereign of the Storm Throne' })],
+      cards: [
+        monsterCard({
+          id: 557845671,
+          name: 'zeus, duelist of the storm throne',
+          userdmg: '7200000000',
+        }),
+      ],
+    }),
+  );
+  env.clock.time += 1_500;
+  page.worker.tick();
+
+  assert.deepEqual(page.win.replaced, [
+    'https://demonicscans.org/battle.php?id=557845671&veyra_visit=v2',
+  ]);
+  assert.equal(env.run().target.damageValue, 7_509_177_599);
 });
 
 test('the Phase 2 worker uses Power Slash while affordable and Slash otherwise', async () => {
@@ -933,7 +1006,7 @@ test('the Phase 2 worker uses Power Slash while affordable and Slash otherwise',
   assert.equal(env.posts.at(-1).params.skill_id, '0');
 });
 
-test('a won Phase 2 duel returns to the same boss and Phase 3 uses the combined damage target', async () => {
+test('a won Phase 2 duel returns to the same boss and Phase 3 adds to actual Phase 1 damage', async () => {
   const env = createEnv({ configure: (config) => enableOlympus(config, ['zeus'], '3b', '4b') });
   phasedBattleRun(env);
   env.phaseStates.push({
@@ -955,15 +1028,20 @@ test('a won Phase 2 duel returns to the same boss and Phase 3 uses the combined 
 
   env.controller = stubController();
   const ascendedDoc = fakeDoc({
-    selectors: { [dom.SELECTORS.battleTitle]: el({ text: 'Zeus, Ascended Sovereign of the Storm Throne' }) },
+    selectors: {
+      [dom.SELECTORS.battleTitle]: el({ text: 'Zeus, Ascended Sovereign of the Storm Throne' }),
+      [dom.SELECTORS.playerDamage]: el({ text: '3,509,177,599' }),
+      [dom.SELECTORS.phaseDamageChip]: [el({ text: 'Phase DMG: 0' })],
+    },
   });
   page = env.page('https://demonicscans.org/battle.php?id=557845671&veyra_visit=v1', ascendedDoc);
   page.worker.tick();
   await flush();
   assert.deepEqual(env.controller.calls.slice(0, 2), [
-    ['target', 7e9],
+    ['target', 7_509_177_599],
     ['attacks', ['-1', '0']],
   ]);
+  assert.equal(env.run().target.phase1ActualDamageValue, 3_509_177_599);
 });
 
 test('a failed fight returns to the hub for a retry; no stamina ends the visit', async () => {
