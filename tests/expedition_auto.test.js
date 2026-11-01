@@ -88,3 +88,62 @@ test('standalone expedition powers follow the selected class', () => {
   assert.equal(helpers.choosePower(catalog().powers, 'mage'), 'arcane_well');
   assert.equal(helpers.choosePower(catalog().powers, 'tank'), 'iron_skin');
 });
+
+test('standalone expedition ticker keeps worker and fallback timers active in background tabs', () => {
+  const documentListeners = new Map();
+  const windowListeners = new Map();
+  const workers = [];
+  const intervals = [];
+  const clearedIntervals = [];
+  const revokedUrls = [];
+  class FakeWorker {
+    constructor(url) {
+      this.url = url;
+      this.messages = [];
+      this.terminated = false;
+      workers.push(this);
+    }
+    postMessage(message) { this.messages.push(message); }
+    terminate() { this.terminated = true; }
+  }
+  const win = {
+    document: {
+      addEventListener: (name, listener) => documentListeners.set(name, listener),
+      removeEventListener: (name, listener) => {
+        if (documentListeners.get(name) === listener) documentListeners.delete(name);
+      },
+    },
+    Worker: FakeWorker,
+    Blob: class FakeBlob {},
+    URL: {
+      createObjectURL: () => 'blob:expedition-worker',
+      revokeObjectURL: (url) => revokedUrls.push(url),
+    },
+    setInterval: (listener, delay) => {
+      intervals.push({ listener, delay });
+      return 17;
+    },
+    clearInterval: (id) => clearedIntervals.push(id),
+    setTimeout: (listener) => listener(),
+    addEventListener: (name, listener) => windowListeners.set(name, listener),
+    removeEventListener: (name, listener) => {
+      if (windowListeners.get(name) === listener) windowListeners.delete(name);
+    },
+  };
+  let ticks = 0;
+  const stop = helpers.createBackgroundTicker(win, () => { ticks += 1; }, 750);
+
+  assert.equal(intervals[0].delay, 750);
+  assert.deepEqual(workers[0].messages[0], { type: 'start', interval: 750 });
+  workers[0].onmessage();
+  documentListeners.get('visibilitychange')();
+  windowListeners.get('pageshow')();
+  assert.equal(ticks, 3);
+
+  stop();
+  assert.deepEqual(clearedIntervals, [17]);
+  assert.equal(workers[0].terminated, true);
+  assert.deepEqual(revokedUrls, ['blob:expedition-worker']);
+  assert.equal(documentListeners.size, 0);
+  assert.equal(windowListeners.size, 0);
+});

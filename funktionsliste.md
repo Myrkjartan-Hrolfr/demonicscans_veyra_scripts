@@ -181,6 +181,7 @@ Die Lizenz erlaubt Bündeln und Ändern; der MIT-Copyright-Hinweis muss im Bundl
 | 8.6 | Gefahrenfelder und Rettungen | [vorh.] | Lethal-, Flächen- und Bodenwarnungen werden vor dem Angriff verlassen, sofern ein sicheres Nachbarfeld existiert. Automatische Rescues sind einstellbar und bevorzugen gefallene menschliche Gruppenmitglieder vor NPCs. |
 | 8.7 | Loot und temporäre Powers | [vorh.] | Seltene umkämpfte Drops können automatisch alle beansprucht oder alle abgelehnt werden. Powers werden anhand der aktuellen Klasse bewertet; persönliche und gewöhnliche Drops bleiben der Spielverteilung überlassen. |
 | 8.8 | Bestätigte API-Aktionen und Statusfenster | [vorh.] | Nutzt den CSRF-geschützten JSON-Endpunkt des Spielclients mit eindeutigen Request-IDs. Das eigene Live-Fenster zeigt Start, Gruppenphase, Abschnitt, Aktion, Abschluss oder Fehler; nach fünf wiederholten Fehlern stoppt das Skript sicher. |
+| 8.9 | Weiterlauf bei inaktivem Tab | [vorh.] | Ein Dedicated Worker liefert den Takt auch bei einem nicht sichtbaren Tab; ein normaler Timer dient als Fallback. Bei `visibilitychange`, `pageshow` und Fokus wird sofort nachgeholt. Vollständig vom Browser eingefrorene oder verworfene Tabs können grundsätzlich kein Userscript ausführen. |
 
 ---
 

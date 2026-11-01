@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Dragon Realm Expedition Auto
 // @namespace    local.veyra.expeditions
-// @version      1.0.0
+// @version      1.1.0
 // @description  Independently starts and completes Dragon Realm expeditions, including party setup, votes, combat, loot and powers.
 // @match        https://demonicscans.org/event_page.php*
 // @match        https://www.demonicscans.org/event_page.php*
@@ -287,6 +287,67 @@
     }).sort((left, right) => right.score - left.score || left.index - right.index)[0]?.key || '';
   }
 
+  // A normal window.setInterval is heavily throttled in background tabs.
+  // A dedicated worker is usually allowed to keep a steadier cadence. The
+  // window timer stays as a fallback for browsers or CSPs that block workers.
+  function createBackgroundTicker(win, callback, intervalMs = TICK_MS) {
+    const doc = win.document;
+    let worker = null;
+    let workerUrl = '';
+    const fallbackId = win.setInterval(callback, intervalMs);
+    try {
+      if (typeof win.Worker === 'function' && typeof win.Blob === 'function' && win.URL?.createObjectURL) {
+        const source = `
+          let timer = 0;
+          self.onmessage = (event) => {
+            if (event.data?.type === 'stop') {
+              clearInterval(timer);
+              timer = 0;
+              return;
+            }
+            if (event.data?.type === 'start') {
+              clearInterval(timer);
+              const delay = Math.max(250, Number(event.data.interval) || 1000);
+              timer = setInterval(() => self.postMessage(Date.now()), delay);
+              self.postMessage(Date.now());
+            }
+          };
+        `;
+        workerUrl = win.URL.createObjectURL(new win.Blob([source], { type: 'text/javascript' }));
+        worker = new win.Worker(workerUrl);
+        worker.onmessage = callback;
+        worker.onerror = () => {
+          worker?.terminate?.();
+          worker = null;
+        };
+        worker.postMessage({ type: 'start', interval: intervalMs });
+        win.setTimeout?.(() => {
+          if (workerUrl) win.URL.revokeObjectURL?.(workerUrl);
+          workerUrl = '';
+        }, 0);
+      }
+    } catch {
+      worker?.terminate?.();
+      worker = null;
+      if (workerUrl) win.URL?.revokeObjectURL?.(workerUrl);
+      workerUrl = '';
+    }
+
+    const catchUp = () => callback();
+    doc.addEventListener?.('visibilitychange', catchUp);
+    win.addEventListener?.('pageshow', catchUp);
+    win.addEventListener?.('focus', catchUp);
+    return () => {
+      win.clearInterval?.(fallbackId);
+      worker?.postMessage?.({ type: 'stop' });
+      worker?.terminate?.();
+      if (workerUrl) win.URL?.revokeObjectURL?.(workerUrl);
+      doc.removeEventListener?.('visibilitychange', catchUp);
+      win.removeEventListener?.('pageshow', catchUp);
+      win.removeEventListener?.('focus', catchUp);
+    };
+  }
+
   function start(win) {
     const doc = win.document;
     const page = new URL(win.location.href);
@@ -331,7 +392,7 @@
     doc.head.appendChild(style);
     const root = doc.createElement('section');
     root.id = PANEL_ID;
-    root.innerHTML = `<header><strong>🧭 Expedition Auto</strong><button class="ea-fold" type="button">−</button></header><div class="ea-body"><div class="ea-actions"><button class="ea-start" type="button">Start</button></div><div class="ea-status"></div><div class="ea-grid"><label><span>Start private expeditions automatically</span><input data-key="autoStart" type="checkbox"></label><label><span>Fill empty slots with NPCs</span><input data-key="fillWithNpcs" type="checkbox"></label><label><span>Preferred class</span><select data-key="preferredClass">${CLASSES.map((name) => `<option value="${name}">${name[0].toUpperCase() + name.slice(1)}</option>`).join('')}</select></label><label><span>Preferred route</span><select data-key="routeChoice"><option value="left">Left</option><option value="right">Right</option></select></label><label><span>Claim contested rare drops</span><input data-key="claimRareLoot" type="checkbox"></label><label><span>Rescue fallen party members</span><input data-key="autoRescue" type="checkbox"></label></div><p class="ea-note">Automatic start can spend daily expedition entries. Combat uses the most expensive ready attack first and avoids marked danger tiles.</p></div>`;
+    root.innerHTML = `<header><strong>🧭 Expedition Auto</strong><button class="ea-fold" type="button">−</button></header><div class="ea-body"><div class="ea-actions"><button class="ea-start" type="button">Start</button></div><div class="ea-status"></div><div class="ea-grid"><label><span>Start private expeditions automatically</span><input data-key="autoStart" type="checkbox"></label><label><span>Fill empty slots with NPCs</span><input data-key="fillWithNpcs" type="checkbox"></label><label><span>Preferred class</span><select data-key="preferredClass">${CLASSES.map((name) => `<option value="${name}">${name[0].toUpperCase() + name.slice(1)}</option>`).join('')}</select></label><label><span>Preferred route</span><select data-key="routeChoice"><option value="left">Left</option><option value="right">Right</option></select></label><label><span>Claim contested rare drops</span><input data-key="claimRareLoot" type="checkbox"></label><label><span>Rescue fallen party members</span><input data-key="autoRescue" type="checkbox"></label></div><p class="ea-note">Automatic start can spend daily expedition entries. Combat uses the most expensive ready attack first and avoids marked danger tiles. A background worker keeps polling while this tab is inactive; completely suspended or discarded tabs cannot run userscripts.</p></div>`;
     doc.body.appendChild(root);
     const status = root.querySelector('.ea-status');
     const startButton = root.querySelector('.ea-start');
@@ -560,7 +621,7 @@
       }
     }
 
-    win.setInterval(() => void tick(), TICK_MS);
+    createBackgroundTicker(win, () => void tick(), TICK_MS);
     if (settings.enabled) void tick();
   }
 
@@ -574,6 +635,7 @@
       choosePower,
       dangerTiles,
       distance,
+      createBackgroundTicker,
       normalizeSettings,
       skillReady,
       targetable,
