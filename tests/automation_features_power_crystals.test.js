@@ -83,3 +83,43 @@ test('Power Crystal upgrades are enabled only when both gold and materials suffi
   assert.equal(quickset.upgradeAffordable(data, 9_999_999), false);
   assert.equal(quickset.upgradeAffordable(null, 100_000_000), false);
 });
+
+test('Power Crystal bulk removal includes every equipped crystal from visible equipment once', () => {
+  assert.deepEqual(
+    quickset.crystalIdsFromEquipment([
+      { slots: [{ crystalId: 11 }, { crystalId: null }, { crystalId: 12 }] },
+      { slots: [{ crystalId: 12 }, { crystalId: 13 }, {}] },
+    ]),
+    [11, 12, 13],
+  );
+  assert.deepEqual(quickset.crystalIdsFromEquipment([]), []);
+});
+
+test('Power Crystal view state restores filters, selection and scroll only while fresh', () => {
+  const now = 1_000_000;
+  assert.deepEqual(
+    quickset.normalizeViewState({
+      savedAt: now - 1000,
+      typeFilter: 'Weapon',
+      setFilter: 'Vaelith',
+      searchFilter: 'testament',
+      selectedCrystalId: 24326,
+      scrollX: 12,
+      scrollY: 345,
+      availableScrollTop: 67,
+      inactiveScrollTop: 8,
+    }, now),
+    {
+      savedAt: now - 1000,
+      typeFilter: 'Weapon',
+      setFilter: 'Vaelith',
+      searchFilter: 'testament',
+      selectedCrystalId: 24326,
+      scrollX: 12,
+      scrollY: 345,
+      availableScrollTop: 67,
+      inactiveScrollTop: 8,
+    },
+  );
+  assert.equal(quickset.normalizeViewState({ savedAt: now - 6 * 60 * 1000 }, now), null);
+});

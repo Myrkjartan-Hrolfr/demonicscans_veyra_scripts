@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.9.0
+// @version      0.9.3
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -18285,6 +18285,8 @@
     const STYLE_ID = 'veyra-power-crystal-quickset-style';
     const ROOT_ID = 'veyra-power-crystal-quickset';
     const RESULT_KEY = 'veyra:power-crystals:quickset-result';
+    const VIEW_STATE_KEY = 'veyra:power-crystals:quickset-view';
+    const VIEW_STATE_MAX_AGE_MS = 5 * 60 * 1000;
     const PAGE_PATH = '/power_crystals.php';
     const MAX_POST_RETRIES = 4;
 
@@ -18306,6 +18308,7 @@
       #${ROOT_ID} button { background: #304a86; border: 1px solid #5e79b4; border-radius: 8px; color: #fff; cursor: pointer; font-weight: 700; min-height: 34px; padding: 6px 10px; }
       #${ROOT_ID} button:hover { filter: brightness(1.1); }
       #${ROOT_ID} button:disabled { cursor: not-allowed; filter: none; opacity: .42; }
+      #${ROOT_ID} button.pcq-danger { background: #7b3040; border-color: #b85b6d; }
       #${ROOT_ID} .pcq-layout { display: grid; gap: 16px; grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr); }
       #${ROOT_ID} .pcq-column { min-width: 0; }
       #${ROOT_ID} .pcq-column-title { display: flex; justify-content: space-between; gap: 8px; margin: 0 0 9px; }
@@ -18330,7 +18333,10 @@
       #${ROOT_ID} .pcq-side-box { background: rgba(255,255,255,.035); border: 1px solid var(--pcq-border); border-radius: 15px; margin-bottom: 11px; padding: 11px; }
       #${ROOT_ID} .pcq-side-box h3 { margin-bottom: 8px; }
       #${ROOT_ID} .pcq-available { max-height: 390px; overflow: auto; padding-right: 3px; }
-      #${ROOT_ID} .pcq-available.pcq-dragover { background: rgba(60,207,145,.1); border: 1px dashed #3ccf91; border-radius: 10px; min-height: 70px; }
+      #${ROOT_ID} .pcq-available-panel { transition: background .15s ease, border-color .15s ease, box-shadow .15s ease; }
+      #${ROOT_ID} .pcq-available-panel.pcq-dragover { background: rgba(60,207,145,.12); border-color: #3ccf91; box-shadow: 0 0 0 2px rgba(60,207,145,.25) inset; }
+      #${ROOT_ID} .pcq-available-panel.pcq-dragover .pcq-drop-hint { color: #caffea; }
+      #${ROOT_ID} .pcq-drop-hint { color: #91a2ca; font-size: 11px; margin: -3px 0 9px; }
       #${ROOT_ID} .pcq-inactive { display: grid; gap: 6px; max-height: 180px; overflow: auto; }
       #${ROOT_ID} .pcq-stock { align-items: center; display: grid; font-size: 12px; gap: 7px; grid-template-columns: 30px minmax(0,1fr) auto; }
       #${ROOT_ID} .pcq-stock img { height: 30px; object-fit: contain; width: 30px; }
@@ -18674,6 +18680,20 @@
       return actions;
     }
 
+    function crystalIdsFromEquipment(items) {
+      const ids = [];
+      const seen = new Set();
+      for (const item of items || []) {
+        for (const slot of item?.slots || []) {
+          const id = Number(slot?.crystalId);
+          if (!Number.isSafeInteger(id) || id <= 0 || seen.has(id)) continue;
+          seen.add(id);
+          ids.push(id);
+        }
+      }
+      return ids;
+    }
+
     function createElement(doc, tag, className = '', text = '') {
       const element = doc.createElement(tag);
       if (className) element.className = className;
@@ -18687,6 +18707,25 @@
 
     function sleep(ms) {
       return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function normalizeViewState(value, now = Date.now()) {
+      if (!value || typeof value !== 'object') return null;
+      const savedAt = Number(value.savedAt);
+      if (!Number.isFinite(savedAt) || now - savedAt < 0 || now - savedAt > VIEW_STATE_MAX_AGE_MS) return null;
+      const finite = (entry) => Math.max(0, Number.isFinite(Number(entry)) ? Number(entry) : 0);
+      const selected = Number(value.selectedCrystalId);
+      return {
+        savedAt,
+        typeFilter: typeof value.typeFilter === 'string' ? value.typeFilter : 'all',
+        setFilter: typeof value.setFilter === 'string' ? value.setFilter : 'all',
+        searchFilter: typeof value.searchFilter === 'string' ? value.searchFilter : '',
+        selectedCrystalId: Number.isSafeInteger(selected) && selected > 0 ? selected : null,
+        scrollX: finite(value.scrollX),
+        scrollY: finite(value.scrollY),
+        availableScrollTop: finite(value.availableScrollTop),
+        inactiveScrollTop: finite(value.inactiveScrollTop),
+      };
     }
 
     module.exports = Object.freeze({
@@ -18704,11 +18743,13 @@
       enabledBy: 'veyra:powerCrystals:quicksetEnabled',
       callNumber,
       cleanImageName,
+      crystalIdsFromEquipment,
       inferEquipmentMeta,
       parseInlineJson,
       parseJsonAssignment,
       parsePageState,
       planCrystalMove,
+      normalizeViewState,
       upgradeAffordable,
 
       matches(url) {
@@ -18723,11 +18764,16 @@
         injectStyle(doc, STYLE_ID, CSS);
         const metadata = new Map();
         let liveState = parsePageState(doc, metadata);
-        let selectedCrystalId = null;
+        let restoredView = null;
+        try {
+          restoredView = normalizeViewState(JSON.parse(win.sessionStorage?.getItem(VIEW_STATE_KEY) || 'null'));
+          win.sessionStorage?.removeItem(VIEW_STATE_KEY);
+        } catch {}
+        let selectedCrystalId = restoredView?.selectedCrystalId || null;
         let busy = false;
-        let typeFilter = 'all';
-        let setFilter = 'all';
-        let searchFilter = '';
+        let typeFilter = restoredView?.typeFilter || 'all';
+        let setFilter = restoredView?.setFilter || 'all';
+        let searchFilter = restoredView?.searchFilter || '';
 
         const root = createElement(doc, 'section', 'pcq-panel');
         root.id = ROOT_ID;
@@ -18742,13 +18788,14 @@
             <label>Equipment-Typ<select data-filter="type"></select></label>
             <label>Set<select data-filter="set"></select></label>
             <label class="pcq-search">Suchen<input type="search" data-filter="search" placeholder="Equipmentname …"></label>
+            <button type="button" class="pcq-danger" data-action="unequip-visible" disabled>Sichtbare Crystals entfernen</button>
             <span class="pcq-muted" data-role="filter-count"></span>
           </div>
           <div class="pcq-layout">
             <div class="pcq-column"><div class="pcq-column-title"><h3>Equipment</h3><span class="pcq-muted">3 Slots je Item</span></div><div class="pcq-equipment-list"></div></div>
             <aside class="pcq-column">
               <div class="pcq-side-box"><h3>Ausgewählter Crystal</h3><div class="pcq-details"></div></div>
-              <div class="pcq-side-box"><h3>Aktiviert & verfügbar</h3><div class="pcq-crystal-list pcq-available"></div></div>
+              <div class="pcq-side-box pcq-available-panel" data-drop-zone="available"><h3>Aktiviert & verfügbar</h3><p class="pcq-drop-hint">Ausgerüsteten Crystal hierher ziehen, um ihn zu entfernen.</p><div class="pcq-crystal-list pcq-available"></div></div>
               <div class="pcq-side-box"><h3>Vorhanden, nicht aktiviert</h3><div class="pcq-inactive"></div><p class="pcq-help" style="margin-top:8px">Nur Übersicht – Aktivieren bleibt wegen des unwiderruflichen Verbrauchsschutzes in der Originalansicht.</p></div>
             </aside>
           </div>`;
@@ -18758,12 +18805,14 @@
 
         const status = root.querySelector('.pcq-status');
         const equipmentList = root.querySelector('.pcq-equipment-list');
+        const availablePanel = root.querySelector('[data-drop-zone="available"]');
         const availableList = root.querySelector('.pcq-crystal-list');
         const inactiveList = root.querySelector('.pcq-inactive');
         const details = root.querySelector('.pcq-details');
         const typeSelect = root.querySelector('[data-filter="type"]');
         const setSelect = root.querySelector('[data-filter="set"]');
         const searchInput = root.querySelector('[data-filter="search"]');
+        const unequipVisibleButton = root.querySelector('[data-action="unequip-visible"]');
         const countLabel = root.querySelector('[data-role="filter-count"]');
 
         const setStatus = (message, kind = '') => {
@@ -18774,7 +18823,34 @@
           busy = value;
           root.setAttribute('aria-busy', value ? 'true' : 'false');
         };
+        const saveViewState = () => {
+          try {
+            win.sessionStorage?.setItem(VIEW_STATE_KEY, JSON.stringify({
+              savedAt: Date.now(),
+              typeFilter,
+              setFilter,
+              searchFilter,
+              selectedCrystalId,
+              scrollX: Number(win.scrollX || 0),
+              scrollY: Number(win.scrollY || 0),
+              availableScrollTop: Number(availableList.scrollTop || 0),
+              inactiveScrollTop: Number(inactiveList.scrollTop || 0),
+            }));
+          } catch {}
+        };
+        const restoreViewState = () => {
+          if (!restoredView) return;
+          availableList.scrollTop = restoredView.availableScrollTop;
+          inactiveList.scrollTop = restoredView.inactiveScrollTop;
+          const restoreWindowScroll = () => win.scrollTo?.(restoredView.scrollX, restoredView.scrollY);
+          if (typeof win.requestAnimationFrame === 'function') {
+            win.requestAnimationFrame(() => win.requestAnimationFrame(restoreWindowScroll));
+          } else {
+            win.setTimeout?.(restoreWindowScroll, 0);
+          }
+        };
         const rememberAndReload = (message, kind = 'ok') => {
+          saveViewState();
           try {
             win.sessionStorage?.setItem(RESULT_KEY, JSON.stringify({ message, kind }));
           } catch {}
@@ -18796,12 +18872,13 @@
           const all = createElement(doc, 'option', '', allLabel);
           all.value = 'all';
           select.appendChild(all);
-          for (const value of values) {
+          const options = current !== 'all' && !values.includes(current) ? [current, ...values] : values;
+          for (const value of options) {
             const option = createElement(doc, 'option', '', value);
             option.value = value;
             select.appendChild(option);
           }
-          select.value = values.includes(current) ? current : 'all';
+          select.value = options.includes(current) ? current : 'all';
         }
 
         function renderFilters() {
@@ -18915,6 +18992,11 @@
         function renderEquipment() {
           equipmentList.replaceChildren();
           const items = filteredEquipment();
+          const visibleCrystalIds = crystalIdsFromEquipment(items);
+          unequipVisibleButton.disabled = visibleCrystalIds.length === 0;
+          unequipVisibleButton.textContent = visibleCrystalIds.length
+            ? `Sichtbare Crystals entfernen (${visibleCrystalIds.length})`
+            : 'Sichtbare Crystals entfernen';
           countLabel.textContent = `${items.length}/${liveState.equipment.length} Items`;
           if (!items.length) {
             equipmentList.appendChild(createElement(doc, 'div', 'pcq-empty-state', 'Kein Equipment passt zu den Filtern.'));
@@ -19102,6 +19184,7 @@
           } catch (error) {
             reloadScheduled = true;
             setStatus(`Zuordnung gestoppt: ${error?.message || error}. Seite wird zur sicheren Synchronisierung neu geladen.`, 'error');
+            saveViewState();
             try { win.sessionStorage?.setItem(RESULT_KEY, JSON.stringify({ message: `Zuordnung gestoppt: ${error?.message || error}`, kind: 'error' })); } catch {}
             win.setTimeout?.(() => win.location?.reload?.(), 1200);
           } finally {
@@ -19128,6 +19211,42 @@
           } catch (error) {
             reloadScheduled = true;
             const message = `Entfernen gestoppt: ${error?.message || error}`;
+            saveViewState();
+            try { win.sessionStorage?.setItem(RESULT_KEY, JSON.stringify({ message, kind: 'error' })); } catch {}
+            setStatus(`${message}. Seite wird aktualisiert …`, 'error');
+            win.setTimeout?.(() => win.location?.reload?.(), 1200);
+          } finally {
+            if (!reloadScheduled) setBusy(false);
+          }
+        }
+
+        async function releaseVisibleCrystals() {
+          if (busy) return;
+          const visibleItems = filteredEquipment();
+          const crystalIds = crystalIdsFromEquipment(visibleItems);
+          if (!crystalIds.length) return setStatus('Auf dem sichtbaren Equipment sind keine Crystals ausgerüstet.');
+          const equipmentCount = visibleItems.filter((item) => item.slots.some((slot) => slot.crystalId)).length;
+          const prompt = `${crystalIds.length} Crystal${crystalIds.length === 1 ? '' : 's'} aus ${equipmentCount} sichtbaren Equipmentteil${equipmentCount === 1 ? '' : 'en'} entfernen?`;
+          if (!win.confirm?.(prompt)) return;
+          setBusy(true);
+          let completed = 0;
+          let reloadScheduled = false;
+          try {
+            for (const crystalId of crystalIds) {
+              setStatus(`Sichtbare Crystals entfernen: ${completed + 1}/${crystalIds.length} …`);
+              await postMutation({ action: 'unequip_crystal', crystal_id: crystalId });
+              if (currentEquipmentForCrystal(crystalId)) {
+                throw new Error(`Server hat Crystal ${crystalId} nicht als entfernt bestätigt.`);
+              }
+              completed += 1;
+              if (completed < crystalIds.length) await sleep(250);
+            }
+            reloadScheduled = true;
+            rememberAndReload(`${completed} sichtbare Crystal${completed === 1 ? '' : 's'} wurden entfernt.`);
+          } catch (error) {
+            reloadScheduled = true;
+            const message = `${completed} von ${crystalIds.length} Crystals entfernt; danach gestoppt: ${error?.message || error}`;
+            saveViewState();
             try { win.sessionStorage?.setItem(RESULT_KEY, JSON.stringify({ message, kind: 'error' })); } catch {}
             setStatus(`${message}. Seite wird aktualisiert …`, 'error');
             win.setTimeout?.(() => win.location?.reload?.(), 1200);
@@ -19185,6 +19304,7 @@
           } catch (error) {
             reloadScheduled = true;
             const message = `${completed} Schritt(e) bestätigt; danach gestoppt: ${error?.message || error}`;
+            saveViewState();
             try { win.sessionStorage?.setItem(RESULT_KEY, JSON.stringify({ message, kind: 'error' })); } catch {}
             setStatus(`${message}. Seite wird aktualisiert …`, 'error');
             win.setTimeout?.(() => win.location?.reload?.(), 1200);
@@ -19196,21 +19316,30 @@
         typeSelect.addEventListener('change', () => { typeFilter = typeSelect.value; renderEquipment(); });
         setSelect.addEventListener('change', () => { setFilter = setSelect.value; renderEquipment(); });
         searchInput.addEventListener('input', () => { searchFilter = searchInput.value; renderEquipment(); });
-        root.querySelector('[data-action="reload"]').addEventListener('click', () => win.location?.reload?.());
-        availableList.addEventListener('dragover', (event) => {
+        unequipVisibleButton.addEventListener('click', releaseVisibleCrystals);
+        root.querySelector('[data-action="reload"]').addEventListener('click', () => {
+          saveViewState();
+          win.location?.reload?.();
+        });
+        availablePanel.addEventListener('dragover', (event) => {
           event.preventDefault();
-          availableList.classList.add('pcq-dragover');
+          availablePanel.classList.add('pcq-dragover');
           if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
         });
-        availableList.addEventListener('dragleave', () => availableList.classList.remove('pcq-dragover'));
-        availableList.addEventListener('drop', (event) => {
+        availablePanel.addEventListener('dragleave', (event) => {
+          if (!availablePanel.contains(event.relatedTarget)) availablePanel.classList.remove('pcq-dragover');
+        });
+        availablePanel.addEventListener('drop', (event) => {
           event.preventDefault();
-          availableList.classList.remove('pcq-dragover');
+          event.stopPropagation();
+          availablePanel.classList.remove('pcq-dragover');
           const crystalId = numberFromText(event.dataTransfer?.getData('text/plain'), selectedCrystalId || 0);
           if (crystalId) releaseCrystal(crystalId);
         });
 
+        searchInput.value = searchFilter;
         render();
+        restoreViewState();
 
         // The Power Crystals DOM exposes inventory IDs but no item names/types.
         // Enrich from inventory.php when that page exposes a matching inventory ID;
@@ -19225,6 +19354,7 @@
             for (const [key, value] of exact) metadata.set(key, value);
             liveState = parsePageState(liveState.doc, metadata);
             render();
+            restoreViewState();
           }
         } catch (error) {
           ctx.warn?.('Equipment metadata enrichment failed; using image names.', error);
