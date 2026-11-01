@@ -6,6 +6,7 @@ const assert = require('node:assert/strict');
 const GENERAL = require('../src/features/general');
 const autoBattleExtras = require('../src/features/general/auto-battle-extras');
 const autoFarmActivate = require('../src/features/general/auto-farm-activate-buttons');
+const powerCrystalQuickset = require('../src/features/general/power-crystal-quickset');
 const navigation = require('../src/features/general/custom-navigation');
 const attackButtons = require('../src/features/general/better-attack-buttons');
 const asterion = require('../src/features/general/asterion-detect');
@@ -67,9 +68,11 @@ test('general features keep veyra-hud keys and defaults', () => {
   assert.equal(defaults['ui-improvements:enableBuyAllButtons'], true);
   assert.equal(defaults['veyra:shops:damonBulkBuy'], true);
   assert.equal(defaults['veyra:autoFarm:showTargetActivateButtons'], true);
+  assert.equal(defaults['veyra:powerCrystals:quicksetEnabled'], true);
   assert.equal(GENERAL[0].id, 'adventurers-guild-layout');
   assert.equal(GENERAL[1].id, 'auto-battle-extras');
   assert.equal(GENERAL[2].id, 'auto-farm-activate-buttons');
+  assert.equal(GENERAL[3].id, 'power-crystal-quickset');
 });
 
 test('features only match their pages', () => {
@@ -87,6 +90,8 @@ test('features only match their pages', () => {
   assert.equal(autoBattleExtras.matches(url('/game_dash.php')), false);
   assert.equal(autoFarmActivate.matches(url('/active_wave.php?gate=5&wave=9')), true);
   assert.equal(autoFarmActivate.matches(url('/adventurers_guild.php')), false);
+  assert.equal(powerCrystalQuickset.matches(url('/power_crystals.php')), true);
+  assert.equal(powerCrystalQuickset.matches(url('/inventory.php')), false);
 });
 
 test('Auto Farm Activate enables one target and disables the others', () => {

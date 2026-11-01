@@ -3,7 +3,7 @@
 Grundlage: `arbeitsauftrag.txt`, die bestehenden Skripte und die Beispielseiten in `veyra_seiten.txt`.
 Status-Legende: **[vorh.]** existiert schon weitgehend · **[anp.]** existiert, muss angepasst werden · **[neu]** neu zu bauen · **[?]** offene Frage
 
-Aktueller Stand: Alle beauftragten Punkte sind umgesetzt. Ab Version 0.8.4 nutzt Olympus für Phase 3 den tatsächlich in Phase 1 angerichteten Schaden; die Adventurer's Guild steuert einen vollständigen konfigurierbaren Auto-Farm-Lauf. Castle of the Fallen Prince ist ab Version 0.7.0 als eigene, zunächst deaktivierte Route enthalten. Nur die ausdrücklich ausgeschlossenen Punkte 5.4, 7.15 und 7.16 bleiben unverändert.
+Aktueller Stand: Alle beauftragten Punkte sind umgesetzt. Ab Version 0.9.0 enthält General Settings einen Power-Crystal-Quickset mit Equipment-Filtern, Drag-and-drop und ressourcengeprüften Mehrfach-Upgrades. Olympus nutzt für Phase 3 den tatsächlich in Phase 1 angerichteten Schaden; die Adventurer's Guild steuert einen vollständigen konfigurierbaren Auto-Farm-Lauf. Castle of the Fallen Prince ist ab Version 0.7.0 als eigene, zunächst deaktivierte Route enthalten. Nur die ausdrücklich ausgeschlossenen Punkte 5.4, 7.15 und 7.16 bleiben unverändert.
 
 ---
 
@@ -165,6 +165,7 @@ Die Lizenz erlaubt Bündeln und Ändern; der MIT-Copyright-Hinweis muss im Bundl
 | 7.14 | Inventar-Filter | [vorh.] | |
 | 7.15 | Debug-Konsole | – | Entfällt (F19) |
 | 7.16 | Gamba Enhanced (Event 7) und Equipment Presets | – | Entfallen (F19) |
+| 7.17 | Power Crystal Quickset | [vorh.] | In General Settings ein-/ausschaltbar. Zeigt Equipment nach Typ und Set filterbar mit allen Crystal-Slots, erlaubt Ziehen/Antippen und Tauschen, listet freie aktivierte sowie inaktive Crystals und führt additive Level-/Stern-Upgrades nur solange Gold und Materialien reichen aus. |
 
 ---
 

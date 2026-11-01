@@ -4,6 +4,7 @@ module.exports = [
   require('./adventurers-guild-layout'),
   require('./auto-battle-extras'),
   require('./auto-farm-activate-buttons'),
+  require('./power-crystal-quickset'),
   require('./better-header'),
   require('./custom-navigation'),
   require('./battle-drawer-scroll'),
