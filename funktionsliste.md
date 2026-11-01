@@ -3,7 +3,7 @@
 Grundlage: `arbeitsauftrag.txt`, die bestehenden Skripte und die Beispielseiten in `veyra_seiten.txt`.
 Status-Legende: **[vorh.]** existiert schon weitgehend · **[anp.]** existiert, muss angepasst werden · **[neu]** neu zu bauen · **[?]** offene Frage
 
-Aktueller Stand: Alle beauftragten Punkte sind umgesetzt. Ab Version 0.9.4 zeigt „Unclaimed Kills“ exakte Werte bis 999999 und erst danach `999999+`. General Settings enthält einen Power-Crystal-Quickset mit Equipment-Filtern, Drag-and-drop einschließlich Entfernen ins Verfügbar-Panel, Sammelentfernung für sichtbares Equipment, ressourcengeprüften Mehrfach-Upgrades und Wiederherstellung der Ansicht nach Aktions-Reloads. Olympus nutzt für Phase 3 den tatsächlich in Phase 1 angerichteten Schaden; die Adventurer's Guild steuert einen vollständigen konfigurierbaren Auto-Farm-Lauf. Castle of the Fallen Prince ist ab Version 0.7.0 als eigene, zunächst deaktivierte Route enthalten. Nur die ausdrücklich ausgeschlossenen Punkte 5.4, 7.15 und 7.16 bleiben unverändert.
+Aktueller Stand: Das Hauptbundle bleibt bei Version 0.9.5. Dragon-Realm-Expeditionen sind bewusst nicht Teil dieser Automation, sondern liegen als eigenständiges Userscript `expedition-auto.js` mit eigenem Start/Stop-Schalter, Einstellungen und Statusfenster vor. General Settings enthält außerdem den Power-Crystal-Quickset; Olympus, Adventurer's Guild, Shadowbridge, Castle of the Fallen Prince und Crucible werden weiterhin über ihre eigenen Routen automatisiert. Die „Unclaimed Kills“-Anzeige bleibt wegen der serverseitigen Begrenzung unverändert. Die ausdrücklich ausgeschlossenen Punkte 5.4, 7.15 und 7.16 bleiben unverändert.
 
 ---
 
@@ -24,14 +24,14 @@ Aktueller Stand: Alle beauftragten Punkte sind umgesetzt. Ab Version 0.9.4 zeigt
 |---|---|---|---|
 | 1.1 | Start/Stop des gesamten Ablaufs | [vorh.] | |
 | 1.2 | Menü mit einer Liste aller aufrufbaren Seiten | [vorh.] | Die bestehende Seitenleiste mit Unteransicht bleibt (F12). |
-| 1.3 | Pro Seite: Name, Countdown bis zum nächsten Aufruf, Toggle zum Aktivieren/Deaktivieren, Button für das Untermenü | [vorh.] | Für PvP, Wave 3, Olympus, Adventurer's Guild, Shadowbridge, Castle of the Fallen Prince und Crucible vorhanden. |
+| 1.3 | Pro Seite: Name, Countdown bis zum nächsten Aufruf, Toggle zum Aktivieren/Deaktivieren, Button für das Untermenü | [vorh.] | Für PvP, Wave 3, Olympus, Adventurer's Guild, Shadowbridge, Castle of the Fallen Prince und Crucible vorhanden. Expeditionen bleiben ein eigenständiges Skript. |
 | 1.4 | Countdown abgelaufen → zur Seite navigieren und Seitenskript starten | [vorh.] | |
 | 1.5 | Seitenskript fertig → zur Hauptseite zurück und Countdown neu starten | [vorh.] | |
 | 1.6 | Untermenü-Standardfeld: Looplänge in Minuten | [vorh.] | Jede Route hat ein eigenes editierbares Minutenfeld (1–1440); eine Verkürzung zieht einen laufenden Countdown sofort vor. |
 | 1.7 | Untermenü-Standardauswahl: Stamina-Tränke und Heiltränke | [vorh.] | Pro Route getrennte Auswahl für 30 Small, 251 Large, 35 Full, 359 Adventurer Stamina und 108 Full HP. |
 | 1.8 | Hauptseite wählbar | [vorh.] | |
 | 1.9 | Höchstdauer pro Besuch / Timeout, danach geordneter Rückzug | [vorh.] | `maxVisit` und Drain-Logik sind vorhanden. |
-| 1.10 | Neue Routen: Olympus-Domänen, Shadowbridge, Castle of the Fallen Prince und Crucible | [vorh.] | Die mutierenden Dungeon-Routen sind nach einem Update sicherheitshalber zunächst deaktiviert. |
+| 1.10 | Neue Routen: Olympus-Domänen, Shadowbridge, Castle of the Fallen Prince und Crucible | [vorh.] | Die mutierenden Routen sind nach einem Update sicherheitshalber zunächst deaktiviert. |
 
 ## 2. Wave-Seiten (Wave 3 + Olympus)
 
@@ -155,7 +155,7 @@ Die Lizenz erlaubt Bündeln und Ändern; der MIT-Copyright-Hinweis muss im Bundl
 | 7.4 | Bessere Angriffs-Buttons und Asterion-Multiplikator (auch automatisch von `pets.php` gelesen) | [vorh.] | Multiplikator wird erkannt, gespeichert und für Anzeigen sowie Stamina-Prüfungen verwendet; an `damage.php` geht weiterhin der Basiswert. |
 | 7.5 | Battle Pass: zum aktuellen Level scrollen, Scrollleisten synchron | [vorh.] | |
 | 7.6 | Wave-Seite: Auswahl ohne Limit, nach HP sortieren/filtern, nach Namen gruppieren, Gate-Info ausblenden | [vorh.] | Eindeutige IDs und kompatible Korrektur des alten Tippfehler-Schlüssels. |
-| 7.7 | Wave-Seite: Loot X (schnell, Boss-Blacklist), In-Battle-Zähler, Heal-Button, HP-Leiste blinkt bei wenig HP, Auto-Farm-Buttons sichtbar, Join-Links an Boss-Karten | [vorh.] | Mit 5.1 zusammengeführt, höchstens vier parallele Loot-Requests und vollständige Quest-Loot-Sperre. Der exklusive Auto-Farm-Target-Button ist im General-Menü ein-/ausblendbar; er aktiviert die gewählte Gruppe und deaktiviert alle übrigen. „Unclaimed Kills“ wird bis 999999 exakt und darüber als `999999+` angezeigt; der Restwert wird mit einem einzelnen Abruf der letzten Dead-Loot-Seite bestimmt. |
+| 7.7 | Wave-Seite: Loot X (schnell, Boss-Blacklist), In-Battle-Zähler, Heal-Button, HP-Leiste blinkt bei wenig HP, Auto-Farm-Buttons sichtbar, Join-Links an Boss-Karten | [vorh.] | Mit 5.1 zusammengeführt, höchstens vier parallele Loot-Requests und vollständige Quest-Loot-Sperre. Der exklusive Auto-Farm-Target-Button ist im General-Menü ein-/ausblendbar; er aktiviert die gewählte Gruppe und deaktiviert alle übrigen. |
 | 7.8 | Strategic Attack (Skill-Reihenfolge, Schadenslimit, Quick Join & Attack) | [vorh.] | Gemeinsame Rate-Limit-/Retry-Logik und Asterion-korrekte Stamina-Prüfung. |
 | 7.9 | Merchant: „Buy N“-Buttons | [vorh.] | Shop-Kaufmodule teilen sich konsistente Mengen- und Sicherheitslogik. |
 | 7.10 | Gildenmitgliederliste sortierbar | [vorh.] | Rollen, Zahlen, Daten und Text werden stabil sortiert. |
@@ -166,6 +166,21 @@ Die Lizenz erlaubt Bündeln und Ändern; der MIT-Copyright-Hinweis muss im Bundl
 | 7.15 | Debug-Konsole | – | Entfällt (F19) |
 | 7.16 | Gamba Enhanced (Event 7) und Equipment Presets | – | Entfallen (F19) |
 | 7.17 | Power Crystal Quickset | [vorh.] | In General Settings ein-/ausschaltbar. Zeigt Equipment nach Typ und Set filterbar mit allen Crystal-Slots, erlaubt Ziehen/Antippen und Tauschen sowie das Entfernen aus Equipment per Drop auf das gesamte „Aktiviert & verfügbar“-Panel. Ein Sammelbutton entfernt nach Bestätigung alle Crystals aus den aktuell gefilterten/sichtbaren Equipmentteilen. Listet freie aktivierte sowie inaktive Crystals und führt additive Level-/Stern-Upgrades nur solange Gold und Materialien reichen aus. Filter, Suche, Auswahl sowie Seiten- und Listenscrollposition werden nach jedem Aktions-Reload wiederhergestellt. |
+
+---
+
+## 8. Dragon Realm Expeditions
+
+| # | Funktion | Status | Notiz |
+|---|---|---|---|
+| 8.1 | Eigenständiges Userscript mit eigenem Bedienfeld | [vorh.] | `expedition-auto.js` ist vollständig vom Hauptbundle getrennt und läuft nur auf der Dragon-Realm-Haupt- und Expeditionsseite. Start/Stop, Einklappen, Einstellungen und Status sind im eigenen Fenster enthalten. |
+| 8.2 | Bestehende Expeditionen und Abreisegruppen automatisch fortsetzen | [vorh.] | Erkennt `activeParty`, bestätigt die eigene Abreise und hält den Besuch während eines aktiven Laufs offen. Wartende manuelle Gruppen ohne genügend Mitglieder werden nach einer Minute erneut geprüft. |
+| 8.3 | Optional automatisch private Expedition starten | [vorh.] | Standardmäßig aus, damit niemals ungefragt ein täglicher Eintrag verbraucht wird. Optional werden freie Plätze mit NPC-Begleitern gefüllt, die Abreise geöffnet und bestätigt. Öffentliche Fremdgruppen werden nicht automatisch betreten. |
+| 8.4 | Klasse und Wegwahl konfigurierbar | [vorh.] | Die bevorzugte Klasse wird nur gesetzt, wenn noch keine Expeditionsklasse gewählt wurde. Bei Routenabstimmungen wird zuverlässig links oder rechts gewählt. |
+| 8.5 | Taktischen Rundenkampf automatisch führen | [vorh.] | Verwendet verfügbare Angriffsskills vom höchsten zum niedrigsten Energiepreis. Ziele werden in Reichweite gewählt, andernfalls nähert sich der Spieler auf einem freien Feld oder verwendet Guard. Bereits ausgeführte Aktionen werden anhand `battleSerial`, Runde und Serverzustand nicht wiederholt. |
+| 8.6 | Gefahrenfelder und Rettungen | [vorh.] | Lethal-, Flächen- und Bodenwarnungen werden vor dem Angriff verlassen, sofern ein sicheres Nachbarfeld existiert. Automatische Rescues sind einstellbar und bevorzugen gefallene menschliche Gruppenmitglieder vor NPCs. |
+| 8.7 | Loot und temporäre Powers | [vorh.] | Seltene umkämpfte Drops können automatisch alle beansprucht oder alle abgelehnt werden. Powers werden anhand der aktuellen Klasse bewertet; persönliche und gewöhnliche Drops bleiben der Spielverteilung überlassen. |
+| 8.8 | Bestätigte API-Aktionen und Statusfenster | [vorh.] | Nutzt den CSRF-geschützten JSON-Endpunkt des Spielclients mit eindeutigen Request-IDs. Das eigene Live-Fenster zeigt Start, Gruppenphase, Abschnitt, Aktion, Abschluss oder Fehler; nach fünf wiederholten Fehlern stoppt das Skript sicher. |
 
 ---
 
@@ -199,4 +214,4 @@ Die Lizenz erlaubt Bündeln und Ändern; der MIT-Copyright-Hinweis muss im Bundl
 
 ## Offene Fragen
 
-Keine.
+- **Unclaimed Kills oberhalb 249.899:** Die Seite liefert nur `249,899+` und fünf Seiten mit den jüngsten 1.000 Einträgen. Für eine exakte Anzeige bis 999999 wird entweder ein ungekappter Server-/API-Wert benötigt oder es muss ausdrücklich der nicht gleichbedeutende Auto-Farm-Killzähler als Näherung verwendet werden.

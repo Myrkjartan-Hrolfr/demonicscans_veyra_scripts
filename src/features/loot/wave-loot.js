@@ -98,7 +98,6 @@ const DONE_CLASS = 'veyra-looted';
 const PAGE_SIZE = 200;
 const EXTRACT_CAP = 5;
 const PAGE_FETCH_DELAY_MS = 250;
-const UNCLAIMED_DISPLAY_CAP = 999_999;
 
 function parseDamage(value) {
   const digits = String(value ?? '').replace(/[^\d]/g, '');
@@ -153,19 +152,6 @@ function parseDeadPageCount({ text = '', unclaimed = null } = {}) {
   if (match) return { current: Number(match[1]) || 1, total: Math.max(1, Number(match[2]) || 1) };
   const count = Number(unclaimed);
   return { current: 1, total: Number.isFinite(count) && count > 0 ? Math.ceil(count / PAGE_SIZE) : 1 };
-}
-
-function formatUnclaimedKills(count, cap = UNCLAIMED_DISPLAY_CAP) {
-  const value = Math.max(0, Math.floor(Number(count) || 0));
-  const limit = Math.max(0, Math.floor(Number(cap) || 0));
-  return value > limit ? `${limit}+` : String(value);
-}
-
-function exactCountFromLastPage(totalPages, lastPageCount, pageSize = PAGE_SIZE) {
-  const pages = Math.max(1, Math.floor(Number(totalPages) || 1));
-  const size = Math.max(1, Math.floor(Number(pageSize) || PAGE_SIZE));
-  const remainder = Math.max(0, Math.min(size, Math.floor(Number(lastPageCount) || 0)));
-  return (pages - 1) * size + remainder;
 }
 
 // Stable ascending sort by damage.
@@ -248,64 +234,7 @@ function readUnclaimedKills(doc) {
   const pill = [...doc.querySelectorAll('.unclaimed-pill')].find((element) =>
     /unclaimed\s+kills/i.test(element.textContent || ''),
   );
-  return parseGameNumber(String(pill?.querySelector('.count')?.textContent ?? '').replace(/\+\s*$/, ''));
-}
-
-function findUnclaimedPill(doc) {
-  return [...(doc?.querySelectorAll?.('.unclaimed-pill') || [])].find((element) =>
-    /unclaimed\s+kills/i.test(element.textContent || ''),
-  ) || null;
-}
-
-function exactCountFromAttributes(pill, count) {
-  // Do not trust a generic data-count: the server may cap that value at the
-  // same threshold as the visible text. Only explicitly exact/total fields
-  // may bypass the last-page calculation.
-  const names = ['data-exact-count', 'data-total-count', 'data-unclaimed-count'];
-  for (const element of [count, pill]) {
-    for (const name of names) {
-      const raw = element?.getAttribute?.(name);
-      if (!raw || /\+/.test(raw)) continue;
-      const parsed = parseGameNumber(raw);
-      if (parsed !== null) return parsed;
-    }
-  }
-  return null;
-}
-
-async function improveUnclaimedKillsDisplay(ctx) {
-  const doc = ctx.doc;
-  const pill = findUnclaimedPill(doc);
-  const count = pill?.querySelector?.('.count');
-  if (!count || count.dataset?.veyraExactCount) return null;
-
-  const original = String(count.textContent || '').trim();
-  let exact = exactCountFromAttributes(pill, count);
-  if (exact === null && !/\+/.test(original)) exact = parseGameNumber(original);
-
-  if (exact === null) {
-    const pageText = findDeadPageText(doc);
-    const match = String(pageText?.textContent || '').match(/Dead\s+loot\s+page\s+(\d+)\s*\/\s*(\d+)/i);
-    if (!match) return null;
-    const currentPage = Math.max(1, Number(match[1]) || 1);
-    const totalPages = Math.max(1, Number(match[2]) || 1);
-    let lastDocument = doc;
-    if (currentPage !== totalPages) {
-      const url = new URL(ctx.url.href);
-      url.searchParams.set('dead_page', String(totalPages));
-      url.searchParams.set('_veyra_unclaimed_exact', String(Date.now()));
-      lastDocument = await ctx.fetchDocument(url.toString());
-      if (isCloudflareError(lastDocument)) return null;
-    }
-    exact = exactCountFromLastPage(totalPages, deadCards(lastDocument).length);
-  }
-
-  count.textContent = formatUnclaimedKills(exact);
-  count.dataset.veyraExactCount = String(exact);
-  count.title = exact > UNCLAIMED_DISPLAY_CAP
-    ? `Exact unclaimed kills: ${exact.toLocaleString('en-US')}`
-    : '';
-  return exact;
+  return parseGameNumber(pill?.querySelector('.count')?.textContent ?? null);
 }
 
 // Finds the "Dead loot page x / y" text node outside of scripts.
@@ -986,11 +915,6 @@ module.exports = Object.freeze({
     if (!doc?.body) return;
     ensureLootStyle(doc);
     ensureWaveStyle(doc);
-    try {
-      await improveUnclaimedKillsDisplay(ctx);
-    } catch (error) {
-      ctx.warn('Could not extend the unclaimed-kills display.', error);
-    }
     const session = createSession(ctx);
     const pageInfo = parseDeadPageCount({ text: findDeadPageText(doc)?.textContent, unclaimed: readUnclaimedKills(doc) });
     session.totalPages = pageInfo.total;
@@ -1013,8 +937,6 @@ module.exports = Object.freeze({
 
   helpers: Object.freeze({
     cardInfo,
-    exactCountFromLastPage,
-    formatUnclaimedKills,
     parseDamage,
     parseDeadPageCount,
     selectLootTargets,
