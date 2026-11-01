@@ -300,11 +300,22 @@ test('wave cardInfo and selectLootTargets honour guard, blacklist, damage and vi
 });
 
 test('wave dead page count and damage sort', () => {
-  const { parseDeadPageCount, sortByDamage, parseDamage } = waveLoot.helpers;
+  const {
+    exactCountFromLastPage,
+    formatUnclaimedKills,
+    parseDeadPageCount,
+    sortByDamage,
+    parseDamage,
+  } = waveLoot.helpers;
   assert.deepEqual(parseDeadPageCount({ text: 'Dead loot page 1 / 4' }), { current: 1, total: 4 });
   assert.deepEqual(parseDeadPageCount({ unclaimed: 401 }), { current: 1, total: 3 });
   assert.deepEqual(parseDeadPageCount({ unclaimed: null }), { current: 1, total: 1 });
   assert.deepEqual(parseDeadPageCount(), { current: 1, total: 1 });
+  assert.equal(exactCountFromLastPage(1, 137), 137);
+  assert.equal(exactCountFromLastPage(1501, 42), 300_042);
+  assert.equal(formatUnclaimedKills(250_000), '250000');
+  assert.equal(formatUnclaimedKills(999_999), '999999');
+  assert.equal(formatUnclaimedKills(1_000_000), '999999+');
   assert.equal(parseDamage('3,247,818,809'), 3_247_818_809);
   assert.equal(parseDamage(undefined), 0);
   const sorted = sortByDamage(
