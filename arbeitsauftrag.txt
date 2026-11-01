@@ -1,5 +1,22 @@
-- The Polyhedral Crucible
-Error: PvP: PvP reward page did not confirm its victory rewa · In 03:34
-Neuer PvP Kampf wird nicht gestartet
+1. Für Addventurer Guild muss folgender ablauf erfolgen
+- überprüfen ob quests verfügbar sind
+- wenn nein -> beenden
+- wenn ja 
+    -> zu olymp äußerer bereich wechseln
+    -> wenn auto farm läuft -> auto farm stopen
+    -> wenn autofarm finished -> auto farm reset
+    -> auto farm konfigurieren. Hierfür muss in der Adventurer Guild config noch einstellungen angelegt werden. Ich möchte die anzahl der zu farmenden monster
+    -> sonstige auto farm einstellungen automatisch setzen: 1000 HP Tränke, 1 Large Stamina Pot, sonstige stamina tränke 0, loot to level up off setzen
+    -> Anzahl der zu jagenden monster auf die voreingestellte anzahl
+    -> alles speichern
+    -> Target mit den 9 olympus monstern aktivieren, alle anderen deaktivieren
+    -> auto farm starten
+    -> warten bis auto farm fertig ist
+    -> loop bis alle quests fertig sind:
+        -> zur adventurer guild und quest wählen.
+        -> zurück zur olympus und das entsprechende questmonster looten (10 Stück). Hier ist darauf zu achten ob die monster in batches (karten) vorhanden sind. Dann muss die anzahl in einer karte gezählt werden.
+        -> wieder zur quest belohnung einsammeln (aktive quest bestätigen)
+    -> wenn alle Quests beendet sind ist der vorgang fertig
 
-- Crucible LoopTimer wird nicht beachtete. Wenn man ihn neu setzt, wird er korrekt runter gezählt, nach ausführung beim neustart ist er immer 5 minuten
+2. Bei Phase 3 der Olympus Bosse braucht es eine Korektur. Die Schadenshöhe für Phase 3 muss nicht zu der voreingestellten von Phase 1 addiert werden, sondern zu dem tatsächlich in Phase 1 angerichteten Schaden.
+3. Der Activate Button für Targets beim Auto Farm fehlt. Baue in die allgemeinen einstellungen ein, dass ich den ein oder ausblenden kann.
