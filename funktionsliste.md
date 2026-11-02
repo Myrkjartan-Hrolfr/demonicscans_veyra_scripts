@@ -3,7 +3,7 @@
 Grundlage: `arbeitsauftrag.txt`, die bestehenden Skripte und die Beispielseiten in `veyra_seiten.txt`.
 Status-Legende: **[vorh.]** existiert schon weitgehend · **[anp.]** existiert, muss angepasst werden · **[neu]** neu zu bauen · **[?]** offene Frage
 
-Aktueller Stand: Das Hauptbundle bleibt bei Version 0.9.5. Dragon-Realm-Expeditionen sind bewusst nicht Teil dieser Automation, sondern liegen als eigenständiges Userscript `expedition-auto.js` mit eigenem Start/Stop-Schalter, Einstellungen und Statusfenster vor. General Settings enthält außerdem den Power-Crystal-Quickset; Olympus, Adventurer's Guild, Shadowbridge, Castle of the Fallen Prince und Crucible werden weiterhin über ihre eigenen Routen automatisiert. Die „Unclaimed Kills“-Anzeige bleibt wegen der serverseitigen Begrenzung unverändert. Die ausdrücklich ausgeschlossenen Punkte 5.4, 7.15 und 7.16 bleiben unverändert.
+Aktueller Stand: Das Hauptbundle steht bei Version 0.9.6. Dragon-Realm-Expeditionen sind bewusst nicht Teil dieser Automation, sondern liegen als eigenständiges Userscript `expedition-auto.js` mit eigenem Start/Stop-Schalter, Einstellungen und Statusfenster vor. General Settings enthält außerdem den Power-Crystal-Quickset; Olympus, Adventurer's Guild, Shadowbridge, Castle of the Fallen Prince und Crucible werden weiterhin über ihre eigenen Routen automatisiert. Die „Unclaimed Kills“-Anzeige bleibt wegen der serverseitigen Begrenzung unverändert. Die ausdrücklich ausgeschlossenen Punkte 5.4, 7.15 und 7.16 bleiben unverändert.
 
 ---
 
@@ -165,7 +165,7 @@ Die Lizenz erlaubt Bündeln und Ändern; der MIT-Copyright-Hinweis muss im Bundl
 | 7.14 | Inventar-Filter | [vorh.] | |
 | 7.15 | Debug-Konsole | – | Entfällt (F19) |
 | 7.16 | Gamba Enhanced (Event 7) und Equipment Presets | – | Entfallen (F19) |
-| 7.17 | Power Crystal Quickset | [vorh.] | In General Settings ein-/ausschaltbar. Zeigt Equipment nach Typ und Set filterbar mit allen Crystal-Slots, erlaubt Ziehen/Antippen und Tauschen sowie das Entfernen aus Equipment per Drop auf das gesamte „Aktiviert & verfügbar“-Panel. Ein Sammelbutton entfernt nach Bestätigung alle Crystals aus den aktuell gefilterten/sichtbaren Equipmentteilen. Listet freie aktivierte sowie inaktive Crystals und führt additive Level-/Stern-Upgrades nur solange Gold und Materialien reichen aus. Filter, Suche, Auswahl sowie Seiten- und Listenscrollposition werden nach jedem Aktions-Reload wiederhergestellt. |
+| 7.17 | Power Crystal Quickset | [vorh.] | In General Settings ein-/ausschaltbar. Zeigt Equipment nach Typ und Set filterbar mit allen Crystal-Slots. Ein Klick auf einen Crystal wählt diesen immer aus und wechselt eine bestehende Auswahl; Einsetzen und Tauschen erfolgen anschließend über einen leeren Zielslot, die eindeutige Schaltfläche „Hier tauschen“ oder per Drag-and-drop. Entfernen ist per Drop auf das gesamte „Aktiviert & verfügbar“-Panel möglich. Ein Sammelbutton entfernt nach Bestätigung alle Crystals aus den aktuell gefilterten/sichtbaren Equipmentteilen. Listet freie aktivierte sowie inaktive Crystals und führt additive Level-/Stern-Upgrades nur solange Gold und Materialien reichen aus. Filter, Suche, Auswahl sowie Seiten- und Listenscrollposition werden nach jedem Aktions-Reload wiederhergestellt. |
 
 ---
 

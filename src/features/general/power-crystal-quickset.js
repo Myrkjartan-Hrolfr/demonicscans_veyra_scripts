@@ -40,9 +40,10 @@ const CSS = `
   #${ROOT_ID} .pcq-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; }
   #${ROOT_ID} .pcq-tag { background: rgba(110,168,255,.11); border: 1px solid rgba(110,168,255,.25); border-radius: 999px; color: #cfe0ff; font-size: 10px; padding: 3px 7px; }
   #${ROOT_ID} .pcq-slots { display: grid; gap: 7px; grid-template-columns: repeat(3, minmax(0,1fr)); margin-top: 9px; }
-  #${ROOT_ID} .pcq-slot { align-items: center; background: #0c1426; border: 1px dashed #53678f; border-radius: 10px; cursor: pointer; display: flex; justify-content: center; min-height: 70px; padding: 5px; position: relative; text-align: center; }
+  #${ROOT_ID} .pcq-slot { align-items: center; background: #0c1426; border: 1px dashed #53678f; border-radius: 10px; cursor: pointer; display: flex; flex-direction: column; justify-content: center; min-height: 70px; padding: 5px; position: relative; text-align: center; }
   #${ROOT_ID} .pcq-slot.pcq-dragover { background: rgba(60,207,145,.14); border-color: #3ccf91; }
   #${ROOT_ID} .pcq-slot.pcq-selected-target { border-color: #ffce6a; }
+  #${ROOT_ID} button.pcq-slot-apply { font-size: 10px; margin-top: 4px; min-height: 26px; padding: 3px 6px; width: 100%; }
   #${ROOT_ID} .pcq-empty { color: #7787ad; font-size: 11px; }
   #${ROOT_ID} .pcq-crystal { align-items: center; background: rgba(110,168,255,.07); border: 1px solid rgba(110,168,255,.2); border-radius: 10px; cursor: grab; display: grid; gap: 7px; grid-template-columns: 42px minmax(0,1fr); min-width: 0; padding: 6px; text-align: left; width: 100%; }
   #${ROOT_ID} .pcq-crystal:active { cursor: grabbing; }
@@ -500,7 +501,7 @@ module.exports = Object.freeze({
     root.setAttribute('aria-busy', 'false');
     root.innerHTML = `
       <div class="pcq-head">
-        <div><h2>💎 Power Crystal Quickset</h2><p class="pcq-help">Crystal ziehen oder antippen, dann Zielslot wählen. Belegte Slots werden ausgetauscht.</p></div>
+        <div><h2>💎 Power Crystal Quickset</h2><p class="pcq-help">Crystal anklicken, um die Auswahl zu wechseln. Danach leeren Zielslot oder „Hier tauschen“ anklicken – alternativ Drag-and-drop verwenden.</p></div>
         <button type="button" data-action="reload">↻ Neu laden</button>
       </div>
       <div class="pcq-status" role="status">Bereit.</div>
@@ -617,7 +618,7 @@ module.exports = Object.freeze({
       setStatus('Crystal ausgewählt. Jetzt einen Zielslot anklicken oder den Crystal dorthin ziehen.');
     }
 
-    function crystalNode(crystal, activate = null) {
+    function crystalNode(crystal) {
       const node = createElement(doc, 'div', `pcq-crystal${selectedCrystalId === crystal.id ? ' pcq-selected' : ''}`);
       node.draggable = true;
       node.dataset.crystalId = String(crystal.id);
@@ -634,12 +635,13 @@ module.exports = Object.freeze({
       node.append(image, meta);
       node.addEventListener('click', (event) => {
         event.stopPropagation();
-        (activate || selectCrystal)(crystal.id);
+        selectCrystal(crystal.id);
       });
       node.addEventListener('keydown', (event) => {
         if (event.key === 'Enter' || event.key === ' ') {
           event.preventDefault();
-          (activate || selectCrystal)(crystal.id);
+          event.stopPropagation();
+          selectCrystal(crystal.id);
         }
       });
       node.addEventListener('dragstart', (event) => {
@@ -744,10 +746,16 @@ module.exports = Object.freeze({
           const crystal = slot.crystalId ? liveState.crystalById.get(slot.crystalId) : null;
           const accept = (crystalId) => moveCrystal(Number(crystalId), item.key, slot.crystalId || null);
           if (crystal) {
-            target.appendChild(crystalNode(crystal, () => {
-              if (selectedCrystalId && selectedCrystalId !== crystal.id) accept(selectedCrystalId);
-              else selectCrystal(crystal.id);
-            }));
+            target.appendChild(crystalNode(crystal));
+            if (selectedCrystalId && selectedCrystalId !== crystal.id) {
+              const apply = createElement(doc, 'button', 'pcq-slot-apply', 'Hier tauschen');
+              apply.type = 'button';
+              apply.addEventListener('click', (event) => {
+                event.stopPropagation();
+                accept(selectedCrystalId);
+              });
+              target.appendChild(apply);
+            }
           } else {
             target.appendChild(createElement(doc, 'span', 'pcq-empty', selectedCrystalId ? 'Hier einsetzen' : 'Leer'));
           }
