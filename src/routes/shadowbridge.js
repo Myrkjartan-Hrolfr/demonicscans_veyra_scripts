@@ -6,6 +6,8 @@ const DEFAULT_DAMAGE = '1m';
 const DEFAULT_ATTACK_COOLDOWN_MS = 100;
 const MIN_ATTACK_COOLDOWN_MS = 100;
 const MAX_ATTACK_COOLDOWN_MS = 2_000;
+const KILL_SELECTED_KEY = 'veyra:shadowbridge:kill-selected:v1';
+const KILL_SELECTED_MAX_AGE_MS = 2 * 60 * 60_000;
 
 const SHADOWBRIDGE_MONSTERS = Object.freeze(
   [
@@ -116,6 +118,57 @@ function cleanDungeonSettings(value) {
   return settings;
 }
 
+function createKillSelectedRequest(value, now = Date.now(), requestId = '') {
+  const settings = normalizeSettings(value);
+  const targetIds = settings.order.filter((id) => settings.monsters[id]?.enabled === true);
+  const includeBoss = settings.bossRoom.enabled === true;
+  if (targetIds.length === 0 && !includeBoss) return null;
+  return {
+    version: 1,
+    requestId: String(requestId || `kill-${now}-${Math.random().toString(36).slice(2)}`),
+    createdAt: now,
+    targetIds,
+    includeBoss,
+  };
+}
+
+function normalizeKillSelectedRequest(value, now = Date.now()) {
+  if (!value || typeof value !== 'object' || value.version !== 1) return null;
+  const requestId = String(value.requestId || '').trim().slice(0, 120);
+  const createdAt = Number(value.createdAt);
+  if (
+    !requestId ||
+    !Number.isFinite(createdAt) ||
+    createdAt <= 0 ||
+    createdAt > now + 5_000 ||
+    now - createdAt > KILL_SELECTED_MAX_AGE_MS
+  ) {
+    return null;
+  }
+  const selected = new Set(
+    (Array.isArray(value.targetIds) ? value.targetIds : [])
+      .map(String)
+      .filter((id) => MONSTER_ID_SET.has(id)),
+  );
+  const targetIds = MONSTER_IDS.filter((id) => selected.has(id));
+  const includeBoss = value.includeBoss === true;
+  if (targetIds.length === 0 && !includeBoss) return null;
+  return { version: 1, requestId, createdAt, targetIds, includeBoss };
+}
+
+function applyKillSelectedRequest(value, request) {
+  const settings = normalizeSettings(value);
+  const selected = new Set(request?.targetIds || []);
+  for (const monster of SHADOWBRIDGE_MONSTERS) {
+    const target = settings.monsters[monster.id];
+    target.enabled = selected.has(monster.id);
+    if (target.enabled) target.mode = 'kill';
+  }
+  settings.bossRoom.enabled = request?.includeBoss === true;
+  if (settings.bossRoom.enabled) settings.bossRoom.mode = 'kill';
+  return settings;
+}
+
 function setTouchSize(element, includeWidth = false) {
   if (!element?.style) return;
   element.style.minHeight = '44px';
@@ -216,6 +269,20 @@ function renderSettings(ctx) {
   });
   setTouchSize(cleanButton);
   actionGroup.appendChild(cleanButton);
+  const killSelectedButton = ctx.make('button', {
+    id: `${ctx.idPrefix}-kill-selected`,
+    className: ctx.cls('primary'),
+    type: 'button',
+    text: 'Kill Selected',
+    title: 'Immediately attack every enabled target until it is defeated without changing saved target modes',
+  });
+  setTouchSize(killSelectedButton);
+  actionGroup.appendChild(killSelectedButton);
+  const killSelectedStatus = ctx.make('div', {
+    id: `${ctx.idPrefix}-kill-selected-status`,
+    className: ctx.cls('hint'),
+  });
+  actionGroup.appendChild(killSelectedStatus);
   actionGroup.appendChild(
     ctx.make('div', {
       className: ctx.cls('hint'),
@@ -462,6 +529,33 @@ function renderSettings(ctx) {
     syncControls();
   });
 
+  killSelectedButton.addEventListener('click', () => {
+    const request = createKillSelectedRequest(ctx.settings);
+    if (!request) {
+      killSelectedStatus.textContent = 'No targets are enabled. Select at least one monster or the Boss Room.';
+      return;
+    }
+    const targetCount = request.targetIds.length + (request.includeBoss ? 1 : 0);
+    if (
+      typeof ctx.win?.confirm === 'function' &&
+      !ctx.win.confirm(`Attack ${targetCount} selected Shadowbridge target${targetCount === 1 ? '' : 's'} until defeated?`)
+    ) {
+      return;
+    }
+    if (!ctx.store?.write?.(KILL_SELECTED_KEY, request)) {
+      killSelectedStatus.textContent = 'The temporary Kill Selected request could not be saved.';
+      return;
+    }
+    const scheduled = ctx.runRouteNow?.();
+    if (!scheduled?.ok) {
+      const saved = normalizeKillSelectedRequest(ctx.store.read?.(KILL_SELECTED_KEY));
+      if (saved?.requestId === request.requestId) ctx.store.remove?.(KILL_SELECTED_KEY);
+      killSelectedStatus.textContent = scheduled?.message || 'Kill Selected could not be started.';
+      return;
+    }
+    killSelectedStatus.textContent = `Kill Selected ${scheduled.queued ? 'queued' : 'started'} for ${targetCount} target${targetCount === 1 ? '' : 's'}. Saved settings remain unchanged.`;
+  });
+
   renderOrder();
 }
 
@@ -481,7 +575,11 @@ module.exports = Object.freeze({
   SHADOWBRIDGE_BOSS_ROOM,
   SHADOWBRIDGE_MONSTERS,
   SHADOWBRIDGE_SKILLS,
+  KILL_SELECTED_KEY,
+  KILL_SELECTED_MAX_AGE_MS,
+  applyKillSelectedRequest,
   cleanDungeonSettings,
+  createKillSelectedRequest,
 
   matchesUrl(url) {
     return (
@@ -495,5 +593,6 @@ module.exports = Object.freeze({
   },
 
   normalizeSettings,
+  normalizeKillSelectedRequest,
   renderSettings,
 });

@@ -108,6 +108,32 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
     return saved.routes[routeId];
   }
 
+  function runRouteNow(routeId, now = Date.now()) {
+    const route = getRoute(routeId);
+    if (!route) return { ok: false, message: 'The requested automation route does not exist.' };
+    const config = loadConfig();
+    if (!config.enabled) {
+      return { ok: false, message: 'Start Veyra Automation before using Kill Selected.' };
+    }
+    const runtime = loadRuntime(now);
+    if (runtime.activeVisit?.taskId === routeId) {
+      return {
+        ok: false,
+        message: `${route.label} is already running. Try Kill Selected again afterwards.`,
+      };
+    }
+    // Manual runs take priority over every normally overdue loop once the
+    // current visit has handed over safely.
+    runtime.manualRouteId = routeId;
+    runtime.nextRunAt[routeId] = 0;
+    saveRuntime(runtime, now);
+    const queued = Boolean(runtime.activeVisit);
+    setStatus(queued ? `${route.label} is queued after ${label(runtime.activeVisit.taskId)}.` : `Starting ${route.label} now …`);
+    ui.update(config, loadRuntime(now));
+    if (!queued) tick();
+    return { ok: true, queued };
+  }
+
   function saveActiveVisit(runtime, visit, now = Date.now()) {
     const normalizedVisit = normalizeVisit(visit);
     if (!normalizedVisit) return runtime;
@@ -471,7 +497,10 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
       if (!config.enabled) {
         handlePaused(runtime, config, now);
       } else if (runtime.activeVisit) {
-        if (!isRouteEnabled(config, runtime.activeVisit.taskId)) {
+        if (
+          !isRouteEnabled(config, runtime.activeVisit.taskId) &&
+          runtime.manualRouteId !== runtime.activeVisit.taskId
+        ) {
           handleDisabledRouteVisit(runtime, config, now);
         } else {
           const storedCommand = normalizeVisit(store.read(COMMAND_KEY));
@@ -545,6 +574,7 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
     start,
     stopPolling,
     tick,
+    runRouteNow,
     updateRouteConfig,
   };
 }

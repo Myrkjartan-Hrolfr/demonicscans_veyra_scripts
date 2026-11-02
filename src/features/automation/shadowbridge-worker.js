@@ -12,9 +12,15 @@ const { createJsonStore, getStorage } = require('../../core/storage');
 const { sleep } = require('../../core/time');
 const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
 const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
+const { RUNTIME_KEY } = require('../../scheduler/runtime');
 const { staminaCost, staminaMultiplier } = require('../shared/asterion');
 const logic = require('./shadowbridge-logic');
 const { createShadowbridgeStatusView } = require('./shadowbridge-status');
+const {
+  KILL_SELECTED_KEY,
+  applyKillSelectedRequest,
+  normalizeKillSelectedRequest,
+} = require('../../routes/shadowbridge');
 
 const ROUTE_ID = 'shadowbridge';
 const JOIN_URL = '/dungeon_join_battle.php';
@@ -107,6 +113,7 @@ function createShadowbridgeWorker({
     processed: new Set(),
     attacks: 0,
     targets: 0,
+    killSelectedRequestId: '',
   };
 
   function currentUrl() {
@@ -177,6 +184,11 @@ function createShadowbridgeWorker({
     publish(state, true, message, visitId, true);
     statusView.finish(message, state);
     log(message, state === 'error' ? 'warn' : 'info');
+    if (runtime.killSelectedRequestId) {
+      const request = store.read(KILL_SELECTED_KEY);
+      if (String(request?.requestId || '') === runtime.killSelectedRequestId) store.remove?.(KILL_SELECTED_KEY);
+      runtime.killSelectedRequestId = '';
+    }
   }
 
   function assertCanMutate(visitId) {
@@ -510,7 +522,18 @@ function createShadowbridgeWorker({
 
   async function executeVisit(command) {
     const visitId = command.visitId;
-    const route = routeConfig();
+    const configuredRoute = routeConfig();
+    const storedKillSelected = routeId === ROUTE_ID ? store.read(KILL_SELECTED_KEY) : null;
+    const killSelected = normalizeKillSelectedRequest(storedKillSelected, now());
+    if (storedKillSelected && !killSelected) store.remove?.(KILL_SELECTED_KEY);
+    const manualVisit = routeId === ROUTE_ID && store.read(RUNTIME_KEY)?.manualRouteId === ROUTE_ID;
+    if (manualVisit && !killSelected) {
+      throw new Error('The temporary Kill Selected request is missing or expired; no targets were attacked.');
+    }
+    if (killSelected) runtime.killSelectedRequestId = killSelected.requestId;
+    const route = killSelected
+      ? { ...configuredRoute, settings: applyKillSelectedRequest(configuredRoute.settings, killSelected) }
+      : configuredRoute;
     const hasEnabledTargets = profile.hasEnabledTargets
       ? profile.hasEnabledTargets(route.settings)
       : Object.values(route.settings.monsters).some((target) => target.enabled) || route.settings.bossRoom.enabled;
@@ -519,8 +542,11 @@ function createShadowbridgeWorker({
       return;
     }
 
-    statusView.begin(`Looking for the active ${dungeonName} instance.`);
-    setWorkingMessage(visitId, `Looking for the active ${dungeonName} instance.`);
+    const openingMessage = killSelected
+      ? `Kill Selected: looking for the active ${dungeonName} instance.`
+      : `Looking for the active ${dungeonName} instance.`;
+    statusView.begin(openingMessage);
+    setWorkingMessage(visitId, openingMessage);
     const entry = parseHubEntry(doc, currentUrl()?.href);
     if (!entry) throw new Error(`The ${dungeonName} entry was not found on the guild-dungeon page.`);
     const userId = await getUserId();
@@ -599,6 +625,7 @@ function createShadowbridgeWorker({
     runtime.processed = new Set();
     runtime.attacks = 0;
     runtime.targets = 0;
+    runtime.killSelectedRequestId = '';
     try {
       await executeVisit(command);
     } catch (error) {

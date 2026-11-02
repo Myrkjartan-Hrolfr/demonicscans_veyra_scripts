@@ -120,9 +120,11 @@ test('loop length is clamped and drives the next countdown', () => {
     issuedAt: NOW,
     deadlineAt: NOW + 1,
   };
+  runtime.manualRouteId = 'wave3';
   const completed = completeRuntimeVisit(runtime, 'done', NOW, config);
   assert.equal(completed.nextRunAt.wave3, NOW + 45 * 60_000);
   assert.equal(completed.activeVisit, null);
+  assert.equal(completed.manualRouteId, '');
   assert.equal(completed.lastResult.state, 'done');
 });
 
@@ -195,6 +197,10 @@ test('chooseDueRoute skips disabled pages and picks the earliest due one', () =>
   const config = createDefaultConfig();
   config.routes.wave3.enabled = false;
   assert.equal(chooseDueRoute(runtime, NOW, config).id, 'pvp');
+
+  runtime.manualRouteId = 'shadowbridge';
+  assert.equal(config.routes.shadowbridge.enabled, false);
+  assert.equal(chooseDueRoute(runtime, NOW, config).id, 'shadowbridge');
 });
 
 test('countdown text in the menu', () => {
@@ -204,6 +210,8 @@ test('countdown text in the menu', () => {
   assert.equal(countdownText('pvp', config, runtime, NOW), 'In 01:30');
   config.routes.pvp.enabled = false;
   assert.equal(countdownText('pvp', config, runtime, NOW), 'Inactive');
+  runtime.manualRouteId = 'pvp';
+  assert.equal(countdownText('pvp', config, runtime, NOW), 'Queued manually');
 });
 
 test('engine starts a due visit and navigates to the page', () => {
@@ -315,6 +323,51 @@ test('updateRouteConfig stores per-page potions and applies a shorter loop at on
   assert.deepEqual(config.routes.pvp.potions.stamina, []);
   assert.equal(config.routes.wave3.settings.useStaminaPotions, true);
   assert.ok(store.read(RUNTIME_KEY).nextRunAt.wave3 <= Date.now() + 2 * 60_000);
+});
+
+test('runRouteNow schedules a disabled route once without changing its configuration or toggle', () => {
+  const { engine, store } = createEngine('https://demonicscans.org/pvp.php');
+  const config = createDefaultConfig();
+  assert.equal(config.routes.shadowbridge.enabled, false);
+  store.write(CONFIG_KEY, config);
+  const runtime = createDefaultRuntime(Date.now());
+  for (const routeId of Object.keys(runtime.nextRunAt)) runtime.nextRunAt[routeId] = Date.now() + 60_000;
+  store.write(RUNTIME_KEY, runtime);
+  engine.start();
+  const before = structuredClone(store.read(CONFIG_KEY).routes.shadowbridge.settings);
+
+  const result = engine.runRouteNow('shadowbridge');
+
+  assert.equal(result.ok, true);
+  assert.equal(store.read(COMMAND_KEY).taskId, 'shadowbridge');
+  assert.equal(store.read(CONFIG_KEY).routes.shadowbridge.enabled, false);
+  assert.equal(store.read(RUNTIME_KEY).manualRouteId, 'shadowbridge');
+  assert.deepEqual(store.read(CONFIG_KEY).routes.shadowbridge.settings, before);
+});
+
+test('runRouteNow queues Shadowbridge behind a different active visit', () => {
+  const now = Date.now();
+  const { engine, store } = createEngine('https://demonicscans.org/pvp.php');
+  const config = createDefaultConfig();
+  const runtime = createDefaultRuntime(now);
+  runtime.activeVisit = {
+    version: 1,
+    visitId: 'active-pvp',
+    taskId: 'pvp',
+    phase: 'running',
+    returnPath: '/pvp.php',
+    issuedAt: now,
+    deadlineAt: now + 60_000,
+  };
+  store.write(CONFIG_KEY, config);
+  store.write(RUNTIME_KEY, runtime);
+
+  const result = engine.runRouteNow('shadowbridge', now);
+
+  assert.deepEqual(result, { ok: true, queued: true });
+  assert.equal(store.read(RUNTIME_KEY).activeVisit.visitId, 'active-pvp');
+  assert.equal(store.read(RUNTIME_KEY).manualRouteId, 'shadowbridge');
+  assert.equal(store.read(RUNTIME_KEY).nextRunAt.shadowbridge, 0);
 });
 
 test('the bundle builds and evaluates without errors', () => {

@@ -20,6 +20,7 @@ function createDefaultRuntime(now = Date.now()) {
     version: PROTOCOL_VERSION,
     nextRunAt,
     notes: {},
+    manualRouteId: '',
     activeVisit: null,
     lastResult: null,
   };
@@ -58,6 +59,7 @@ function normalizeRuntime(value, now = Date.now()) {
     version: PROTOCOL_VERSION,
     nextRunAt,
     notes: normalizeNotes(value.notes),
+    manualRouteId: getRoute(value.manualRouteId) ? String(value.manualRouteId) : '',
     activeVisit: normalizeVisit(value.activeVisit),
     lastResult,
   };
@@ -92,6 +94,8 @@ function isUrlWithinVisit(taskId, value, visitId, base = 'https://demonicscans.o
 
 function chooseDueRoute(runtime, now = Date.now(), config = null) {
   if (!runtime || runtime.activeVisit) return null;
+  const manualRoute = getRoute(runtime.manualRouteId);
+  if (manualRoute) return manualRoute;
   const normalizedConfig = normalizeConfig(config);
 
   return (
@@ -123,6 +127,7 @@ function completeRuntimeVisit(runtime, outcome, now = Date.now(), config = null,
     delete next.notes[visit.taskId];
   }
   next.activeVisit = null;
+  if (next.manualRouteId === visit.taskId) next.manualRouteId = '';
   next.lastResult = {
     taskId: visit.taskId,
     state: outcome === 'done' ? 'done' : 'error',

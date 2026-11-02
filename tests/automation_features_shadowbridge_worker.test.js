@@ -6,6 +6,7 @@ const assert = require('node:assert/strict');
 const { COMMAND_KEY, workerStatusKey } = require('../src/core/protocol');
 const { CONFIG_KEY, createDefaultConfig } = require('../src/scheduler/config');
 const { LEASE_KEY, TAB_KEY } = require('../src/scheduler/engine');
+const { RUNTIME_KEY } = require('../src/scheduler/runtime');
 const {
   DAMAGE_URL,
   JOIN_URL,
@@ -14,6 +15,7 @@ const {
   readStamina,
 } = require('../src/features/automation/shadowbridge-worker');
 const { progressDetails } = require('../src/features/automation/shadowbridge-status');
+const { KILL_SELECTED_KEY, createKillSelectedRequest } = require('../src/routes/shadowbridge');
 
 const NOW = 1_800_000_000_000;
 
@@ -76,6 +78,9 @@ function createStore(initial = {}) {
     write(key, value) {
       values.set(key, structuredClone(value));
       return true;
+    },
+    remove(key) {
+      values.delete(key);
     },
   };
 }
@@ -378,6 +383,62 @@ test('joins, attacks to the live loot limit and sends the base skill cost despit
       percent: 100,
     },
   );
+});
+
+test('Kill Selected temporarily overrides enabled targets and damage modes until the monster is dead', async () => {
+  const config = shadowConfig({ mode: 'max-loot' });
+  config.routes.shadowbridge.settings.monsters['talla-flint-stem'].enabled = false;
+  const savedSettings = structuredClone(config.routes.shadowbridge.settings);
+  let attacks = 0;
+  const env = createEnvironment({
+    config,
+    battleDocuments: [
+      battleDocument({ joined: true, includeOwnRow: false, monsterHp: 200, monsterMaxHp: 200 }),
+    ],
+    post(url) {
+      if (url !== DAMAGE_URL) throw new Error(`Unexpected POST ${url}`);
+      attacks += 1;
+      return attacks === 1
+        ? {
+            ok: true,
+            status: 200,
+            text: '',
+            json: { status: 'success', damage: 100, hp: { value: 100, max: 200 } },
+          }
+        : {
+            ok: true,
+            status: 200,
+            text: '',
+            json: { status: 'success', damage: 100, hp: { value: 0, max: 200 } },
+          };
+    },
+  });
+  const requestSettings = structuredClone(savedSettings);
+  requestSettings.monsters['talla-flint-stem'].enabled = true;
+  env.store.write(
+    KILL_SELECTED_KEY,
+    createKillSelectedRequest(requestSettings, NOW, 'kill-selected-test'),
+  );
+  env.store.write(RUNTIME_KEY, { manualRouteId: 'shadowbridge' });
+
+  await env.worker.tick();
+
+  assert.equal(env.posts.filter((entry) => entry.url === DAMAGE_URL).length, 2);
+  assert.equal(env.store.read(workerStatusKey('shadowbridge')).state, 'done');
+  assert.equal(env.store.read(KILL_SELECTED_KEY), null);
+  assert.deepEqual(env.store.read(CONFIG_KEY).routes.shadowbridge.settings, savedSettings);
+});
+
+test('a manual Shadowbridge visit without its Kill Selected request fails closed', async () => {
+  const env = createEnvironment({ config: shadowConfig({ mode: 'kill' }) });
+  env.store.write(RUNTIME_KEY, { manualRouteId: 'shadowbridge' });
+
+  await env.worker.tick();
+
+  assert.equal(env.posts.length, 0);
+  const status = env.store.read(workerStatusKey('shadowbridge'));
+  assert.equal(status.state, 'error');
+  assert.match(status.message, /Kill Selected request is missing or expired/i);
 });
 
 test('switches to the alternative skill when remaining monster HP reach the missing Max Loot damage', async () => {

@@ -47,16 +47,35 @@ function walk(root) {
   return [root, ...root.children.flatMap(walk)];
 }
 
-function renderHarness(initialSettings = shadowbridge.createDefaultSettings()) {
+function renderHarness(initialSettings = shadowbridge.createDefaultSettings(), options = {}) {
   const container = makeElement('div');
   let settings = shadowbridge.normalizeSettings(initialSettings);
   let updates = 0;
+  let runCount = 0;
+  const stored = new Map();
   const ctx = {
     container,
     idPrefix: 'veyra-automation-shadowbridge',
     settings,
     cls: (name) => `veyra-automation__${name}`,
     make: makeElement,
+    win: { confirm: () => options.confirm !== false },
+    store: {
+      read(key) {
+        return stored.has(key) ? structuredClone(stored.get(key)) : null;
+      },
+      write(key, value) {
+        stored.set(key, structuredClone(value));
+        return true;
+      },
+      remove(key) {
+        stored.delete(key);
+      },
+    },
+    runRouteNow() {
+      runCount += 1;
+      return options.runResult || { ok: true };
+    },
     addSectionTitle(text) {
       container.appendChild(makeElement('div', { text }));
     },
@@ -85,7 +104,14 @@ function renderHarness(initialSettings = shadowbridge.createDefaultSettings()) {
   };
   shadowbridge.renderSettings(ctx);
   const byId = (id) => walk(container).find((element) => element.id === id);
-  return { byId, container, getSettings: () => settings, updateCount: () => updates };
+  return {
+    byId,
+    container,
+    getSettings: () => settings,
+    readStored: (key) => ctx.store.read(key),
+    runCount: () => runCount,
+    updateCount: () => updates,
+  };
 }
 
 test('Shadowbridge route is registered with a distinct listing entry and immutable canonical targets', () => {
@@ -198,10 +224,54 @@ test('Clean Dungeon enables every target in kill mode without discarding other s
   assert.deepEqual(cleaned.order, custom.order);
 });
 
-test('Shadowbridge menu exposes English touch controls, live modes, ordering and Clean Dungeon', () => {
+test('Kill Selected creates a one-time kill plan without changing saved target settings', () => {
+  const settings = shadowbridge.createDefaultSettings();
+  for (const target of Object.values(settings.monsters)) target.enabled = false;
+  settings.monsters['talla-flint-stem'] = { enabled: true, mode: 'custom', damage: '9m' };
+  settings.monsters['zorgra-frost-vein'] = { enabled: true, mode: 'max-loot', damage: '1m' };
+  settings.bossRoom = { enabled: false, mode: 'max-exp', damage: '20m' };
+  const before = structuredClone(settings);
+  const request = shadowbridge.createKillSelectedRequest(settings, 1_800_000_000_000, 'manual-kill');
+  const normalized = shadowbridge.normalizeKillSelectedRequest(request, 1_800_000_000_001);
+  const effective = shadowbridge.applyKillSelectedRequest(settings, normalized);
+
+  assert.deepEqual(normalized.targetIds, ['talla-flint-stem', 'zorgra-frost-vein']);
+  assert.equal(normalized.includeBoss, false);
+  assert.equal(effective.monsters['talla-flint-stem'].enabled, true);
+  assert.equal(effective.monsters['talla-flint-stem'].mode, 'kill');
+  assert.equal(effective.monsters['zorgra-frost-vein'].mode, 'kill');
+  assert.equal(effective.monsters['pip-tanglefoot'].enabled, false);
+  assert.equal(effective.bossRoom.enabled, false);
+  assert.deepEqual(settings, before);
+});
+
+test('Kill Selected button schedules the temporary plan and does not persist mode changes', () => {
+  const settings = shadowbridge.createDefaultSettings();
+  for (const target of Object.values(settings.monsters)) target.enabled = false;
+  settings.monsters['talla-flint-stem'] = { enabled: true, mode: 'custom', damage: '9m' };
+  settings.bossRoom.enabled = false;
+  const harness = renderHarness(settings);
+  const before = structuredClone(harness.getSettings());
+
+  harness.byId('veyra-automation-shadowbridge-kill-selected').dispatch('click');
+
+  const request = harness.readStored(shadowbridge.KILL_SELECTED_KEY);
+  assert.deepEqual(request.targetIds, ['talla-flint-stem']);
+  assert.equal(request.includeBoss, false);
+  assert.equal(harness.runCount(), 1);
+  assert.equal(harness.updateCount(), 0);
+  assert.deepEqual(harness.getSettings(), before);
+  assert.match(
+    harness.byId('veyra-automation-shadowbridge-kill-selected-status').textContent,
+    /Saved settings remain unchanged/,
+  );
+});
+
+test('Shadowbridge menu exposes English touch controls, live modes, ordering, Clean Dungeon and Kill Selected', () => {
   const harness = renderHarness();
   const prefix = 'veyra-automation-shadowbridge';
   const cleanButton = harness.byId(`${prefix}-clean-dungeon`);
+  const killSelectedButton = harness.byId(`${prefix}-kill-selected`);
   const skill = harness.byId(`${prefix}-skill`);
   const alternativeSkill = harness.byId(`${prefix}-alternative-skill`);
   const cooldown = harness.byId(`${prefix}-attack-cooldown-ms`);
@@ -211,6 +281,8 @@ test('Shadowbridge menu exposes English touch controls, live modes, ordering and
   const bossMode = harness.byId(`${prefix}-target-boss-room-mode`);
 
   assert.equal(cleanButton.textContent, 'Clean Dungeon');
+  assert.equal(killSelectedButton.textContent, 'Kill Selected');
+  assert.equal(killSelectedButton.style.minHeight, '44px');
   assert.equal(cleanButton.style.minHeight, '44px');
   assert.equal(firstUp.style.minWidth, '44px');
   assert.equal(firstDown.style.minHeight, '44px');

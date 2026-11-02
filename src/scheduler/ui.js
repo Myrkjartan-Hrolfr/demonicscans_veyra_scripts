@@ -133,10 +133,11 @@ const STYLES = `
 `;
 
 function countdownText(routeId, config, runtime, now) {
-  if (config.routes[routeId]?.enabled === false) return 'Inactive';
   if (runtime?.activeVisit?.taskId === routeId) {
     return runtime.activeVisit.phase === 'running' ? 'Running now' : 'Preparing';
   }
+  if (runtime?.manualRouteId === routeId) return 'Queued manually';
+  if (config.routes[routeId]?.enabled === false) return 'Inactive';
   const countdown = formatCountdown(runtime?.nextRunAt?.[routeId], now);
   const note = runtime?.notes?.[routeId];
   return note ? `${note} · ${countdown}` : countdown;
@@ -275,6 +276,10 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
       cls,
       idPrefix,
       container,
+
+      runRouteNow() {
+        return state.actions.runRouteNow(routeId);
+      },
 
       updateSettings(mutator) {
         return state.actions.updateRouteConfig(routeId, (next) => mutator(next.settings)).settings;

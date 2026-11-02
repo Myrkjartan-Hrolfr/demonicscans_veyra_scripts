@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.9.6
+// @version      0.9.7
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -8781,9 +8781,15 @@
     const { sleep } = require('../../core/time');
     const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
     const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
+    const { RUNTIME_KEY } = require('../../scheduler/runtime');
     const { staminaCost, staminaMultiplier } = require('../shared/asterion');
     const logic = require('./shadowbridge-logic');
     const { createShadowbridgeStatusView } = require('./shadowbridge-status');
+    const {
+      KILL_SELECTED_KEY,
+      applyKillSelectedRequest,
+      normalizeKillSelectedRequest,
+    } = require('../../routes/shadowbridge');
 
     const ROUTE_ID = 'shadowbridge';
     const JOIN_URL = '/dungeon_join_battle.php';
@@ -8876,6 +8882,7 @@
         processed: new Set(),
         attacks: 0,
         targets: 0,
+        killSelectedRequestId: '',
       };
 
       function currentUrl() {
@@ -8946,6 +8953,11 @@
         publish(state, true, message, visitId, true);
         statusView.finish(message, state);
         log(message, state === 'error' ? 'warn' : 'info');
+        if (runtime.killSelectedRequestId) {
+          const request = store.read(KILL_SELECTED_KEY);
+          if (String(request?.requestId || '') === runtime.killSelectedRequestId) store.remove?.(KILL_SELECTED_KEY);
+          runtime.killSelectedRequestId = '';
+        }
       }
 
       function assertCanMutate(visitId) {
@@ -9279,7 +9291,18 @@
 
       async function executeVisit(command) {
         const visitId = command.visitId;
-        const route = routeConfig();
+        const configuredRoute = routeConfig();
+        const storedKillSelected = routeId === ROUTE_ID ? store.read(KILL_SELECTED_KEY) : null;
+        const killSelected = normalizeKillSelectedRequest(storedKillSelected, now());
+        if (storedKillSelected && !killSelected) store.remove?.(KILL_SELECTED_KEY);
+        const manualVisit = routeId === ROUTE_ID && store.read(RUNTIME_KEY)?.manualRouteId === ROUTE_ID;
+        if (manualVisit && !killSelected) {
+          throw new Error('The temporary Kill Selected request is missing or expired; no targets were attacked.');
+        }
+        if (killSelected) runtime.killSelectedRequestId = killSelected.requestId;
+        const route = killSelected
+          ? { ...configuredRoute, settings: applyKillSelectedRequest(configuredRoute.settings, killSelected) }
+          : configuredRoute;
         const hasEnabledTargets = profile.hasEnabledTargets
           ? profile.hasEnabledTargets(route.settings)
           : Object.values(route.settings.monsters).some((target) => target.enabled) || route.settings.bossRoom.enabled;
@@ -9288,8 +9311,11 @@
           return;
         }
 
-        statusView.begin(`Looking for the active ${dungeonName} instance.`);
-        setWorkingMessage(visitId, `Looking for the active ${dungeonName} instance.`);
+        const openingMessage = killSelected
+          ? `Kill Selected: looking for the active ${dungeonName} instance.`
+          : `Looking for the active ${dungeonName} instance.`;
+        statusView.begin(openingMessage);
+        setWorkingMessage(visitId, openingMessage);
         const entry = parseHubEntry(doc, currentUrl()?.href);
         if (!entry) throw new Error(`The ${dungeonName} entry was not found on the guild-dungeon page.`);
         const userId = await getUserId();
@@ -9368,6 +9394,7 @@
         runtime.processed = new Set();
         runtime.attacks = 0;
         runtime.targets = 0;
+        runtime.killSelectedRequestId = '';
         try {
           await executeVisit(command);
         } catch (error) {
@@ -25259,6 +25286,8 @@
     const DEFAULT_ATTACK_COOLDOWN_MS = 100;
     const MIN_ATTACK_COOLDOWN_MS = 100;
     const MAX_ATTACK_COOLDOWN_MS = 2_000;
+    const KILL_SELECTED_KEY = 'veyra:shadowbridge:kill-selected:v1';
+    const KILL_SELECTED_MAX_AGE_MS = 2 * 60 * 60_000;
 
     const SHADOWBRIDGE_MONSTERS = Object.freeze(
       [
@@ -25369,6 +25398,57 @@
       return settings;
     }
 
+    function createKillSelectedRequest(value, now = Date.now(), requestId = '') {
+      const settings = normalizeSettings(value);
+      const targetIds = settings.order.filter((id) => settings.monsters[id]?.enabled === true);
+      const includeBoss = settings.bossRoom.enabled === true;
+      if (targetIds.length === 0 && !includeBoss) return null;
+      return {
+        version: 1,
+        requestId: String(requestId || `kill-${now}-${Math.random().toString(36).slice(2)}`),
+        createdAt: now,
+        targetIds,
+        includeBoss,
+      };
+    }
+
+    function normalizeKillSelectedRequest(value, now = Date.now()) {
+      if (!value || typeof value !== 'object' || value.version !== 1) return null;
+      const requestId = String(value.requestId || '').trim().slice(0, 120);
+      const createdAt = Number(value.createdAt);
+      if (
+        !requestId ||
+        !Number.isFinite(createdAt) ||
+        createdAt <= 0 ||
+        createdAt > now + 5_000 ||
+        now - createdAt > KILL_SELECTED_MAX_AGE_MS
+      ) {
+        return null;
+      }
+      const selected = new Set(
+        (Array.isArray(value.targetIds) ? value.targetIds : [])
+          .map(String)
+          .filter((id) => MONSTER_ID_SET.has(id)),
+      );
+      const targetIds = MONSTER_IDS.filter((id) => selected.has(id));
+      const includeBoss = value.includeBoss === true;
+      if (targetIds.length === 0 && !includeBoss) return null;
+      return { version: 1, requestId, createdAt, targetIds, includeBoss };
+    }
+
+    function applyKillSelectedRequest(value, request) {
+      const settings = normalizeSettings(value);
+      const selected = new Set(request?.targetIds || []);
+      for (const monster of SHADOWBRIDGE_MONSTERS) {
+        const target = settings.monsters[monster.id];
+        target.enabled = selected.has(monster.id);
+        if (target.enabled) target.mode = 'kill';
+      }
+      settings.bossRoom.enabled = request?.includeBoss === true;
+      if (settings.bossRoom.enabled) settings.bossRoom.mode = 'kill';
+      return settings;
+    }
+
     function setTouchSize(element, includeWidth = false) {
       if (!element?.style) return;
       element.style.minHeight = '44px';
@@ -25469,6 +25549,20 @@
       });
       setTouchSize(cleanButton);
       actionGroup.appendChild(cleanButton);
+      const killSelectedButton = ctx.make('button', {
+        id: `${ctx.idPrefix}-kill-selected`,
+        className: ctx.cls('primary'),
+        type: 'button',
+        text: 'Kill Selected',
+        title: 'Immediately attack every enabled target until it is defeated without changing saved target modes',
+      });
+      setTouchSize(killSelectedButton);
+      actionGroup.appendChild(killSelectedButton);
+      const killSelectedStatus = ctx.make('div', {
+        id: `${ctx.idPrefix}-kill-selected-status`,
+        className: ctx.cls('hint'),
+      });
+      actionGroup.appendChild(killSelectedStatus);
       actionGroup.appendChild(
         ctx.make('div', {
           className: ctx.cls('hint'),
@@ -25715,6 +25809,33 @@
         syncControls();
       });
 
+      killSelectedButton.addEventListener('click', () => {
+        const request = createKillSelectedRequest(ctx.settings);
+        if (!request) {
+          killSelectedStatus.textContent = 'No targets are enabled. Select at least one monster or the Boss Room.';
+          return;
+        }
+        const targetCount = request.targetIds.length + (request.includeBoss ? 1 : 0);
+        if (
+          typeof ctx.win?.confirm === 'function' &&
+          !ctx.win.confirm(`Attack ${targetCount} selected Shadowbridge target${targetCount === 1 ? '' : 's'} until defeated?`)
+        ) {
+          return;
+        }
+        if (!ctx.store?.write?.(KILL_SELECTED_KEY, request)) {
+          killSelectedStatus.textContent = 'The temporary Kill Selected request could not be saved.';
+          return;
+        }
+        const scheduled = ctx.runRouteNow?.();
+        if (!scheduled?.ok) {
+          const saved = normalizeKillSelectedRequest(ctx.store.read?.(KILL_SELECTED_KEY));
+          if (saved?.requestId === request.requestId) ctx.store.remove?.(KILL_SELECTED_KEY);
+          killSelectedStatus.textContent = scheduled?.message || 'Kill Selected could not be started.';
+          return;
+        }
+        killSelectedStatus.textContent = `Kill Selected ${scheduled.queued ? 'queued' : 'started'} for ${targetCount} target${targetCount === 1 ? '' : 's'}. Saved settings remain unchanged.`;
+      });
+
       renderOrder();
     }
 
@@ -25734,7 +25855,11 @@
       SHADOWBRIDGE_BOSS_ROOM,
       SHADOWBRIDGE_MONSTERS,
       SHADOWBRIDGE_SKILLS,
+      KILL_SELECTED_KEY,
+      KILL_SELECTED_MAX_AGE_MS,
+      applyKillSelectedRequest,
       cleanDungeonSettings,
+      createKillSelectedRequest,
 
       matchesUrl(url) {
         return (
@@ -25748,6 +25873,7 @@
       },
 
       normalizeSettings,
+      normalizeKillSelectedRequest,
       renderSettings,
     });
   },
@@ -26017,6 +26143,32 @@
           }, now);
         }
         return saved.routes[routeId];
+      }
+
+      function runRouteNow(routeId, now = Date.now()) {
+        const route = getRoute(routeId);
+        if (!route) return { ok: false, message: 'The requested automation route does not exist.' };
+        const config = loadConfig();
+        if (!config.enabled) {
+          return { ok: false, message: 'Start Veyra Automation before using Kill Selected.' };
+        }
+        const runtime = loadRuntime(now);
+        if (runtime.activeVisit?.taskId === routeId) {
+          return {
+            ok: false,
+            message: `${route.label} is already running. Try Kill Selected again afterwards.`,
+          };
+        }
+        // Manual runs take priority over every normally overdue loop once the
+        // current visit has handed over safely.
+        runtime.manualRouteId = routeId;
+        runtime.nextRunAt[routeId] = 0;
+        saveRuntime(runtime, now);
+        const queued = Boolean(runtime.activeVisit);
+        setStatus(queued ? `${route.label} is queued after ${label(runtime.activeVisit.taskId)}.` : `Starting ${route.label} now …`);
+        ui.update(config, loadRuntime(now));
+        if (!queued) tick();
+        return { ok: true, queued };
       }
 
       function saveActiveVisit(runtime, visit, now = Date.now()) {
@@ -26382,7 +26534,10 @@
           if (!config.enabled) {
             handlePaused(runtime, config, now);
           } else if (runtime.activeVisit) {
-            if (!isRouteEnabled(config, runtime.activeVisit.taskId)) {
+            if (
+              !isRouteEnabled(config, runtime.activeVisit.taskId) &&
+              runtime.manualRouteId !== runtime.activeVisit.taskId
+            ) {
               handleDisabledRouteVisit(runtime, config, now);
             } else {
               const storedCommand = normalizeVisit(store.read(COMMAND_KEY));
@@ -26456,6 +26611,7 @@
         start,
         stopPolling,
         tick,
+        runRouteNow,
         updateRouteConfig,
       };
     }
@@ -26523,6 +26679,7 @@
         version: PROTOCOL_VERSION,
         nextRunAt,
         notes: {},
+        manualRouteId: '',
         activeVisit: null,
         lastResult: null,
       };
@@ -26561,6 +26718,7 @@
         version: PROTOCOL_VERSION,
         nextRunAt,
         notes: normalizeNotes(value.notes),
+        manualRouteId: getRoute(value.manualRouteId) ? String(value.manualRouteId) : '',
         activeVisit: normalizeVisit(value.activeVisit),
         lastResult,
       };
@@ -26595,6 +26753,8 @@
 
     function chooseDueRoute(runtime, now = Date.now(), config = null) {
       if (!runtime || runtime.activeVisit) return null;
+      const manualRoute = getRoute(runtime.manualRouteId);
+      if (manualRoute) return manualRoute;
       const normalizedConfig = normalizeConfig(config);
 
       return (
@@ -26626,6 +26786,7 @@
         delete next.notes[visit.taskId];
       }
       next.activeVisit = null;
+      if (next.manualRouteId === visit.taskId) next.manualRouteId = '';
       next.lastResult = {
         taskId: visit.taskId,
         state: outcome === 'done' ? 'done' : 'error',
@@ -26791,10 +26952,11 @@
     `;
 
     function countdownText(routeId, config, runtime, now) {
-      if (config.routes[routeId]?.enabled === false) return 'Inactive';
       if (runtime?.activeVisit?.taskId === routeId) {
         return runtime.activeVisit.phase === 'running' ? 'Running now' : 'Preparing';
       }
+      if (runtime?.manualRouteId === routeId) return 'Queued manually';
+      if (config.routes[routeId]?.enabled === false) return 'Inactive';
       const countdown = formatCountdown(runtime?.nextRunAt?.[routeId], now);
       const note = runtime?.notes?.[routeId];
       return note ? `${note} · ${countdown}` : countdown;
@@ -26933,6 +27095,10 @@
           cls,
           idPrefix,
           container,
+
+          runRouteNow() {
+            return state.actions.runRouteNow(routeId);
+          },
 
           updateSettings(mutator) {
             return state.actions.updateRouteConfig(routeId, (next) => mutator(next.settings)).settings;

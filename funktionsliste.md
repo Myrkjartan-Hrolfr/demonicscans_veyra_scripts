@@ -3,7 +3,7 @@
 Grundlage: `arbeitsauftrag.txt`, die bestehenden Skripte und die Beispielseiten in `veyra_seiten.txt`.
 Status-Legende: **[vorh.]** existiert schon weitgehend · **[anp.]** existiert, muss angepasst werden · **[neu]** neu zu bauen · **[?]** offene Frage
 
-Aktueller Stand: Das Hauptbundle steht bei Version 0.9.6. Dragon-Realm-Expeditionen sind bewusst nicht Teil dieser Automation, sondern liegen als eigenständiges Userscript `expedition-auto.js` mit eigenem Start/Stop-Schalter, Einstellungen und Statusfenster vor. General Settings enthält außerdem den Power-Crystal-Quickset; Olympus, Adventurer's Guild, Shadowbridge, Castle of the Fallen Prince und Crucible werden weiterhin über ihre eigenen Routen automatisiert. Die „Unclaimed Kills“-Anzeige bleibt wegen der serverseitigen Begrenzung unverändert. Die ausdrücklich ausgeschlossenen Punkte 5.4, 7.15 und 7.16 bleiben unverändert.
+Aktueller Stand: Das Hauptbundle steht bei Version 0.9.7. Dragon-Realm-Expeditionen sind bewusst nicht Teil dieser Automation, sondern liegen als eigenständiges Userscript `expedition-auto.js` mit eigenem Start/Stop-Schalter, Einstellungen und Statusfenster vor. General Settings enthält außerdem den Power-Crystal-Quickset; Olympus, Adventurer's Guild, Shadowbridge, Castle of the Fallen Prince und Crucible werden weiterhin über ihre eigenen Routen automatisiert. Die „Unclaimed Kills“-Anzeige bleibt wegen der serverseitigen Begrenzung unverändert. Die ausdrücklich ausgeschlossenen Punkte 5.4, 7.15 und 7.16 bleiben unverändert.
 
 ---
 
@@ -81,6 +81,7 @@ URLs: Wave 3 `active_wave.php?gate=3&wave=8`. Olympus `gate=5`: außen wave=9, H
 | 4.1.8 | Skript wie `dungeon_auto_damage_fast`, aber eigenständig | [vorh.] | Keine Abhängigkeit vom externen UI-Improvements-Skript. |
 | 4.1.9 | Mehrere Locations (1–4) durchlaufen | [vorh.] | |
 | 4.1.10 | Live-Statusfenster während Shadowbridge-Angriffen | [vorh.] | Ein einklappbares, mobil angepasstes Fenster listet alle Ziele des aktuellen Besuchs in Angriffsreihenfolge. Es markiert wartend / aktiv / erledigt / Fehler und zeigt bei Schadenszielen den eigenen Schaden gegen die live gelesene Zielgrenze, im Kill-Modus die verbleibenden Monster-HP sowie jeweils die Angriffsanzahl. |
+| 4.1.11 | „Kill Selected“ für die aktivierten Ziele | [vorh.] | Startet nach Bestätigung einen einmaligen Shadowbridge-Lauf und greift genau die derzeit aktivierten Monster sowie optional den Bossraum bis zu ihrem Tod an. Dafür wird nur ein temporärer Auftrag erzeugt; gespeicherte Active-Toggles, Schadensmodi, Schadenswerte, Reihenfolge und der Shadowbridge-Route-Toggle bleiben unverändert. Läuft bereits eine andere Route, wird der Auftrag mit Vorrang dahinter eingereiht. Nur die Hauptautomation muss für die geschützte Navigation laufen. |
 
 ### 4.2 Castle of the Fallen Prince
 
