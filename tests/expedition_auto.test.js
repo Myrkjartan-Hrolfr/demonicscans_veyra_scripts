@@ -21,6 +21,7 @@ function catalog() {
     skills: {
       cheap: { name: 'Cheap Bolt', target: 'enemy', range: 3, cost: 0 },
       expensive: { name: 'Meteor', target: 'enemy', range: 3, cost: 40 },
+      heal: { name: 'Greater Heal', text: 'Restore HP to an ally.', target: 'ally', range: 3, cost: 30 },
       guard: { name: 'Guard', target: 'self', cost: 0 },
       rescue: { name: 'Rescue', target: 'fallen', range: 3, cost: 30 },
     },
@@ -56,6 +57,40 @@ test('standalone expedition combat uses expensive attacks before cheap attacks',
   const decision = helpers.chooseCombatAction(battle(), catalog(), 42, { autoRescue: true });
   assert.equal(decision.action, 'order');
   assert.equal(decision.data.order.skill, 'expensive');
+  assert.equal(decision.data.order.target, 'e1');
+});
+
+test('standalone expedition healer prioritizes the lowest ally below 90 percent', () => {
+  const decision = helpers.chooseCombatAction(
+    battle({
+      actors: [
+        actor({ class: 'healer', skills: ['cheap', 'heal'] }),
+        actor({ id: 'wounded', uid: 99, class: 'warrior', hp: 899, maxHp: 1_000, row: 5, col: 2 }),
+        actor({ id: 'lowest', uid: 98, class: 'tank', hp: 850, maxHp: 1_000, row: 5, col: 3 }),
+      ],
+    }),
+    catalog(),
+    42,
+    { autoRescue: true },
+  );
+  assert.equal(decision.action, 'order');
+  assert.equal(decision.data.order.skill, 'heal');
+  assert.equal(decision.data.order.target, 'lowest');
+});
+
+test('standalone expedition healer attacks when nobody is below 90 percent', () => {
+  const decision = helpers.chooseCombatAction(
+    battle({
+      actors: [
+        actor({ class: 'healer', skills: ['cheap', 'heal'] }),
+        actor({ id: 'ally', uid: 99, class: 'warrior', hp: 900, maxHp: 1_000, row: 5, col: 2 }),
+      ],
+    }),
+    catalog(),
+    42,
+    { autoRescue: true },
+  );
+  assert.equal(decision.data.order.skill, 'cheap');
   assert.equal(decision.data.order.target, 'e1');
 });
 

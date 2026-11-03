@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Dragon Realm Expedition Auto
 // @namespace    local.veyra.expeditions
-// @version      1.1.0
+// @version      1.2.0
 // @description  Independently starts and completes Dragon Realm expeditions, including party setup, votes, combat, loot and powers.
 // @match        https://demonicscans.org/event_page.php*
 // @match        https://www.demonicscans.org/event_page.php*
@@ -203,6 +203,25 @@
     return Number(unit?.maxHp) > 0 ? Number(unit.hp || 0) / Number(unit.maxHp) : 1;
   }
 
+  function chooseSupportAction(run, catalog, actor, skills, threshold, healingOnly = false) {
+    const pattern = healingOnly
+      ? /heal|restore|recover|mend|renew|regenerat|rejuvenat|cure\s+wound|vital/
+      : /heal|restore|recover|mend|renew|regenerat|rejuvenat|cure\s+wound|vital|shield|protect|guard|cleanse/;
+    for (const key of skills) {
+      const skill = catalog.skills[key];
+      if (!['ally', 'self'].includes(skill.target)) continue;
+      const text = `${key} ${skill.name || ''} ${skill.text || ''} ${skill.description || ''}`.toLowerCase();
+      if (!pattern.test(text)) continue;
+      const targets = (run.actors || []).filter((unit) => targetable(run, actor, unit, key, catalog)).sort(
+        (left, right) => healthRatio(left) - healthRatio(right),
+      );
+      if (targets[0] && healthRatio(targets[0]) < threshold) {
+        return orderDecision(run, key, targets[0].id, `${skill.name || key} on ${targets[0].name || 'ally'}.`);
+      }
+    }
+    return null;
+  }
+
   function chooseCombatAction(run, catalog, userId, settings) {
     const actor = actorFor(run, userId);
     if (!actor) return { action: '', message: 'Waiting for your hunter.' };
@@ -235,6 +254,11 @@
     const skills = (actor.skills || []).filter((key) => skillReady(run, actor, key, catalog)).sort(
       (left, right) => Number(catalog.skills[right]?.cost || 0) - Number(catalog.skills[left]?.cost || 0),
     );
+    const actorClass = String(actor.class || actor.combat_class || '').toLowerCase();
+    if (actorClass === 'healer') {
+      const healing = chooseSupportAction(run, catalog, actor, skills, 0.9, true);
+      if (healing) return healing;
+    }
     for (const key of skills) {
       const skill = catalog.skills[key];
       if (skill.target !== 'enemy') continue;
@@ -244,18 +268,8 @@
       );
       if (targets[0]) return orderDecision(run, key, targets[0].id, `${skill.name || key} on ${targets[0].name || 'enemy'}.`);
     }
-    for (const key of skills) {
-      const skill = catalog.skills[key];
-      if (!['ally', 'self'].includes(skill.target)) continue;
-      const text = `${skill.name || ''} ${skill.text || ''}`.toLowerCase();
-      if (!/heal|restore|recover|shield|protect|guard|cleanse/.test(text)) continue;
-      const targets = (run.actors || []).filter((unit) => targetable(run, actor, unit, key, catalog)).sort(
-        (left, right) => healthRatio(left) - healthRatio(right),
-      );
-      if (targets[0] && healthRatio(targets[0]) < 0.8) {
-        return orderDecision(run, key, targets[0].id, `${skill.name || key} on ${targets[0].name || 'ally'}.`);
-      }
-    }
+    const support = chooseSupportAction(run, catalog, actor, skills, 0.8);
+    if (support) return support;
     const move = chooseMove(run, actor);
     if (move) {
       return {
