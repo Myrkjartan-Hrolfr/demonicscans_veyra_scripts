@@ -110,6 +110,22 @@ test('standalone expedition healer attacks when nobody is below 90 percent', () 
   assert.equal(decision.data.order.target, 'e1');
 });
 
+test('standalone expedition healer attacks when healing is not currently possible', () => {
+  const decision = helpers.chooseCombatAction(
+    battle({
+      actors: [
+        actor({ class: 'healer', energy: 10, skills: ['cheap', 'heal'] }),
+        actor({ id: 'ally', uid: 99, class: 'warrior', hp: 200, maxHp: 1_000, row: 5, col: 2 }),
+      ],
+    }),
+    catalog(),
+    42,
+    { autoRescue: true },
+  );
+  assert.equal(decision.data.order.skill, 'cheap');
+  assert.equal(decision.data.order.target, 'e1');
+});
+
 test('standalone expedition combat escapes danger and rescues humans first', () => {
   const escape = helpers.chooseCombatAction(
     battle({ ground_warning: [{ row: 6, col: 2 }] }),
