@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Dragon Realm Expedition Auto
 // @namespace    local.veyra.expeditions
-// @version      1.2.0
+// @version      1.2.1
 // @description  Independently starts and completes Dragon Realm expeditions, including party setup, votes, combat, loot and powers.
 // @match        https://demonicscans.org/event_page.php*
 // @match        https://www.demonicscans.org/event_page.php*
@@ -222,6 +222,44 @@
     return null;
   }
 
+  function chooseHealerAction(run, catalog, actor, skills, threshold = 0.9) {
+    const healingPattern = /heal|restore|recover|mend|renew|regenerat|rejuvenat|cure\s+wound|vital/;
+    const candidates = [];
+    skills.forEach((key, skillPriority) => {
+      const skill = catalog.skills[key];
+      if (!['ally', 'self'].includes(skill.target)) return;
+      const text = `${key} ${skill.name || ''} ${skill.text || ''} ${skill.description || ''}`.toLowerCase();
+      if (!healingPattern.test(text)) return;
+      for (const target of run.actors || []) {
+        if (targetable(run, actor, target, key, catalog) && healthRatio(target) < threshold) {
+          candidates.push({ key, skill, skillPriority, target });
+        }
+      }
+    });
+    if (!candidates.length) return null;
+
+    const actorHealth = healthRatio(actor);
+    const targetPriority = (target) => {
+      const self = target.id === actor.id;
+      if (actorHealth <= 0.3) return self ? 0 : 1;
+      if (!self && healthRatio(target) < actorHealth) return 0;
+      return self ? 1 : 2;
+    };
+    candidates.sort(
+      (left, right) =>
+        targetPriority(left.target) - targetPriority(right.target) ||
+        healthRatio(left.target) - healthRatio(right.target) ||
+        left.skillPriority - right.skillPriority,
+    );
+    const chosen = candidates[0];
+    return orderDecision(
+      run,
+      chosen.key,
+      chosen.target.id,
+      `${chosen.skill.name || chosen.key} on ${chosen.target.name || 'ally'}.`,
+    );
+  }
+
   function chooseCombatAction(run, catalog, userId, settings) {
     const actor = actorFor(run, userId);
     if (!actor) return { action: '', message: 'Waiting for your hunter.' };
@@ -241,6 +279,15 @@
     }
     if (actedThisRound(run, actor)) return { action: '', message: `Round ${run.round}: action completed.` };
 
+    const skills = (actor.skills || []).filter((key) => skillReady(run, actor, key, catalog)).sort(
+      (left, right) => Number(catalog.skills[right]?.cost || 0) - Number(catalog.skills[left]?.cost || 0),
+    );
+    const actorClass = String(actor.class || actor.combat_class || '').toLowerCase();
+    if (actorClass === 'healer' && healthRatio(actor) <= 0.3) {
+      const selfPreservation = chooseHealerAction(run, catalog, actor, skills);
+      if (selfPreservation) return selfPreservation;
+    }
+
     if (settings.autoRescue && skillReady(run, actor, 'rescue', catalog)) {
       const fallen = (run.actors || []).filter(
         (unit) =>
@@ -251,12 +298,8 @@
       if (fallen[0]) return orderDecision(run, 'rescue', fallen[0].id, `Rescuing ${fallen[0].name || 'party member'}.`);
     }
 
-    const skills = (actor.skills || []).filter((key) => skillReady(run, actor, key, catalog)).sort(
-      (left, right) => Number(catalog.skills[right]?.cost || 0) - Number(catalog.skills[left]?.cost || 0),
-    );
-    const actorClass = String(actor.class || actor.combat_class || '').toLowerCase();
     if (actorClass === 'healer') {
-      const healing = chooseSupportAction(run, catalog, actor, skills, 0.9, true);
+      const healing = chooseHealerAction(run, catalog, actor, skills);
       if (healing) return healing;
     }
     for (const key of skills) {
