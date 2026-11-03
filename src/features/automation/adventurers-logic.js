@@ -21,10 +21,13 @@ function parseQuestRequirement(text) {
   const source = String(text || '').replace(/\s+/g, ' ').trim();
   const countMatch = source.match(/\b(?:kill|loot)\s+(\d+)\s+monster(?:\(s\)|s)?\b/i);
   const targetMatch = source.match(/\bMonster\s*:\s*(.+?)\s*[·|]\s*min\s*([\d.,]+\s*[kmbtq]?)\s*(?:dmg|damage)\b/i);
-  if (!countMatch || !targetMatch) return null;
-  const count = Number.parseInt(countMatch[1], 10);
-  const minDamage = parseGameNumber(targetMatch[2].replace(/\s+/g, ''));
-  const name = String(targetMatch[1] || '').trim();
+  const descriptionMatch = source.match(
+    /\b(?:kill|loot)\s+(\d+)\s+(.+?)\s+while\s+dealing\s+at\s+least\s+([\d.,]+\s*[kmbtq]?)\s+(?:dmg|damage)\b/i,
+  );
+  if ((!countMatch || !targetMatch) && !descriptionMatch) return null;
+  const count = Number.parseInt(descriptionMatch?.[1] || countMatch?.[1], 10);
+  const minDamage = parseGameNumber(String(descriptionMatch?.[3] || targetMatch?.[2] || '').replace(/\s+/g, ''));
+  const name = String(descriptionMatch?.[2] || targetMatch?.[1] || '').trim();
   if (!name || !Number.isFinite(count) || count <= 0 || minDamage === null || minDamage < 0) return null;
   return { name, normalizedName: normalizeName(name), count, minDamage };
 }
@@ -51,7 +54,9 @@ function parseQuests(root, nowMs = Date.now()) {
   const nowSeconds = Math.floor(nowMs / 1_000);
   const quests = [];
   for (const row of root?.querySelectorAll?.('.quest-row') || []) {
-    const requirement = parseQuestRequirement(row.querySelector?.('.quest-req-text')?.textContent);
+    const requirement =
+      parseQuestRequirement(row.querySelector?.('.quest-req-text')?.textContent) ||
+      parseQuestRequirement(row.querySelector?.('.quest-main-desc')?.textContent);
     if (!requirement) continue;
     const accept = actionId(row, 'acceptQuest');
     const finish = actionId(row, 'finishQuest');

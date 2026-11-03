@@ -106,7 +106,14 @@ function questRow({ id = '31', state = 'available', current = 0, count = 10, coo
     if (current >= count) buttons.push(element({ attrs: { onclick: `finishQuest(${id}, this)` } }));
   }
   const one = {
-    '.quest-req-text': element({ text: `Kill ${count} monster(s) · Monster: Kraken · min 5m dmg` }),
+    '.quest-req-text': element({
+      text: state === 'active'
+        ? `Kill ${count} monster(s) · min 5,000,000 dmg`
+        : `Kill ${count} monster(s) · Monster: Kraken · min 5m dmg`,
+    }),
+    '.quest-main-desc': element({
+      text: `The Kraken threatens the coast. Kill ${count} Kraken while dealing at least 5m damage to each.`,
+    }),
     '.quest-main-title': element({ text: 'Wrath of the Abyss' }),
     '.quest-progress': element({ text: `${current} / ${count}` }),
   };
@@ -274,7 +281,30 @@ test('quest requirements parse names with commas and compact damage values', () 
       minDamage: 5_000_000,
     },
   );
+  assert.deepEqual(
+    logic.parseQuestRequirement(
+      'Kill 10 Charybdis, Living Maelstrom while dealing at least 5m damage to each.',
+    ),
+    {
+      name: 'Charybdis, Living Maelstrom',
+      normalizedName: 'charybdis, living maelstrom',
+      count: 10,
+      minDamage: 5_000_000,
+    },
+  );
   assert.equal(logic.parseQuestRequirement('Collect ten apples'), null);
+});
+
+test('active quest rows recover the monster name from their description', () => {
+  const [quest] = logic.parseQuests(guildDocument('active', 0, 10), NOW);
+  assert.equal(quest.id, '31');
+  assert.equal(quest.state, 'active');
+  assert.deepEqual(quest.requirement, {
+    name: 'Kraken',
+    normalizedName: 'kraken',
+    count: 10,
+    minDamage: 5_000_000,
+  });
 });
 
 test('duplicate quest targets are aggregated so enough monsters are farmed for every quest', () => {
