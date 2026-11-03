@@ -526,12 +526,18 @@ test('worker accepts, loots and finishes a ready quest without ever giving it up
     removeEventListener() {},
   };
   const pageDoc = guildDocument('available', 0, 1);
+  let waveFetches = 0;
   const worker = createAdventurersWorker({
     win,
     doc: pageDoc,
     store,
-    fetchDocument: async (url) =>
-      String(url).includes('active_wave.php') ? waveDocument() : guildDocument(state, progress, 1),
+    fetchDocument: async (url) => {
+      if (!String(url).includes('active_wave.php')) return guildDocument(state, progress, 1);
+      waveFetches += 1;
+      return waveFetches === 1
+        ? waveDocument([], { farmState: 'paused', killed: 0, target: 123 })
+        : waveDocument();
+    },
     postForm: async (url, params) => {
       posts.push({ url, params });
       if (url === ACCEPT_PATH) state = 'active';
@@ -551,7 +557,16 @@ test('worker accepts, loots and finishes a ready quest without ever giving it up
     posts.filter((entry) => [ACCEPT_PATH, LOOT_PATH, FINISH_PATH].includes(entry.url)).map((entry) => entry.url),
     [ACCEPT_PATH, LOOT_PATH, FINISH_PATH],
   );
-  assert.equal(posts.some((entry) => entry.url === AUTO_FARM_PATH && entry.params.action === 'reset'), true);
+  const firstReset = posts.findIndex(
+    (entry) => entry.url === AUTO_FARM_PATH && entry.params.action === 'reset',
+  );
+  const firstConfiguration = posts.findIndex(
+    (entry) =>
+      entry.url === AUTO_FARM_PATH &&
+      ['update_target', 'add_target', 'save_settings'].includes(entry.params.action),
+  );
+  assert.ok(firstReset >= 0);
+  assert.ok(firstReset < firstConfiguration, 'Auto Farm must reset before quest targets or settings are changed');
   const questFarmSettings = posts.find(
     (entry) => entry.url === AUTO_FARM_PATH && entry.params.action === 'save_settings' && entry.params.TOTAL_MONSTERS_TO_KILL === '123',
   );
@@ -583,6 +598,46 @@ test('worker accepts, loots and finishes a ready quest without ever giving it up
   assert.equal(status.state, 'done');
   assert.equal(status.safeToLeave, true);
   assert.equal(status.retryAt, NOW + 48 * 60 * 60_000);
+});
+
+test('worker skips Auto Farm when every required quest monster is already available', async () => {
+  let state = 'available';
+  let progress = 0;
+  const posts = [];
+  const store = createStore({
+    [COMMAND_KEY]: runningAdventurersCommand('adv-skip-farm'),
+  });
+  const pageDoc = guildDocument('available', 0, 1);
+  const worker = createAdventurersWorker({
+    win: adventurersWindow(pageDoc),
+    doc: pageDoc,
+    store,
+    fetchDocument: async (url) =>
+      String(url).includes('active_wave.php')
+        ? waveDocument([deadCard({ id: '2001', quantity: 1 })])
+        : guildDocument(state, progress, 1),
+    postForm: async (url, params) => {
+      posts.push({ url, params });
+      if (url === ACCEPT_PATH) state = 'active';
+      if (url === LOOT_PATH) progress = 1;
+      if (url === FINISH_PATH) state = 'cooldown';
+      return { ok: true, status: 200, json: { status: url === LOOT_PATH ? 'success' : 'ok' }, text: '' };
+    },
+    getUserId: async () => '7',
+    sleepImpl: async () => {},
+    now: () => NOW,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await worker.tick();
+
+  assert.equal(posts.some((entry) => entry.url === AUTO_FARM_PATH), false);
+  assert.deepEqual(
+    posts.filter((entry) => [ACCEPT_PATH, LOOT_PATH, FINISH_PATH].includes(entry.url)).map((entry) => entry.url),
+    [ACCEPT_PATH, LOOT_PATH, FINISH_PATH],
+  );
+  assert.equal(store.read(AUTOFARM_SNAPSHOT_KEY), null);
+  assert.equal(store.read(workerStatusKey('adventurers')).state, 'done');
 });
 
 test('worker continues a leased visit when the server removes the Adventurers route marker', async () => {

@@ -314,7 +314,17 @@ function createAdventurersWorker({
       store.write(AUTOFARM_SNAPSHOT_KEY, snapshot);
     }
 
+    const configuredFor = requirementSignature(requirements);
     const initialState = logic.autoFarmState(waveDoc);
+    if (snapshot.configuredFor === configuredFor) {
+      if (initialState === 'paused') {
+        requireSuccess(
+          await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: 1 }),
+          'Resuming quest Auto Farm',
+        );
+      }
+      return;
+    }
     if (initialState === 'running') {
       requireSuccess(
         await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: 0 }),
@@ -322,10 +332,8 @@ function createAdventurersWorker({
       );
       await waitWithGuard(visitId, ACTION_DELAY_MS);
     }
-    if (initialState === 'finished') {
-      requireSuccess(await guardedPost(visitId, AUTO_FARM_PATH, { action: 'reset' }), 'Resetting Auto Farm');
-      await waitWithGuard(visitId, ACTION_DELAY_MS);
-    }
+    requireSuccess(await guardedPost(visitId, AUTO_FARM_PATH, { action: 'reset' }), 'Resetting Auto Farm');
+    await waitWithGuard(visitId, ACTION_DELAY_MS);
 
     const requiredByName = new Map(requirements.map((requirement) => [requirement.normalizedName, requirement]));
     const targets = logic.readAutoFarmTargets(waveDoc);
@@ -375,7 +383,7 @@ function createAdventurersWorker({
     );
     requireSuccess(await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: 1 }), 'Starting Auto Farm');
 
-    snapshot.configuredFor = requirementSignature(requirements);
+    snapshot.configuredFor = configuredFor;
     snapshot.questNames = [...new Set([...(snapshot.questNames || []), ...requirements.map((item) => item.normalizedName)])];
     store.write(AUTOFARM_SNAPSHOT_KEY, snapshot);
   }
@@ -500,8 +508,26 @@ function createAdventurersWorker({
   }
 
   async function ensurePrefarmed(visitId, requirements) {
-    showDeadMonstersForQuestPool();
-    let waveDoc = await fetchFresh(visitId, logic.WAVE_PATH);
+    const existing = await readDeadPool(visitId, requirements);
+    if (logic.requirementsSatisfied(requirements, existing.monsters)) {
+      const snapshot = store.read(AUTOFARM_SNAPSHOT_KEY);
+      if (
+        snapshot?.version &&
+        Array.isArray(snapshot.targets) &&
+        logic.autoFarmState(existing.waveDoc) === 'running'
+      ) {
+        requireSuccess(
+          await guardedPost(visitId, AUTO_FARM_PATH, { action: 'toggle', enabled: 0 }),
+          'Pausing completed quest Auto Farm',
+        );
+      }
+      setWorkingMessage(
+        visitId,
+        'All required quest monsters are already available; skipping Auto Farm and starting quest turn-ins.',
+      );
+      return existing.waveDoc;
+    }
+    let waveDoc = existing.waveDoc;
     setWorkingMessage(visitId, `Preparing Auto Farm for all ${requirements.length} Olympus quest monsters.`);
     await configureAutoFarm(visitId, requirements, waveDoc);
 
