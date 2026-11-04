@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Dragon Realm Expedition Auto
 // @namespace    local.veyra.expeditions
-// @version      1.2.1
+// @version      1.3.0
 // @description  Independently starts and completes Dragon Realm expeditions, including party setup, votes, combat, loot and powers.
 // @match        https://demonicscans.org/event_page.php*
 // @match        https://www.demonicscans.org/event_page.php*
@@ -183,6 +183,106 @@
     )[0] || null;
   }
 
+  function unitRole(unit) {
+    return `${unit?.class || ''} ${unit?.combat_class || ''} ${unit?.role || ''} ${unit?.archetype || ''} ${unit?.name || ''}`.toLowerCase();
+  }
+
+  function isHealer(unit) {
+    return /\bheal(?:er|ing)?\b|\bcleric\b|\bpriest\b|\bmedic\b|\brestorer?\b/.test(unitRole(unit));
+  }
+
+  function compareScores(left, right) {
+    for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+      const difference = Number(left[index] || 0) - Number(right[index] || 0);
+      if (difference) return difference;
+    }
+    return 0;
+  }
+
+  function enemyThreat(position, enemies) {
+    return enemies.reduce((score, enemy) => {
+      const tiles = distance(position, enemy);
+      if (tiles <= 1) return score + 100;
+      if (tiles === 2) return score + 10;
+      if (tiles === 3) return score + 1;
+      return score;
+    }, 0);
+  }
+
+  function coverScore(position, protectedUnits, enemies) {
+    let score = 0;
+    for (const protectedUnit of protectedUnits) {
+      for (const enemy of enemies) {
+        const direct = distance(enemy, protectedUnit);
+        const enemyToPosition = distance(enemy, position);
+        const positionToProtected = distance(position, protectedUnit);
+        if (enemyToPosition < direct && enemyToPosition + positionToProtected === direct) {
+          score += isHealer(protectedUnit) ? 3 : 1;
+        }
+      }
+    }
+    return score;
+  }
+
+  function chooseTacticalMove(run, actor, force = false) {
+    const danger = dangerTiles(run);
+    const moves = validMoves(run, actor).filter((position) => !danger.has(pointKey(position)));
+    if (!moves.length) return null;
+    const enemies = (run.enemies || []).filter((enemy) => Number(enemy.hp) > 0);
+    const allies = (run.actors || []).filter((unit) => Number(unit.hp) > 0 && unit.id !== actor.id);
+    const actorClass = String(actor.class || actor.combat_class || '').toLowerCase();
+    const healers = (run.actors || []).filter((unit) => Number(unit.hp) > 0 && isHealer(unit));
+    const healer = healers.sort((left, right) => distance(actor, left) - distance(actor, right))[0] || null;
+    const nearestEnemy = (position) => enemies.length
+      ? Math.min(...enemies.map((enemy) => distance(position, enemy)))
+      : 99;
+
+    let score;
+    let message;
+    if (actorClass === 'healer') {
+      const wounded = allies.filter(
+        (unit) => healthRatio(unit) < 0.9 && distance(actor, unit) > 3,
+      ).sort(
+        (left, right) => healthRatio(left) - healthRatio(right) || distance(actor, left) - distance(actor, right),
+      )[0] || null;
+      const immediateThreat = enemies.some((enemy) => distance(actor, enemy) <= 1);
+      if (!force && !wounded && !immediateThreat) return null;
+      score = (position) => [
+        enemyThreat(position, enemies),
+        wounded ? distance(position, wounded) : 0,
+        -nearestEnemy(position),
+      ];
+      message = 'Repositioning safely toward the most wounded ally.';
+    } else if (actorClass === 'tank') {
+      score = (position) => [
+        healer ? Math.max(0, distance(position, healer) - 3) : 0,
+        -enemies.filter((enemy) => distance(position, enemy) <= 1).length,
+        -coverScore(position, allies, enemies),
+        -enemies.filter((enemy) => distance(position, enemy) <= 3).length,
+        nearestEnemy(position),
+      ];
+      message = 'Gathering enemies while covering the party.';
+    } else {
+      if (!healer) return null;
+      score = (position) => [
+        Math.max(0, distance(position, healer) - 3),
+        -coverScore(position, [healer], enemies),
+        enemyThreat(position, enemies),
+        distance(position, healer),
+      ];
+      message = 'Staying close to and shielding the healer.';
+    }
+
+    const ranked = moves.map((position) => ({ position, score: score(position) })).sort(
+      (left, right) =>
+        compareScores(left.score, right.score) ||
+        left.position.row - right.position.row ||
+        left.position.col - right.position.col,
+    );
+    if (!ranked[0] || (!force && compareScores(ranked[0].score, score(actor)) >= 0)) return null;
+    return { position: ranked[0].position, message };
+  }
+
   function rescueAvailable(run, unit) {
     const guild = unit && !unit.bot && unit.guild_dragon
       ? Math.max(0, Number(run?.guild_dragon_rescues?.[unit.guild] || 0))
@@ -238,16 +338,8 @@
     });
     if (!candidates.length) return null;
 
-    const actorHealth = healthRatio(actor);
-    const targetPriority = (target) => {
-      const self = target.id === actor.id;
-      if (actorHealth <= 0.3) return self ? 0 : 1;
-      if (!self && healthRatio(target) < actorHealth) return 0;
-      return self ? 1 : 2;
-    };
     candidates.sort(
       (left, right) =>
-        targetPriority(left.target) - targetPriority(right.target) ||
         healthRatio(left.target) - healthRatio(right.target) ||
         left.skillPriority - right.skillPriority,
     );
@@ -260,6 +352,32 @@
     );
   }
 
+  function chooseAttackAction(run, catalog, actor, skills) {
+    const candidates = [];
+    skills.forEach((key, skillPriority) => {
+      const skill = catalog.skills[key];
+      if (skill.target !== 'enemy') return;
+      for (const target of run.enemies || []) {
+        if (targetable(run, actor, target, key, catalog)) candidates.push({ key, skill, skillPriority, target });
+      }
+    });
+    candidates.sort(
+      (left, right) =>
+        Number(isHealer(right.target)) - Number(isHealer(left.target)) ||
+        left.skillPriority - right.skillPriority ||
+        Number(right.target.boss) - Number(left.target.boss) ||
+        Number(left.target.hp || 0) - Number(right.target.hp || 0),
+    );
+    if (!candidates[0]) return null;
+    const chosen = candidates[0];
+    return orderDecision(
+      run,
+      chosen.key,
+      chosen.target.id,
+      `${chosen.skill.name || chosen.key} on ${chosen.target.name || 'enemy'}.`,
+    );
+  }
+
   function chooseCombatAction(run, catalog, userId, settings) {
     const actor = actorFor(run, userId);
     if (!actor) return { action: '', message: 'Waiting for your hunter.' };
@@ -267,7 +385,7 @@
 
     const danger = dangerTiles(run);
     if (!movedThisRound(run, actor) && danger.has(pointKey(actor))) {
-      const escape = chooseMove(run, actor, true);
+      const escape = chooseTacticalMove(run, actor, true)?.position || chooseMove(run, actor, true);
       if (escape) {
         return {
           action: 'move',
@@ -277,7 +395,18 @@
         };
       }
     }
-    if (actedThisRound(run, actor)) return { action: '', message: `Round ${run.round}: action completed.` };
+    if (actedThisRound(run, actor)) {
+      const tactical = chooseTacticalMove(run, actor);
+      if (tactical) {
+        return {
+          action: 'move',
+          key: `move:${run.battleSerial}:${run.round}:${pointKey(tactical.position)}`,
+          message: tactical.message,
+          data: { round: run.round, battle: run.battleSerial, position: tactical.position },
+        };
+      }
+      return { action: '', message: `Round ${run.round}: action completed.` };
+    }
 
     const skills = (actor.skills || []).filter((key) => skillReady(run, actor, key, catalog)).sort(
       (left, right) => Number(catalog.skills[right]?.cost || 0) - Number(catalog.skills[left]?.cost || 0),
@@ -302,15 +431,17 @@
       const healing = chooseHealerAction(run, catalog, actor, skills);
       if (healing) return healing;
     }
-    for (const key of skills) {
-      const skill = catalog.skills[key];
-      if (skill.target !== 'enemy') continue;
-      const targets = (run.enemies || []).filter((enemy) => targetable(run, actor, enemy, key, catalog)).sort(
-        (left, right) =>
-          Number(right.boss) - Number(left.boss) || Number(left.hp || 0) - Number(right.hp || 0),
-      );
-      if (targets[0]) return orderDecision(run, key, targets[0].id, `${skill.name || key} on ${targets[0].name || 'enemy'}.`);
+    const tactical = chooseTacticalMove(run, actor);
+    if (tactical) {
+      return {
+        action: 'move',
+        key: `move:${run.battleSerial}:${run.round}:${pointKey(tactical.position)}`,
+        message: tactical.message,
+        data: { round: run.round, battle: run.battleSerial, position: tactical.position },
+      };
     }
+    const attack = chooseAttackAction(run, catalog, actor, skills);
+    if (attack) return attack;
     const support = chooseSupportAction(run, catalog, actor, skills, 0.8);
     if (support) return support;
     const move = chooseMove(run, actor);
@@ -689,6 +820,7 @@
       actorFor,
       chooseCombatAction,
       chooseMove,
+      chooseTacticalMove,
       choosePower,
       dangerTiles,
       distance,
