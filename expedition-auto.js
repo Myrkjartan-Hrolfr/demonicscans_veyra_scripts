@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Dragon Realm Expedition Auto
 // @namespace    local.veyra.expeditions
-// @version      1.4.1
+// @version      1.4.2
 // @description  Independently starts and completes Dragon Realm expeditions, including party setup, votes, combat, loot and powers.
 // @match        https://demonicscans.org/event_page.php*
 // @match        https://www.demonicscans.org/event_page.php*
@@ -435,6 +435,13 @@
         };
       }
       return { action: '', message: `Round ${run.round}: action completed.` };
+    }
+
+    if (effectActive(run, actor, 'interrupted')) {
+      if (skillReady(run, actor, 'guard', catalog) && targetable(run, actor, actor, 'guard', catalog)) {
+        return orderDecision(run, 'guard', actor.id, 'Interrupted; using Guard.');
+      }
+      return { action: '', message: 'Interrupted; Guard is not currently available.' };
     }
 
     const skills = enabledCombatSkills(actor, catalog, settings).filter((key) => skillReady(run, actor, key, catalog)).sort(

@@ -365,6 +365,25 @@ test('standalone expedition combat escapes danger and rescues humans first', () 
   assert.equal(rescue.data.order.target, 'human');
 });
 
+test('standalone expedition combat always guards while interrupted', () => {
+  const decision = helpers.chooseCombatAction(
+    battle({
+      actors: [
+        actor({
+          class: 'healer', hp: 200, maxHp: 1_000, skills: ['cheap', 'heal'], interrupted_until: 3,
+        }),
+        actor({ id: 'fallen', uid: 99, class: 'warrior', hp: 0, row: 5, col: 2 }),
+      ],
+    }),
+    catalog(),
+    42,
+    { autoRescue: true },
+  );
+  assert.equal(decision.action, 'order');
+  assert.equal(decision.data.order.skill, 'guard');
+  assert.equal(decision.data.order.target, 'u1');
+});
+
 test('standalone expedition powers follow the selected class', () => {
   assert.equal(helpers.choosePower(catalog().powers, 'mage'), 'arcane_well');
   assert.equal(helpers.choosePower(catalog().powers, 'tank'), 'iron_skin');
