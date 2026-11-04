@@ -50,7 +50,50 @@ test('standalone expedition settings remain safe by default', () => {
     claimRareLoot: true,
     autoRescue: true,
     collapsed: false,
+    disabledSkills: {},
   });
+});
+
+test('standalone expedition skill selection is stored per class and keeps zero-cost skills enabled', () => {
+  const settings = helpers.normalizeSettings({
+    disabledSkills: {
+      mage: ['expensive', 'cheap', 'expensive', ''],
+      unknown: ['cheap'],
+    },
+  });
+  assert.deepEqual(settings.disabledSkills, { mage: ['expensive', 'cheap'] });
+  assert.deepEqual(helpers.enabledCombatSkills(actor(), catalog(), settings), ['cheap']);
+  assert.deepEqual(
+    helpers.enabledCombatSkills(actor({ class: 'healer' }), catalog(), settings),
+    ['cheap', 'expensive'],
+  );
+});
+
+test('standalone expedition combat immediately respects disabled paid skills', () => {
+  const decision = helpers.chooseCombatAction(
+    battle(),
+    catalog(),
+    42,
+    { autoRescue: true, disabledSkills: { mage: ['expensive'] } },
+  );
+  assert.equal(decision.data.order.skill, 'cheap');
+  assert.equal(decision.data.order.target, 'e1');
+});
+
+test('standalone expedition healer does not use a heal disabled live by the player', () => {
+  const decision = helpers.chooseCombatAction(
+    battle({
+      actors: [
+        actor({ class: 'healer', skills: ['cheap', 'heal'] }),
+        actor({ id: 'ally', uid: 99, class: 'warrior', hp: 200, maxHp: 1_000, row: 5, col: 2 }),
+      ],
+    }),
+    catalog(),
+    42,
+    { autoRescue: true, disabledSkills: { healer: ['heal'] } },
+  );
+  assert.equal(decision.data.order.skill, 'cheap');
+  assert.equal(decision.data.order.target, 'e1');
 });
 
 test('standalone expedition combat uses expensive attacks before cheap attacks', () => {

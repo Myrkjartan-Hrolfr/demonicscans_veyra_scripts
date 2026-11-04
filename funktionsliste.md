@@ -183,6 +183,7 @@ Die Lizenz erlaubt Bündeln und Ändern; der MIT-Copyright-Hinweis muss im Bundl
 | 8.7 | Loot und temporäre Powers | [vorh.] | Seltene umkämpfte Drops können automatisch alle beansprucht oder alle abgelehnt werden. Powers werden anhand der aktuellen Klasse bewertet; persönliche und gewöhnliche Drops bleiben der Spielverteilung überlassen. |
 | 8.8 | Bestätigte API-Aktionen und Statusfenster | [vorh.] | Nutzt den CSRF-geschützten JSON-Endpunkt des Spielclients mit eindeutigen Request-IDs. Das eigene Live-Fenster zeigt Start, Gruppenphase, Abschnitt, Aktion, Abschluss oder Fehler; nach fünf wiederholten Fehlern stoppt das Skript sicher. |
 | 8.9 | Weiterlauf bei inaktivem Tab | [vorh.] | Ein Dedicated Worker liefert den Takt auch bei einem nicht sichtbaren Tab; ein normaler Timer dient als Fallback. Bei `visibilitychange`, `pageshow` und Fokus wird sofort nachgeholt. Vollständig vom Browser eingefrorene oder verworfene Tabs können grundsätzlich kein Userscript ausführen. |
+| 8.10 | Skills der gespielten Klasse live auswählen | [vorh.] | Das Expeditionsfenster zeigt im aktiven Lauf alle Skills aus `actor.skills` mit Name, Energy-Kosten, Zielart und Reichweite. Kostenpflichtige Skills lassen sich per Checkbox sofort aktivieren oder deaktivieren; die Auswahl wird getrennt pro Klasse lokal gespeichert. Der eine Skill mit 0 Energy bleibt sichtbar, dauerhaft aktiviert und kann nicht abgeschaltet werden. |
 
 ---
 

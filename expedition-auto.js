@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Dragon Realm Expedition Auto
 // @namespace    local.veyra.expeditions
-// @version      1.3.0
+// @version      1.4.0
 // @description  Independently starts and completes Dragon Realm expeditions, including party setup, votes, combat, loot and powers.
 // @match        https://demonicscans.org/event_page.php*
 // @match        https://www.demonicscans.org/event_page.php*
@@ -34,7 +34,18 @@
     claimRareLoot: true,
     autoRescue: true,
     collapsed: false,
+    disabledSkills: {},
   });
+
+  function normalizeDisabledSkills(value) {
+    const normalized = {};
+    for (const className of CLASSES) {
+      if (!Array.isArray(value?.[className])) continue;
+      const keys = [...new Set(value[className].map((key) => String(key || '').trim()).filter(Boolean))];
+      if (keys.length) normalized[className] = keys;
+    }
+    return normalized;
+  }
 
   function normalizeSettings(value) {
     const preferredClass = String(value?.preferredClass || DEFAULTS.preferredClass).toLowerCase();
@@ -47,7 +58,17 @@
       claimRareLoot: value?.claimRareLoot !== false,
       autoRescue: value?.autoRescue !== false,
       collapsed: value?.collapsed === true,
+      disabledSkills: normalizeDisabledSkills(value?.disabledSkills),
     };
+  }
+
+  function enabledCombatSkills(actor, catalog, settings) {
+    const actorClass = String(actor?.class || actor?.combat_class || '').toLowerCase();
+    const disabled = new Set(settings?.disabledSkills?.[actorClass] || []);
+    return [...new Set(Array.isArray(actor?.skills) ? actor.skills : [])].filter((key) => {
+      const skill = catalog?.skills?.[key];
+      return skill && (Number(skill.cost) === 0 || !disabled.has(key));
+    });
   }
 
   function footprint(unit) {
@@ -408,7 +429,7 @@
       return { action: '', message: `Round ${run.round}: action completed.` };
     }
 
-    const skills = (actor.skills || []).filter((key) => skillReady(run, actor, key, catalog)).sort(
+    const skills = enabledCombatSkills(actor, catalog, settings).filter((key) => skillReady(run, actor, key, catalog)).sort(
       (left, right) => Number(catalog.skills[right]?.cost || 0) - Number(catalog.skills[left]?.cost || 0),
     );
     const actorClass = String(actor.class || actor.combat_class || '').toLowerCase();
@@ -559,6 +580,8 @@
       failures: 0,
       returning: false,
       message: 'Ready.',
+      combatActor: null,
+      skillSignature: '',
     };
 
     function save() {
@@ -576,15 +599,21 @@
       #${PANEL_ID} .ea-status{padding:9px;border-radius:8px;background:#22263a;color:#cbd3ff;white-space:pre-wrap;overflow-wrap:anywhere;margin-bottom:10px}
       #${PANEL_ID} .ea-grid{display:grid;gap:8px}#${PANEL_ID} label{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px;border:1px solid #34394f;border-radius:8px;background:#202332}
       #${PANEL_ID} label span{min-width:0}#${PANEL_ID} input[type="checkbox"]{width:18px;height:18px;flex:0 0 auto}#${PANEL_ID} select{width:145px;max-width:48%}#${PANEL_ID} .ea-note{margin:9px 1px 0;color:#a8aec7;font-size:11px}
+      #${PANEL_ID} .ea-skill-section{margin-top:12px;padding-top:10px;border-top:1px solid #34394f}#${PANEL_ID} .ea-skill-title{font-weight:800;color:#eef0ff;margin-bottom:7px}
+      #${PANEL_ID} .ea-skill-list{display:grid;gap:6px}#${PANEL_ID} .ea-skill-row{padding:7px 8px}#${PANEL_ID} .ea-skill-name{display:block;font-weight:700;color:#f4f5ff}
+      #${PANEL_ID} .ea-skill-meta{display:block;color:#aeb5d2;font-size:11px;margin-top:1px}#${PANEL_ID} .ea-skill-row input:disabled{opacity:.65;cursor:not-allowed}
     `;
     doc.head.appendChild(style);
     const root = doc.createElement('section');
     root.id = PANEL_ID;
-    root.innerHTML = `<header><strong>🧭 Expedition Auto</strong><button class="ea-fold" type="button">−</button></header><div class="ea-body"><div class="ea-actions"><button class="ea-start" type="button">Start</button></div><div class="ea-status"></div><div class="ea-grid"><label><span>Start private expeditions automatically</span><input data-key="autoStart" type="checkbox"></label><label><span>Fill empty slots with NPCs</span><input data-key="fillWithNpcs" type="checkbox"></label><label><span>Preferred class</span><select data-key="preferredClass">${CLASSES.map((name) => `<option value="${name}">${name[0].toUpperCase() + name.slice(1)}</option>`).join('')}</select></label><label><span>Preferred route</span><select data-key="routeChoice"><option value="left">Left</option><option value="right">Right</option></select></label><label><span>Claim contested rare drops</span><input data-key="claimRareLoot" type="checkbox"></label><label><span>Rescue fallen party members</span><input data-key="autoRescue" type="checkbox"></label></div><p class="ea-note">Automatic start can spend daily expedition entries. Combat uses the most expensive ready attack first and avoids marked danger tiles. A background worker keeps polling while this tab is inactive; completely suspended or discarded tabs cannot run userscripts.</p></div>`;
+    root.innerHTML = `<header><strong>🧭 Expedition Auto</strong><button class="ea-fold" type="button">−</button></header><div class="ea-body"><div class="ea-actions"><button class="ea-start" type="button">Start</button></div><div class="ea-status"></div><div class="ea-grid"><label><span>Start private expeditions automatically</span><input data-key="autoStart" type="checkbox"></label><label><span>Fill empty slots with NPCs</span><input data-key="fillWithNpcs" type="checkbox"></label><label><span>Preferred class</span><select data-key="preferredClass">${CLASSES.map((name) => `<option value="${name}">${name[0].toUpperCase() + name.slice(1)}</option>`).join('')}</select></label><label><span>Preferred route</span><select data-key="routeChoice"><option value="left">Left</option><option value="right">Right</option></select></label><label><span>Claim contested rare drops</span><input data-key="claimRareLoot" type="checkbox"></label><label><span>Rescue fallen party members</span><input data-key="autoRescue" type="checkbox"></label></div><section class="ea-skill-section" hidden><div class="ea-skill-title"></div><div class="ea-skill-list"></div><p class="ea-note">Changes apply live to the next available skill action. The 0-Energy skill always remains enabled.</p></section><p class="ea-note">Automatic start can spend daily expedition entries. Combat uses the most expensive ready attack first and avoids marked danger tiles. A background worker keeps polling while this tab is inactive; completely suspended or discarded tabs cannot run userscripts.</p></div>`;
     doc.body.appendChild(root);
     const status = root.querySelector('.ea-status');
     const startButton = root.querySelector('.ea-start');
     const foldButton = root.querySelector('.ea-fold');
+    const skillSection = root.querySelector('.ea-skill-section');
+    const skillTitle = root.querySelector('.ea-skill-title');
+    const skillList = root.querySelector('.ea-skill-list');
 
     function setStatus(message, delay = 0) {
       runtime.message = String(message || '');
@@ -603,6 +632,56 @@
         else input.value = settings[key];
       }
       status.textContent = settings.enabled ? runtime.message : 'Paused.';
+      renderSkillControls();
+    }
+
+    function renderSkillControls() {
+      const actor = runtime.combatActor;
+      const actorClass = String(actor?.class || actor?.combat_class || '').toLowerCase();
+      const keys = [...new Set(Array.isArray(actor?.skills) ? actor.skills : [])].filter(
+        (key) => runtime.catalog?.skills?.[key],
+      );
+      skillSection.hidden = !actorClass || !keys.length;
+      skillList.replaceChildren();
+      if (skillSection.hidden) return;
+      skillTitle.textContent = `Combat skills · ${actorClass[0].toUpperCase()}${actorClass.slice(1)}`;
+      const disabled = new Set(settings.disabledSkills?.[actorClass] || []);
+      for (const key of keys) {
+        const skill = runtime.catalog.skills[key];
+        const free = Number(skill.cost) === 0;
+        const row = doc.createElement('label');
+        row.className = 'ea-skill-row';
+        const text = doc.createElement('span');
+        const name = doc.createElement('span');
+        name.className = 'ea-skill-name';
+        name.textContent = skill.name || key;
+        const meta = doc.createElement('span');
+        meta.className = 'ea-skill-meta';
+        const details = [`${Number(skill.cost) || 0} Energy`];
+        if (skill.target) details.push(String(skill.target));
+        if (Number.isFinite(Number(skill.range))) details.push(`Range ${Number(skill.range)}`);
+        if (free) details.push('always enabled');
+        meta.textContent = details.join(' · ');
+        text.append(name, meta);
+        const checkbox = doc.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.dataset.skillKey = key;
+        checkbox.checked = free || !disabled.has(key);
+        checkbox.disabled = free;
+        checkbox.setAttribute('aria-label', `${skill.name || key} enabled`);
+        row.append(text, checkbox);
+        skillList.appendChild(row);
+      }
+    }
+
+    function syncSkillControls(actor) {
+      runtime.combatActor = actor || null;
+      const actorClass = String(actor?.class || actor?.combat_class || '').toLowerCase();
+      const keys = Array.isArray(actor?.skills) ? actor.skills : [];
+      const signature = `${actorClass}:${keys.join(',')}`;
+      if (signature === runtime.skillSignature) return;
+      runtime.skillSignature = signature;
+      renderSkillControls();
     }
 
     startButton.addEventListener('click', () => {
@@ -625,6 +704,24 @@
         save();
       });
     }
+    skillList.addEventListener('change', (event) => {
+      const checkbox = event.target.closest?.('input[data-skill-key]');
+      if (!checkbox || checkbox.disabled) return;
+      const actorClass = String(runtime.combatActor?.class || runtime.combatActor?.combat_class || '').toLowerCase();
+      const skill = runtime.catalog?.skills?.[checkbox.dataset.skillKey];
+      if (!CLASSES.includes(actorClass) || !skill || Number(skill.cost) === 0) {
+        checkbox.checked = true;
+        return;
+      }
+      const disabled = new Set(settings.disabledSkills?.[actorClass] || []);
+      if (checkbox.checked) disabled.delete(checkbox.dataset.skillKey);
+      else disabled.add(checkbox.dataset.skillKey);
+      settings.disabledSkills = { ...settings.disabledSkills, [actorClass]: [...disabled] };
+      settings = normalizeSettings(settings);
+      runtime.nextTickAt = 0;
+      save();
+      if (settings.enabled) void tick();
+    });
     renderControls();
 
     function endpoint() {
@@ -737,6 +834,7 @@
       const run = party.run;
       if (!run) return setStatus('Expedition is starting…');
       const actor = actorFor(run, userId());
+      syncSkillControls(actor);
       const section = `Section ${Number(run.section || 0) + 1}/${run.sections?.length || '?'}`;
       if (run.phase === 'battle') {
         const decision = chooseCombatAction(run, runtime.catalog, userId(), settings);
@@ -777,6 +875,7 @@
         state = await loadState(runtime.partyId);
       }
       if (!state.party) {
+        syncSkillControls(null);
         runtime.partyId = 0;
         if (!settings.autoStart) return setStatus('No active expedition. Automatic start is disabled.', 5_000);
         const remaining = Math.max(0, Number(state.profile?.limit || 0) - Number(state.profile?.entries || 0));
@@ -787,6 +886,7 @@
         return perform('create_private', {}, 'create-private', 'Creating a private expedition party…');
       }
       if (state.party.status === 'active' || ['cleared', 'failed'].includes(state.party.status)) return activeRun(state);
+      syncSkillControls(null);
       return waitingParty(state);
     }
 
@@ -824,6 +924,7 @@
       choosePower,
       dangerTiles,
       distance,
+      enabledCombatSkills,
       createBackgroundTicker,
       normalizeSettings,
       skillReady,
