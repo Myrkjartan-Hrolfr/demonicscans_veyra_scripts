@@ -304,6 +304,42 @@ test('standalone expedition healer moves safely toward the lowest ally outside h
   assert.deepEqual(decision.data.position, { lane: 0, row: 6, col: 3 });
 });
 
+test('standalone expedition healer values heal range to the lowest ally before tank range', () => {
+  const decision = helpers.chooseCombatAction(
+    battle({
+      actors: [
+        actor({ class: 'healer', row: 4, col: 3, skills: ['cheap', 'heal'] }),
+        actor({ id: 'tank', uid: 99, class: 'tank', row: 4, col: 0 }),
+        actor({ id: 'wounded', uid: 98, class: 'warrior', hp: 200, maxHp: 1_000, row: 4, col: 7 }),
+      ],
+      enemies: [],
+    }),
+    catalog(),
+    42,
+    { autoRescue: true },
+  );
+  assert.equal(decision.action, 'move');
+  assert.deepEqual(decision.data.position, { lane: 0, row: 4, col: 4 });
+});
+
+test('standalone expedition healer escapes toward the party instead of isolating itself', () => {
+  const decision = helpers.chooseCombatAction(
+    battle({
+      actors: [
+        actor({ class: 'healer', row: 6, col: 3, skills: ['cheap', 'heal'] }),
+        actor({ id: 'ally-one', uid: 99, class: 'warrior', row: 6, col: 4 }),
+        actor({ id: 'ally-two', uid: 98, class: 'mage', row: 7, col: 4 }),
+      ],
+      enemies: [enemy('e1', 5, 3)],
+    }),
+    catalog(),
+    42,
+    { autoRescue: true },
+  );
+  assert.equal(decision.action, 'move');
+  assert.deepEqual(decision.data.position, { lane: 0, row: 7, col: 3 });
+});
+
 test('standalone expedition combat escapes danger and rescues humans first', () => {
   const escape = helpers.chooseCombatAction(
     battle({ ground_warning: [{ row: 6, col: 2 }] }),

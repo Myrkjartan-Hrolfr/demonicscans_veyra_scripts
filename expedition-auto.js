@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Dragon Realm Expedition Auto
 // @namespace    local.veyra.expeditions
-// @version      1.4.0
+// @version      1.4.1
 // @description  Independently starts and completes Dragon Realm expeditions, including party setup, votes, combat, loot and powers.
 // @match        https://demonicscans.org/event_page.php*
 // @match        https://www.demonicscans.org/event_page.php*
@@ -261,19 +261,27 @@
     let score;
     let message;
     if (actorClass === 'healer') {
-      const wounded = allies.filter(
-        (unit) => healthRatio(unit) < 0.9 && distance(actor, unit) > 3,
-      ).sort(
+      const lowestAlly = [...allies].sort(
         (left, right) => healthRatio(left) - healthRatio(right) || distance(actor, left) - distance(actor, right),
       )[0] || null;
+      const wounded = lowestAlly && healthRatio(lowestAlly) < 0.9 && distance(actor, lowestAlly) > 3
+        ? lowestAlly
+        : null;
+      const tank = [...allies].filter(
+        (unit) => String(unit.class || unit.combat_class || '').toLowerCase() === 'tank',
+      ).sort((left, right) => distance(actor, left) - distance(actor, right))[0] || null;
       const immediateThreat = enemies.some((enemy) => distance(actor, enemy) <= 1);
       if (!force && !wounded && !immediateThreat) return null;
       score = (position) => [
+        enemies.filter((enemy) => distance(position, enemy) <= 1).length,
+        allies.filter((ally) => distance(position, ally) > 3).length,
+        lowestAlly ? Math.max(0, distance(position, lowestAlly) - 3) : 0,
+        tank ? Math.max(0, distance(position, tank) - 3) : 0,
+        -allies.filter((ally) => distance(position, ally) <= 2).length,
         enemyThreat(position, enemies),
-        wounded ? distance(position, wounded) : 0,
         -nearestEnemy(position),
       ];
-      message = 'Repositioning safely toward the most wounded ally.';
+      message = 'Repositioning safely within heal range without leaving the party.';
     } else if (actorClass === 'tank') {
       score = (position) => [
         healer ? Math.max(0, distance(position, healer) - 3) : 0,
