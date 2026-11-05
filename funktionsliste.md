@@ -3,7 +3,7 @@
 Grundlage: `arbeitsauftrag.txt`, die bestehenden Skripte und die Beispielseiten in `veyra_seiten.txt`.
 Status-Legende: **[vorh.]** existiert schon weitgehend · **[anp.]** existiert, muss angepasst werden · **[neu]** neu zu bauen · **[?]** offene Frage
 
-Aktueller Stand: Das Hauptbundle steht bei Version 0.9.10. Dragon-Realm-Expeditionen sind bewusst nicht Teil dieser Automation, sondern liegen als eigenständiges Userscript `expedition-auto.js` mit eigenem Start/Stop-Schalter, Einstellungen und Statusfenster vor. General Settings enthält außerdem den Power-Crystal-Quickset; Olympus, Adventurer's Guild, Shadowbridge, Castle of the Fallen Prince und Crucible werden weiterhin über ihre eigenen Routen automatisiert. Die „Unclaimed Kills“-Anzeige bleibt wegen der serverseitigen Begrenzung unverändert. Die ausdrücklich ausgeschlossenen Punkte 5.4, 7.15 und 7.16 bleiben unverändert.
+Aktueller Stand: Das Hauptbundle steht bei Version 0.9.11. Dragon-Realm-Expeditionen sind bewusst nicht Teil dieser Automation, sondern liegen als eigenständiges Userscript `expedition-auto.js` mit eigenem Start/Stop-Schalter, Einstellungen und Statusfenster vor. General Settings enthält außerdem den Power-Crystal-Quickset; Olympus, Adventurer's Guild, Shadowbridge, Castle of the Fallen Prince und Crucible werden weiterhin über ihre eigenen Routen automatisiert. Die „Unclaimed Kills“-Anzeige bleibt wegen der serverseitigen Begrenzung unverändert. Die ausdrücklich ausgeschlossenen Punkte 5.4, 7.15 und 7.16 bleiben unverändert.
 
 ---
 
@@ -26,10 +26,10 @@ Aktueller Stand: Das Hauptbundle steht bei Version 0.9.10. Dragon-Realm-Expediti
 | 1.2 | Menü mit einer Liste aller aufrufbaren Seiten | [vorh.] | Die bestehende Seitenleiste mit Unteransicht bleibt (F12). |
 | 1.3 | Pro Seite: Name, Countdown bis zum nächsten Aufruf, Toggle zum Aktivieren/Deaktivieren, Button für das Untermenü | [vorh.] | Für PvP, Wave 3, Olympus, Adventurer's Guild, Shadowbridge, Castle of the Fallen Prince und Crucible vorhanden. Expeditionen bleiben ein eigenständiges Skript. |
 | 1.4 | Countdown abgelaufen → zur Seite navigieren und Seitenskript starten | [vorh.] | |
-| 1.5 | Seitenskript fertig → zur Hauptseite zurück und Countdown neu starten | [vorh.] | |
+| 1.5 | Seitenskript fertig → zur Hauptseite zurück und Countdown neu starten | [vorh.] | Nach jedem Besuch wird fest `/game_dash.php` geladen. Dadurch wird keine Automationsroute als dauerhafte Startseite mit veraltetem Seitenstand weiterverwendet. |
 | 1.6 | Untermenü-Standardfeld: Looplänge in Minuten | [vorh.] | Jede Route hat ein eigenes editierbares Minutenfeld (1–1440); eine Verkürzung zieht einen laufenden Countdown sofort vor. |
 | 1.7 | Untermenü-Standardauswahl: Stamina-Tränke und Heiltränke | [vorh.] | Pro Route getrennte Auswahl für 30 Small, 251 Large, 35 Full, 359 Adventurer Stamina und 108 Full HP. |
-| 1.8 | Hauptseite wählbar | [vorh.] | |
+| 1.8 | Feste neutrale Hauptseite | [vorh.] | Die frühere Startseitenwahl wurde entfernt. Im Leerlauf und nach jedem Besuch kehrt der Scheduler immer zu `/game_dash.php` zurück; alte gespeicherte `homeRouteId`-Werte werden ignoriert. |
 | 1.9 | Höchstdauer pro Besuch / Timeout, danach geordneter Rückzug | [vorh.] | `maxVisit` und Drain-Logik sind vorhanden. |
 | 1.10 | Neue Routen: Olympus-Domänen, Shadowbridge, Castle of the Fallen Prince und Crucible | [vorh.] | Die mutierenden Routen sind nach einem Update sicherheitshalber zunächst deaktiviert. |
 

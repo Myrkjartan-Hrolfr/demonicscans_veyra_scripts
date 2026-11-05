@@ -78,7 +78,7 @@ function assertTimedOut({ navigations, store }) {
   assert.equal(runtime.activeVisit, null);
   assert.equal(runtime.lastResult.state, 'error');
   assert.equal(store.read(COMMAND_KEY), null);
-  assert.deepEqual(navigations, ['https://demonicscans.org/pvp.php']);
+  assert.deepEqual(navigations, ['https://demonicscans.org/game_dash.php']);
 }
 
 test('an expired running visit without a worker heartbeat fails and returns home', () => {

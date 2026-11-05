@@ -70,7 +70,7 @@ function createEngine(href, storageValues = {}) {
 
 test('default config gives every page a loop length and its own potion selection', () => {
   const config = createDefaultConfig();
-  assert.equal(config.homeRouteId, 'pvp');
+  assert.equal(Object.hasOwn(config, 'homeRouteId'), false);
   for (const route of Object.values(ROUTES)) {
     const routeConfig = config.routes[route.id];
     assert.equal(routeConfig.enabled, route.defaultEnabled !== false);
@@ -86,6 +86,7 @@ test('new mutating routes stay disabled when an older config has no entry for th
     homeRouteId: 'pvp',
     routes: { pvp: { enabled: true } },
   });
+  assert.equal(Object.hasOwn(config, 'homeRouteId'), false);
   assert.equal(config.routes.adventurers.enabled, false);
   assert.equal(config.routes.shadowbridge.enabled, false);
   assert.equal(config.routes.crucible.enabled, false);
@@ -230,6 +231,26 @@ test('engine starts a due visit and navigates to the page', () => {
   assert.equal(store.read(COMMAND_KEY).phase, 'running');
 });
 
+test('idle Shadowbridge returns directly to the fixed home page without creating a visit', () => {
+  const now = Date.now();
+  const { engine, store, win } = createEngine(
+    'https://demonicscans.org/guild_dungeon.php?veyra_route=shadowbridge',
+  );
+  const config = createDefaultConfig();
+  config.routes.shadowbridge.enabled = true;
+  const runtime = createDefaultRuntime(now);
+  for (const routeId of Object.keys(runtime.nextRunAt)) runtime.nextRunAt[routeId] = now + 60_000;
+  store.write(CONFIG_KEY, { ...config, homeRouteId: 'shadowbridge' });
+  store.write(RUNTIME_KEY, runtime);
+
+  engine.start();
+
+  assert.equal(store.read(COMMAND_KEY), null);
+  assert.equal(store.read(RUNTIME_KEY).activeVisit, null);
+  assert.equal(Object.hasOwn(store.read(CONFIG_KEY), 'homeRouteId'), false);
+  assert.deepEqual(win.navigations, ['https://demonicscans.org/game_dash.php']);
+});
+
 test('engine keeps a running Adventurers visit on the canonical URL when the server removes its marker', () => {
   const now = Date.now();
   const config = createDefaultConfig();
@@ -265,7 +286,6 @@ test('engine finishes a visit when the worker reports done and schedules by loop
   const now = Date.now();
   const config = createDefaultConfig();
   config.routes.pvp.loopMinutes = 7;
-  config.homeRouteId = 'wave3';
   const runtime = createDefaultRuntime(now);
   runtime.nextRunAt.wave3 = now + 60_000;
   runtime.activeVisit = {
@@ -292,7 +312,7 @@ test('engine finishes a visit when the worker reports done and schedules by loop
   const saved = store.read(RUNTIME_KEY);
   assert.equal(saved.activeVisit, null);
   assert.ok(Math.abs(saved.nextRunAt.pvp - (now + 7 * 60_000)) < 5_000);
-  assert.deepEqual(win.navigations, ['https://demonicscans.org/active_wave.php?gate=3&wave=8']);
+  assert.deepEqual(win.navigations, ['https://demonicscans.org/game_dash.php']);
   assert.equal(store.read(COMMAND_KEY), null);
 });
 
@@ -326,7 +346,7 @@ test('updateRouteConfig stores per-page potions and applies a shorter loop at on
 });
 
 test('runRouteNow schedules a disabled route once without changing its configuration or toggle', () => {
-  const { engine, store } = createEngine('https://demonicscans.org/pvp.php');
+  const { engine, store } = createEngine('https://demonicscans.org/game_dash.php');
   const config = createDefaultConfig();
   assert.equal(config.routes.shadowbridge.enabled, false);
   store.write(CONFIG_KEY, config);

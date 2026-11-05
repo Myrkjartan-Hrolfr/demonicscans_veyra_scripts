@@ -311,9 +311,9 @@ function read(storage, key) {
   return raw ? JSON.parse(raw) : null;
 }
 
-function configuredStorage({ homeRouteId = 'pvp', runtime } = {}) {
+function configuredStorage({ runtime } = {}) {
   const storage = createStorage();
-  save(storage, CONFIG_KEY, { ...createDefaultConfig(), homeRouteId });
+  save(storage, CONFIG_KEY, createDefaultConfig());
   if (runtime) save(storage, RUNTIME_KEY, runtime);
   return storage;
 }
@@ -371,6 +371,7 @@ test('default config exposes route toggles and all four Wave 3 boss settings', (
 
 test('normalizes old configs and preserves valid Wave 3 drawer settings', () => {
   const migrated = normalizeConfig({ version: 1, enabled: true, homeRouteId: 'pvp' });
+  assert.equal(Object.hasOwn(migrated, 'homeRouteId'), false);
   assert.equal(migrated.routes.pvp.enabled, true);
   assert.equal(migrated.routes.wave3.settings.bosses.skarn.damage, '3b');
 
@@ -453,10 +454,7 @@ test('floating trigger opens the drawer and its controls persist scheduler confi
   trigger.click();
   assert.equal(drawer.dataset.open, 'true');
 
-  const home = byId('veyra-meta-scheduler-home');
-  home.value = 'wave3';
-  home.dispatch('change');
-  assert.equal(read(localStorage, CONFIG_KEY).homeRouteId, 'wave3');
+  assert.equal(byId('veyra-meta-scheduler-home'), null);
 
   const waveToggle = byId('veyra-meta-scheduler-route-wave3-enabled');
   waveToggle.checked = false;
@@ -536,7 +534,7 @@ test('a disabled due route does not issue a visit command', () => {
 
   assert.equal(localStorage.getItem(COMMAND_KEY), null);
   assert.equal(read(localStorage, RUNTIME_KEY).activeVisit, null);
-  assert.deepEqual(harness.navigation.replacements, []);
+  assert.deepEqual(harness.navigation.replacements, ['https://demonicscans.org/game_dash.php']);
 });
 
 test('a disabled active route times out and returns home without a worker heartbeat', () => {
@@ -561,7 +559,7 @@ test('a disabled active route times out and returns home without a worker heartb
   assert.equal(settledRuntime.activeVisit, null);
   assert.equal(settledRuntime.lastResult.state, 'error');
   assert.equal(localStorage.getItem(COMMAND_KEY), null);
-  assert.deepEqual(harness.navigation.replacements, ['https://demonicscans.org/pvp.php']);
+  assert.deepEqual(harness.navigation.replacements, ['https://demonicscans.org/game_dash.php']);
 });
 
 test('a busy standalone PvP battle defers a due route change', () => {
@@ -588,7 +586,6 @@ test('a busy standalone PvP battle defers a due route change', () => {
 
 test('a manual Wave 3 battle without a visit marker is not interrupted while its worker is busy', () => {
   const localStorage = configuredStorage({
-    homeRouteId: 'wave3',
     runtime: runtimeWithDuePvp(),
   });
   save(localStorage, workerStatusKey('wave3'), {
@@ -635,7 +632,7 @@ test('matching worker completion schedules the next run and returns home', () =>
   assert.equal(nextRuntime.activeVisit, null);
   assert.equal(nextRuntime.nextRunAt.wave3, NOW + ROUTES.wave3.intervalMs);
   assert.equal(localStorage.getItem(COMMAND_KEY), null);
-  assert.deepEqual(harness.navigation.replacements, ['https://demonicscans.org/pvp.php']);
+  assert.deepEqual(harness.navigation.replacements, ['https://demonicscans.org/game_dash.php']);
 });
 
 test('a stale completion from another visit is ignored', () => {
@@ -678,11 +675,11 @@ test('a Wave 3 battle carrying its visit marker is not redirected when a heartbe
   assert.deepEqual(harness.navigation.replacements, []);
 });
 
-test('the configured Wave 3 home route is used after a PvP visit', () => {
+test('the fixed game home page is used after a PvP visit', () => {
   const runtime = createDefaultRuntime(NOW);
   const visit = runningVisit('pvp', ROUTES.wave3.path);
   runtime.activeVisit = visit;
-  const localStorage = configuredStorage({ homeRouteId: 'wave3', runtime });
+  const localStorage = configuredStorage({ runtime });
   save(localStorage, COMMAND_KEY, visit);
   save(localStorage, workerStatusKey('pvp'), {
     version: 1,
@@ -695,9 +692,7 @@ test('the configured Wave 3 home route is used after a PvP visit', () => {
 
   const harness = runScheduler({ href: 'https://demonicscans.org/pvp.php', localStorage });
 
-  assert.deepEqual(harness.navigation.replacements, [
-    'https://demonicscans.org/active_wave.php?gate=3&wave=8',
-  ]);
+  assert.deepEqual(harness.navigation.replacements, ['https://demonicscans.org/game_dash.php']);
 });
 
 test('repeated polls cannot issue duplicate location replacements', () => {
@@ -754,7 +749,7 @@ test('an unsafe terminal status cannot finish or navigate until the worker becom
   harness.timers.runInterval();
 
   assert.equal(read(localStorage, RUNTIME_KEY).activeVisit, null);
-  assert.deepEqual(harness.navigation.replacements, ['https://demonicscans.org/pvp.php']);
+  assert.deepEqual(harness.navigation.replacements, ['https://demonicscans.org/game_dash.php']);
 });
 
 test('a running deadline requests draining and waits for a matching safe status', () => {
@@ -794,7 +789,7 @@ test('a running deadline requests draining and waits for a matching safe status'
   const settledRuntime = read(localStorage, RUNTIME_KEY);
   assert.equal(settledRuntime.activeVisit, null);
   assert.equal(settledRuntime.lastResult.state, 'error');
-  assert.deepEqual(harness.navigation.replacements, ['https://demonicscans.org/pvp.php']);
+  assert.deepEqual(harness.navigation.replacements, ['https://demonicscans.org/game_dash.php']);
 });
 
 test('an expired initial drain aborts when no fresh unsafe worker blocks it', () => {
@@ -812,7 +807,7 @@ test('an expired initial drain aborts when no fresh unsafe worker blocks it', ()
   assert.equal(read(localStorage, RUNTIME_KEY).activeVisit, null);
   assert.equal(read(localStorage, RUNTIME_KEY).lastResult.state, 'error');
   assert.equal(localStorage.getItem(COMMAND_KEY), null);
-  assert.deepEqual(harness.navigation.replacements, []);
+  assert.deepEqual(harness.navigation.replacements, ['https://demonicscans.org/game_dash.php']);
 });
 
 test('an expired initial drain still waits for a fresh unsafe current worker', () => {
@@ -902,7 +897,7 @@ test('runtime is reloaded after winning the scheduler lease', () => {
 
   assert.equal(localStorage.getItem(COMMAND_KEY), null);
   assert.equal(read(localStorage, RUNTIME_KEY).activeVisit, null);
-  assert.deepEqual(harness.navigation.replacements, []);
+  assert.deepEqual(harness.navigation.replacements, ['https://demonicscans.org/game_dash.php']);
 });
 
 test('the target receives its full visit deadline after a draining hand-off', () => {

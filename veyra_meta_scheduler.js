@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Veyra - Meta Scheduler
 // @namespace    local.veyra.meta-scheduler
-// @version      1.1.0
-// @description  Coordinates periodic Veyra page workers and returns to a configurable home page.
+// @version      1.2.0
+// @description  Coordinates periodic Veyra page workers and always returns to the game home page.
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
 // @run-at       document-idle
@@ -22,6 +22,7 @@
   const STATUS_KEY_SUFFIX = ':status:v1';
 
   const PROTOCOL_VERSION = 1;
+  const HOME_PATH = '/game_dash.php';
   const POLL_INTERVAL_MS = 1_000;
   const STATUS_FRESH_MS = 15_000;
   const LEASE_MS = 15_000;
@@ -148,7 +149,6 @@
     return {
       version: PROTOCOL_VERSION,
       enabled: true,
-      homeRouteId: 'pvp',
       routes,
     };
   }
@@ -192,7 +192,6 @@
     return {
       version: PROTOCOL_VERSION,
       enabled: value.enabled !== false,
-      homeRouteId: ROUTES[value.homeRouteId] ? value.homeRouteId : defaults.homeRouteId,
       routes,
     };
   }
@@ -409,6 +408,7 @@
   const testExports = Object.freeze({
     COMMAND_KEY,
     CONFIG_KEY,
+    HOME_PATH,
     LEASE_KEY,
     POLL_INTERVAL_MS,
     PROTOCOL_VERSION,
@@ -590,11 +590,19 @@
     return routeIdForUrl(currentUrl()) === routeId;
   }
 
+  function isAtHome() {
+    return /\/game_dash\.php\/?$/i.test(currentUrl().pathname);
+  }
+
   function navigateTo(path) {
     if (state.navigationPending || !path) return false;
     state.navigationPending = true;
     window.location.replace(new URL(path, window.location.origin).href);
     return true;
+  }
+
+  function navigateHome() {
+    if (!isAtHome()) navigateTo(HOME_PATH);
   }
 
   function makeVisitId(now = Date.now()) {
@@ -607,7 +615,7 @@
       visitId: makeVisitId(now),
       taskId: route.id,
       phase: 'draining',
-      returnPath: ROUTES[config.homeRouteId].path,
+      returnPath: HOME_PATH,
       issuedAt: now,
       deadlineAt: now + route.maxVisitMs,
     };
@@ -750,9 +758,7 @@
         : `${route.label} wurde mit einem Fehler beendet.`,
     );
 
-    if (!isAtRoute(config.homeRouteId)) {
-      navigateTo(ROUTES[config.homeRouteId].path);
-    }
+    navigateHome();
   }
 
   function finishVisitWithoutNavigation(runtime, outcome, now) {
@@ -804,7 +810,7 @@
     if (now >= visit.deadlineAt) {
       clearActiveVisit(runtime, 'error', now);
       setStatus(`${ROUTES[visit.taskId].label} wurde nach dem Zeitlimit deaktiviert.`);
-      if (!isAtRoute(config.homeRouteId)) navigateTo(ROUTES[config.homeRouteId].path);
+      navigateHome();
       return;
     }
 
@@ -830,7 +836,7 @@
 
     clearActiveVisit(runtime, 'error', now);
     setStatus(`${ROUTES[visit.taskId].label} wurde deaktiviert.`);
-    if (!isAtRoute(config.homeRouteId)) navigateTo(ROUTES[config.homeRouteId].path);
+    navigateHome();
   }
 
   function handleOffRouteRecovery(visit, now) {
@@ -942,13 +948,26 @@
         return;
       }
 
-      if (!isAtRoute(config.homeRouteId)) {
-        startVisit(runtime, ROUTES[config.homeRouteId], config, now);
+      if (!isAtHome()) {
+        const currentRouteId = currentWorkerRouteId(now);
+        const currentStatus = currentRouteId ? readWorkerStatus(currentRouteId) : null;
+        if (
+          currentRouteId &&
+          isFreshWorkerStatus(currentStatus, now) &&
+          (currentStatus.safeToLeave !== true ||
+            currentStatus.state === 'busy' ||
+            currentStatus.state === 'working')
+        ) {
+          setStatus(`Warte, bis ${ROUTES[currentRouteId].label} sicher verlassen werden kann …`);
+        } else {
+          setStatus('Kehre zur Home-Seite zurück …');
+          navigateTo(HOME_PATH);
+        }
         updateUi(config, loadRuntime(now));
         return;
       }
 
-      setStatus(`Warte auf ${ROUTES[config.homeRouteId].label}.`);
+      setStatus('Warte auf der Home-Seite.');
       updateUi(config, runtime);
     } catch (error) {
       console.error('[Veyra Meta] Scheduler tick failed.', error);
@@ -1290,10 +1309,8 @@
     const root = ensureUi();
     if (!root) return;
 
-    const select = document.getElementById?.(`${UI_ID}-home`);
     const toggle = document.getElementById?.(`${UI_ID}-toggle`);
     const status = document.getElementById?.(`${UI_ID}-status`);
-    if (select && select.value !== config.homeRouteId) select.value = config.homeRouteId;
     if (toggle) {
       toggle.textContent = config.enabled ? 'Stop' : 'Start';
       toggle.dataset.enabled = String(config.enabled);
@@ -1307,7 +1324,7 @@
       const visit = runtime?.activeVisit;
       status.textContent = visit
         ? `${ROUTES[visit.taskId].label}: ${visit.phase}`
-        : `Hauptseite: ${ROUTES[config.homeRouteId].label}`;
+        : 'Hauptseite: Home';
     } else if (status) {
       status.textContent = state.statusText;
     }
@@ -1418,24 +1435,7 @@
       tick();
     });
 
-    const select = document.createElement('select');
-    select.id = `${UI_ID}-home`;
-    select.className = `${UI_ID}__select`;
-    select.title = 'Hauptseite';
-    select.setAttribute?.('aria-label', 'Hauptseite');
-    for (const route of Object.values(ROUTES)) {
-      const option = document.createElement('option');
-      option.value = route.id;
-      option.textContent = `Hauptseite · ${route.label}`;
-      select.appendChild(option);
-    }
-    select.addEventListener('change', () => {
-      const config = loadConfig();
-      saveConfig({ ...config, homeRouteId: select.value });
-      tick();
-    });
     topRow.appendChild(toggle);
-    topRow.appendChild(select);
 
     const status = makeUiElement('div', {
       id: `${UI_ID}-status`,

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.9.10
+// @version      0.9.11
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -25990,7 +25990,7 @@
 
     const { createDefaultPotionSettings, normalizePotionSettings } = require('../core/potions');
     const { PROTOCOL_VERSION } = require('../core/protocol');
-    const { ROUTE_IDS, ROUTE_LIST, getRoute } = require('../routes');
+    const { ROUTE_LIST, getRoute } = require('../routes');
 
     const CONFIG_KEY = 'veyra:orchestrator:config:v1';
     const MIN_LOOP_MINUTES = 1;
@@ -26023,7 +26023,6 @@
       return {
         version: PROTOCOL_VERSION,
         enabled: true,
-        homeRouteId: ROUTE_IDS[0],
         routes,
       };
     }
@@ -26039,7 +26038,6 @@
       return {
         version: PROTOCOL_VERSION,
         enabled: value.enabled !== false,
-        homeRouteId: getRoute(value.homeRouteId) ? value.homeRouteId : ROUTE_IDS[0],
         routes,
       };
     }
@@ -26098,6 +26096,7 @@
 
     const LEASE_KEY = 'veyra:orchestrator:lease:v1';
     const TAB_KEY = 'veyra:orchestrator:tab:v1';
+    const HOME_PATH = '/game_dash.php';
     const POLL_INTERVAL_MS = 1_000;
     const LEASE_MS = 15_000;
     const LEASE_RENEW_MS = 5_000;
@@ -26262,6 +26261,10 @@
         return routeIdForUrl(currentUrl()) === routeId;
       }
 
+      function isAtHome() {
+        return /\/game_dash\.php\/?$/i.test(currentUrl().pathname);
+      }
+
       function navigateTo(path) {
         if (state.navigationPending || !path) return false;
         state.navigationPending = true;
@@ -26269,8 +26272,8 @@
         return true;
       }
 
-      function navigateHome(config) {
-        if (!isAtRoute(config.homeRouteId)) navigateTo(getRoute(config.homeRouteId).path);
+      function navigateHome() {
+        if (!isAtHome()) navigateTo(HOME_PATH);
       }
 
       function makeVisitId(now = Date.now()) {
@@ -26286,7 +26289,7 @@
             visitId: makeVisitId(now),
             taskId: route.id,
             phase: 'draining',
-            returnPath: getRoute(config.homeRouteId).path,
+            returnPath: HOME_PATH,
             issuedAt: now,
             deadlineAt: now + route.maxVisitMs,
           },
@@ -26365,7 +26368,7 @@
         }
         if (hint?.note && finiteTimestamp(hint.retryAt, 0) > now) setStatus(`${routeLabel}: ${hint.note}.`);
         else setStatus(outcome === 'done' ? `${routeLabel} finished.` : `${routeLabel} stopped with an error.`);
-        navigateHome(config);
+        navigateHome();
       }
 
       function finishVisitWithoutNavigation(runtime, config, outcome, now) {
@@ -26446,7 +26449,7 @@
         if (now >= visit.deadlineAt) {
           clearActiveVisit(runtime, 'error', config, now);
           setStatus(`${label(visit.taskId)} was disabled after the time limit.`);
-          navigateHome(config);
+          navigateHome();
           return;
         }
 
@@ -26468,7 +26471,7 @@
 
         clearActiveVisit(runtime, 'error', config, now);
         setStatus(`${label(visit.taskId)} was disabled.`);
-        navigateHome(config);
+        navigateHome();
       }
 
       function handleOffRouteRecovery(visit, now) {
@@ -26583,10 +26586,23 @@
             const dueRoute = chooseDueRoute(runtime, now, config);
             if (dueRoute) {
               startVisit(runtime, dueRoute, config, now);
-            } else if (!isAtRoute(config.homeRouteId)) {
-              startVisit(runtime, getRoute(config.homeRouteId), config, now);
+            } else if (!isAtHome()) {
+              const currentRouteId = currentWorkerRouteId(now);
+              const currentStatus = currentRouteId ? readWorkerStatus(currentRouteId) : null;
+              if (
+                currentRouteId &&
+                isFreshWorkerStatus(currentStatus, now) &&
+                (currentStatus.safeToLeave !== true ||
+                  currentStatus.state === 'busy' ||
+                  currentStatus.state === 'working')
+              ) {
+                setStatus(`Waiting until ${label(currentRouteId)} can be left safely …`);
+              } else {
+                setStatus('Returning to Home …');
+                navigateTo(HOME_PATH);
+              }
             } else {
-              setStatus(`Waiting on ${label(config.homeRouteId)}.`);
+              setStatus('Waiting on Home.');
             }
           }
 
@@ -26648,6 +26664,7 @@
     }
 
     module.exports = {
+      HOME_PATH,
       LEASE_KEY,
       POLL_INTERVAL_MS,
       TAB_KEY,
@@ -26850,7 +26867,7 @@
   "scheduler/ui.js": function (module, exports, require) {
     'use strict';
 
-    // Drawer menu of the scheduler: start/stop, home page, one row per page with
+    // Drawer menu of the scheduler: start/stop, one row per page with
     // countdown, enable switch and a settings view. Every settings view starts
     // with the standard fields (loop length, stamina and healing potions) and
     // then shows whatever the route itself renders.
@@ -27425,24 +27442,7 @@
           state.actions.tick();
         });
 
-        const select = doc.createElement('select');
-        select.id = `${UI_ID}-home`;
-        select.className = cls('select');
-        select.title = 'Home page';
-        select.setAttribute?.('aria-label', 'Home page');
-        for (const route of ROUTE_LIST) {
-          const option = doc.createElement('option');
-          option.value = route.id;
-          option.textContent = `Home page · ${route.label}`;
-          select.appendChild(option);
-        }
-        select.addEventListener('change', () => {
-          const config = state.actions.loadConfig();
-          state.actions.saveConfig({ ...config, homeRouteId: select.value });
-          state.actions.tick();
-        });
         topRow.appendChild(toggle);
-        topRow.appendChild(select);
 
         const status = make('div', { id: `${UI_ID}-status`, className: cls('status') });
         status.setAttribute?.('aria-live', 'polite');
@@ -27492,9 +27492,6 @@
       function update(config, runtime) {
         if (!ensureUi()) return;
 
-        const select = byId(`${UI_ID}-home`);
-        if (select && select.value !== config.homeRouteId) select.value = config.homeRouteId;
-
         const toggle = byId(`${UI_ID}-toggle`);
         if (toggle) {
           toggle.textContent = config.enabled ? 'Stop' : 'Start';
@@ -27511,7 +27508,7 @@
             state.statusText ||
             (visit
               ? `${getRoute(visit.taskId).label}: ${visit.phase}`
-              : `Home page: ${getRoute(config.homeRouteId).label}`);
+              : 'Home page: Home');
         }
 
         const now = Date.now();

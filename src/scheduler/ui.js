@@ -1,6 +1,6 @@
 'use strict';
 
-// Drawer menu of the scheduler: start/stop, home page, one row per page with
+// Drawer menu of the scheduler: start/stop, one row per page with
 // countdown, enable switch and a settings view. Every settings view starts
 // with the standard fields (loop length, stamina and healing potions) and
 // then shows whatever the route itself renders.
@@ -575,24 +575,7 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
       state.actions.tick();
     });
 
-    const select = doc.createElement('select');
-    select.id = `${UI_ID}-home`;
-    select.className = cls('select');
-    select.title = 'Home page';
-    select.setAttribute?.('aria-label', 'Home page');
-    for (const route of ROUTE_LIST) {
-      const option = doc.createElement('option');
-      option.value = route.id;
-      option.textContent = `Home page · ${route.label}`;
-      select.appendChild(option);
-    }
-    select.addEventListener('change', () => {
-      const config = state.actions.loadConfig();
-      state.actions.saveConfig({ ...config, homeRouteId: select.value });
-      state.actions.tick();
-    });
     topRow.appendChild(toggle);
-    topRow.appendChild(select);
 
     const status = make('div', { id: `${UI_ID}-status`, className: cls('status') });
     status.setAttribute?.('aria-live', 'polite');
@@ -642,9 +625,6 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
   function update(config, runtime) {
     if (!ensureUi()) return;
 
-    const select = byId(`${UI_ID}-home`);
-    if (select && select.value !== config.homeRouteId) select.value = config.homeRouteId;
-
     const toggle = byId(`${UI_ID}-toggle`);
     if (toggle) {
       toggle.textContent = config.enabled ? 'Stop' : 'Start';
@@ -661,7 +641,7 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
         state.statusText ||
         (visit
           ? `${getRoute(visit.taskId).label}: ${visit.phase}`
-          : `Home page: ${getRoute(config.homeRouteId).label}`);
+          : 'Home page: Home');
     }
 
     const now = Date.now();

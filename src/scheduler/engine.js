@@ -30,6 +30,7 @@ const {
 
 const LEASE_KEY = 'veyra:orchestrator:lease:v1';
 const TAB_KEY = 'veyra:orchestrator:tab:v1';
+const HOME_PATH = '/game_dash.php';
 const POLL_INTERVAL_MS = 1_000;
 const LEASE_MS = 15_000;
 const LEASE_RENEW_MS = 5_000;
@@ -194,6 +195,10 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
     return routeIdForUrl(currentUrl()) === routeId;
   }
 
+  function isAtHome() {
+    return /\/game_dash\.php\/?$/i.test(currentUrl().pathname);
+  }
+
   function navigateTo(path) {
     if (state.navigationPending || !path) return false;
     state.navigationPending = true;
@@ -201,8 +206,8 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
     return true;
   }
 
-  function navigateHome(config) {
-    if (!isAtRoute(config.homeRouteId)) navigateTo(getRoute(config.homeRouteId).path);
+  function navigateHome() {
+    if (!isAtHome()) navigateTo(HOME_PATH);
   }
 
   function makeVisitId(now = Date.now()) {
@@ -218,7 +223,7 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
         visitId: makeVisitId(now),
         taskId: route.id,
         phase: 'draining',
-        returnPath: getRoute(config.homeRouteId).path,
+        returnPath: HOME_PATH,
         issuedAt: now,
         deadlineAt: now + route.maxVisitMs,
       },
@@ -297,7 +302,7 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
     }
     if (hint?.note && finiteTimestamp(hint.retryAt, 0) > now) setStatus(`${routeLabel}: ${hint.note}.`);
     else setStatus(outcome === 'done' ? `${routeLabel} finished.` : `${routeLabel} stopped with an error.`);
-    navigateHome(config);
+    navigateHome();
   }
 
   function finishVisitWithoutNavigation(runtime, config, outcome, now) {
@@ -378,7 +383,7 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
     if (now >= visit.deadlineAt) {
       clearActiveVisit(runtime, 'error', config, now);
       setStatus(`${label(visit.taskId)} was disabled after the time limit.`);
-      navigateHome(config);
+      navigateHome();
       return;
     }
 
@@ -400,7 +405,7 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
 
     clearActiveVisit(runtime, 'error', config, now);
     setStatus(`${label(visit.taskId)} was disabled.`);
-    navigateHome(config);
+    navigateHome();
   }
 
   function handleOffRouteRecovery(visit, now) {
@@ -515,10 +520,23 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
         const dueRoute = chooseDueRoute(runtime, now, config);
         if (dueRoute) {
           startVisit(runtime, dueRoute, config, now);
-        } else if (!isAtRoute(config.homeRouteId)) {
-          startVisit(runtime, getRoute(config.homeRouteId), config, now);
+        } else if (!isAtHome()) {
+          const currentRouteId = currentWorkerRouteId(now);
+          const currentStatus = currentRouteId ? readWorkerStatus(currentRouteId) : null;
+          if (
+            currentRouteId &&
+            isFreshWorkerStatus(currentStatus, now) &&
+            (currentStatus.safeToLeave !== true ||
+              currentStatus.state === 'busy' ||
+              currentStatus.state === 'working')
+          ) {
+            setStatus(`Waiting until ${label(currentRouteId)} can be left safely …`);
+          } else {
+            setStatus('Returning to Home …');
+            navigateTo(HOME_PATH);
+          }
         } else {
-          setStatus(`Waiting on ${label(config.homeRouteId)}.`);
+          setStatus('Waiting on Home.');
         }
       }
 
@@ -580,6 +598,7 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
 }
 
 module.exports = {
+  HOME_PATH,
   LEASE_KEY,
   POLL_INTERVAL_MS,
   TAB_KEY,
