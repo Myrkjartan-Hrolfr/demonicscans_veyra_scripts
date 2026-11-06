@@ -119,6 +119,32 @@ test('standalone expedition combat attacks enemy healers before bosses', () => {
   assert.equal(decision.data.order.target, 'enemy-healer');
 });
 
+test('standalone expedition combat attacks Clown objectives instead of the immortal boss', () => {
+  const decision = helpers.chooseCombatAction(
+    battle({
+      enemies: [
+        enemy('clown', 3, 2, { name: 'The Clown', role: 'Immortal', boss: true, immortal: true }),
+        enemy('box', 4, 2, { name: 'Jack-in-the-Box', role: 'Destroy to break protection' }),
+      ],
+    }),
+    catalog(),
+    42,
+    { autoRescue: true },
+  );
+  assert.equal(decision.action, 'order');
+  assert.equal(decision.data.order.target, 'box');
+});
+
+test('standalone expedition endpoint preserves the active special mode', () => {
+  const clown = helpers.createEndpoint('https://demonicscans.org', 'clown');
+  assert.equal(clown.pathname, '/event_hunt.php');
+  assert.equal(clown.searchParams.get('event'), '13');
+  assert.equal(clown.searchParams.get('lodge_map'), '24');
+  assert.equal(clown.searchParams.get('tab'), 'expeditions');
+  assert.equal(clown.searchParams.get('mode'), 'clown');
+  assert.equal(helpers.createEndpoint('https://demonicscans.org', 'bad mode!').searchParams.has('mode'), false);
+});
+
 test('standalone expedition combat uses a cheaper skill when only it can reach an enemy healer', () => {
   const skillCatalog = catalog();
   skillCatalog.skills.expensive.range = 1;
@@ -363,6 +389,35 @@ test('standalone expedition combat escapes danger and rescues humans first', () 
   );
   assert.equal(rescue.data.order.skill, 'rescue');
   assert.equal(rescue.data.order.target, 'human');
+});
+
+test('standalone expedition combat leaves active lethal boss-hazard tiles before acting', () => {
+  const run = battle({
+    enemies: [enemy('clown', 3, 2, {
+      boss: true,
+      immortal: true,
+      hazard: {
+        skill: 'laughing_gas',
+        resolve_round: 3,
+        tiles: [{ row: 6, col: 2 }, { row: 6, col: 3 }],
+      },
+    })],
+  });
+  assert.equal(helpers.dangerTiles(run).has('6:2'), true);
+  assert.deepEqual(helpers.chooseEmergencyEscape(run, run.actors[0]), { lane: 0, row: 5, col: 2 });
+  const decision = helpers.chooseCombatAction(run, catalog(), 42, { autoRescue: true });
+  assert.equal(decision.action, 'move');
+  assert.deepEqual(decision.data.position, { lane: 0, row: 5, col: 2 });
+  assert.match(decision.message, /special-effect tile/i);
+});
+
+test('standalone expedition combat also leaves persistent ground effects immediately', () => {
+  const run = battle({
+    ground_warning: [{ row: 6, col: 2 }, { row: 6, col: 1 }],
+  });
+  const decision = helpers.chooseCombatAction(run, catalog(), 42, { autoRescue: true });
+  assert.equal(decision.action, 'move');
+  assert.deepEqual(decision.data.position, { lane: 0, row: 5, col: 2 });
 });
 
 test('standalone expedition combat always guards while interrupted', () => {

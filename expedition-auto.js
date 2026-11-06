@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Dragon Realm Expedition Auto
 // @namespace    local.veyra.expeditions
-// @version      1.4.2
+// @version      1.4.4
 // @description  Independently starts and completes Dragon Realm expeditions, including party setup, votes, combat, loot and powers.
 // @match        https://demonicscans.org/event_page.php*
 // @match        https://www.demonicscans.org/event_page.php*
@@ -212,6 +212,16 @@
     return /\bheal(?:er|ing)?\b|\bcleric\b|\bpriest\b|\bmedic\b|\brestorer?\b/.test(unitRole(unit));
   }
 
+  function isBattleObjective(unit) {
+    return Boolean(unit?.objective || unit?.priority_target || unit?.must_destroy) ||
+      /jack[- ]?in[- ]?the[- ]?box|destroy.*(?:protection|shield)|\b(?:ward|totem|pylon)\b/.test(unitRole(unit));
+  }
+
+  function isInvulnerable(unit) {
+    return Boolean(unit?.immortal || unit?.invulnerable || unit?.untargetable) ||
+      /\bimmortal\b|\binvulnerable\b|unlimited\s+hp/.test(unitRole(unit));
+  }
+
   function compareScores(left, right) {
     for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
       const difference = Number(left[index] || 0) - Number(right[index] || 0);
@@ -312,6 +322,11 @@
     return { position: ranked[0].position, message };
   }
 
+  function chooseEmergencyEscape(run, actor) {
+    if (!actor || movedThisRound(run, actor) || !dangerTiles(run).has(pointKey(actor))) return null;
+    return chooseTacticalMove(run, actor, true)?.position || chooseMove(run, actor, true);
+  }
+
   function rescueAvailable(run, unit) {
     const guild = unit && !unit.bot && unit.guild_dragon
       ? Math.max(0, Number(run?.guild_dragon_rescues?.[unit.guild] || 0))
@@ -393,6 +408,8 @@
     candidates.sort(
       (left, right) =>
         Number(isHealer(right.target)) - Number(isHealer(left.target)) ||
+        Number(isBattleObjective(right.target)) - Number(isBattleObjective(left.target)) ||
+        Number(isInvulnerable(left.target)) - Number(isInvulnerable(right.target)) ||
         left.skillPriority - right.skillPriority ||
         Number(right.target.boss) - Number(left.target.boss) ||
         Number(left.target.hp || 0) - Number(right.target.hp || 0),
@@ -412,17 +429,14 @@
     if (!actor) return { action: '', message: 'Waiting for your hunter.' };
     if (Number(actor.hp) <= 0) return { action: '', message: 'Your hunter is down; waiting for Rescue.' };
 
-    const danger = dangerTiles(run);
-    if (!movedThisRound(run, actor) && danger.has(pointKey(actor))) {
-      const escape = chooseTacticalMove(run, actor, true)?.position || chooseMove(run, actor, true);
-      if (escape) {
-        return {
-          action: 'move',
-          key: `move:${run.battleSerial}:${run.round}:${pointKey(escape)}`,
-          message: 'Leaving a marked danger tile.',
-          data: { round: run.round, battle: run.battleSerial, position: escape },
-        };
-      }
+    const escape = chooseEmergencyEscape(run, actor);
+    if (escape) {
+      return {
+        action: 'move',
+        key: `move:${run.battleSerial}:${run.round}:${pointKey(escape)}`,
+        message: 'Leaving a lethal or persistent special-effect tile.',
+        data: { round: run.round, battle: run.battleSerial, position: escape },
+      };
     }
     if (actedThisRound(run, actor)) {
       const tactical = chooseTacticalMove(run, actor);
@@ -509,6 +523,21 @@
       const score = wanted.reduce((sum, word, priority) => sum + (text.includes(word) ? wanted.length - priority : 0), 0);
       return { key, score, index };
     }).sort((left, right) => right.score - left.score || left.index - right.index)[0]?.key || '';
+  }
+
+  function normalizeExpeditionMode(value) {
+    const mode = String(value || '').trim().toLowerCase();
+    return /^[a-z0-9_-]{1,32}$/.test(mode) ? mode : '';
+  }
+
+  function createEndpoint(origin, mode = '') {
+    const url = new URL('/event_hunt.php', origin);
+    url.searchParams.set('event', '13');
+    url.searchParams.set('lodge_map', '24');
+    url.searchParams.set('tab', 'expeditions');
+    const normalizedMode = normalizeExpeditionMode(mode);
+    if (normalizedMode) url.searchParams.set('mode', normalizedMode);
+    return url;
   }
 
   // A normal window.setInterval is heavily throttled in background tabs.
@@ -739,12 +768,12 @@
     });
     renderControls();
 
+    function expeditionMode() {
+      return normalizeExpeditionMode(runtime.boot?.dataset?.mode || page.searchParams.get('mode'));
+    }
+
     function endpoint() {
-      const url = new URL('/event_hunt.php', win.location.origin);
-      url.searchParams.set('event', '13');
-      url.searchParams.set('lodge_map', '24');
-      url.searchParams.set('tab', 'expeditions');
-      return url;
+      return createEndpoint(win.location.origin, expeditionMode());
     }
 
     function attribute(tag, name) {
@@ -759,7 +788,14 @@
       const csrf = attribute(tag, 'data-csrf');
       const user = attribute(tag, 'data-user');
       if (!response.ok || !csrf || !user) throw Error('Could not load expedition access data.');
-      runtime.boot = { dataset: { csrf, user, practice: attribute(tag, 'data-practice') || '0' } };
+      runtime.boot = {
+        dataset: {
+          csrf,
+          user,
+          practice: attribute(tag, 'data-practice') || '0',
+          mode: attribute(tag, 'data-mode') || expeditionMode(),
+        },
+      };
     }
 
     const userId = () => Number(runtime.boot?.dataset?.user || 0);
@@ -934,6 +970,7 @@
       actedThisRound,
       actorFor,
       chooseCombatAction,
+      chooseEmergencyEscape,
       chooseMove,
       chooseTacticalMove,
       choosePower,
@@ -941,6 +978,10 @@
       distance,
       enabledCombatSkills,
       createBackgroundTicker,
+      createEndpoint,
+      isBattleObjective,
+      isInvulnerable,
+      normalizeExpeditionMode,
       normalizeSettings,
       skillReady,
       targetable,
