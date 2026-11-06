@@ -154,7 +154,7 @@ function deadCard({ id = '1001', damage = '5000000', expiresAt = NOW + 60_000, q
   });
 }
 
-function waveDocument(cards = [deadCard()], { farmState = 'finished', killed = 90, target = 90 } = {}) {
+function waveDocument(cards = [deadCard()], { farmState = 'finished', killed = 95, target = 95 } = {}) {
   const option = element({ text: 'Kraken', value: '501', selected: true });
   const monsterSelect = element({ value: '501', many: { option: [option] } });
   const targetRow = element({
@@ -266,7 +266,16 @@ test("Adventurer's Guild route is distinct and disabled by default", () => {
   assert.equal(routeIdForUrl('/adventurers_guild.php?veyra_route=adventurers'), 'adventurers');
   assert.equal(routeIdForUrl('/adventurers_guild.php'), 'adventurers');
   assert.equal(createDefaultConfig().routes.adventurers.enabled, false);
-  assert.equal(createDefaultConfig().routes.adventurers.settings.farmMonsterCount, 90);
+  assert.equal(createDefaultConfig().routes.adventurers.settings.farmMonsterCount, 95);
+  assert.equal(createDefaultConfig().routes.adventurers.settings.farmStackCount, 10);
+  assert.deepEqual(adventurersRoute.normalizeSettings({ farmMonsterCount: 90 }), {
+    farmMonsterCount: 95,
+    farmStackCount: 10,
+  });
+  assert.deepEqual(adventurersRoute.normalizeSettings({ farmMonsterCount: 123, farmStackCount: 17 }), {
+    farmMonsterCount: 123,
+    farmStackCount: 17,
+  });
 });
 
 test('quest requirements parse names with commas and compact damage values', () => {
@@ -533,6 +542,7 @@ test('worker accepts, loots and finishes a ready quest without ever giving it up
   const config = createDefaultConfig();
   config.routes.adventurers.enabled = true;
   config.routes.adventurers.settings.farmMonsterCount = 123;
+  config.routes.adventurers.settings.farmStackCount = 17;
   const store = createStore({
     [CONFIG_KEY]: config,
     [COMMAND_KEY]: {
@@ -600,6 +610,10 @@ test('worker accepts, loots and finishes a ready quest without ever giving it up
   const questFarmSettings = posts.find(
     (entry) => entry.url === AUTO_FARM_PATH && entry.params.action === 'save_settings' && entry.params.TOTAL_MONSTERS_TO_KILL === '123',
   );
+  const questTargetUpdate = posts.find(
+    (entry) => entry.url === AUTO_FARM_PATH && entry.params.action === 'update_target' && entry.params.IS_ENABLED === 1,
+  );
+  assert.equal(questTargetUpdate?.params.MAX_STACK_PER_HIT, 17);
   assert.deepEqual(
     {
       total: questFarmSettings?.params.TOTAL_MONSTERS_TO_KILL,

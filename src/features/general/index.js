@@ -5,6 +5,7 @@ module.exports = [
   require('./auto-battle-extras'),
   require('./auto-farm-activate-buttons'),
   require('./power-crystal-quickset'),
+  require('./shadow-army-manager'),
   require('./better-header'),
   require('./custom-navigation'),
   require('./battle-drawer-scroll'),

@@ -258,15 +258,18 @@ function createAdventurersWorker({
     throw new Error(`${label} failed${responseMessage(response) ? `: ${responseMessage(response)}` : '.'}`);
   }
 
-  function routeConfig() {
-    return normalizeConfig(store.read(CONFIG_KEY)).routes[ROUTE_ID];
+  function farmSettings() {
+    return normalizeConfig(store.read(CONFIG_KEY)).routes[ROUTE_ID].settings;
   }
 
-  function requirementSignature(requirements) {
-    return (requirements || [])
+  function requirementSignature(requirements, settings) {
+    const requirementsPart = (requirements || [])
       .map((requirement) => `${requirement.normalizedName}:${requirement.count}:${requirement.minDamage}`)
       .sort()
       .join('|');
+    // A settings change must invalidate the previous quest-farm setup so the
+    // worker resets and applies the new values on its next preparation pass.
+    return `farm:${settings.farmMonsterCount}:stack:${settings.farmStackCount}|${requirementsPart}`;
   }
 
   function makeTargetPayload(target, patch = {}) {
@@ -280,11 +283,10 @@ function createAdventurersWorker({
     };
   }
 
-  function potionSettings(base) {
-    const count = Math.max(1, Math.round(Number(routeConfig()?.settings?.farmMonsterCount) || 90));
+  function potionSettings(base, settings) {
     return {
       ...base,
-      TOTAL_MONSTERS_TO_KILL: String(count),
+      TOTAL_MONSTERS_TO_KILL: String(settings.farmMonsterCount),
       HP_POTIONS_MAX_TO_USE: String(POTION_LIMIT),
       STAM_POT_SMALL_ITEM_MAX_TO_USE: '0',
       STAM_POT_HALF_ITEM_ID_MAX_TO_USE: '1',
@@ -314,7 +316,8 @@ function createAdventurersWorker({
       store.write(AUTOFARM_SNAPSHOT_KEY, snapshot);
     }
 
-    const configuredFor = requirementSignature(requirements);
+    const settings = farmSettings();
+    const configuredFor = requirementSignature(requirements, settings);
     const initialState = logic.autoFarmState(waveDoc);
     if (snapshot.configuredFor === configuredFor) {
       if (initialState === 'paused') {
@@ -344,7 +347,7 @@ function createAdventurersWorker({
       const requirement = requiredByName.get(target.normalizedName);
       if (requirement) found.add(target.normalizedName);
       const desired = requirement
-        ? { enabled: 1, mode: '1', minDamage: requirement.minDamage, maxStack: 50 }
+        ? { enabled: 1, mode: '1', minDamage: requirement.minDamage, maxStack: settings.farmStackCount }
         : target.enabled
           ? { enabled: 0 }
           : null;
@@ -367,7 +370,7 @@ function createAdventurersWorker({
           DAMAGE_OR_CAP: 1,
           MIN_DAMAGE: requirement.minDamage,
           IS_ENABLED: 1,
-          MAX_STACK_PER_HIT: 50,
+          MAX_STACK_PER_HIT: settings.farmStackCount,
         }),
         `Adding Auto Farm target ${requirement.name}`,
       );
@@ -377,7 +380,7 @@ function createAdventurersWorker({
     requireSuccess(
       await guardedPost(visitId, AUTO_FARM_PATH, {
         action: 'save_settings',
-        ...potionSettings(logic.readAutoFarmSettings(waveDoc)),
+        ...potionSettings(logic.readAutoFarmSettings(waveDoc), settings),
       }),
       'Saving Auto Farm quest settings',
     );
@@ -544,7 +547,7 @@ function createAdventurersWorker({
       if (pausedPolls >= 3) {
         throw new Error('Auto Farm stopped before reaching its configured monster total.');
       }
-      const target = progress.target || Number(routeConfig()?.settings?.farmMonsterCount) || 90;
+      const target = progress.target || farmSettings().farmMonsterCount;
       setWorkingMessage(
         visitId,
         `Auto Farm is hunting Olympus quest monsters: ${progress.killed.toLocaleString()} / ${target.toLocaleString()}.`,
