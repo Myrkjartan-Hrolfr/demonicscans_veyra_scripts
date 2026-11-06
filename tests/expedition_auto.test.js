@@ -135,6 +135,25 @@ test('standalone expedition combat attacks Clown objectives instead of the immor
   assert.equal(decision.data.order.target, 'box');
 });
 
+test('standalone expedition combat recognizes and prioritizes Jack-in-the-Box by its API id', () => {
+  const decision = helpers.chooseCombatAction(
+    battle({
+      enemies: [
+        enemy('enemy-healer', 4, 2, { role: 'Healer' }),
+        enemy('clown_box_31', 5, 2, { name: '', role: '' }),
+        enemy('clown', 3, 2, { name: 'The Clown', role: 'Immortal', boss: true, immortal: true }),
+      ],
+    }),
+    catalog(),
+    42,
+    { autoRescue: true },
+  );
+  assert.equal(helpers.isJackInTheBox({ id: 'clown_box_31' }), true);
+  assert.equal(decision.action, 'order');
+  assert.equal(decision.data.order.skill, 'expensive');
+  assert.equal(decision.data.order.target, 'clown_box_31');
+});
+
 test('standalone expedition endpoint preserves the active special mode', () => {
   const clown = helpers.createEndpoint('https://demonicscans.org', 'clown');
   assert.equal(clown.pathname, '/event_hunt.php');

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Dragon Realm Expedition Auto
 // @namespace    local.veyra.expeditions
-// @version      1.4.4
+// @version      1.4.5
 // @description  Independently starts and completes Dragon Realm expeditions, including party setup, votes, combat, loot and powers.
 // @match        https://demonicscans.org/event_page.php*
 // @match        https://www.demonicscans.org/event_page.php*
@@ -205,16 +205,21 @@
   }
 
   function unitRole(unit) {
-    return `${unit?.class || ''} ${unit?.combat_class || ''} ${unit?.role || ''} ${unit?.archetype || ''} ${unit?.name || ''}`.toLowerCase();
+    return `${unit?.class || ''} ${unit?.combat_class || ''} ${unit?.role || ''} ${unit?.archetype || ''} ${unit?.name || ''} ${unit?.id || ''} ${unit?.type || ''} ${unit?.kind || ''} ${unit?.enemy_type || ''} ${unit?.template || ''} ${unit?.slug || ''}`.toLowerCase();
   }
 
   function isHealer(unit) {
     return /\bheal(?:er|ing)?\b|\bcleric\b|\bpriest\b|\bmedic\b|\brestorer?\b/.test(unitRole(unit));
   }
 
+  function isJackInTheBox(unit) {
+    return /jack[-_ ]?in[-_ ]?the[-_ ]?box|clown[-_ ]?box/.test(unitRole(unit));
+  }
+
   function isBattleObjective(unit) {
     return Boolean(unit?.objective || unit?.priority_target || unit?.must_destroy) ||
-      /jack[- ]?in[- ]?the[- ]?box|destroy.*(?:protection|shield)|\b(?:ward|totem|pylon)\b/.test(unitRole(unit));
+      isJackInTheBox(unit) ||
+      /destroy.*(?:protection|shield)|\b(?:ward|totem|pylon)\b/.test(unitRole(unit));
   }
 
   function isInvulnerable(unit) {
@@ -407,6 +412,7 @@
     });
     candidates.sort(
       (left, right) =>
+        Number(isJackInTheBox(right.target)) - Number(isJackInTheBox(left.target)) ||
         Number(isHealer(right.target)) - Number(isHealer(left.target)) ||
         Number(isBattleObjective(right.target)) - Number(isBattleObjective(left.target)) ||
         Number(isInvulnerable(left.target)) - Number(isInvulnerable(right.target)) ||
@@ -981,6 +987,7 @@
       createEndpoint,
       isBattleObjective,
       isInvulnerable,
+      isJackInTheBox,
       normalizeExpeditionMode,
       normalizeSettings,
       skillReady,
