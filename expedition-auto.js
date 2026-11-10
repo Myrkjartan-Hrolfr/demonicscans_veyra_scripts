@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Dragon Realm Expedition Auto
 // @namespace    local.veyra.expeditions
-// @version      1.4.5
+// @version      1.4.8
 // @description  Independently starts and completes Dragon Realm expeditions, including party setup, votes, combat, loot and powers.
 // @match        https://demonicscans.org/event_page.php*
 // @match        https://www.demonicscans.org/event_page.php*
@@ -25,11 +25,17 @@
   const TICK_MS = 750;
   const ACTION_THROTTLE_MS = 2_500;
   const CLASSES = Object.freeze(['tank', 'warrior', 'mage', 'archer', 'assassin', 'healer']);
+  const POWER_PREFERENCES = Object.freeze([
+    Object.freeze({ value: 'deep_reserves', label: 'Deep Reserves' }),
+    Object.freeze({ value: 'sharpened_instinct', label: 'Sharpened Instinct' }),
+    Object.freeze({ value: 'steadfast', label: 'Steadfast' }),
+  ]);
   const DEFAULTS = Object.freeze({
     enabled: false,
     autoStart: false,
     fillWithNpcs: true,
     preferredClass: 'mage',
+    preferredPower: 'sharpened_instinct',
     routeChoice: 'left',
     claimRareLoot: true,
     autoRescue: true,
@@ -49,11 +55,13 @@
 
   function normalizeSettings(value) {
     const preferredClass = String(value?.preferredClass || DEFAULTS.preferredClass).toLowerCase();
+    const preferredPower = String(value?.preferredPower || DEFAULTS.preferredPower).toLowerCase();
     return {
       enabled: value?.enabled === true,
       autoStart: value?.autoStart === true,
       fillWithNpcs: value?.fillWithNpcs !== false,
       preferredClass: CLASSES.includes(preferredClass) ? preferredClass : DEFAULTS.preferredClass,
+      preferredPower: POWER_PREFERENCES.some((power) => power.value === preferredPower) ? preferredPower : DEFAULTS.preferredPower,
       routeChoice: value?.routeChoice === 'right' ? 'right' : 'left',
       claimRareLoot: value?.claimRareLoot !== false,
       autoRescue: value?.autoRescue !== false,
@@ -110,6 +118,20 @@
 
   function movedThisRound(run, actor) {
     return actor?.moved_on === `${run?.battleSerial}:${run?.round}`;
+  }
+
+  function turnFinished(run, actor) {
+    if (Number(run?.pacing_version) !== 1 || !actor?.id) return false;
+    const stamp = [
+      run.phase,
+      run.section,
+      run.encounter,
+      run.battleSerial,
+      run.round,
+      run.vote_runoff || 0,
+      run.branch_puzzle || '',
+    ].join(':');
+    return run?.pace_done?.[actor.id] === stamp;
   }
 
   function actorFor(run, userId) {
@@ -434,6 +456,7 @@
     const actor = actorFor(run, userId);
     if (!actor) return { action: '', message: 'Waiting for your hunter.' };
     if (Number(actor.hp) <= 0) return { action: '', message: 'Your hunter is down; waiting for Rescue.' };
+    if (turnFinished(run, actor)) return { action: '', message: `Round ${run.round}: turn finished.` };
 
     const escape = chooseEmergencyEscape(run, actor);
     if (escape) {
@@ -452,6 +475,14 @@
           key: `move:${run.battleSerial}:${run.round}:${pointKey(tactical.position)}`,
           message: tactical.message,
           data: { round: run.round, battle: run.battleSerial, position: tactical.position },
+        };
+      }
+      if (Number(run.pacing_version) === 1) {
+        return {
+          action: 'finish',
+          key: `finish:${run.battleSerial}:${run.round}`,
+          message: `Round ${run.round}: ending turn.`,
+          data: { round: run.round, battle: run.battleSerial },
         };
       }
       return { action: '', message: `Round ${run.round}: action completed.` };
@@ -515,7 +546,7 @@
     return { action: '', message: `Round ${run.round}: no valid action.` };
   }
 
-  function choosePower(powers, actorClass) {
+  function choosePower(powers, actorClass, excluded = [], preferredPower = '') {
     const wanted = {
       tank: ['defense', 'armour', 'armor', 'health', 'hp', 'shield'],
       warrior: ['attack', 'damage', 'critical', 'strength'],
@@ -524,11 +555,73 @@
       assassin: ['critical', 'attack', 'damage', 'evade'],
       healer: ['heal', 'magic', 'energy', 'health'],
     }[actorClass] || ['damage', 'health', 'energy'];
-    return Object.entries(powers || {}).map(([key, power], index) => {
+    const preference = POWER_PREFERENCES.find((power) => power.value === preferredPower);
+    const omitted = new Set(excluded || []);
+    return Object.entries(powers || {}).filter(([key]) => !omitted.has(key)).map(([key, power], index) => {
       const text = `${power?.name || ''} ${power?.text || ''}`.toLowerCase();
       const score = wanted.reduce((sum, word, priority) => sum + (text.includes(word) ? wanted.length - priority : 0), 0);
-      return { key, score, index };
-    }).sort((left, right) => right.score - left.score || left.index - right.index)[0]?.key || '';
+      const preferred = Boolean(preference) && (
+        key === preference.value || String(power?.name || '').trim().toLowerCase() === preference.label.toLowerCase()
+      );
+      return { key, preferred, score, index };
+    }).sort(
+      (left, right) => Number(right.preferred) - Number(left.preferred) || right.score - left.score || left.index - right.index,
+    )[0]?.key || '';
+  }
+
+  function choosePacedPhaseAction(run, actor, catalog, settings, party) {
+    if (Number(run?.pacing_version) !== 1 || !['loot', 'powers'].includes(run?.phase)) return null;
+    if (!actor) return { action: '', message: 'Waiting for your hunter.' };
+    if (turnFinished(run, actor)) return { action: '', message: `${run.phase === 'loot' ? 'Loot choices' : 'Powers'} confirmed.` };
+    const partyId = Number(party?.id || 0);
+    const selection = party?.selection;
+
+    if (run.phase === 'loot') {
+      const lots = (run.loot || []).filter(
+        (lot) => !lot.personal && !Object.prototype.hasOwnProperty.call(lot.claims || {}, actor.id),
+      );
+      if (lots.length) {
+        return {
+          action: 'claim',
+          key: `loot:${selection}:${settings.claimRareLoot}`,
+          message: `${settings.claimRareLoot ? 'Claiming' : 'Passing'} rare drops…`,
+          data: { party: partyId, selection, lots: lots.map((lot) => lot.id), selected: settings.claimRareLoot },
+        };
+      }
+      return {
+        action: 'finish',
+        key: `finish:${partyId}:${selection}:loot`,
+        message: 'Confirming loot choices…',
+        data: { party: partyId, selection },
+      };
+    }
+
+    const choices = run.powerChoices?.[actor.id] || {};
+    const picks = Math.max(1, Number(run.power_picks) || 1);
+    const missingPick = Array.from({ length: picks }, (_, pick) => pick).find(
+      (pick) => !Object.prototype.hasOwnProperty.call(choices, pick),
+    );
+    if (missingPick !== undefined) {
+      const power = choosePower(
+        catalog?.powers,
+        actor.class || actor.combat_class,
+        Object.values(choices),
+        settings.preferredPower,
+      );
+      if (!power) throw Error('No temporary power is available.');
+      return {
+        action: 'power',
+        key: `power:${partyId}:${selection}:${missingPick}:${power}`,
+        message: `Selecting temporary power ${missingPick + 1}/${picks}…`,
+        data: { party: partyId, selection, power, pick: missingPick },
+      };
+    }
+    return {
+      action: 'finish',
+      key: `finish:${partyId}:${selection}:powers`,
+      message: 'Confirming power choices…',
+      data: { party: partyId, selection },
+    };
   }
 
   function normalizeExpeditionMode(value) {
@@ -656,7 +749,7 @@
     doc.head.appendChild(style);
     const root = doc.createElement('section');
     root.id = PANEL_ID;
-    root.innerHTML = `<header><strong>🧭 Expedition Auto</strong><button class="ea-fold" type="button">−</button></header><div class="ea-body"><div class="ea-actions"><button class="ea-start" type="button">Start</button></div><div class="ea-status"></div><div class="ea-grid"><label><span>Start private expeditions automatically</span><input data-key="autoStart" type="checkbox"></label><label><span>Fill empty slots with NPCs</span><input data-key="fillWithNpcs" type="checkbox"></label><label><span>Preferred class</span><select data-key="preferredClass">${CLASSES.map((name) => `<option value="${name}">${name[0].toUpperCase() + name.slice(1)}</option>`).join('')}</select></label><label><span>Preferred route</span><select data-key="routeChoice"><option value="left">Left</option><option value="right">Right</option></select></label><label><span>Claim contested rare drops</span><input data-key="claimRareLoot" type="checkbox"></label><label><span>Rescue fallen party members</span><input data-key="autoRescue" type="checkbox"></label></div><section class="ea-skill-section" hidden><div class="ea-skill-title"></div><div class="ea-skill-list"></div><p class="ea-note">Changes apply live to the next available skill action. The 0-Energy skill always remains enabled.</p></section><p class="ea-note">Automatic start can spend daily expedition entries. Combat uses the most expensive ready attack first and avoids marked danger tiles. A background worker keeps polling while this tab is inactive; completely suspended or discarded tabs cannot run userscripts.</p></div>`;
+    root.innerHTML = `<header><strong>🧭 Expedition Auto</strong><button class="ea-fold" type="button">−</button></header><div class="ea-body"><div class="ea-actions"><button class="ea-start" type="button">Start</button></div><div class="ea-status"></div><div class="ea-grid"><label><span>Start private expeditions automatically</span><input data-key="autoStart" type="checkbox"></label><label><span>Fill empty slots with NPCs</span><input data-key="fillWithNpcs" type="checkbox"></label><label><span>Preferred class</span><select data-key="preferredClass">${CLASSES.map((name) => `<option value="${name}">${name[0].toUpperCase() + name.slice(1)}</option>`).join('')}</select></label><label><span>Preferred route</span><select data-key="routeChoice"><option value="left">Left</option><option value="right">Right</option></select></label><label><span>Preferred power</span><select data-key="preferredPower">${POWER_PREFERENCES.map((power) => `<option value="${power.value}">${power.label}</option>`).join('')}</select></label><label><span>Claim contested rare drops</span><input data-key="claimRareLoot" type="checkbox"></label><label><span>Rescue fallen party members</span><input data-key="autoRescue" type="checkbox"></label></div><section class="ea-skill-section" hidden><div class="ea-skill-title"></div><div class="ea-skill-list"></div><p class="ea-note">Changes apply live to the next available skill action. The 0-Energy skill always remains enabled.</p></section><p class="ea-note">Automatic start can spend daily expedition entries. Combat uses the most expensive ready attack first and avoids marked danger tiles. A background worker keeps polling while this tab is inactive; completely suspended or discarded tabs cannot run userscripts.</p></div>`;
     doc.body.appendChild(root);
     const status = root.querySelector('.ea-status');
     const startButton = root.querySelector('.ea-start');
@@ -902,6 +995,11 @@
         if (actor && run.votes?.[actor.id] === settings.routeChoice) return setStatus(`${section} · Route vote submitted.`);
         return perform('vote', { party: party.id, selection: party.selection, choice: settings.routeChoice }, `vote:${party.selection}:${settings.routeChoice}`, `${section} · Voting ${settings.routeChoice}…`);
       }
+      const pacedPhase = choosePacedPhaseAction(run, actor, runtime.catalog, settings, party);
+      if (pacedPhase) {
+        if (!pacedPhase.action) return setStatus(`${section} · ${pacedPhase.message}`);
+        return perform(pacedPhase.action, pacedPhase.data, pacedPhase.key, `${section} · ${pacedPhase.message}`);
+      }
       if (run.phase === 'loot') {
         const lots = (run.loot || []).filter((lot) => !lot.personal && (!actor || !Object.prototype.hasOwnProperty.call(lot.claims || {}, actor.id)));
         if (!lots.length) return setStatus(`${section} · Loot choice submitted.`);
@@ -980,6 +1078,7 @@
       chooseMove,
       chooseTacticalMove,
       choosePower,
+      choosePacedPhaseAction,
       dangerTiles,
       distance,
       enabledCombatSkills,
@@ -992,6 +1091,7 @@
       normalizeSettings,
       skillReady,
       targetable,
+      turnFinished,
       validMoves,
     }),
   });

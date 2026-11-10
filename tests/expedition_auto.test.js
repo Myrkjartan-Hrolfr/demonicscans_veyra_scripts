@@ -46,6 +46,7 @@ test('standalone expedition settings remain safe by default', () => {
     autoStart: false,
     fillWithNpcs: true,
     preferredClass: 'mage',
+    preferredPower: 'sharpened_instinct',
     routeChoice: 'left',
     claimRareLoot: true,
     autoRescue: true,
@@ -101,6 +102,31 @@ test('standalone expedition combat uses expensive attacks before cheap attacks',
   assert.equal(decision.action, 'order');
   assert.equal(decision.data.order.skill, 'expensive');
   assert.equal(decision.data.order.target, 'e1');
+});
+
+test('standalone expedition combat ends a paced turn after all useful actions are complete', () => {
+  const run = battle({
+    pacing_version: 1,
+    actors: [actor({ acted_on: '7:3', moved_on: '7:3' })],
+  });
+  const decision = helpers.chooseCombatAction(run, catalog(), 42, { autoRescue: true });
+  assert.equal(decision.action, 'finish');
+  assert.equal(decision.key, 'finish:7:3');
+  assert.deepEqual(decision.data, { round: 3, battle: 7 });
+});
+
+test('standalone expedition combat does not finish the same turn twice', () => {
+  const run = battle({
+    pacing_version: 1,
+    section: 4,
+    encounter: 2,
+    actors: [actor({ acted_on: '7:3', moved_on: '7:3' })],
+    pace_done: { u1: 'battle:4:2:7:3:0:' },
+  });
+  assert.equal(helpers.turnFinished(run, run.actors[0]), true);
+  const decision = helpers.chooseCombatAction(run, catalog(), 42, { autoRescue: true });
+  assert.equal(decision.action, '');
+  assert.match(decision.message, /turn finished/i);
 });
 
 test('standalone expedition combat attacks enemy healers before bosses', () => {
@@ -461,6 +487,87 @@ test('standalone expedition combat always guards while interrupted', () => {
 test('standalone expedition powers follow the selected class', () => {
   assert.equal(helpers.choosePower(catalog().powers, 'mage'), 'arcane_well');
   assert.equal(helpers.choosePower(catalog().powers, 'tank'), 'iron_skin');
+});
+
+test('standalone expedition uses the configured one of the three standard powers', () => {
+  const powers = {
+    reserve: { name: 'Deep Reserves', text: '+10% maximum HP.' },
+    instinct: { name: 'Sharpened Instinct', text: '+10% ATK and Magic.' },
+    defense: { name: 'Steadfast', text: '+15% Defense.' },
+  };
+  assert.equal(helpers.choosePower(powers, 'healer', [], 'deep_reserves'), 'reserve');
+  assert.equal(helpers.choosePower(powers, 'healer', [], 'sharpened_instinct'), 'instinct');
+  assert.equal(helpers.choosePower(powers, 'healer', [], 'steadfast'), 'defense');
+  assert.equal(helpers.choosePower(powers, 'healer', ['instinct'], 'sharpened_instinct'), 'reserve');
+});
+
+test('standalone expedition confirms paced loot after all choices were saved', () => {
+  const run = battle({
+    phase: 'loot',
+    pacing_version: 1,
+    loot: [
+      { id: 'personal', personal: true, claims: {} },
+      { id: 'rare', personal: false, claims: { u1: true } },
+    ],
+  });
+  const decision = helpers.choosePacedPhaseAction(
+    run,
+    run.actors[0],
+    catalog(),
+    { claimRareLoot: true },
+    { id: 19, selection: 6 },
+  );
+  assert.equal(decision.action, 'finish');
+  assert.deepEqual(decision.data, { party: 19, selection: 6 });
+  assert.match(decision.message, /confirming loot/i);
+});
+
+test('standalone expedition saves missing paced loot choices before confirming', () => {
+  const run = battle({
+    phase: 'loot',
+    pacing_version: 1,
+    loot: [{ id: 'rare', personal: false, claims: {} }],
+  });
+  const decision = helpers.choosePacedPhaseAction(
+    run,
+    run.actors[0],
+    catalog(),
+    { claimRareLoot: false },
+    { id: 19, selection: 6 },
+  );
+  assert.equal(decision.action, 'claim');
+  assert.deepEqual(decision.data.lots, ['rare']);
+  assert.equal(decision.data.selected, false);
+});
+
+test('standalone expedition fills every paced power slot and then confirms', () => {
+  const choosingRun = battle({
+    phase: 'powers',
+    pacing_version: 1,
+    power_picks: 2,
+    powerChoices: { u1: { 0: 'arcane_well' } },
+  });
+  const choosing = helpers.choosePacedPhaseAction(
+    choosingRun,
+    choosingRun.actors[0],
+    catalog(),
+    {},
+    { id: 19, selection: 7 },
+  );
+  assert.equal(choosing.action, 'power');
+  assert.equal(choosing.data.pick, 1);
+  assert.equal(choosing.data.power, 'iron_skin');
+
+  choosingRun.powerChoices.u1[1] = 'iron_skin';
+  const confirming = helpers.choosePacedPhaseAction(
+    choosingRun,
+    choosingRun.actors[0],
+    catalog(),
+    {},
+    { id: 19, selection: 7 },
+  );
+  assert.equal(confirming.action, 'finish');
+  assert.deepEqual(confirming.data, { party: 19, selection: 7 });
 });
 
 test('standalone expedition ticker keeps worker and fallback timers active in background tabs', () => {
