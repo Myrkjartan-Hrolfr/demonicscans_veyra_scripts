@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Dragon Realm Expedition Auto
 // @namespace    local.veyra.expeditions
-// @version      1.4.8
+// @version      1.4.9
 // @description  Independently starts and completes Dragon Realm expeditions, including party setup, votes, combat, loot and powers.
 // @match        https://demonicscans.org/event_page.php*
 // @match        https://www.demonicscans.org/event_page.php*
@@ -298,27 +298,19 @@
     let score;
     let message;
     if (actorClass === 'healer') {
-      const lowestAlly = [...allies].sort(
-        (left, right) => healthRatio(left) - healthRatio(right) || distance(actor, left) - distance(actor, right),
-      )[0] || null;
-      const wounded = lowestAlly && healthRatio(lowestAlly) < 0.9 && distance(actor, lowestAlly) > 3
-        ? lowestAlly
-        : null;
-      const tank = [...allies].filter(
-        (unit) => String(unit.class || unit.combat_class || '').toLowerCase() === 'tank',
-      ).sort((left, right) => distance(actor, left) - distance(actor, right))[0] || null;
-      const immediateThreat = enemies.some((enemy) => distance(actor, enemy) <= 1);
-      if (!force && !wounded && !immediateThreat) return null;
+      const healingNeeded = [actor, ...allies].some((unit) => healthRatio(unit) < 0.9);
+      const teammatesInHealRange = (position) => allies.filter((ally) => distance(position, ally) <= 3).length;
+      const canAttack = (position) => enemies.some(
+        (enemy) => !isInvulnerable(enemy) && distance(position, enemy) <= 3,
+      );
       score = (position) => [
-        enemies.filter((enemy) => distance(position, enemy) <= 1).length,
-        allies.filter((ally) => distance(position, ally) > 3).length,
-        lowestAlly ? Math.max(0, distance(position, lowestAlly) - 3) : 0,
-        tank ? Math.max(0, distance(position, tank) - 3) : 0,
-        -allies.filter((ally) => distance(position, ally) <= 2).length,
-        enemyThreat(position, enemies),
-        -nearestEnemy(position),
+        -teammatesInHealRange(position),
+        healingNeeded ? 0 : Number(!canAttack(position)),
+        allies.reduce((sum, ally) => sum + distance(position, ally), 0),
       ];
-      message = 'Repositioning safely within heal range without leaving the party.';
+      message = healingNeeded
+        ? 'Positioning within heal range of as many party members as possible.'
+        : 'Positioning near the party with an enemy in attack range.';
     } else if (actorClass === 'tank') {
       score = (position) => [
         healer ? Math.max(0, distance(position, healer) - 3) : 0,
@@ -531,7 +523,7 @@
     if (attack) return attack;
     const support = chooseSupportAction(run, catalog, actor, skills, 0.8);
     if (support) return support;
-    const move = chooseMove(run, actor);
+    const move = actorClass === 'healer' ? null : chooseMove(run, actor);
     if (move) {
       return {
         action: 'move',
