@@ -57,6 +57,7 @@ function createPrinceWorker(options) {
       idleText: 'Scanning Castle of the Fallen Prince…',
       workingText: 'Castle attack is working…',
       fallbackTargetName: 'Castle monster',
+      totalLabel: 'Castle monsters',
     });
   return createShadowbridgeWorker({
     ...options,

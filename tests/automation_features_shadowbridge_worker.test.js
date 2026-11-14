@@ -14,7 +14,11 @@ const {
   createShadowbridgeWorker,
   readStamina,
 } = require('../src/features/automation/shadowbridge-worker');
-const { progressDetails } = require('../src/features/automation/shadowbridge-status');
+const {
+  createShadowbridgeStatusView,
+  progressDetails,
+  targetCounts,
+} = require('../src/features/automation/shadowbridge-status');
 const { KILL_SELECTED_KEY, createKillSelectedRequest } = require('../src/routes/shadowbridge');
 
 const NOW = 1_800_000_000_000;
@@ -290,6 +294,29 @@ test('formats Shadowbridge progress for damage targets and kill targets', () => 
     percent: 25,
     text: '7,500 / 10,000 monster HP · 3 attack(s)',
   });
+});
+
+test('Shadowbridge overview keeps the active monster first and counts the complete Warren plan', () => {
+  const view = createShadowbridgeStatusView(null);
+  view.begin();
+  view.setPlan([
+    { key: 'gate-1:a', name: 'First Gate A' },
+    { key: 'gate-1:b', name: 'First Gate B' },
+    { key: 'gate-2:c', name: 'Second Gate C' },
+  ]);
+  view.updateTarget('gate-1:b', { status: 'active' });
+
+  let snapshot = view.snapshot();
+  assert.deepEqual(snapshot.entries.map((entry) => entry.key), ['gate-1:b', 'gate-1:a', 'gate-2:c']);
+  assert.deepEqual(snapshot.counts, { attacked: 1, total: 3, waiting: 2 });
+
+  view.updateTarget('gate-1:b', { status: 'completed' });
+  view.updateTarget('gate-2:c', { status: 'active' });
+  view.setPlan([{ key: 'gate-3:d', name: 'Third Gate D' }]);
+  snapshot = view.snapshot();
+  assert.deepEqual(snapshot.entries.map((entry) => entry.key), ['gate-2:c', 'gate-1:a', 'gate-1:b', 'gate-3:d']);
+  assert.deepEqual(snapshot.counts, { attacked: 2, total: 4, waiting: 2 });
+  assert.deepEqual(targetCounts(snapshot.entries), { attacked: 2, total: 4, waiting: 2 });
 });
 
 test('does not fetch or mutate when a different tab owns the scheduler lease', async () => {

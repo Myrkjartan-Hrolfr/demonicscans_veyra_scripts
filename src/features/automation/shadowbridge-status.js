@@ -21,6 +21,7 @@ const STYLES = `
   }
   #${PANEL_ID} .sbp-title { font-size: 14px; font-weight: 900; }
   #${PANEL_ID} .sbp-summary { margin-top: 3px; color: #aeb5d5; font-size: 11px; overflow-wrap: anywhere; }
+  #${PANEL_ID} .sbp-total { margin-top: 4px; color: #cdd2eb; font-size: 10px; font-weight: 800; }
   #${PANEL_ID} .sbp-toggle {
     width: 34px; height: 32px; padding: 0; border: 1px solid #3b3e59; border-radius: 9px;
     background: #292b40; color: #fff; font: 900 17px/1 Arial,sans-serif; cursor: pointer;
@@ -112,11 +113,19 @@ function progressDetails(entry = {}) {
   };
 }
 
+function targetCounts(entries = []) {
+  const values = entries instanceof Map ? [...entries.values()] : [...entries];
+  const total = values.length;
+  const attacked = values.filter((entry) => ['active', 'completed', 'error'].includes(String(entry?.status || 'queued'))).length;
+  return { attacked, total, waiting: Math.max(0, total - attacked) };
+}
+
 function createShadowbridgeStatusView(doc, options = {}) {
   const title = String(options.title || 'Shadowbridge attack progress');
   const idleText = String(options.idleText || 'Scanning dungeon…');
   const workingText = String(options.workingText || 'Dungeon attack is working…');
   const fallbackTargetName = String(options.fallbackTargetName || 'Dungeon monster');
+  const totalLabel = String(options.totalLabel || 'Warren monsters');
   const state = {
     active: false,
     collapsed: false,
@@ -130,6 +139,7 @@ function createShadowbridgeStatusView(doc, options = {}) {
   let panel = null;
   let list = null;
   let summary = null;
+  let total = null;
   let toggle = null;
 
   function make(tagName, className = '', text = '') {
@@ -168,6 +178,8 @@ function createShadowbridgeStatusView(doc, options = {}) {
     copy.appendChild(make('div', 'sbp-title', title));
     summary = make('div', 'sbp-summary', state.summary || idleText);
     copy.appendChild(summary);
+    total = make('div', 'sbp-total');
+    copy.appendChild(total);
     toggle = make('button', 'sbp-toggle', '−');
     toggle.type = 'button';
     toggle.title = 'Collapse progress';
@@ -193,8 +205,16 @@ function createShadowbridgeStatusView(doc, options = {}) {
     panel.dataset.state = state.phase;
     panel.dataset.collapsed = String(state.collapsed);
     summary.textContent = state.summary || workingText;
+    const counts = targetCounts(state.entries);
+    total.textContent = counts.total
+      ? `${totalLabel}: ${counts.attacked} attacked / ${counts.total} total · ${counts.waiting} waiting`
+      : `${totalLabel}: scanning…`;
     const rows = [];
-    for (const key of state.order) {
+    const displayOrder = [
+      ...state.order.filter((key) => state.entries.get(key)?.status === 'active'),
+      ...state.order.filter((key) => state.entries.get(key)?.status !== 'active'),
+    ];
+    for (const key of displayOrder) {
       const entry = state.entries.get(key);
       if (!entry) continue;
       const details = progressDetails(entry);
@@ -269,11 +289,16 @@ function createShadowbridgeStatusView(doc, options = {}) {
   }
 
   function snapshot() {
+    const displayOrder = [
+      ...state.order.filter((key) => state.entries.get(key)?.status === 'active'),
+      ...state.order.filter((key) => state.entries.get(key)?.status !== 'active'),
+    ];
     return {
       active: state.active,
       phase: state.phase,
       summary: state.summary,
-      entries: state.order.map((key) => ({ ...state.entries.get(key), progress: progressDetails(state.entries.get(key)) })),
+      counts: targetCounts(state.entries),
+      entries: displayOrder.map((key) => ({ ...state.entries.get(key), progress: progressDetails(state.entries.get(key)) })),
     };
   }
 
@@ -282,6 +307,7 @@ function createShadowbridgeStatusView(doc, options = {}) {
     panel = null;
     list = null;
     summary = null;
+    total = null;
     toggle = null;
     state.active = false;
   }
@@ -294,4 +320,5 @@ module.exports = {
   STYLE_ID,
   createShadowbridgeStatusView,
   progressDetails,
+  targetCounts,
 };
