@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.9.15
+// @version      0.9.16
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -40,6 +40,11 @@
   'use strict';
 
   const __modules = {
+  "build-profile.js": function (module, exports, require) {
+    'use strict';
+
+    module.exports = Object.freeze({"variant":"full","includeShadowbridge":true});
+  },
   "core/crucible-debug.js": function (module, exports, require) {
     'use strict';
 
@@ -6821,6 +6826,7 @@
   "features/automation/index.js": function (module, exports, require) {
     'use strict';
 
+    const buildProfile = require('../../build-profile');
     const { adventurersWorkerFeature } = require('./adventurers-worker');
     const { bossWorkerFeature } = require('./boss-worker');
     const { crucibleWorkerFeature } = require('./crucible-worker');
@@ -6833,7 +6839,7 @@
       bossWorkerFeature,
       pvpWorkerFeature,
       adventurersWorkerFeature,
-      shadowbridgeWorkerFeature,
+      ...(buildProfile.includeShadowbridge ? [shadowbridgeWorkerFeature] : []),
       princeWorkerFeature,
       crucibleWorkerFeature,
       cruciblePvpWatcherFeature,
@@ -25210,6 +25216,7 @@
     // createDefaultSettings(), normalizeSettings(saved),
     // finalizeRouteConfig(routeConfig, savedRoute) and renderSettings(ctx).
 
+    const buildProfile = require('../build-profile');
     const olympus = require('./olympus');
     const pvp = require('./pvp');
     const adventurers = require('./adventurers');
@@ -25218,7 +25225,15 @@
     const prince = require('./prince');
     const wave3 = require('./wave3');
 
-    const ROUTE_LIST = Object.freeze([pvp, wave3, olympus, adventurers, shadowbridge, prince, crucible]);
+    const ROUTE_LIST = Object.freeze([
+      pvp,
+      wave3,
+      olympus,
+      adventurers,
+      ...(buildProfile.includeShadowbridge ? [shadowbridge] : []),
+      prince,
+      crucible,
+    ]);
     const ROUTES = Object.freeze(Object.fromEntries(ROUTE_LIST.map((route) => [route.id, route])));
     const ROUTE_IDS = Object.freeze(ROUTE_LIST.map((route) => route.id));
 

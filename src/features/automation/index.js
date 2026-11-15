@@ -1,5 +1,6 @@
 'use strict';
 
+const buildProfile = require('../../build-profile');
 const { adventurersWorkerFeature } = require('./adventurers-worker');
 const { bossWorkerFeature } = require('./boss-worker');
 const { crucibleWorkerFeature } = require('./crucible-worker');
@@ -12,7 +13,7 @@ module.exports = [
   bossWorkerFeature,
   pvpWorkerFeature,
   adventurersWorkerFeature,
-  shadowbridgeWorkerFeature,
+  ...(buildProfile.includeShadowbridge ? [shadowbridgeWorkerFeature] : []),
   princeWorkerFeature,
   crucibleWorkerFeature,
   cruciblePvpWatcherFeature,

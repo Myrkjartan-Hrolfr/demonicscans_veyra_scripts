@@ -25,7 +25,7 @@ const {
 } = require('../src/scheduler/runtime');
 const { createSchedulerEngine } = require('../src/scheduler/engine');
 const { countdownText } = require('../src/scheduler/ui');
-const { build } = require('../build');
+const { build, buildComunityVersion } = require('../build');
 
 const NOW = 1_800_000_000_000;
 
@@ -399,4 +399,30 @@ test('the bundle builds and evaluates without errors', () => {
   assert.match(source, /Status Potion Auto Use/);
   // Without window/document the entry module must do nothing.
   vm.runInNewContext(source, { console, URL, URLSearchParams }, { filename: path.basename(outFile) });
+});
+
+test('the community-version bundle uses its own identity and excludes the Shadowbridge runtime profile', () => {
+  const { outFile, profile } = buildComunityVersion();
+  const source = fs.readFileSync(outFile, 'utf8');
+  assert.deepEqual(profile, { variant: 'comunity-version', includeShadowbridge: false });
+  assert.match(source, /@name\s+Veyra - Automation Community Version/);
+  assert.match(source, /@namespace\s+local\.veyra\.automation\.comunity-version/);
+  assert.match(source, /"variant":"comunity-version","includeShadowbridge":false/);
+  vm.runInNewContext(source, { console, URL, URLSearchParams }, { filename: path.basename(outFile) });
+
+  const inspectedSource = source.replace(
+    '  __require("main.js");',
+    '  globalThis.__liteRouteIds = __require("routes/index.js").ROUTE_IDS;\n' +
+      '  globalThis.__liteAutomationFeatures = __require("features/automation/index.js").map((feature) => feature.id);',
+  );
+  const context = { console, URL, URLSearchParams };
+  vm.runInNewContext(inspectedSource, context, { filename: `inspect-${path.basename(outFile)}` });
+  const routeIds = Array.from(context.__liteRouteIds);
+  const featureIds = Array.from(context.__liteAutomationFeatures);
+  assert.equal(routeIds.includes('shadowbridge'), false);
+  assert.equal(featureIds.includes('shadowbridge-worker'), false);
+  assert.equal(routeIds.includes('prince'), true);
+  assert.equal(routeIds.includes('crucible'), true);
+  assert.equal(featureIds.includes('prince-worker'), true);
+  assert.equal(featureIds.includes('crucible-worker'), true);
 });

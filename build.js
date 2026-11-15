@@ -9,10 +9,13 @@ const path = require('node:path');
 const ROOT = __dirname;
 const SRC_DIR = path.join(ROOT, 'src');
 const HEADER_FILE = path.join(SRC_DIR, 'userscript.header');
+const COMUNITY_VERSION_HEADER_FILE = path.join(SRC_DIR, 'userscript.comunity-version.header');
 const AUTO_BATTLE_EXTRAS_FILE = path.join(ROOT, 'Auto Battle Extras.user.js');
 const AUTO_BATTLE_EXTRAS_MODULE = 'features/general/auto-battle-extras.js';
+const BUILD_PROFILE_MODULE = 'build-profile.js';
 const ENTRY = 'main.js';
 const OUT_FILE = path.join(ROOT, 'dist', 'veyra_automation.user.js');
+const COMUNITY_VERSION_OUT_FILE = path.join(ROOT, 'dist', 'veyra_automation_comunity_version.user.js');
 
 function collectModules(dir) {
   const modules = [];
@@ -95,18 +98,19 @@ const RUNTIME = `
   }
 `;
 
-function build() {
-  const header = fs.readFileSync(HEADER_FILE, 'utf8').trimEnd();
+function buildBundle({ headerFile, outFile, profile }) {
+  const header = fs.readFileSync(headerFile, 'utf8').trimEnd();
   const files = collectModules(SRC_DIR).sort();
   const ids = files.map(moduleId);
   if (!ids.includes(ENTRY)) throw new Error(`Entry module src/${ENTRY} is missing.`);
 
   const moduleSources = files.map((file) => {
     const id = moduleId(file);
-    const source =
-      id === AUTO_BATTLE_EXTRAS_MODULE
-        ? autoBattleExtrasModuleSource()
-        : fs.readFileSync(file, 'utf8').trimEnd();
+    let source;
+    if (id === AUTO_BATTLE_EXTRAS_MODULE) source = autoBattleExtrasModuleSource();
+    else if (id === BUILD_PROFILE_MODULE) {
+      source = `'use strict';\n\nmodule.exports = Object.freeze(${JSON.stringify(profile)});`;
+    } else source = fs.readFileSync(file, 'utf8').trimEnd();
     return `  ${JSON.stringify(id)}: function (module, exports, require) {\n${indent(source, '    ')}\n  },`;
   });
 
@@ -126,14 +130,31 @@ function build() {
     '',
   ].join('\n');
 
-  fs.mkdirSync(path.dirname(OUT_FILE), { recursive: true });
-  fs.writeFileSync(OUT_FILE, output);
-  return { outFile: OUT_FILE, modules: ids };
+  fs.mkdirSync(path.dirname(outFile), { recursive: true });
+  fs.writeFileSync(outFile, output);
+  return { outFile, modules: ids, profile };
+}
+
+function build() {
+  return buildBundle({
+    headerFile: HEADER_FILE,
+    outFile: OUT_FILE,
+    profile: { variant: 'full', includeShadowbridge: true },
+  });
+}
+
+function buildComunityVersion() {
+  return buildBundle({
+    headerFile: COMUNITY_VERSION_HEADER_FILE,
+    outFile: COMUNITY_VERSION_OUT_FILE,
+    profile: { variant: 'comunity-version', includeShadowbridge: false },
+  });
 }
 
 if (require.main === module) {
-  const { outFile, modules } = build();
-  console.log(`Built ${path.relative(ROOT, outFile)} from ${modules.length} modules.`);
+  for (const result of [build(), buildComunityVersion()]) {
+    console.log(`Built ${path.relative(ROOT, result.outFile)} from ${result.modules.length} modules (${result.profile.variant}).`);
+  }
 }
 
-module.exports = { build };
+module.exports = { build, buildBundle, buildComunityVersion };

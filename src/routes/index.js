@@ -8,6 +8,7 @@
 // createDefaultSettings(), normalizeSettings(saved),
 // finalizeRouteConfig(routeConfig, savedRoute) and renderSettings(ctx).
 
+const buildProfile = require('../build-profile');
 const olympus = require('./olympus');
 const pvp = require('./pvp');
 const adventurers = require('./adventurers');
@@ -16,7 +17,15 @@ const shadowbridge = require('./shadowbridge');
 const prince = require('./prince');
 const wave3 = require('./wave3');
 
-const ROUTE_LIST = Object.freeze([pvp, wave3, olympus, adventurers, shadowbridge, prince, crucible]);
+const ROUTE_LIST = Object.freeze([
+  pvp,
+  wave3,
+  olympus,
+  adventurers,
+  ...(buildProfile.includeShadowbridge ? [shadowbridge] : []),
+  prince,
+  crucible,
+]);
 const ROUTES = Object.freeze(Object.fromEntries(ROUTE_LIST.map((route) => [route.id, route])));
 const ROUTE_IDS = Object.freeze(ROUTE_LIST.map((route) => route.id));
 
