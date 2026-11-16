@@ -6,6 +6,12 @@
 // then shows whatever the route itself renders.
 
 const { POTION_TYPES, potionsOfType } = require('../core/potions');
+const {
+  appendAttackDebugLog,
+  clearAttackDebugLog,
+  formatAttackDebugLog,
+  readAttackDebugLog,
+} = require('../core/attack-debug');
 const { formatCountdown } = require('../core/time');
 const { ROUTE_LIST, getRoute } = require('../routes');
 const { CONFIG_KEY, MAX_LOOP_MINUTES, MIN_LOOP_MINUTES } = require('./config');
@@ -301,6 +307,7 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
 
       setUseGlobalPattern(enabled) {
         saveRouteGlobalPattern(store, routeId, enabled);
+        appendAttackDebugLog(store, 'attack-ui', 'route global pattern toggled', { routeId, enabled: enabled === true });
         return enabled === true;
       },
 
@@ -469,6 +476,7 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
           latest.attack.globalPattern = next;
           state.actions.saveConfig(latest);
           saveGlobalPattern(store, next);
+          appendAttackDebugLog(store, 'attack-ui', 'global pattern saved', next);
           if (rerender) render(content);
         },
       });
@@ -476,6 +484,47 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
         className: cls('hint'),
         text: 'Class attacks appear here after they have been detected on a battle page for this character.',
       }));
+      content.appendChild(make('div', { className: cls('section-title'), text: 'Attack diagnostics' }));
+      const diagnostics = make('div', { className: cls('setting') });
+      const output = make('textarea', { className: cls('input') });
+      output.readOnly = true;
+      output.rows = 14;
+      output.value = formatAttackDebugLog(readAttackDebugLog(store));
+      output.style.minHeight = '240px';
+      output.style.resize = 'vertical';
+      output.style.fontFamily = 'ui-monospace, SFMono-Regular, Consolas, monospace';
+      output.style.fontSize = '10px';
+      diagnostics.appendChild(output);
+      const buttons = make('div');
+      buttons.style.display = 'flex';
+      buttons.style.flexWrap = 'wrap';
+      buttons.style.gap = '8px';
+      const refresh = make('button', { className: cls('primary'), type: 'button', text: 'Refresh log' });
+      const copy = make('button', { className: cls('primary'), type: 'button', text: 'Copy log' });
+      const clear = make('button', { className: cls('primary'), type: 'button', text: 'Clear log' });
+      const refreshOutput = () => {
+        output.value = formatAttackDebugLog(readAttackDebugLog(store));
+        output.scrollTop = output.scrollHeight || 0;
+      };
+      refresh.addEventListener('click', refreshOutput);
+      copy.addEventListener('click', async () => {
+        refreshOutput();
+        try {
+          await win.navigator.clipboard.writeText(output.value);
+          copy.textContent = 'Copied';
+        } catch {
+          output.focus?.();
+          output.select?.();
+          copy.textContent = doc.execCommand?.('copy') ? 'Copied' : 'Select and copy';
+        }
+      });
+      clear.addEventListener('click', () => {
+        clearAttackDebugLog(store);
+        refreshOutput();
+      });
+      buttons.append(refresh, copy, clear);
+      diagnostics.appendChild(buttons);
+      content.appendChild(diagnostics);
     };
     openView('Attack · Settings', render);
     void refreshClassCatalog().then((changed) => {

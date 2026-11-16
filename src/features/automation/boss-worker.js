@@ -15,6 +15,7 @@ const { COMMAND_KEY, publishWorkerStatus } = require('../../core/protocol');
 const { createJsonStore, getStorage } = require('../../core/storage');
 const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
 const { effectiveGlobalPattern, effectiveRouteGlobalPattern } = require('../../scheduler/attack-settings');
+const { appendAttackDebugLog } = require('../../core/attack-debug');
 const mabBridge = require('../battle/mab-bridge');
 const dom = require('./boss-dom');
 const logic = require('./boss-logic');
@@ -818,10 +819,19 @@ function createBossWorker({
         useSpecific: bossSettings.specificPatternEnabled === true,
         specificPattern: bossSettings.specificPattern,
       };
+      appendAttackDebugLog(store, 'boss-worker', 'configuring monster auto battle', {
+        routeId: run.routeId,
+        bossId: run.target.bossId,
+        monsterId: run.target.monsterId,
+        attackPlan,
+        potions,
+        damageTarget,
+      });
       const attackConfigured = typeof controller.setAttackPlan === 'function'
         ? controller.setAttackPlan(attackPlan)
         : controller.setAttacks(skills);
       if (attackConfigured === false) {
+        appendAttackDebugLog(store, 'boss-worker', 'attack plan rejected by controller', attackPlan);
         detachFight();
         finish(run, 'error', 'None of the configured attacks is available in Monster Auto Battle.', t);
         return;

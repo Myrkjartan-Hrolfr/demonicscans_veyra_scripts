@@ -5,6 +5,7 @@
 // sequentially. Every mutation is guarded by the current visit id and lease.
 
 const { parseFraction, parseGameNumber } = require('../../core/numbers');
+const { appendAttackDebugLog } = require('../../core/attack-debug');
 const {
   appendCrucibleDebugLog,
   sanitize,
@@ -530,6 +531,13 @@ function createCrucibleWorker({
       throw new Error(`The specific attack pattern for ${target.name || 'the Crucible monster'} is empty.`);
     }
     const fallbackSkill = dungeonLogic.skillForId(route.settings.skill);
+    appendAttackDebugLog(store, 'crucible-worker', 'attack pattern resolved', {
+      target: target.name,
+      specificPattern,
+      globalPattern,
+      selectedPattern: attackPattern,
+      fallbackSkill: route.settings.skill,
+    });
     if (!fallbackSkill) throw new Error('The selected Crucible PvE skill is invalid.');
     const resources = createResourceManager(visitId, route, battle.doc);
     let ownDamage = battle.snapshot.ownDamage;
@@ -565,6 +573,12 @@ function createCrucibleWorker({
         },
       });
       const result = dungeonLogic.parseAttackResponse(response);
+      appendAttackDebugLog(store, 'crucible-worker', 'attack result', {
+        target: target.name,
+        skill: { id: skill.id, name: skill.name },
+        attempt: attempts,
+        result,
+      });
       if (!result.ok) {
         if (/not enough stamina|insufficient stamina/i.test(result.message)) {
           await resources.ensureStamina(effectiveStaminaCost, true, !attackPattern || attackPattern.useStaminaPotions);

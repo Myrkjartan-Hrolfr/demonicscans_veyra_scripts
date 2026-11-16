@@ -45,6 +45,74 @@
 
     module.exports = Object.freeze({"variant":"comunity-version","includeShadowbridge":false});
   },
+  "core/attack-debug.js": function (module, exports, require) {
+    'use strict';
+
+    const { sanitize } = require('./crucible-debug');
+
+    const ATTACK_DEBUG_LOG_KEY = 'veyra:attack:debug-log:v1';
+    const MAX_ENTRIES = 500;
+
+    function normalize(value) {
+      const entries = [];
+      for (const raw of Array.isArray(value?.entries) ? value.entries.slice(-MAX_ENTRIES) : []) {
+        const at = Number(raw?.at);
+        if (!Number.isFinite(at)) continue;
+        entries.push({
+          at,
+          source: String(raw?.source || 'attack').slice(0, 60),
+          event: String(raw?.event || 'event').slice(0, 140),
+          details: sanitize(raw?.details),
+        });
+      }
+      return { version: 1, entries };
+    }
+
+    function readAttackDebugLog(store) {
+      try {
+        return normalize(store?.read?.(ATTACK_DEBUG_LOG_KEY));
+      } catch {
+        return normalize(null);
+      }
+    }
+
+    function appendAttackDebugLog(store, source, event, details = null, now = Date.now()) {
+      try {
+        const log = readAttackDebugLog(store);
+        log.entries.push({ at: Number(now) || Date.now(), source, event, details: sanitize(details) });
+        if (log.entries.length > MAX_ENTRIES) log.entries.splice(0, log.entries.length - MAX_ENTRIES);
+        return store?.write?.(ATTACK_DEBUG_LOG_KEY, log) !== false;
+      } catch {
+        return false;
+      }
+    }
+
+    function clearAttackDebugLog(store) {
+      try {
+        store?.remove?.(ATTACK_DEBUG_LOG_KEY);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    function formatAttackDebugLog(value) {
+      const log = normalize(value);
+      if (!log.entries.length) return 'No attack diagnostic entries recorded.';
+      return log.entries.map((entry) => {
+        const details = entry.details == null ? '' : ` ${JSON.stringify(entry.details)}`;
+        return `[${new Date(entry.at).toISOString()}] [${entry.source}] ${entry.event}${details}`;
+      }).join('\n');
+    }
+
+    module.exports = {
+      ATTACK_DEBUG_LOG_KEY,
+      appendAttackDebugLog,
+      clearAttackDebugLog,
+      formatAttackDebugLog,
+      readAttackDebugLog,
+    };
+  },
   "core/crucible-debug.js": function (module, exports, require) {
     'use strict';
 
@@ -3053,6 +3121,7 @@
     const { createJsonStore, getStorage } = require('../../core/storage');
     const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
     const { effectiveGlobalPattern, effectiveRouteGlobalPattern } = require('../../scheduler/attack-settings');
+    const { appendAttackDebugLog } = require('../../core/attack-debug');
     const mabBridge = require('../battle/mab-bridge');
     const dom = require('./boss-dom');
     const logic = require('./boss-logic');
@@ -3856,10 +3925,19 @@
             useSpecific: bossSettings.specificPatternEnabled === true,
             specificPattern: bossSettings.specificPattern,
           };
+          appendAttackDebugLog(store, 'boss-worker', 'configuring monster auto battle', {
+            routeId: run.routeId,
+            bossId: run.target.bossId,
+            monsterId: run.target.monsterId,
+            attackPlan,
+            potions,
+            damageTarget,
+          });
           const attackConfigured = typeof controller.setAttackPlan === 'function'
             ? controller.setAttackPlan(attackPlan)
             : controller.setAttacks(skills);
           if (attackConfigured === false) {
+            appendAttackDebugLog(store, 'boss-worker', 'attack plan rejected by controller', attackPlan);
             detachFight();
             finish(run, 'error', 'None of the configured attacks is available in Monster Auto Battle.', t);
             return;
@@ -5396,6 +5474,7 @@
     // sequentially. Every mutation is guarded by the current visit id and lease.
 
     const { parseFraction, parseGameNumber } = require('../../core/numbers');
+    const { appendAttackDebugLog } = require('../../core/attack-debug');
     const {
       appendCrucibleDebugLog,
       sanitize,
@@ -5921,6 +6000,13 @@
           throw new Error(`The specific attack pattern for ${target.name || 'the Crucible monster'} is empty.`);
         }
         const fallbackSkill = dungeonLogic.skillForId(route.settings.skill);
+        appendAttackDebugLog(store, 'crucible-worker', 'attack pattern resolved', {
+          target: target.name,
+          specificPattern,
+          globalPattern,
+          selectedPattern: attackPattern,
+          fallbackSkill: route.settings.skill,
+        });
         if (!fallbackSkill) throw new Error('The selected Crucible PvE skill is invalid.');
         const resources = createResourceManager(visitId, route, battle.doc);
         let ownDamage = battle.snapshot.ownDamage;
@@ -5956,6 +6042,12 @@
             },
           });
           const result = dungeonLogic.parseAttackResponse(response);
+          appendAttackDebugLog(store, 'crucible-worker', 'attack result', {
+            target: target.name,
+            skill: { id: skill.id, name: skill.name },
+            attempt: attempts,
+            result,
+          });
           if (!result.ok) {
             if (/not enough stamina|insufficient stamina/i.test(result.message)) {
               await resources.ensureStamina(effectiveStaminaCost, true, !attackPattern || attackPattern.useStaminaPotions);
@@ -8906,6 +8998,7 @@
     // only by the tab that owns the scheduler lease.
 
     const { parseFraction, parseGameNumber } = require('../../core/numbers');
+    const { appendAttackDebugLog } = require('../../core/attack-debug');
     const { COMMAND_KEY, normalizeVisit, publishWorkerStatus } = require('../../core/protocol');
     const { pickPotion, readPotionInventory, usePotion } = require('../../core/potions');
     const { createJsonStore, getStorage } = require('../../core/storage');
@@ -9340,6 +9433,13 @@
           : null;
         const attackPattern = specificPattern?.skillIds.length ? specificPattern : globalPattern?.skillIds.length ? globalPattern : null;
         const attackCatalog = new Map(availableAttacks(route.attack).map((attack) => [attack.id, attack]));
+        appendAttackDebugLog(store, `${routeId}-worker`, 'attack pattern resolved', {
+          target: target.name,
+          specificPattern,
+          globalPattern,
+          selectedPattern: attackPattern,
+          fallbackSkill: route.settings.skill,
+        });
         if (target.target.specificPatternEnabled && !specificPattern?.skillIds.length) {
           throw new Error(`The specific attack pattern for ${target.name || workerName} is empty.`);
         }
@@ -9394,6 +9494,12 @@
             },
           });
           const result = logic.parseAttackResponse(response);
+          appendAttackDebugLog(store, `${routeId}-worker`, 'attack result', {
+            target: target.name,
+            skill: { id: skill.id, name: skill.name },
+            attempt: attempts,
+            result,
+          });
           if (!result.ok) {
             if (/not enough stamina|insufficient stamina/i.test(result.message)) {
               await resources.ensureStamina(
@@ -9982,6 +10088,14 @@
         // selected attacks remain in slots 1-3 as fallbacks after the pattern.
         setAttackPlan(plan = {}) {
           engine.discoverAttacks();
+          engine.debug('controller received attack plan', {
+            useGlobal: plan.useGlobal === true,
+            useSpecific: plan.useSpecific === true,
+            globalPattern: plan.globalPattern,
+            specificPattern: plan.specificPattern,
+            fallbackSkillIds: plan.fallbackSkillIds,
+            liveAttacks: state.attacks.map((attack) => ({ key: attack.key, skillId: attack.skillId, costs: attack.costs })),
+          });
           const fallbackKeys = mapSkillIdsToAttackKeys(state.attacks, plan.fallbackSkillIds || []);
           if (fallbackKeys) state.settings.attackKeys = fallbackKeys;
           const source = plan.useSpecific ? plan.specificPattern : plan.useGlobal ? plan.globalPattern : null;
@@ -9995,7 +10109,10 @@
             const skillId = String(rawId);
             const matches = state.attacks.filter((attack) => attack.skillId === skillId);
             const attack = matches.find((candidate) => candidate.group === GROUP_STANDARD) || matches[0];
-            if (!attack) return false;
+            if (!attack) {
+              engine.debug('controller rejected unavailable pattern skill', { skillId, source });
+              return false;
+            }
             attackKeys.push(attack.key);
           }
           if (!attackKeys.length) return false;
@@ -10012,6 +10129,11 @@
             state.settings.globalPattern = pattern;
           }
           afterSettingsChange();
+          engine.debug('controller applied attack plan', {
+            primaryMode: state.settings.primaryMode,
+            pattern,
+            fallbackKeys: state.settings.attackKeys,
+          });
           return true;
         },
 
@@ -10189,6 +10311,7 @@
     function createEngine(options) {
       const { doc, win, postForm, settingsStore, resumeStore } = options;
       const warn = options.warn || noop;
+      const debug = options.debug || noop;
 
       const ui = {
         setStatus: noop,
@@ -10949,6 +11072,14 @@
         const pattern = selectedPattern(state.settings, getMonsterId());
         if (!pattern) return null;
         const sequence = pattern.attackKeys.map((key) => findAttack(state.attacks, key)).filter(Boolean);
+        debug('pattern prepare', {
+          mode: state.settings.primaryMode,
+          monsterId: getMonsterId(),
+          index: state.patternIndex,
+          configuredKeys: pattern.attackKeys,
+          availableAttacks: state.attacks.map((attack) => ({ key: attack.key, costs: attack.costs })),
+          resolvedSequence: sequence.map((attack) => attack.key),
+        });
         if (!sequence.length) {
           stop('The selected attack pattern is empty.', 'error', 'error');
           return { handled: true };
@@ -10986,6 +11117,14 @@
             }
           }
           log(`Starting attack pattern (${sequence.length} attacks, ${formatNumber(costs.stamina)} STA / ${formatNumber(costs.mana)} MP).`);
+          debug('pattern loop admitted', {
+            length: sequence.length,
+            costs,
+            stamina: getCurrentStamina(),
+            mana: getCurrentMana(),
+            useStaminaPotions: pattern.useStaminaPotions,
+            useManaPotions: pattern.useManaPotions,
+          });
         }
 
         const attack = sequence[state.patternIndex % sequence.length];
@@ -11261,6 +11400,7 @@
 
       // Ends the run (or records why a run could not start).
       function stop(message = 'Stopped manually.', tone = 'idle', reason = 'stopped') {
+        debug('engine stopped', { message, tone, reason, patternIndex: state.patternIndex, running: state.running });
         state.running = false;
         state.finished = true;
         state.reason = reason;
@@ -11301,6 +11441,12 @@
 
         const problem = state.card ? validateSettings() : 'No monster card with attack buttons was found.';
         if (problem) {
+          debug('start validation failed', {
+            problem,
+            primaryMode: state.settings.primaryMode,
+            monsterId: getMonsterId(),
+            attackKeys: state.settings.attackKeys,
+          });
           state.finished = true;
           state.reason = 'error';
           setStatus(problem, 'error');
@@ -11334,6 +11480,12 @@
         state.finished = false;
         state.reason = null;
         state.running = true;
+        debug('engine started', {
+          resumed: Boolean(resumeData),
+          monsterId: getMonsterId(),
+          primaryMode: state.settings.primaryMode,
+          patternIndex: state.patternIndex,
+        });
 
         ui.updateButtons();
         refreshMetrics();
@@ -11395,6 +11547,13 @@
 
             log(`${attackLabel}: ${prepared.attack.name}.`);
             const outcome = await performAttack(prepared.attack, button, beforeDamage, beforeExperience, beforeFeedback);
+            debug('attack outcome', {
+              attack: prepared.attack.key,
+              isPattern: prepared.isPattern === true,
+              patternIndex: state.patternIndex,
+              patternLength: prepared.patternLength,
+              outcome,
+            });
             if (!state.running) break;
 
             if (outcome.type === 'damage' || outcome.type === 'success') {
@@ -11404,6 +11563,7 @@
               state.lastDamage = Math.max(0, outcome.damage || 0);
               state.sessionDamage += state.lastDamage;
               if (prepared.isPattern) state.patternIndex = (state.patternIndex + 1) % prepared.patternLength;
+              if (prepared.isPattern) debug('pattern advanced', { nextIndex: state.patternIndex });
 
               if (outcome.mode === 'api') {
                 const wasPoisonActive = state.poisonActive;
@@ -11516,6 +11676,7 @@
         setCard,
         setStatus,
         log,
+        debug,
         start,
         stop,
         subscribe,
@@ -12725,6 +12886,7 @@
     const { ID, createResumeStore, createSettingsStore, resumeKey, settingsKey } = require('./mab-settings');
     const { CONFIG_KEY } = require('../../scheduler/config');
     const { cacheClassAttacks } = require('../../scheduler/attack-settings');
+    const { appendAttackDebugLog } = require('../../core/attack-debug');
 
     function isBattlePage(url) {
       return /\/battle\.php$/i.test(url?.pathname || '');
@@ -12753,6 +12915,7 @@
         postForm: ctx.postForm,
         settingsStore: createSettingsStore(storageOf(win, 'localStorage'), settingsKey(host, pathname), warn),
         resumeStore: createResumeStore(storageOf(win, 'sessionStorage'), resumeKey(host, pathname)),
+        debug: (event, details) => appendAttackDebugLog(ctx.store, 'mab-engine', event, details),
         warn,
       });
       const { state } = engine;
@@ -28131,6 +28294,12 @@
     // then shows whatever the route itself renders.
 
     const { POTION_TYPES, potionsOfType } = require('../core/potions');
+    const {
+      appendAttackDebugLog,
+      clearAttackDebugLog,
+      formatAttackDebugLog,
+      readAttackDebugLog,
+    } = require('../core/attack-debug');
     const { formatCountdown } = require('../core/time');
     const { ROUTE_LIST, getRoute } = require('../routes');
     const { CONFIG_KEY, MAX_LOOP_MINUTES, MIN_LOOP_MINUTES } = require('./config');
@@ -28426,6 +28595,7 @@
 
           setUseGlobalPattern(enabled) {
             saveRouteGlobalPattern(store, routeId, enabled);
+            appendAttackDebugLog(store, 'attack-ui', 'route global pattern toggled', { routeId, enabled: enabled === true });
             return enabled === true;
           },
 
@@ -28594,6 +28764,7 @@
               latest.attack.globalPattern = next;
               state.actions.saveConfig(latest);
               saveGlobalPattern(store, next);
+              appendAttackDebugLog(store, 'attack-ui', 'global pattern saved', next);
               if (rerender) render(content);
             },
           });
@@ -28601,6 +28772,47 @@
             className: cls('hint'),
             text: 'Class attacks appear here after they have been detected on a battle page for this character.',
           }));
+          content.appendChild(make('div', { className: cls('section-title'), text: 'Attack diagnostics' }));
+          const diagnostics = make('div', { className: cls('setting') });
+          const output = make('textarea', { className: cls('input') });
+          output.readOnly = true;
+          output.rows = 14;
+          output.value = formatAttackDebugLog(readAttackDebugLog(store));
+          output.style.minHeight = '240px';
+          output.style.resize = 'vertical';
+          output.style.fontFamily = 'ui-monospace, SFMono-Regular, Consolas, monospace';
+          output.style.fontSize = '10px';
+          diagnostics.appendChild(output);
+          const buttons = make('div');
+          buttons.style.display = 'flex';
+          buttons.style.flexWrap = 'wrap';
+          buttons.style.gap = '8px';
+          const refresh = make('button', { className: cls('primary'), type: 'button', text: 'Refresh log' });
+          const copy = make('button', { className: cls('primary'), type: 'button', text: 'Copy log' });
+          const clear = make('button', { className: cls('primary'), type: 'button', text: 'Clear log' });
+          const refreshOutput = () => {
+            output.value = formatAttackDebugLog(readAttackDebugLog(store));
+            output.scrollTop = output.scrollHeight || 0;
+          };
+          refresh.addEventListener('click', refreshOutput);
+          copy.addEventListener('click', async () => {
+            refreshOutput();
+            try {
+              await win.navigator.clipboard.writeText(output.value);
+              copy.textContent = 'Copied';
+            } catch {
+              output.focus?.();
+              output.select?.();
+              copy.textContent = doc.execCommand?.('copy') ? 'Copied' : 'Select and copy';
+            }
+          });
+          clear.addEventListener('click', () => {
+            clearAttackDebugLog(store);
+            refreshOutput();
+          });
+          buttons.append(refresh, copy, clear);
+          diagnostics.appendChild(buttons);
+          content.appendChild(diagnostics);
         };
         openView('Attack · Settings', render);
         void refreshClassCatalog().then((changed) => {

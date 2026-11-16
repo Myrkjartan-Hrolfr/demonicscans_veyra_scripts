@@ -6,6 +6,7 @@
 // only by the tab that owns the scheduler lease.
 
 const { parseFraction, parseGameNumber } = require('../../core/numbers');
+const { appendAttackDebugLog } = require('../../core/attack-debug');
 const { COMMAND_KEY, normalizeVisit, publishWorkerStatus } = require('../../core/protocol');
 const { pickPotion, readPotionInventory, usePotion } = require('../../core/potions');
 const { createJsonStore, getStorage } = require('../../core/storage');
@@ -440,6 +441,13 @@ function createShadowbridgeWorker({
       : null;
     const attackPattern = specificPattern?.skillIds.length ? specificPattern : globalPattern?.skillIds.length ? globalPattern : null;
     const attackCatalog = new Map(availableAttacks(route.attack).map((attack) => [attack.id, attack]));
+    appendAttackDebugLog(store, `${routeId}-worker`, 'attack pattern resolved', {
+      target: target.name,
+      specificPattern,
+      globalPattern,
+      selectedPattern: attackPattern,
+      fallbackSkill: route.settings.skill,
+    });
     if (target.target.specificPatternEnabled && !specificPattern?.skillIds.length) {
       throw new Error(`The specific attack pattern for ${target.name || workerName} is empty.`);
     }
@@ -494,6 +502,12 @@ function createShadowbridgeWorker({
         },
       });
       const result = logic.parseAttackResponse(response);
+      appendAttackDebugLog(store, `${routeId}-worker`, 'attack result', {
+        target: target.name,
+        skill: { id: skill.id, name: skill.name },
+        attempt: attempts,
+        result,
+      });
       if (!result.ok) {
         if (/not enough stamina|insufficient stamina/i.test(result.message)) {
           await resources.ensureStamina(

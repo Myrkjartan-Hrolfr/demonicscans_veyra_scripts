@@ -69,6 +69,14 @@ function createController(engine, syncForm = () => {}) {
     // selected attacks remain in slots 1-3 as fallbacks after the pattern.
     setAttackPlan(plan = {}) {
       engine.discoverAttacks();
+      engine.debug('controller received attack plan', {
+        useGlobal: plan.useGlobal === true,
+        useSpecific: plan.useSpecific === true,
+        globalPattern: plan.globalPattern,
+        specificPattern: plan.specificPattern,
+        fallbackSkillIds: plan.fallbackSkillIds,
+        liveAttacks: state.attacks.map((attack) => ({ key: attack.key, skillId: attack.skillId, costs: attack.costs })),
+      });
       const fallbackKeys = mapSkillIdsToAttackKeys(state.attacks, plan.fallbackSkillIds || []);
       if (fallbackKeys) state.settings.attackKeys = fallbackKeys;
       const source = plan.useSpecific ? plan.specificPattern : plan.useGlobal ? plan.globalPattern : null;
@@ -82,7 +90,10 @@ function createController(engine, syncForm = () => {}) {
         const skillId = String(rawId);
         const matches = state.attacks.filter((attack) => attack.skillId === skillId);
         const attack = matches.find((candidate) => candidate.group === GROUP_STANDARD) || matches[0];
-        if (!attack) return false;
+        if (!attack) {
+          engine.debug('controller rejected unavailable pattern skill', { skillId, source });
+          return false;
+        }
         attackKeys.push(attack.key);
       }
       if (!attackKeys.length) return false;
@@ -99,6 +110,11 @@ function createController(engine, syncForm = () => {}) {
         state.settings.globalPattern = pattern;
       }
       afterSettingsChange();
+      engine.debug('controller applied attack plan', {
+        primaryMode: state.settings.primaryMode,
+        pattern,
+        fallbackKeys: state.settings.attackKeys,
+      });
       return true;
     },
 

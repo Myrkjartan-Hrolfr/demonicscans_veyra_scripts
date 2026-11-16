@@ -19,6 +19,7 @@ const { attackFromButton } = require('./mab-attacks');
 const { ID, createResumeStore, createSettingsStore, resumeKey, settingsKey } = require('./mab-settings');
 const { CONFIG_KEY } = require('../../scheduler/config');
 const { cacheClassAttacks } = require('../../scheduler/attack-settings');
+const { appendAttackDebugLog } = require('../../core/attack-debug');
 
 function isBattlePage(url) {
   return /\/battle\.php$/i.test(url?.pathname || '');
@@ -47,6 +48,7 @@ function run(ctx) {
     postForm: ctx.postForm,
     settingsStore: createSettingsStore(storageOf(win, 'localStorage'), settingsKey(host, pathname), warn),
     resumeStore: createResumeStore(storageOf(win, 'sessionStorage'), resumeKey(host, pathname)),
+    debug: (event, details) => appendAttackDebugLog(ctx.store, 'mab-engine', event, details),
     warn,
   });
   const { state } = engine;

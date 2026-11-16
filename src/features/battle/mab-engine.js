@@ -134,6 +134,7 @@ function noop() {}
 function createEngine(options) {
   const { doc, win, postForm, settingsStore, resumeStore } = options;
   const warn = options.warn || noop;
+  const debug = options.debug || noop;
 
   const ui = {
     setStatus: noop,
@@ -894,6 +895,14 @@ function createEngine(options) {
     const pattern = selectedPattern(state.settings, getMonsterId());
     if (!pattern) return null;
     const sequence = pattern.attackKeys.map((key) => findAttack(state.attacks, key)).filter(Boolean);
+    debug('pattern prepare', {
+      mode: state.settings.primaryMode,
+      monsterId: getMonsterId(),
+      index: state.patternIndex,
+      configuredKeys: pattern.attackKeys,
+      availableAttacks: state.attacks.map((attack) => ({ key: attack.key, costs: attack.costs })),
+      resolvedSequence: sequence.map((attack) => attack.key),
+    });
     if (!sequence.length) {
       stop('The selected attack pattern is empty.', 'error', 'error');
       return { handled: true };
@@ -931,6 +940,14 @@ function createEngine(options) {
         }
       }
       log(`Starting attack pattern (${sequence.length} attacks, ${formatNumber(costs.stamina)} STA / ${formatNumber(costs.mana)} MP).`);
+      debug('pattern loop admitted', {
+        length: sequence.length,
+        costs,
+        stamina: getCurrentStamina(),
+        mana: getCurrentMana(),
+        useStaminaPotions: pattern.useStaminaPotions,
+        useManaPotions: pattern.useManaPotions,
+      });
     }
 
     const attack = sequence[state.patternIndex % sequence.length];
@@ -1206,6 +1223,7 @@ function createEngine(options) {
 
   // Ends the run (or records why a run could not start).
   function stop(message = 'Stopped manually.', tone = 'idle', reason = 'stopped') {
+    debug('engine stopped', { message, tone, reason, patternIndex: state.patternIndex, running: state.running });
     state.running = false;
     state.finished = true;
     state.reason = reason;
@@ -1246,6 +1264,12 @@ function createEngine(options) {
 
     const problem = state.card ? validateSettings() : 'No monster card with attack buttons was found.';
     if (problem) {
+      debug('start validation failed', {
+        problem,
+        primaryMode: state.settings.primaryMode,
+        monsterId: getMonsterId(),
+        attackKeys: state.settings.attackKeys,
+      });
       state.finished = true;
       state.reason = 'error';
       setStatus(problem, 'error');
@@ -1279,6 +1303,12 @@ function createEngine(options) {
     state.finished = false;
     state.reason = null;
     state.running = true;
+    debug('engine started', {
+      resumed: Boolean(resumeData),
+      monsterId: getMonsterId(),
+      primaryMode: state.settings.primaryMode,
+      patternIndex: state.patternIndex,
+    });
 
     ui.updateButtons();
     refreshMetrics();
@@ -1340,6 +1370,13 @@ function createEngine(options) {
 
         log(`${attackLabel}: ${prepared.attack.name}.`);
         const outcome = await performAttack(prepared.attack, button, beforeDamage, beforeExperience, beforeFeedback);
+        debug('attack outcome', {
+          attack: prepared.attack.key,
+          isPattern: prepared.isPattern === true,
+          patternIndex: state.patternIndex,
+          patternLength: prepared.patternLength,
+          outcome,
+        });
         if (!state.running) break;
 
         if (outcome.type === 'damage' || outcome.type === 'success') {
@@ -1349,6 +1386,7 @@ function createEngine(options) {
           state.lastDamage = Math.max(0, outcome.damage || 0);
           state.sessionDamage += state.lastDamage;
           if (prepared.isPattern) state.patternIndex = (state.patternIndex + 1) % prepared.patternLength;
+          if (prepared.isPattern) debug('pattern advanced', { nextIndex: state.patternIndex });
 
           if (outcome.mode === 'api') {
             const wasPoisonActive = state.poisonActive;
@@ -1461,6 +1499,7 @@ function createEngine(options) {
     setCard,
     setStatus,
     log,
+    debug,
     start,
     stop,
     subscribe,
