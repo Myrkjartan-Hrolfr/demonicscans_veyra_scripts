@@ -565,6 +565,35 @@ test('the fast attack posts to damage.php and stops at the target', async () => 
   assert.equal(state.yourDamage, 3e9);
 });
 
+test('a global attack pattern advances through every attack and loops', async () => {
+  const skillIds = [];
+  let totalDamage = 0;
+  const { engine } = createBattlePage({
+    stamina: '100',
+    search: '?dgmid=11&instance_id=22',
+    postForm: async (_url, params) => {
+      skillIds.push(params.skill_id);
+      totalDamage += 10;
+      return {
+        ok: true,
+        status: 200,
+        text: JSON.stringify({ status: 'success', damage: 10, totaldmgdealt: totalDamage, stamina_after: 100 }),
+        json: null,
+      };
+    },
+  });
+  const controller = createController(engine);
+  assert.equal(controller.setAttackPlan({
+    fallbackSkillIds: ['0'],
+    useGlobal: true,
+    globalPattern: { skillIds: ['0', '-1'], useStaminaPotions: false, useManaPotions: false },
+  }), true);
+  controller.setTargetDamage(40);
+  engine.state.settings.delayMs = 0;
+  await engine.start();
+  assert.deepEqual(skillIds, ['0', '-1', '0', '-1']);
+});
+
 test('controller maps attacks, potions and target into the saved settings', async () => {
   const potions = [
     potionButton({ item: '30', name: 'Small Stamina Potion', quantity: 4 }),

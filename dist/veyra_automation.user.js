@@ -10963,14 +10963,16 @@
         if (discoverAttacks()) ui.renderAttackOptions();
         syncPoisonStatusFromLog();
 
-        const poisonAttack = getSelectedPoisonAttack();
-        if (state.poisonActive && poisonAttack) return preparePoisonAttack(poisonAttack);
-
+        // A selected global or monster-specific pattern is the primary attack
+        // and must not be displaced by the legacy poison override.
         if (state.settings.primaryMode !== 'attack') {
           const preparedPattern = await preparePatternAttack();
           if (preparedPattern?.retry) return { retry: true };
           if (preparedPattern?.attack || !state.running) return preparedPattern?.attack ? preparedPattern : null;
         }
+
+        const poisonAttack = getSelectedPoisonAttack();
+        if (state.poisonActive && poisonAttack) return preparePoisonAttack(poisonAttack);
 
         const attacks = [getSelectedAttack(0), getSelectedAttack(1), getSelectedAttack(2)];
         const primary = attacks[0];
