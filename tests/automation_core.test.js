@@ -144,9 +144,10 @@ test('postForm rechecks permission before a rate-limit retry', async () => {
 test('potion settings keep only known items of the right type in priority order', () => {
   assert.deepEqual(normalizePotionSettings({ stamina: [35, 30, 108, 999, '251'], heal: [108, 30] }), {
     stamina: [30, 251, 35],
+    mana: [],
     heal: [108],
   });
-  assert.deepEqual(normalizePotionSettings(null), { stamina: [], heal: [] });
+  assert.deepEqual(normalizePotionSettings(null), { stamina: [], mana: [], heal: [] });
 });
 
 test('pickPotion uses the first selected potion in stock', () => {

@@ -10,7 +10,7 @@
 // so reloads, navigation and mobile tab freezes resume where they left off.
 
 const { formatGameNumber } = require('../../core/numbers');
-const { pickPotion, readPotionInventory, usePotion } = require('../../core/potions');
+const { pickPotion, potionsOfType, readPotionInventory, usePotion } = require('../../core/potions');
 const { COMMAND_KEY, publishWorkerStatus } = require('../../core/protocol');
 const { createJsonStore, getStorage } = require('../../core/storage');
 const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
@@ -791,12 +791,6 @@ function createBossWorker({
   function configureAndStart(controller, run, damageTarget, t) {
     const routeConfig = loadRouteConfig(run.routeId);
     const skills = routeConfig?.settings?.skills?.length ? [...routeConfig.settings.skills] : ['0'];
-    const potions = {
-      stamina: [...(routeConfig?.potions?.stamina || [])],
-      mana: [...(routeConfig?.potions?.mana || [])],
-      heal: [...(routeConfig?.potions?.heal || [])],
-    };
-
     attachFight(controller, run.target.monsterId, damageTarget);
     controller.setTargetDamage(damageTarget.damageValue);
     const state = controllerState(controller);
@@ -818,6 +812,22 @@ function createBossWorker({
         ),
         useSpecific: bossSettings.specificPatternEnabled === true,
         specificPattern: bossSettings.specificPattern,
+      };
+      const activePattern = attackPlan.useSpecific
+        ? attackPlan.specificPattern
+        : attackPlan.useGlobal
+          ? attackPlan.globalPattern
+          : null;
+      const selectedPotions = (type, allowFromPattern) => {
+        const configured = [...(routeConfig?.potions?.[type] || [])];
+        return configured.length || !allowFromPattern
+          ? configured
+          : potionsOfType(type).map((potion) => potion.itemId);
+      };
+      const potions = {
+        stamina: selectedPotions('stamina', activePattern?.useStaminaPotions === true),
+        mana: selectedPotions('mana', activePattern?.useManaPotions === true),
+        heal: [...(routeConfig?.potions?.heal || [])],
       };
       appendAttackDebugLog(store, 'boss-worker', 'configuring monster auto battle', {
         routeId: run.routeId,

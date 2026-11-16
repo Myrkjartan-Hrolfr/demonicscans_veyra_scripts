@@ -5,6 +5,7 @@ const { parseGameNumber } = require('./numbers');
 
 const POTION_TYPES = Object.freeze({
   stamina: Object.freeze({ id: 'stamina', label: 'Stamina potions' }),
+  mana: Object.freeze({ id: 'mana', label: 'Mana potions' }),
   heal: Object.freeze({ id: 'heal', label: 'Healing potions' }),
 });
 
@@ -14,6 +15,8 @@ const POTION_CATALOG = Object.freeze([
   Object.freeze({ itemId: 251, type: 'stamina', name: 'Large Stamina Potion' }),
   Object.freeze({ itemId: 35, type: 'stamina', name: 'Full Stamina Potion' }),
   Object.freeze({ itemId: 359, type: 'stamina', name: 'Adventurer Stamina Potion' }),
+  Object.freeze({ itemId: 162, type: 'mana', name: 'Mana Potion S' }),
+  Object.freeze({ itemId: 163, type: 'mana', name: 'Mana Potion L' }),
   Object.freeze({ itemId: 108, type: 'heal', name: 'Full HP Potion' }),
 ]);
 

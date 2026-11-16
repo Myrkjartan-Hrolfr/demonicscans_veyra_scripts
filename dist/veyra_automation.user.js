@@ -693,6 +693,7 @@
 
     const POTION_TYPES = Object.freeze({
       stamina: Object.freeze({ id: 'stamina', label: 'Stamina potions' }),
+      mana: Object.freeze({ id: 'mana', label: 'Mana potions' }),
       heal: Object.freeze({ id: 'heal', label: 'Healing potions' }),
     });
 
@@ -702,6 +703,8 @@
       Object.freeze({ itemId: 251, type: 'stamina', name: 'Large Stamina Potion' }),
       Object.freeze({ itemId: 35, type: 'stamina', name: 'Full Stamina Potion' }),
       Object.freeze({ itemId: 359, type: 'stamina', name: 'Adventurer Stamina Potion' }),
+      Object.freeze({ itemId: 162, type: 'mana', name: 'Mana Potion S' }),
+      Object.freeze({ itemId: 163, type: 'mana', name: 'Mana Potion L' }),
       Object.freeze({ itemId: 108, type: 'heal', name: 'Full HP Potion' }),
     ]);
 
@@ -3116,7 +3119,7 @@
     // so reloads, navigation and mobile tab freezes resume where they left off.
 
     const { formatGameNumber } = require('../../core/numbers');
-    const { pickPotion, readPotionInventory, usePotion } = require('../../core/potions');
+    const { pickPotion, potionsOfType, readPotionInventory, usePotion } = require('../../core/potions');
     const { COMMAND_KEY, publishWorkerStatus } = require('../../core/protocol');
     const { createJsonStore, getStorage } = require('../../core/storage');
     const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
@@ -3897,12 +3900,6 @@
       function configureAndStart(controller, run, damageTarget, t) {
         const routeConfig = loadRouteConfig(run.routeId);
         const skills = routeConfig?.settings?.skills?.length ? [...routeConfig.settings.skills] : ['0'];
-        const potions = {
-          stamina: [...(routeConfig?.potions?.stamina || [])],
-          mana: [...(routeConfig?.potions?.mana || [])],
-          heal: [...(routeConfig?.potions?.heal || [])],
-        };
-
         attachFight(controller, run.target.monsterId, damageTarget);
         controller.setTargetDamage(damageTarget.damageValue);
         const state = controllerState(controller);
@@ -3924,6 +3921,22 @@
             ),
             useSpecific: bossSettings.specificPatternEnabled === true,
             specificPattern: bossSettings.specificPattern,
+          };
+          const activePattern = attackPlan.useSpecific
+            ? attackPlan.specificPattern
+            : attackPlan.useGlobal
+              ? attackPlan.globalPattern
+              : null;
+          const selectedPotions = (type, allowFromPattern) => {
+            const configured = [...(routeConfig?.potions?.[type] || [])];
+            return configured.length || !allowFromPattern
+              ? configured
+              : potionsOfType(type).map((potion) => potion.itemId);
+          };
+          const potions = {
+            stamina: selectedPotions('stamina', activePattern?.useStaminaPotions === true),
+            mana: selectedPotions('mana', activePattern?.useManaPotions === true),
+            heal: [...(routeConfig?.potions?.heal || [])],
           };
           appendAttackDebugLog(store, 'boss-worker', 'configuring monster auto battle', {
             routeId: run.routeId,

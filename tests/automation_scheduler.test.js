@@ -150,7 +150,7 @@ test('default config gives every page a loop length and its own potion selection
     const routeConfig = config.routes[route.id];
     assert.equal(routeConfig.enabled, route.defaultEnabled !== false);
     assert.equal(routeConfig.loopMinutes, route.defaultLoopMinutes);
-    assert.deepEqual(routeConfig.potions, { stamina: [], heal: [] });
+    assert.deepEqual(routeConfig.potions, { stamina: [], mana: [], heal: [] });
   }
 });
 
@@ -175,8 +175,8 @@ test('potion selections are stored per page and stay independent', () => {
       wave3: { potions: { stamina: [251, 35], heal: [] } },
     },
   });
-  assert.deepEqual(config.routes.pvp.potions, { stamina: [30], heal: [108] });
-  assert.deepEqual(config.routes.wave3.potions, { stamina: [251, 35], heal: [] });
+  assert.deepEqual(config.routes.pvp.potions, { stamina: [30], mana: [], heal: [108] });
+  assert.deepEqual(config.routes.wave3.potions, { stamina: [251, 35], mana: [], heal: [] });
 });
 
 test('loop length is clamped and drives the next countdown', () => {
