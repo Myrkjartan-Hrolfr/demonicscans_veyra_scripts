@@ -161,6 +161,8 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
     reference: null,
     resizeListener: null,
     keydownListener: null,
+    classCatalogLoaded: false,
+    classCatalogPromise: null,
   };
 
   const byId = (id) => doc.getElementById?.(id) || null;
@@ -379,6 +381,31 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
     }
   }
 
+  function refreshClassCatalog() {
+    if (state.classCatalogLoaded) return Promise.resolve(false);
+    if (state.classCatalogPromise) return state.classCatalogPromise;
+    if (typeof win.fetch !== 'function' || typeof win.DOMParser !== 'function') return Promise.resolve(false);
+    state.classCatalogPromise = (async () => {
+      try {
+        const response = await win.fetch('/pvp.php', {
+          credentials: 'same-origin',
+          cache: 'no-store',
+          headers: { 'X-Requested-With': 'XMLHttpRequest' },
+        });
+        if (!response?.ok) return false;
+        const html = await response.text();
+        const source = new win.DOMParser().parseFromString(html, 'text/html');
+        return cacheClassAttacksFromDocument(store, CONFIG_KEY, source);
+      } catch {
+        return false;
+      } finally {
+        state.classCatalogLoaded = true;
+        state.classCatalogPromise = null;
+      }
+    })();
+    return state.classCatalogPromise;
+  }
+
   function openView(titleText, render) {
     const drawer = byId(`${UI_ID}-drawer`);
     const title = byId(`${UI_ID}-sub-title`);
@@ -403,9 +430,13 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
       renderStandardSettings(ctx, routeConfig);
       route.renderSettings?.(ctx);
     });
+    void refreshClassCatalog().then((changed) => {
+      if (changed && state.subRouteId === routeId) openRouteSettings(routeId);
+    });
   }
 
   function openAttackSettings() {
+    state.subRouteId = 'attack';
     const render = (content) => {
       replaceChildren(content);
       cacheClassAttacksFromDocument(store, CONFIG_KEY, doc);
@@ -432,6 +463,9 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
       }));
     };
     openView('Attack · Settings', render);
+    void refreshClassCatalog().then((changed) => {
+      if (changed && state.subRouteId === 'attack') openAttackSettings();
+    });
   }
 
   function buildAttackRow() {
