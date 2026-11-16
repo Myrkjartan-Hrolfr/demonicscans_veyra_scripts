@@ -16,6 +16,7 @@ const { createJsonStore, getStorage } = require('../../core/storage');
 const { sleep } = require('../../core/time');
 const crucibleRoute = require('../../routes/crucible');
 const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
+const { availableAttacks, normalizePattern } = require('../../scheduler/attack-settings');
 const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
 const { staminaCost, staminaMultiplier } = require('../shared/asterion');
 const logic = require('./crucible-logic');
@@ -290,7 +291,8 @@ function createCrucibleWorker({
   }
 
   function routeConfig() {
-    return normalizeConfig(store.read(CONFIG_KEY)).routes[ROUTE_ID];
+    const config = normalizeConfig(store.read(CONFIG_KEY));
+    return { ...config.routes[ROUTE_ID], attack: config.attack };
   }
 
   function minimalArmyContribution(battleId) {
@@ -346,11 +348,13 @@ function createCrucibleWorker({
 
   function createResourceManager(visitId, route, initialDoc) {
     let currentStamina = readStamina(initialDoc);
+    let currentMana = parseFraction(initialDoc?.querySelector?.('#pManaText')?.textContent)?.current ?? null;
     let inventory = readPotionInventory(initialDoc);
 
     async function refresh() {
       const sourceDoc = await readDashboard(visitId);
       currentStamina = readStamina(sourceDoc);
+      currentMana = parseFraction(sourceDoc?.querySelector?.('#pManaText')?.textContent)?.current ?? null;
       inventory = readPotionInventory(sourceDoc);
       return sourceDoc;
     }
@@ -374,11 +378,12 @@ function createCrucibleWorker({
       return result;
     }
 
-    async function ensureStamina(required, forceRefresh = false) {
+    async function ensureStamina(required, forceRefresh = false, allowPotion = true) {
       if (forceRefresh || currentStamina === null) await refresh();
       if (currentStamina === null || currentStamina >= required) return true;
       await ensureInventory();
       if (currentStamina === null || currentStamina >= required) return true;
+      if (!allowPotion) throw new VisitStop('resource', 'Pattern stamina potions are disabled.');
       const potion = pickPotion(inventory, route.potions.stamina);
       if (!potion) {
         throw new VisitStop(
@@ -412,11 +417,29 @@ function createCrucibleWorker({
       return true;
     }
 
+    async function ensureMana(required, forceRefresh = false, allowPotion = true) {
+      if (required <= 0) return true;
+      if (forceRefresh || currentMana === null) await refresh();
+      if (currentMana === null || currentMana >= required) return true;
+      await ensureInventory();
+      if (!allowPotion) throw new VisitStop('resource', 'Pattern mana potions are disabled.');
+      const potion = pickPotion(inventory, route.potions.mana);
+      if (!potion) throw new VisitStop('resource', `Only ${currentMana} mana remains and no selected mana potion is available.`);
+      await consumePotion(potion, 'The selected mana potion');
+      await refresh();
+      if (currentMana !== null && currentMana < required) throw new VisitStop('resource', `Mana is still below ${required}.`);
+      return true;
+    }
+
     function spendStamina(amount) {
       if (currentStamina !== null) currentStamina = Math.max(0, currentStamina - amount);
     }
 
-    return { ensureHealth, ensureStamina, spendStamina };
+    function spendMana(amount) {
+      if (currentMana !== null) currentMana = Math.max(0, currentMana - amount);
+    }
+
+    return { ensureHealth, ensureMana, ensureStamina, spendMana, spendStamina };
   }
 
   async function fetchBattle(target, userId) {
@@ -485,14 +508,15 @@ function createCrucibleWorker({
     if (!decision.ok) throw new Error(`${target.name || 'Crucible PvE target'}: ${decision.error}`);
     if (decision.done) return { reason: 'target', attacks: 0 };
 
-    const skill = dungeonLogic.skillForId(route.settings.skill);
-    const payload = dungeonLogic.buildDamagePayload({
-      instanceId: target.instanceId,
-      monsterId: target.monsterId,
-      skillId: route.settings.skill,
-    });
-    if (!skill || !payload) throw new Error('The selected Crucible PvE skill is invalid.');
-    const effectiveStaminaCost = staminaCost(skill.cost, asterionMultiplier);
+    const specificPattern = target.target.specificPatternEnabled ? normalizePattern(target.target.specificPattern) : null;
+    const globalPattern = !specificPattern && route.settings.useGlobalPattern ? normalizePattern(route.attack?.globalPattern) : null;
+    const attackPattern = specificPattern?.skillIds.length ? specificPattern : globalPattern?.skillIds.length ? globalPattern : null;
+    const attackCatalog = new Map(availableAttacks(route.attack).map((attack) => [attack.id, attack]));
+    if (target.target.specificPatternEnabled && !specificPattern?.skillIds.length) {
+      throw new Error(`The specific attack pattern for ${target.name || 'the Crucible monster'} is empty.`);
+    }
+    const fallbackSkill = dungeonLogic.skillForId(route.settings.skill);
+    if (!fallbackSkill) throw new Error('The selected Crucible PvE skill is invalid.');
     const resources = createResourceManager(visitId, route, battle.doc);
     let ownDamage = battle.snapshot.ownDamage;
     let attempts = 0;
@@ -504,7 +528,15 @@ function createCrucibleWorker({
         return { reason: 'target', attacks: attempts };
       }
       await resources.ensureHealth(battle.snapshot);
-      await resources.ensureStamina(effectiveStaminaCost);
+      const patternAttack = attackPattern ? attackCatalog.get(attackPattern.skillIds[attempts % attackPattern.skillIds.length]) : null;
+      if (attackPattern && !patternAttack) throw new Error('The selected Crucible attack pattern contains an unavailable attack.');
+      const skill = patternAttack || { id: fallbackSkill.id, name: fallbackSkill.name, stamina: fallbackSkill.cost, mana: 0 };
+      if (!skill) throw new Error('The selected Crucible attack pattern contains an unavailable attack.');
+      const effectiveStaminaCost = staminaCost(skill.stamina ?? skill.cost, asterionMultiplier);
+      const payload = dungeonLogic.buildDamagePayload({ instanceId: target.instanceId, monsterId: target.monsterId, skillId: skill.id });
+      if (!payload) throw new Error('The selected Crucible PvE skill is invalid.');
+      await resources.ensureStamina(effectiveStaminaCost, false, !attackPattern || attackPattern.useStaminaPotions);
+      await resources.ensureMana(Number(skill.mana) || 0, false, !attackPattern || attackPattern.useManaPotions);
       assertCanMutate(visitId);
 
       setWorkingMessage(
@@ -521,7 +553,7 @@ function createCrucibleWorker({
       const result = dungeonLogic.parseAttackResponse(response);
       if (!result.ok) {
         if (/not enough stamina|insufficient stamina/i.test(result.message)) {
-          await resources.ensureStamina(effectiveStaminaCost, true);
+          await resources.ensureStamina(effectiveStaminaCost, true, !attackPattern || attackPattern.useStaminaPotions);
           continue;
         }
         const retryMs = retryDelayFromMessage(result.message, route.settings.attackCooldownMs);
@@ -539,6 +571,7 @@ function createCrucibleWorker({
       attempts += 1;
       runtime.attacks += 1;
       resources.spendStamina(effectiveStaminaCost);
+      resources.spendMana(Number(skill.mana) || 0);
       if (Number.isFinite(ownDamage)) ownDamage += result.damage;
       if (Number.isFinite(result.playerHp)) battle.snapshot.playerHp = result.playerHp;
       if (result.dead) return { reason: 'dead', attacks: attempts };

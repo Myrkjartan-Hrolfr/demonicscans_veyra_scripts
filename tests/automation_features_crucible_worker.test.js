@@ -375,6 +375,8 @@ test('the available Zenith Lock apex is discovered and attacked with its configu
     enabled: true,
     mode: 'kill',
     damage: '1m',
+    specificPatternEnabled: false,
+    specificPattern: { skillIds: [], useStaminaPotions: false, useManaPotions: false },
   });
 });
 

@@ -14,6 +14,7 @@ const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
 const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
 const { RUNTIME_KEY } = require('../../scheduler/runtime');
 const { staminaCost, staminaMultiplier } = require('../shared/asterion');
+const { availableAttacks, normalizePattern } = require('../../scheduler/attack-settings');
 const logic = require('./shadowbridge-logic');
 const { createShadowbridgeStatusView } = require('./shadowbridge-status');
 const {
@@ -50,6 +51,10 @@ function readStamina(root) {
   if (fraction) return fraction.current;
   const match = raw.match(/[\d,.]+\s*[kmbtq]?/i);
   return match ? parseGameNumber(match[0].replace(/\s+/g, '')) : null;
+}
+
+function readMana(root) {
+  return parseFraction(root?.querySelector?.('#pManaText')?.textContent)?.current ?? null;
 }
 
 function attackPlan(scans, settings, processed = new Set()) {
@@ -218,7 +223,8 @@ function createShadowbridgeWorker({
   }
 
   function routeConfig() {
-    return normalizeConfig(store.read(CONFIG_KEY)).routes[routeId];
+    const config = normalizeConfig(store.read(CONFIG_KEY));
+    return { ...config.routes[routeId], attack: config.attack };
   }
 
   async function readDashboard(visitId) {
@@ -229,11 +235,13 @@ function createShadowbridgeWorker({
   function createResourceManager(visitId, route, initialDoc) {
     let sourceDoc = initialDoc;
     let currentStamina = readStamina(initialDoc);
+    let currentMana = readMana(initialDoc);
     let inventory = readPotionInventory(initialDoc);
 
     async function refresh() {
       sourceDoc = await readDashboard(visitId);
       currentStamina = readStamina(sourceDoc);
+      currentMana = readMana(sourceDoc);
       inventory = readPotionInventory(sourceDoc);
       return sourceDoc;
     }
@@ -255,7 +263,7 @@ function createShadowbridgeWorker({
       return result;
     }
 
-    async function ensureStamina(required, forceRefresh = false) {
+    async function ensureStamina(required, forceRefresh = false, allowPotion = true) {
       if (forceRefresh || currentStamina === null) await refresh();
       // If the dashboard layout does not expose stamina, let damage.php make
       // the authoritative decision.  An insufficient-stamina response comes
@@ -263,6 +271,7 @@ function createShadowbridgeWorker({
       if (currentStamina === null || currentStamina >= required) return true;
       await ensureInventory();
       if (currentStamina === null || currentStamina >= required) return true;
+      if (!allowPotion) throw new VisitStop('resource', `Only ${currentStamina} stamina remains and pattern stamina potions are disabled.`);
       const potion = pickPotion(inventory, route.potions.stamina);
       if (!potion) {
         throw new VisitStop('resource', `Only ${currentStamina} stamina remains and no selected stamina potion is available.`);
@@ -293,11 +302,31 @@ function createShadowbridgeWorker({
       return true;
     }
 
+    async function ensureMana(required, forceRefresh = false, allowPotion = true) {
+      if (required <= 0) return true;
+      if (forceRefresh || currentMana === null) await refresh();
+      if (currentMana === null || currentMana >= required) return true;
+      await ensureInventory();
+      if (!allowPotion) throw new VisitStop('resource', `Only ${currentMana} mana remains and pattern mana potions are disabled.`);
+      const potion = pickPotion(inventory, route.potions.mana);
+      if (!potion) throw new VisitStop('resource', `Only ${currentMana} mana remains and no selected mana potion is available.`);
+      await consumePotion(potion, 'The selected mana potion');
+      await refresh();
+      if (currentMana !== null && currentMana < required) {
+        throw new VisitStop('resource', `Mana is still below the required ${required} after using a potion.`);
+      }
+      return true;
+    }
+
     function spendStamina(amount) {
       if (currentStamina !== null) currentStamina = Math.max(0, currentStamina - amount);
     }
 
-    return { ensureHealth, ensureStamina, refresh, spendStamina };
+    function spendMana(amount) {
+      if (currentMana !== null) currentMana = Math.max(0, currentMana - amount);
+    }
+
+    return { ensureHealth, ensureMana, ensureStamina, refresh, spendMana, spendStamina };
   }
 
   async function fetchBattle(target, userId) {
@@ -389,6 +418,17 @@ function createShadowbridgeWorker({
     let ownDamage = battle.snapshot.ownDamage;
     let attempts = 0;
     let cooldownRetries = 0;
+    const specificPattern = target.target.specificPatternEnabled
+      ? normalizePattern(target.target.specificPattern)
+      : null;
+    const globalPattern = !specificPattern && route.settings.useGlobalPattern
+      ? normalizePattern(route.attack?.globalPattern)
+      : null;
+    const attackPattern = specificPattern?.skillIds.length ? specificPattern : globalPattern?.skillIds.length ? globalPattern : null;
+    const attackCatalog = new Map(availableAttacks(route.attack).map((attack) => [attack.id, attack]));
+    if (target.target.specificPatternEnabled && !specificPattern?.skillIds.length) {
+      throw new Error(`The specific attack pattern for ${target.name || workerName} is empty.`);
+    }
 
     while (attempts < TIMING.maxAttacksPerMonster) {
       assertCanMutate(visitId);
@@ -396,7 +436,7 @@ function createShadowbridgeWorker({
         statusView.updateTarget(target.key, { status: 'completed', result: 'Damage target reached' });
         return { reason: 'target', attacks: attempts };
       }
-      const skillChoice = logic.selectAttackSkill({
+      const skillChoice = attackPattern ? null : logic.selectAttackSkill({
         mode: target.target.mode,
         primarySkillId: route.settings.skill,
         alternativeSkillId: route.settings.alternativeSkill,
@@ -404,7 +444,11 @@ function createShadowbridgeWorker({
         targetDamage: decision.targetDamage,
         ownDamage,
       });
-      const skill = skillChoice?.skill || null;
+      const patternAttack = attackPattern ? attackCatalog.get(attackPattern.skillIds[attempts % attackPattern.skillIds.length]) : null;
+      if (attackPattern && !patternAttack) throw new Error('The selected attack pattern contains an unavailable attack.');
+      const skill = patternAttack
+        ? { id: patternAttack.id, name: patternAttack.name, cost: patternAttack.stamina, mana: patternAttack.mana }
+        : skillChoice?.skill || null;
       const payload = logic.buildDamagePayload({
         instanceId: target.instanceId,
         monsterId: target.monsterId,
@@ -413,10 +457,15 @@ function createShadowbridgeWorker({
       if (!skill || !payload) throw new Error(`The selected ${workerName} skill is invalid.`);
       const effectiveStaminaCost = staminaCost(skill.cost, asterionMultiplier);
       await resources.ensureHealth(battle.snapshot);
-      await resources.ensureStamina(effectiveStaminaCost);
+      await resources.ensureStamina(
+        effectiveStaminaCost,
+        false,
+        !attackPattern || attackPattern.useStaminaPotions,
+      );
+      await resources.ensureMana(Number(skill.mana) || 0, false, !attackPattern || attackPattern.useManaPotions);
       assertCanMutate(visitId);
 
-      const alternativeNote = skillChoice.usedAlternative
+      const alternativeNote = skillChoice?.usedAlternative
         ? `, alternative ${skill.name}: ${battle.snapshot.currentHp} HP <= ${skillChoice.remainingDamage} needed damage`
         : '';
       setWorkingMessage(
@@ -433,7 +482,11 @@ function createShadowbridgeWorker({
       const result = logic.parseAttackResponse(response);
       if (!result.ok) {
         if (/not enough stamina|insufficient stamina/i.test(result.message)) {
-          await resources.ensureStamina(effectiveStaminaCost, true);
+          await resources.ensureStamina(
+            effectiveStaminaCost,
+            true,
+            !attackPattern || attackPattern.useStaminaPotions,
+          );
           continue;
         }
         const retryMs = retryDelayFromMessage(result.message, route.settings.attackCooldownMs);
@@ -451,6 +504,7 @@ function createShadowbridgeWorker({
       attempts += 1;
       runtime.attacks += 1;
       resources.spendStamina(effectiveStaminaCost);
+      resources.spendMana(Number(skill.mana) || 0);
       if (Number.isFinite(ownDamage)) ownDamage += result.damage;
       if (Number.isFinite(result.playerHp)) battle.snapshot.playerHp = result.playerHp;
       if (Number.isFinite(result.currentHp)) battle.snapshot.currentHp = result.currentHp;

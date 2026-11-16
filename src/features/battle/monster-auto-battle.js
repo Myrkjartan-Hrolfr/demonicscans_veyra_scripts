@@ -16,6 +16,8 @@ const { createController } = require('./mab-controller');
 const { createEngine } = require('./mab-engine');
 const { createPanel, injectStyles } = require('./mab-panel');
 const { ID, createResumeStore, createSettingsStore, resumeKey, settingsKey } = require('./mab-settings');
+const { CONFIG_KEY } = require('../../scheduler/config');
+const { cacheClassAttacks } = require('../../scheduler/attack-settings');
 
 function isBattlePage(url) {
   return /\/battle\.php$/i.test(url?.pathname || '');
@@ -70,6 +72,7 @@ function run(ctx) {
     doc.getElementById(ID)?.remove();
     engine.setCard(card);
     engine.discoverAttacks();
+    cacheClassAttacks(ctx.store, CONFIG_KEY, state.attacks);
     engine.discoverPotions();
     injectStyles(doc);
 
@@ -119,6 +122,7 @@ function run(ctx) {
     if (attackChanged) {
       debounce('attacks', 180, () => {
         if (engine.discoverAttacks()) panel?.ui.renderAttackOptions();
+        cacheClassAttacks(ctx.store, CONFIG_KEY, state.attacks);
       });
     }
 

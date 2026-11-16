@@ -2,6 +2,7 @@
 
 const { normalizeDamageTarget } = require('../core/numbers');
 const shadowbridge = require('./shadowbridge');
+const { availableAttacks, normalizePattern, renderPatternEditor } = require('../scheduler/attack-settings');
 
 const DUNGEON_NAME = 'Castle of the Fallen Prince';
 const DEFAULT_DAMAGE = '1m';
@@ -63,6 +64,8 @@ function normalizeTarget(value) {
     enabled: typeof value?.enabled === 'boolean' ? value.enabled : true,
     mode: DAMAGE_MODE_SET.has(value?.mode) ? value.mode : 'max-damage',
     damage: normalizeDamageTarget(value?.damage, DEFAULT_DAMAGE),
+    specificPatternEnabled: value?.specificPatternEnabled === true,
+    specificPattern: normalizePattern(value?.specificPattern),
   };
 }
 
@@ -80,6 +83,7 @@ function normalizeSettings(value) {
     discoveredNames,
     skill: SKILL_ID_SET.has(skill) ? skill : '0',
     attackCooldownMs: normalizeCooldown(value?.attackCooldownMs),
+    useGlobalPattern: value?.useGlobalPattern === true,
   };
 }
 
@@ -140,6 +144,16 @@ function renderSettings(ctx) {
     }),
   );
   ctx.container.appendChild(skillGroup);
+  ctx.addCheckbox({
+    id: 'use-global-pattern',
+    label: 'Global attack pattern (primary attack)',
+    checked: ctx.settings.useGlobalPattern,
+    onChange(checked) {
+      ctx.settings = ctx.updateSettings((settings) => {
+        settings.useGlobalPattern = checked;
+      });
+    },
+  });
 
   const cooldownInput = ctx.addTextInput({
     id: 'attack-cooldown-ms',
@@ -193,6 +207,33 @@ function renderSettings(ctx) {
     enabledLabel.appendChild(enabledInput);
     enabledLabel.appendChild(ctx.make('span', { text: 'Attack this monster' }));
     card.appendChild(enabledLabel);
+
+    ctx.addCheckbox({
+      id: `target-${definition.id}-specific-pattern`,
+      label: 'Use specific attack pattern (overrides global)',
+      checked: target.specificPatternEnabled,
+      parent: card,
+      onChange(checked) {
+        ctx.settings = ctx.updateSettings((settings) => {
+          settings.targets[definition.id].specificPatternEnabled = checked;
+        });
+      },
+    });
+    renderPatternEditor(
+      { ...ctx, container: card },
+      {
+        id: `target-${definition.id}-pattern`,
+        title: 'Specific attack pattern',
+        pattern: normalizePattern(target.specificPattern),
+        attacks: availableAttacks(ctx.loadConfig?.()?.attack || {}),
+        onChange(next, rerender) {
+          ctx.settings = ctx.updateSettings((settings) => {
+            settings.targets[definition.id].specificPattern = next;
+          });
+          if (rerender) ctx.rerender?.();
+        },
+      },
+    );
 
     const modeId = `${ctx.idPrefix}-target-${definition.id}-mode`;
     const modeLabel = ctx.make('label', { text: 'Damage mode' });

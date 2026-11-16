@@ -25,9 +25,30 @@ const {
 } = require('../src/scheduler/runtime');
 const { createSchedulerEngine } = require('../src/scheduler/engine');
 const { countdownText } = require('../src/scheduler/ui');
+const {
+  availableAttacks,
+  normalizeAttackSettings,
+  normalizePattern,
+  patternCosts,
+} = require('../src/scheduler/attack-settings');
 const { build, buildComunityVersion } = require('../build');
 
 const NOW = 1_800_000_000_000;
+
+test('scheduler attack patterns preserve order, potion flags and dynamically known class attacks', () => {
+  const attack = normalizeAttackSettings({
+    globalPattern: {
+      skillIds: ['42', '0', '42'],
+      useStaminaPotions: true,
+      useManaPotions: true,
+    },
+    knownClassAttacks: [{ id: '42', name: 'Arcane Burst', stamina: 12, mana: 30 }],
+  });
+  const attacks = availableAttacks(attack);
+  assert.deepEqual(normalizePattern(attack.globalPattern).skillIds, ['42', '0', '42']);
+  assert.deepEqual(patternCosts(attack.globalPattern, attacks), { stamina: 25, mana: 60 });
+  assert.equal(attacks.find((entry) => entry.id === '42').classAttack, true);
+});
 
 function createStorage(initial = {}) {
   const values = new Map(Object.entries(initial).map(([key, value]) => [key, String(value)]));

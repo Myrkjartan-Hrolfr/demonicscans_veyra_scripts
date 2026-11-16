@@ -3829,6 +3829,7 @@
         const skills = routeConfig?.settings?.skills?.length ? [...routeConfig.settings.skills] : ['0'];
         const potions = {
           stamina: [...(routeConfig?.potions?.stamina || [])],
+          mana: [...(routeConfig?.potions?.mana || [])],
           heal: [...(routeConfig?.potions?.heal || [])],
         };
 
@@ -3843,7 +3844,18 @@
         if (state?.running) {
           log(`Monster Auto Battle is already running against ${run.target.name}; watching it.`);
         } else if (!alreadyDone) {
-          if (controller.setAttacks(skills) === false) {
+          const bossSettings = routeConfig?.settings?.bosses?.[run.target.bossId] || {};
+          const attackPlan = {
+            fallbackSkillIds: skills,
+            useGlobal: routeConfig?.settings?.useGlobalPattern === true,
+            globalPattern: normalizeConfig(store.read(CONFIG_KEY)).attack.globalPattern,
+            useSpecific: bossSettings.specificPatternEnabled === true,
+            specificPattern: bossSettings.specificPattern,
+          };
+          const attackConfigured = typeof controller.setAttackPlan === 'function'
+            ? controller.setAttackPlan(attackPlan)
+            : controller.setAttacks(skills);
+          if (attackConfigured === false) {
             detachFight();
             finish(run, 'error', 'None of the configured attacks is available in Monster Auto Battle.', t);
             return;
@@ -5391,6 +5403,7 @@
     const { sleep } = require('../../core/time');
     const crucibleRoute = require('../../routes/crucible');
     const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
+    const { availableAttacks, normalizePattern } = require('../../scheduler/attack-settings');
     const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
     const { staminaCost, staminaMultiplier } = require('../shared/asterion');
     const logic = require('./crucible-logic');
@@ -5665,7 +5678,8 @@
       }
 
       function routeConfig() {
-        return normalizeConfig(store.read(CONFIG_KEY)).routes[ROUTE_ID];
+        const config = normalizeConfig(store.read(CONFIG_KEY));
+        return { ...config.routes[ROUTE_ID], attack: config.attack };
       }
 
       function minimalArmyContribution(battleId) {
@@ -5721,11 +5735,13 @@
 
       function createResourceManager(visitId, route, initialDoc) {
         let currentStamina = readStamina(initialDoc);
+        let currentMana = parseFraction(initialDoc?.querySelector?.('#pManaText')?.textContent)?.current ?? null;
         let inventory = readPotionInventory(initialDoc);
 
         async function refresh() {
           const sourceDoc = await readDashboard(visitId);
           currentStamina = readStamina(sourceDoc);
+          currentMana = parseFraction(sourceDoc?.querySelector?.('#pManaText')?.textContent)?.current ?? null;
           inventory = readPotionInventory(sourceDoc);
           return sourceDoc;
         }
@@ -5749,11 +5765,12 @@
           return result;
         }
 
-        async function ensureStamina(required, forceRefresh = false) {
+        async function ensureStamina(required, forceRefresh = false, allowPotion = true) {
           if (forceRefresh || currentStamina === null) await refresh();
           if (currentStamina === null || currentStamina >= required) return true;
           await ensureInventory();
           if (currentStamina === null || currentStamina >= required) return true;
+          if (!allowPotion) throw new VisitStop('resource', 'Pattern stamina potions are disabled.');
           const potion = pickPotion(inventory, route.potions.stamina);
           if (!potion) {
             throw new VisitStop(
@@ -5787,11 +5804,29 @@
           return true;
         }
 
+        async function ensureMana(required, forceRefresh = false, allowPotion = true) {
+          if (required <= 0) return true;
+          if (forceRefresh || currentMana === null) await refresh();
+          if (currentMana === null || currentMana >= required) return true;
+          await ensureInventory();
+          if (!allowPotion) throw new VisitStop('resource', 'Pattern mana potions are disabled.');
+          const potion = pickPotion(inventory, route.potions.mana);
+          if (!potion) throw new VisitStop('resource', `Only ${currentMana} mana remains and no selected mana potion is available.`);
+          await consumePotion(potion, 'The selected mana potion');
+          await refresh();
+          if (currentMana !== null && currentMana < required) throw new VisitStop('resource', `Mana is still below ${required}.`);
+          return true;
+        }
+
         function spendStamina(amount) {
           if (currentStamina !== null) currentStamina = Math.max(0, currentStamina - amount);
         }
 
-        return { ensureHealth, ensureStamina, spendStamina };
+        function spendMana(amount) {
+          if (currentMana !== null) currentMana = Math.max(0, currentMana - amount);
+        }
+
+        return { ensureHealth, ensureMana, ensureStamina, spendMana, spendStamina };
       }
 
       async function fetchBattle(target, userId) {
@@ -5860,14 +5895,15 @@
         if (!decision.ok) throw new Error(`${target.name || 'Crucible PvE target'}: ${decision.error}`);
         if (decision.done) return { reason: 'target', attacks: 0 };
 
-        const skill = dungeonLogic.skillForId(route.settings.skill);
-        const payload = dungeonLogic.buildDamagePayload({
-          instanceId: target.instanceId,
-          monsterId: target.monsterId,
-          skillId: route.settings.skill,
-        });
-        if (!skill || !payload) throw new Error('The selected Crucible PvE skill is invalid.');
-        const effectiveStaminaCost = staminaCost(skill.cost, asterionMultiplier);
+        const specificPattern = target.target.specificPatternEnabled ? normalizePattern(target.target.specificPattern) : null;
+        const globalPattern = !specificPattern && route.settings.useGlobalPattern ? normalizePattern(route.attack?.globalPattern) : null;
+        const attackPattern = specificPattern?.skillIds.length ? specificPattern : globalPattern?.skillIds.length ? globalPattern : null;
+        const attackCatalog = new Map(availableAttacks(route.attack).map((attack) => [attack.id, attack]));
+        if (target.target.specificPatternEnabled && !specificPattern?.skillIds.length) {
+          throw new Error(`The specific attack pattern for ${target.name || 'the Crucible monster'} is empty.`);
+        }
+        const fallbackSkill = dungeonLogic.skillForId(route.settings.skill);
+        if (!fallbackSkill) throw new Error('The selected Crucible PvE skill is invalid.');
         const resources = createResourceManager(visitId, route, battle.doc);
         let ownDamage = battle.snapshot.ownDamage;
         let attempts = 0;
@@ -5879,7 +5915,15 @@
             return { reason: 'target', attacks: attempts };
           }
           await resources.ensureHealth(battle.snapshot);
-          await resources.ensureStamina(effectiveStaminaCost);
+          const patternAttack = attackPattern ? attackCatalog.get(attackPattern.skillIds[attempts % attackPattern.skillIds.length]) : null;
+          if (attackPattern && !patternAttack) throw new Error('The selected Crucible attack pattern contains an unavailable attack.');
+          const skill = patternAttack || { id: fallbackSkill.id, name: fallbackSkill.name, stamina: fallbackSkill.cost, mana: 0 };
+          if (!skill) throw new Error('The selected Crucible attack pattern contains an unavailable attack.');
+          const effectiveStaminaCost = staminaCost(skill.stamina ?? skill.cost, asterionMultiplier);
+          const payload = dungeonLogic.buildDamagePayload({ instanceId: target.instanceId, monsterId: target.monsterId, skillId: skill.id });
+          if (!payload) throw new Error('The selected Crucible PvE skill is invalid.');
+          await resources.ensureStamina(effectiveStaminaCost, false, !attackPattern || attackPattern.useStaminaPotions);
+          await resources.ensureMana(Number(skill.mana) || 0, false, !attackPattern || attackPattern.useManaPotions);
           assertCanMutate(visitId);
 
           setWorkingMessage(
@@ -5896,7 +5940,7 @@
           const result = dungeonLogic.parseAttackResponse(response);
           if (!result.ok) {
             if (/not enough stamina|insufficient stamina/i.test(result.message)) {
-              await resources.ensureStamina(effectiveStaminaCost, true);
+              await resources.ensureStamina(effectiveStaminaCost, true, !attackPattern || attackPattern.useStaminaPotions);
               continue;
             }
             const retryMs = retryDelayFromMessage(result.message, route.settings.attackCooldownMs);
@@ -5914,6 +5958,7 @@
           attempts += 1;
           runtime.attacks += 1;
           resources.spendStamina(effectiveStaminaCost);
+          resources.spendMana(Number(skill.mana) || 0);
           if (Number.isFinite(ownDamage)) ownDamage += result.damage;
           if (Number.isFinite(result.playerHp)) battle.snapshot.playerHp = result.playerHp;
           if (result.dead) return { reason: 'dead', attacks: attempts };
@@ -8851,6 +8896,7 @@
     const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
     const { RUNTIME_KEY } = require('../../scheduler/runtime');
     const { staminaCost, staminaMultiplier } = require('../shared/asterion');
+    const { availableAttacks, normalizePattern } = require('../../scheduler/attack-settings');
     const logic = require('./shadowbridge-logic');
     const { createShadowbridgeStatusView } = require('./shadowbridge-status');
     const {
@@ -8887,6 +8933,10 @@
       if (fraction) return fraction.current;
       const match = raw.match(/[\d,.]+\s*[kmbtq]?/i);
       return match ? parseGameNumber(match[0].replace(/\s+/g, '')) : null;
+    }
+
+    function readMana(root) {
+      return parseFraction(root?.querySelector?.('#pManaText')?.textContent)?.current ?? null;
     }
 
     function attackPlan(scans, settings, processed = new Set()) {
@@ -9055,7 +9105,8 @@
       }
 
       function routeConfig() {
-        return normalizeConfig(store.read(CONFIG_KEY)).routes[routeId];
+        const config = normalizeConfig(store.read(CONFIG_KEY));
+        return { ...config.routes[routeId], attack: config.attack };
       }
 
       async function readDashboard(visitId) {
@@ -9066,11 +9117,13 @@
       function createResourceManager(visitId, route, initialDoc) {
         let sourceDoc = initialDoc;
         let currentStamina = readStamina(initialDoc);
+        let currentMana = readMana(initialDoc);
         let inventory = readPotionInventory(initialDoc);
 
         async function refresh() {
           sourceDoc = await readDashboard(visitId);
           currentStamina = readStamina(sourceDoc);
+          currentMana = readMana(sourceDoc);
           inventory = readPotionInventory(sourceDoc);
           return sourceDoc;
         }
@@ -9092,7 +9145,7 @@
           return result;
         }
 
-        async function ensureStamina(required, forceRefresh = false) {
+        async function ensureStamina(required, forceRefresh = false, allowPotion = true) {
           if (forceRefresh || currentStamina === null) await refresh();
           // If the dashboard layout does not expose stamina, let damage.php make
           // the authoritative decision.  An insufficient-stamina response comes
@@ -9100,6 +9153,7 @@
           if (currentStamina === null || currentStamina >= required) return true;
           await ensureInventory();
           if (currentStamina === null || currentStamina >= required) return true;
+          if (!allowPotion) throw new VisitStop('resource', `Only ${currentStamina} stamina remains and pattern stamina potions are disabled.`);
           const potion = pickPotion(inventory, route.potions.stamina);
           if (!potion) {
             throw new VisitStop('resource', `Only ${currentStamina} stamina remains and no selected stamina potion is available.`);
@@ -9130,11 +9184,31 @@
           return true;
         }
 
+        async function ensureMana(required, forceRefresh = false, allowPotion = true) {
+          if (required <= 0) return true;
+          if (forceRefresh || currentMana === null) await refresh();
+          if (currentMana === null || currentMana >= required) return true;
+          await ensureInventory();
+          if (!allowPotion) throw new VisitStop('resource', `Only ${currentMana} mana remains and pattern mana potions are disabled.`);
+          const potion = pickPotion(inventory, route.potions.mana);
+          if (!potion) throw new VisitStop('resource', `Only ${currentMana} mana remains and no selected mana potion is available.`);
+          await consumePotion(potion, 'The selected mana potion');
+          await refresh();
+          if (currentMana !== null && currentMana < required) {
+            throw new VisitStop('resource', `Mana is still below the required ${required} after using a potion.`);
+          }
+          return true;
+        }
+
         function spendStamina(amount) {
           if (currentStamina !== null) currentStamina = Math.max(0, currentStamina - amount);
         }
 
-        return { ensureHealth, ensureStamina, refresh, spendStamina };
+        function spendMana(amount) {
+          if (currentMana !== null) currentMana = Math.max(0, currentMana - amount);
+        }
+
+        return { ensureHealth, ensureMana, ensureStamina, refresh, spendMana, spendStamina };
       }
 
       async function fetchBattle(target, userId) {
@@ -9226,6 +9300,17 @@
         let ownDamage = battle.snapshot.ownDamage;
         let attempts = 0;
         let cooldownRetries = 0;
+        const specificPattern = target.target.specificPatternEnabled
+          ? normalizePattern(target.target.specificPattern)
+          : null;
+        const globalPattern = !specificPattern && route.settings.useGlobalPattern
+          ? normalizePattern(route.attack?.globalPattern)
+          : null;
+        const attackPattern = specificPattern?.skillIds.length ? specificPattern : globalPattern?.skillIds.length ? globalPattern : null;
+        const attackCatalog = new Map(availableAttacks(route.attack).map((attack) => [attack.id, attack]));
+        if (target.target.specificPatternEnabled && !specificPattern?.skillIds.length) {
+          throw new Error(`The specific attack pattern for ${target.name || workerName} is empty.`);
+        }
 
         while (attempts < TIMING.maxAttacksPerMonster) {
           assertCanMutate(visitId);
@@ -9233,7 +9318,7 @@
             statusView.updateTarget(target.key, { status: 'completed', result: 'Damage target reached' });
             return { reason: 'target', attacks: attempts };
           }
-          const skillChoice = logic.selectAttackSkill({
+          const skillChoice = attackPattern ? null : logic.selectAttackSkill({
             mode: target.target.mode,
             primarySkillId: route.settings.skill,
             alternativeSkillId: route.settings.alternativeSkill,
@@ -9241,7 +9326,11 @@
             targetDamage: decision.targetDamage,
             ownDamage,
           });
-          const skill = skillChoice?.skill || null;
+          const patternAttack = attackPattern ? attackCatalog.get(attackPattern.skillIds[attempts % attackPattern.skillIds.length]) : null;
+          if (attackPattern && !patternAttack) throw new Error('The selected attack pattern contains an unavailable attack.');
+          const skill = patternAttack
+            ? { id: patternAttack.id, name: patternAttack.name, cost: patternAttack.stamina, mana: patternAttack.mana }
+            : skillChoice?.skill || null;
           const payload = logic.buildDamagePayload({
             instanceId: target.instanceId,
             monsterId: target.monsterId,
@@ -9250,10 +9339,15 @@
           if (!skill || !payload) throw new Error(`The selected ${workerName} skill is invalid.`);
           const effectiveStaminaCost = staminaCost(skill.cost, asterionMultiplier);
           await resources.ensureHealth(battle.snapshot);
-          await resources.ensureStamina(effectiveStaminaCost);
+          await resources.ensureStamina(
+            effectiveStaminaCost,
+            false,
+            !attackPattern || attackPattern.useStaminaPotions,
+          );
+          await resources.ensureMana(Number(skill.mana) || 0, false, !attackPattern || attackPattern.useManaPotions);
           assertCanMutate(visitId);
 
-          const alternativeNote = skillChoice.usedAlternative
+          const alternativeNote = skillChoice?.usedAlternative
             ? `, alternative ${skill.name}: ${battle.snapshot.currentHp} HP <= ${skillChoice.remainingDamage} needed damage`
             : '';
           setWorkingMessage(
@@ -9270,7 +9364,11 @@
           const result = logic.parseAttackResponse(response);
           if (!result.ok) {
             if (/not enough stamina|insufficient stamina/i.test(result.message)) {
-              await resources.ensureStamina(effectiveStaminaCost, true);
+              await resources.ensureStamina(
+                effectiveStaminaCost,
+                true,
+                !attackPattern || attackPattern.useStaminaPotions,
+              );
               continue;
             }
             const retryMs = retryDelayFromMessage(result.message, route.settings.attackCooldownMs);
@@ -9288,6 +9386,7 @@
           attempts += 1;
           runtime.attacks += 1;
           resources.spendStamina(effectiveStaminaCost);
+          resources.spendMana(Number(skill.mana) || 0);
           if (Number.isFinite(ownDamage)) ownDamage += result.damage;
           if (Number.isFinite(result.playerHp)) battle.snapshot.playerHp = result.playerHp;
           if (Number.isFinite(result.currentHp)) battle.snapshot.currentHp = result.currentHp;
@@ -9790,6 +9889,7 @@
     const { mapSkillIdsToAttackKeys } = require('./mab-attacks');
     const { formatTargetDisplay, parseTarget } = require('./mab-parse');
     const { applyPotionLists } = require('./mab-potions');
+    const { GROUP_STANDARD } = require('./mab-attacks');
 
     // Accepts a number (3e9) or game text ("3b", "3,000,000,000"); 0 means
     // unlimited. Returns the stored text or null for invalid input.
@@ -9845,7 +9945,45 @@
           return true;
         },
 
-        // { stamina: [itemIds], heal: [itemIds] } in priority order. Listed
+        // Places a scheduler pattern in the primary slot. A monster-specific
+        // pattern always wins over the route's global selection; the normal
+        // selected attacks remain in slots 1-3 as fallbacks after the pattern.
+        setAttackPlan(plan = {}) {
+          engine.discoverAttacks();
+          const fallbackKeys = mapSkillIdsToAttackKeys(state.attacks, plan.fallbackSkillIds || []);
+          if (fallbackKeys) state.settings.attackKeys = fallbackKeys;
+          const source = plan.useSpecific ? plan.specificPattern : plan.useGlobal ? plan.globalPattern : null;
+          if (!source) {
+            state.settings.primaryMode = 'attack';
+            afterSettingsChange();
+            return Boolean(fallbackKeys);
+          }
+          const attackKeys = [];
+          for (const rawId of source.skillIds || []) {
+            const skillId = String(rawId);
+            const matches = state.attacks.filter((attack) => attack.skillId === skillId);
+            const attack = matches.find((candidate) => candidate.group === GROUP_STANDARD) || matches[0];
+            if (!attack) return false;
+            attackKeys.push(attack.key);
+          }
+          if (!attackKeys.length) return false;
+          const pattern = {
+            attackKeys,
+            useStaminaPotions: source.useStaminaPotions === true,
+            useManaPotions: source.useManaPotions === true,
+          };
+          if (plan.useSpecific) {
+            state.settings.primaryMode = 'monster-pattern';
+            state.settings.monsterPatterns[engine.getMonsterId()] = pattern;
+          } else {
+            state.settings.primaryMode = 'global-pattern';
+            state.settings.globalPattern = pattern;
+          }
+          afterSettingsChange();
+          return true;
+        },
+
+        // { stamina: [itemIds], mana: [itemIds], heal: [itemIds] } in priority order. Listed
         // potions are enabled, all other potions of that type disabled, and
         // automatic use of that type is on exactly when the list is not empty.
         setPotions(lists) {
@@ -11344,13 +11482,11 @@
     const { cursorAfterFormat, formatNumber, formatTargetDisplay } = require('./mab-parse');
     const { getConfiguredPotionAmount, movePotion, supportsMultiplePotionUse } = require('./mab-potions');
     const { ID } = require('./mab-settings');
-    const { createPattern, normalizePattern, patternCosts } = require('./mab-patterns');
 
     const STYLE_ID = `${ID}-style`;
     const LOG_LIMIT = 60;
     const FORM_FIELDS = Object.freeze([
       '#mabAttack1',
-      '#mabPrimaryMode',
       '#mabAttack2',
       '#mabAttack3',
       '#mabPoisonAttack',
@@ -11415,13 +11551,6 @@
       #${ID} .mab-log > div + div { margin-top: 4px; }
       #${ID} .mab-empty, #${ID} .mab-hint { color: #7883aa; font-size: 10px; line-height: 1.45; }
       #${ID} .mab-hint { margin-top: 9px; }
-      #${ID} .mab-patterns { margin-top: 10px; }
-      #${ID} .mab-pattern-editor { margin-top: 8px; padding: 10px; border: 1px solid #303858; border-radius: 10px; background: #111526; }
-      #${ID} .mab-pattern-editor[hidden] { display: none; }
-      #${ID} .mab-pattern-row { display: grid; grid-template-columns: minmax(0,1fr) auto auto auto; gap: 5px; margin-top: 6px; }
-      #${ID} .mab-pattern-row button { min-width: 30px; border: 1px solid #3a4267; border-radius: 6px; background: #242943; color: #fff; cursor: pointer; }
-      #${ID} .mab-pattern-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin-top: 8px; font-size: 11px; }
-      #${ID} .mab-pattern-cost { color: #b9c5ef; font-variant-numeric: tabular-nums; }
       @media (max-width: 760px) {
         #${ID} .mab-grid, #${ID} .mab-priority-grid { grid-template-columns: 1fr; }
         #${ID} .mab-metrics { grid-template-columns: 1fr 1fr; }
@@ -11445,11 +11574,6 @@
           <div class="mab-grid">
             <label class="mab-field">
               <span>Attack 1 <small>Primary attack</small></span>
-              <select id="mabPrimaryMode">
-                <option value="attack">Single attack</option>
-                <option value="global-pattern">Global attack pattern</option>
-                <option value="monster-pattern">Monster-specific attack pattern</option>
-              </select>
               <select id="mabAttack1"></select>
             </label>
             <label class="mab-field">
@@ -11472,13 +11596,6 @@
               <span>Delay between attacks in ms</span>
               <input id="mabDelay" type="number" inputmode="numeric" min="0" step="50">
             </label>
-          </div>
-          <div class="mab-patterns">
-            <details>
-              <summary>Attack patterns</summary>
-              <div id="mabGlobalPattern" class="mab-pattern-editor"></div>
-              <div id="mabMonsterPattern" class="mab-pattern-editor"></div>
-            </details>
           </div>
           <div class="mab-options">
             <label><input id="mabAutoStamina" type="checkbox"> Use stamina potions automatically</label>
@@ -11578,100 +11695,6 @@
           fillAttackSelect($(`#mabAttack${index + 1}`), state.settings.attackKeys[index], false);
         }
         fillAttackSelect($('#mabPoisonAttack'), state.settings.poisonAttackKey, true);
-        renderPatternEditors();
-      }
-
-      function currentMonsterPattern() {
-        const id = engine.getMonsterId();
-        if (!state.settings.monsterPatterns[id]) state.settings.monsterPatterns[id] = createPattern();
-        return state.settings.monsterPatterns[id];
-      }
-
-      function renderPatternEditor(selector, title, pattern, specific = false) {
-        const container = $(selector);
-        if (!container) return;
-        container.replaceChildren();
-        const heading = doc.createElement('strong');
-        heading.textContent = title;
-        container.appendChild(heading);
-        const normalized = normalizePattern(pattern);
-        Object.assign(pattern, normalized);
-
-        normalized.attackKeys.forEach((key, index) => {
-          const row = doc.createElement('div');
-          row.className = 'mab-pattern-row';
-          const select = doc.createElement('select');
-          fillAttackSelect(select, key, false);
-          select.addEventListener('change', () => {
-            pattern.attackKeys[index] = select.value;
-            engine.saveSettings();
-            renderPatternEditors();
-          });
-          const buttons = [
-            ['↑', () => index > 0 && pattern.attackKeys.splice(index - 1, 0, pattern.attackKeys.splice(index, 1)[0])],
-            ['↓', () => index < pattern.attackKeys.length - 1 && pattern.attackKeys.splice(index + 1, 0, pattern.attackKeys.splice(index, 1)[0])],
-            ['×', () => pattern.attackKeys.splice(index, 1)],
-          ];
-          row.appendChild(select);
-          for (const [label, action] of buttons) {
-            const button = doc.createElement('button');
-            button.type = 'button';
-            button.textContent = label;
-            button.addEventListener('click', () => {
-              action();
-              engine.saveSettings();
-              renderPatternEditors();
-            });
-            row.appendChild(button);
-          }
-          container.appendChild(row);
-        });
-
-        const tools = doc.createElement('div');
-        tools.className = 'mab-pattern-tools';
-        const add = doc.createElement('button');
-        add.type = 'button';
-        add.className = 'mab-button mab-secondary';
-        add.textContent = '+ Add attack';
-        add.disabled = state.attacks.length === 0;
-        add.addEventListener('click', () => {
-          pattern.attackKeys.push(state.attacks[0]?.key || '');
-          engine.saveSettings();
-          renderPatternEditors();
-        });
-        tools.appendChild(add);
-        for (const [key, label] of [
-          ['useStaminaPotions', 'Use stamina potions'],
-          ['useManaPotions', 'Use mana potions'],
-        ]) {
-          const checkboxLabel = doc.createElement('label');
-          const checkbox = doc.createElement('input');
-          checkbox.type = 'checkbox';
-          checkbox.checked = pattern[key] === true;
-          checkbox.addEventListener('change', () => {
-            pattern[key] = checkbox.checked;
-            engine.saveSettings();
-          });
-          checkboxLabel.append(checkbox, ` ${label}`);
-          tools.appendChild(checkboxLabel);
-        }
-        const costs = patternCosts(pattern, state.attacks);
-        const cost = doc.createElement('span');
-        cost.className = 'mab-pattern-cost';
-        cost.textContent = `One loop: ${formatNumber(costs.stamina)} STA / ${formatNumber(costs.mana)} MP`;
-        tools.appendChild(cost);
-        container.appendChild(tools);
-        if (specific) {
-          const hint = doc.createElement('div');
-          hint.className = 'mab-hint';
-          hint.textContent = `Saved only for: ${engine.getMonsterLabel()}`;
-          container.appendChild(hint);
-        }
-      }
-
-      function renderPatternEditors() {
-        renderPatternEditor('#mabGlobalPattern', 'Global pattern (all monsters)', state.settings.globalPattern);
-        renderPatternEditor('#mabMonsterPattern', 'Monster-specific pattern', currentMonsterPattern(), true);
       }
 
       function renderPotionList(type, selector) {
@@ -11818,7 +11841,6 @@
             (number, index) => $(`#mabAttack${number}`)?.value || settings.attackKeys[index] || '',
           ),
         );
-        settings.primaryMode = $('#mabPrimaryMode')?.value || 'attack';
         settings.poisonAttackKey = $('#mabPoisonAttack')?.value || '';
         settings.targetDamage = $('#mabTarget')?.value.trim() || '0';
         settings.delayMs = Math.max(0, Number($('#mabDelay')?.value) || 0);
@@ -11845,10 +11867,6 @@
         if (delay) delay.value = String(settings.delayMs);
         const multiplier = $('#mabMultiplier');
         if (multiplier) multiplier.value = String(settings.levelMultiplier);
-        const primaryMode = $('#mabPrimaryMode');
-        if (primaryMode) primaryMode.value = settings.primaryMode;
-        const attack1 = $('#mabAttack1');
-        if (attack1) attack1.hidden = settings.primaryMode !== 'attack';
         for (const [selector, key] of [
           ['#mabAutoStamina', 'autoStamina'],
           ['#mabAutoMana', 'autoMana'],
@@ -11904,7 +11922,6 @@
           if (!element) continue;
           element.addEventListener('change', () => {
             readForm();
-            if (selector === '#mabPrimaryMode') writeFormValues();
             if (/^#mabAttack\d+$/.test(selector)) renderAttackOptions();
           });
           if (element.matches?.('input[type="text"], input[type="number"]')) element.addEventListener('input', readForm);
@@ -12422,14 +12439,14 @@
     // healing potions 'health'.
     const BRIDGE_TYPES = Object.freeze([
       { list: 'stamina', type: 'stamina', catalogType: 'stamina', autoFlag: 'autoStamina' },
+      { list: 'mana', type: 'mana', catalogType: 'mana', autoFlag: 'autoMana' },
       { list: 'heal', type: 'health', catalogType: 'heal', autoFlag: 'autoHealth' },
     ]);
 
-    // Applies { stamina: [itemIds], heal: [itemIds] }: the listed potions are
+    // Applies { stamina: [itemIds], mana: [itemIds], heal: [itemIds] }: the listed potions are
     // enabled in that priority order, every other known potion of that type is
     // disabled, and the type's "use automatically" switch follows whether the
     // list is empty. A list that is not an array leaves that type untouched.
-    // Mana potions are not part of the automation interface and stay as set.
     function applyPotionLists(settings, lists, potions = []) {
       for (const { list, type, catalogType, autoFlag } of BRIDGE_TYPES) {
         const requested = lists?.[list];
@@ -12646,6 +12663,8 @@
     const { createEngine } = require('./mab-engine');
     const { createPanel, injectStyles } = require('./mab-panel');
     const { ID, createResumeStore, createSettingsStore, resumeKey, settingsKey } = require('./mab-settings');
+    const { CONFIG_KEY } = require('../../scheduler/config');
+    const { cacheClassAttacks } = require('../../scheduler/attack-settings');
 
     function isBattlePage(url) {
       return /\/battle\.php$/i.test(url?.pathname || '');
@@ -12700,6 +12719,7 @@
         doc.getElementById(ID)?.remove();
         engine.setCard(card);
         engine.discoverAttacks();
+        cacheClassAttacks(ctx.store, CONFIG_KEY, state.attacks);
         engine.discoverPotions();
         injectStyles(doc);
 
@@ -12749,6 +12769,7 @@
         if (attackChanged) {
           debounce('attacks', 180, () => {
             if (engine.discoverAttacks()) panel?.ui.renderAttackOptions();
+            cacheClassAttacks(ctx.store, CONFIG_KEY, state.attacks);
           });
         }
 
@@ -24693,15 +24714,13 @@
       normalizeDamageTarget,
       parseGameNumber,
     } = require('../core/numbers');
+    const { STANDARD_ATTACKS, availableAttacks, normalizePattern, renderPatternEditor } = require('../scheduler/attack-settings');
 
-    const STANDARD_SKILLS = Object.freeze([
-      Object.freeze({ id: '-5', name: 'Skill −5', cost: 1_000 }),
-      Object.freeze({ id: '-4', name: 'Legendary Slash', cost: 200 }),
-      Object.freeze({ id: '-3', name: 'Ultimate Slash', cost: 100 }),
-      Object.freeze({ id: '-2', name: 'Heroic Slash', cost: 50 }),
-      Object.freeze({ id: '-1', name: 'Power Slash', cost: 10 }),
-      Object.freeze({ id: '0', name: 'Slash', cost: 1 }),
-    ]);
+    const STANDARD_SKILLS = Object.freeze(STANDARD_ATTACKS.map((attack) => Object.freeze({
+      id: attack.id,
+      name: attack.name,
+      cost: attack.stamina,
+    })));
 
     // Monster Auto Battle has three attack slots.
     const MAX_SKILLS = 3;
@@ -24723,6 +24742,8 @@
           name: boss.name,
           enabled: typeof saved?.enabled === 'boolean' ? saved.enabled : boss.defaultEnabled !== false,
           damage: normalizeDamageTarget(saved?.damage, boss.defaultDamage),
+          specificPatternEnabled: saved?.specificPatternEnabled === true,
+          specificPattern: normalizePattern(saved?.specificPattern),
         };
         if (boss.phase3 === true) {
           normalized.phase3Damage = normalizeAdditionalDamageTarget(
@@ -24732,13 +24753,24 @@
         }
         bosses[boss.id] = normalized;
       }
-      return { bosses, skills: normalizeSkills(value?.skills) };
+      return { bosses, skills: normalizeSkills(value?.skills), useGlobalPattern: value?.useGlobalPattern === true };
     }
 
     // sections: [{ title, bosses: [boss] }]
     function renderBossSettings(ctx, sections) {
       ctx.addSectionTitle('Attacks');
       const skillGroup = ctx.make('div', { className: ctx.cls('setting') });
+      ctx.addCheckbox({
+        id: 'use-global-pattern',
+        label: 'Global attack pattern (primary attack)',
+        checked: ctx.settings.useGlobalPattern,
+        parent: skillGroup,
+        onChange(checked) {
+          ctx.settings = ctx.updateSettings((settings) => {
+            settings.useGlobalPattern = checked;
+          });
+        },
+      });
       for (const skill of STANDARD_SKILLS) {
         ctx.addCheckbox({
           id: `skill-${skill.id}`,
@@ -24796,6 +24828,35 @@
               return next.bosses[boss.id].damage;
             },
           });
+          const patternHost = ctx.make('div', { className: ctx.cls('setting') });
+          ctx.addCheckbox({
+            id: `boss-${boss.id}-specific-pattern`,
+            label: `Use specific attack pattern for ${boss.name}`,
+            checked: bossSettings.specificPatternEnabled,
+            parent: patternHost,
+            onChange(checked) {
+              ctx.settings = ctx.updateSettings((settings) => {
+                settings.bosses[boss.id].specificPatternEnabled = checked;
+              });
+            },
+          });
+          const attackConfig = ctx.loadConfig?.()?.attack || {};
+          renderPatternEditor(
+            { ...ctx, container: patternHost },
+            {
+              id: `boss-${boss.id}-pattern`,
+              title: 'Specific attack pattern',
+              pattern: normalizePattern(bossSettings.specificPattern),
+              attacks: availableAttacks(attackConfig),
+              onChange(next, rerender) {
+                ctx.settings = ctx.updateSettings((settings) => {
+                  settings.bosses[boss.id].specificPattern = next;
+                });
+                if (rerender) ctx.rerender?.();
+              },
+            },
+          );
+          ctx.container.appendChild(patternHost);
           if (boss.phase3 === true) {
             ctx.addTextInput({
               id: `boss-${boss.id}-phase3-damage`,
@@ -24848,6 +24909,7 @@
       formatCrucibleDebugLog,
       readCrucibleDebugLog,
     } = require('../core/crucible-debug');
+    const { availableAttacks, normalizePattern, renderPatternEditor } = require('../scheduler/attack-settings');
 
     const DEFAULT_DAMAGE = '1m';
     const DEFAULT_ATTACK_COOLDOWN_MS = 100;
@@ -24986,6 +25048,10 @@
         enabled: typeof value?.enabled === 'boolean' ? value.enabled : fallback?.enabled !== false,
         mode: PVE_MODE_IDS.has(value?.mode) ? value.mode : fallbackMode,
         damage: normalizeDamageTarget(value?.damage, fallbackDamage),
+        specificPatternEnabled: typeof value?.specificPatternEnabled === 'boolean'
+          ? value.specificPatternEnabled
+          : fallback?.specificPatternEnabled === true,
+        specificPattern: normalizePattern(value?.specificPattern || fallback?.specificPattern),
       };
     }
 
@@ -25059,6 +25125,7 @@
         pveEnabled: value?.pveEnabled !== false,
         skill: SKILL_IDS.has(skill) ? skill : '0',
         attackCooldownMs: normalizeCooldown(value?.attackCooldownMs),
+        useGlobalPattern: value?.useGlobalPattern === true,
         nodeDefaults,
         discoveredMonsters,
         targets,
@@ -25118,6 +25185,17 @@
     function renderSettings(ctx) {
       ctx.addSectionTitle('PvE');
       const pveGeneral = ctx.make('div', { className: ctx.cls('setting') });
+      ctx.addCheckbox({
+        id: 'use-global-pattern',
+        label: 'Global attack pattern (primary attack)',
+        checked: ctx.settings.useGlobalPattern,
+        parent: pveGeneral,
+        onChange(checked) {
+          ctx.settings = ctx.updateSettings((settings) => {
+            settings.useGlobalPattern = checked;
+          });
+        },
+      });
       ctx.addCheckbox({
         id: 'pve-enabled',
         label: 'Enable PvE automation',
@@ -25209,6 +25287,32 @@
         );
         setTouchSize(enabledLabel);
         card.appendChild(enabledLabel);
+        ctx.addCheckbox({
+          id: `pve-target-${domKey}-specific-pattern`,
+          label: 'Use specific attack pattern (overrides global)',
+          checked: target.specificPatternEnabled,
+          parent: card,
+          onChange(checked) {
+            updateTarget(kind, key, (next) => {
+              next.specificPatternEnabled = checked;
+            });
+          },
+        });
+        renderPatternEditor(
+          { ...ctx, container: card },
+          {
+            id: `pve-target-${domKey}-pattern`,
+            title: 'Specific attack pattern',
+            pattern: normalizePattern(target.specificPattern),
+            attacks: availableAttacks(ctx.loadConfig?.()?.attack || {}),
+            onChange(next, rerender) {
+              updateTarget(kind, key, (settings) => {
+                settings.specificPattern = next;
+              });
+              if (rerender) ctx.rerender?.();
+            },
+          },
+        );
 
         const modeLabel = ctx.make('label', { text: 'Damage mode' });
         const modeId = `${ctx.idPrefix}-pve-target-${domKey}-mode`;
@@ -25715,6 +25819,7 @@
 
     const { normalizeDamageTarget } = require('../core/numbers');
     const shadowbridge = require('./shadowbridge');
+    const { availableAttacks, normalizePattern, renderPatternEditor } = require('../scheduler/attack-settings');
 
     const DUNGEON_NAME = 'Castle of the Fallen Prince';
     const DEFAULT_DAMAGE = '1m';
@@ -25776,6 +25881,8 @@
         enabled: typeof value?.enabled === 'boolean' ? value.enabled : true,
         mode: DAMAGE_MODE_SET.has(value?.mode) ? value.mode : 'max-damage',
         damage: normalizeDamageTarget(value?.damage, DEFAULT_DAMAGE),
+        specificPatternEnabled: value?.specificPatternEnabled === true,
+        specificPattern: normalizePattern(value?.specificPattern),
       };
     }
 
@@ -25793,6 +25900,7 @@
         discoveredNames,
         skill: SKILL_ID_SET.has(skill) ? skill : '0',
         attackCooldownMs: normalizeCooldown(value?.attackCooldownMs),
+        useGlobalPattern: value?.useGlobalPattern === true,
       };
     }
 
@@ -25853,6 +25961,16 @@
         }),
       );
       ctx.container.appendChild(skillGroup);
+      ctx.addCheckbox({
+        id: 'use-global-pattern',
+        label: 'Global attack pattern (primary attack)',
+        checked: ctx.settings.useGlobalPattern,
+        onChange(checked) {
+          ctx.settings = ctx.updateSettings((settings) => {
+            settings.useGlobalPattern = checked;
+          });
+        },
+      });
 
       const cooldownInput = ctx.addTextInput({
         id: 'attack-cooldown-ms',
@@ -25906,6 +26024,33 @@
         enabledLabel.appendChild(enabledInput);
         enabledLabel.appendChild(ctx.make('span', { text: 'Attack this monster' }));
         card.appendChild(enabledLabel);
+
+        ctx.addCheckbox({
+          id: `target-${definition.id}-specific-pattern`,
+          label: 'Use specific attack pattern (overrides global)',
+          checked: target.specificPatternEnabled,
+          parent: card,
+          onChange(checked) {
+            ctx.settings = ctx.updateSettings((settings) => {
+              settings.targets[definition.id].specificPatternEnabled = checked;
+            });
+          },
+        });
+        renderPatternEditor(
+          { ...ctx, container: card },
+          {
+            id: `target-${definition.id}-pattern`,
+            title: 'Specific attack pattern',
+            pattern: normalizePattern(target.specificPattern),
+            attacks: availableAttacks(ctx.loadConfig?.()?.attack || {}),
+            onChange(next, rerender) {
+              ctx.settings = ctx.updateSettings((settings) => {
+                settings.targets[definition.id].specificPattern = next;
+              });
+              if (rerender) ctx.rerender?.();
+            },
+          },
+        );
 
         const modeId = `${ctx.idPrefix}-target-${definition.id}-mode`;
         const modeLabel = ctx.make('label', { text: 'Damage mode' });
@@ -26738,12 +26883,184 @@
       },
     });
   },
+  "scheduler/attack-settings.js": function (module, exports, require) {
+    'use strict';
+
+    const STANDARD_ATTACKS = Object.freeze([
+      Object.freeze({ id: '-5', name: 'Skill −5', stamina: 1_000, mana: 0, classAttack: false }),
+      Object.freeze({ id: '-4', name: 'Legendary Slash', stamina: 200, mana: 0, classAttack: false }),
+      Object.freeze({ id: '-3', name: 'Ultimate Slash', stamina: 100, mana: 0, classAttack: false }),
+      Object.freeze({ id: '-2', name: 'Heroic Slash', stamina: 50, mana: 0, classAttack: false }),
+      Object.freeze({ id: '-1', name: 'Power Slash', stamina: 10, mana: 0, classAttack: false }),
+      Object.freeze({ id: '0', name: 'Slash', stamina: 1, mana: 0, classAttack: false }),
+    ]);
+
+    function createPattern() {
+      return { skillIds: [], useStaminaPotions: false, useManaPotions: false };
+    }
+
+    function normalizePattern(value) {
+      return {
+        skillIds: Array.isArray(value?.skillIds)
+          ? value.skillIds.map(String).map((id) => id.trim()).filter(Boolean).slice(0, 30)
+          : [],
+        useStaminaPotions: value?.useStaminaPotions === true,
+        useManaPotions: value?.useManaPotions === true,
+      };
+    }
+
+    function normalizeKnownAttacks(value) {
+      const result = [];
+      const seen = new Set(STANDARD_ATTACKS.map((attack) => attack.id));
+      for (const raw of Array.isArray(value) ? value : []) {
+        const id = String(raw?.id ?? '').trim();
+        const name = String(raw?.name ?? '').trim().slice(0, 100);
+        if (!id || !name || seen.has(id)) continue;
+        seen.add(id);
+        result.push({
+          id,
+          name,
+          stamina: Math.max(0, Number(raw?.stamina) || 0),
+          mana: Math.max(0, Number(raw?.mana) || 0),
+          classAttack: true,
+        });
+      }
+      return result.slice(0, 100);
+    }
+
+    function normalizeAttackSettings(value) {
+      return {
+        globalPattern: normalizePattern(value?.globalPattern),
+        knownClassAttacks: normalizeKnownAttacks(value?.knownClassAttacks),
+      };
+    }
+
+    function availableAttacks(config) {
+      return [...STANDARD_ATTACKS, ...normalizeKnownAttacks(config?.knownClassAttacks)];
+    }
+
+    function cacheClassAttacks(store, configKey, attacks) {
+      const classAttacks = (attacks || [])
+        .filter((attack) => attack.group === 'Class Attacks' && attack.skillId)
+        .map((attack) => ({
+          id: String(attack.skillId),
+          name: attack.name,
+          stamina: Number(attack.costs?.stamina) || 0,
+          mana: Number(attack.costs?.mana) || 0,
+          classAttack: true,
+        }));
+      if (!classAttacks.length || !store) return false;
+      const config = store.read(configKey);
+      if (!config || typeof config !== 'object') return false;
+      const current = normalizeKnownAttacks(config.attack?.knownClassAttacks);
+      const merged = normalizeKnownAttacks([...current, ...classAttacks]);
+      if (JSON.stringify(current) === JSON.stringify(merged)) return false;
+      config.attack = { ...normalizeAttackSettings(config.attack), knownClassAttacks: merged };
+      return store.write(configKey, config);
+    }
+
+    function patternCosts(pattern, attacks) {
+      const byId = new Map((attacks || []).map((attack) => [String(attack.id), attack]));
+      return normalizePattern(pattern).skillIds.reduce(
+        (total, id) => {
+          const attack = byId.get(id);
+          total.stamina += Number(attack?.stamina) || 0;
+          total.mana += Number(attack?.mana) || 0;
+          return total;
+        },
+        { stamina: 0, mana: 0 },
+      );
+    }
+
+    function renderPatternEditor(ctx, { id, title, pattern, attacks, onChange }) {
+      const card = ctx.make('div', { className: ctx.cls('setting') });
+      card.appendChild(ctx.make('div', { className: ctx.cls('setting-label'), text: title }));
+      const save = (rerender = false) => onChange(normalizePattern(pattern), rerender);
+
+      pattern.skillIds.forEach((skillId, index) => {
+        const row = ctx.make('div');
+        row.style.display = 'grid';
+        row.style.gridTemplateColumns = 'minmax(0,1fr) auto auto auto';
+        row.style.gap = '5px';
+        const select = ctx.make('select', { className: ctx.cls('select') });
+        for (const attack of attacks) {
+          const option = ctx.make('option', {
+            text: `${attack.name}${attack.classAttack ? ' · class' : ''} (${attack.stamina} STA${attack.mana ? ` / ${attack.mana} MP` : ''})`,
+          });
+          option.value = attack.id;
+          select.appendChild(option);
+        }
+        select.value = skillId;
+        select.addEventListener('change', () => {
+          pattern.skillIds[index] = select.value;
+          save();
+        });
+        row.appendChild(select);
+        for (const [label, action] of [
+          ['↑', () => index > 0 && pattern.skillIds.splice(index - 1, 0, pattern.skillIds.splice(index, 1)[0])],
+          ['↓', () => index < pattern.skillIds.length - 1 && pattern.skillIds.splice(index + 1, 0, pattern.skillIds.splice(index, 1)[0])],
+          ['×', () => pattern.skillIds.splice(index, 1)],
+        ]) {
+          const button = ctx.make('button', { className: ctx.cls('icon-button'), type: 'button', text: label });
+          button.addEventListener('click', () => {
+            action();
+            save(true);
+          });
+          row.appendChild(button);
+        }
+        card.appendChild(row);
+      });
+
+      const add = ctx.make('button', { className: ctx.cls('primary'), type: 'button', text: '+ Add attack' });
+      add.disabled = attacks.length === 0;
+      add.addEventListener('click', () => {
+        pattern.skillIds.push(attacks[0]?.id || '');
+        save(true);
+      });
+      card.appendChild(add);
+      for (const [key, label] of [
+        ['useStaminaPotions', 'Use stamina potions for this pattern'],
+        ['useManaPotions', 'Use mana potions for this pattern'],
+      ]) {
+        ctx.addCheckbox({
+          id: `${id}-${key}`,
+          label,
+          checked: pattern[key],
+          parent: card,
+          onChange(checked) {
+            pattern[key] = checked;
+            save();
+          },
+        });
+      }
+      const costs = patternCosts(pattern, attacks);
+      card.appendChild(ctx.make('div', {
+        className: ctx.cls('hint'),
+        text: `One loop: ${costs.stamina.toLocaleString('en-US')} stamina / ${costs.mana.toLocaleString('en-US')} mana`,
+      }));
+      ctx.container.appendChild(card);
+      return card;
+    }
+
+    module.exports = {
+      STANDARD_ATTACKS,
+      availableAttacks,
+      cacheClassAttacks,
+      createPattern,
+      normalizeAttackSettings,
+      normalizeKnownAttacks,
+      normalizePattern,
+      patternCosts,
+      renderPatternEditor,
+    };
+  },
   "scheduler/config.js": function (module, exports, require) {
     'use strict';
 
     const { createDefaultPotionSettings, normalizePotionSettings } = require('../core/potions');
     const { PROTOCOL_VERSION } = require('../core/protocol');
     const { ROUTE_LIST, getRoute } = require('../routes');
+    const { normalizeAttackSettings } = require('./attack-settings');
 
     const CONFIG_KEY = 'veyra:orchestrator:config:v1';
     const MIN_LOOP_MINUTES = 1;
@@ -26776,6 +27093,7 @@
       return {
         version: PROTOCOL_VERSION,
         enabled: true,
+        attack: normalizeAttackSettings(null),
         routes,
       };
     }
@@ -26791,6 +27109,7 @@
       return {
         version: PROTOCOL_VERSION,
         enabled: value.enabled !== false,
+        attack: normalizeAttackSettings(value.attack),
         routes,
       };
     }
@@ -27629,6 +27948,7 @@
     const { formatCountdown } = require('../core/time');
     const { ROUTE_LIST, getRoute } = require('../routes');
     const { MAX_LOOP_MINUTES, MIN_LOOP_MINUTES } = require('./config');
+    const { availableAttacks, normalizePattern, renderPatternEditor } = require('./attack-settings');
 
     const UI_ID = 'veyra-automation';
     const SITE_SETTINGS_TRIGGER_ID = 'openSettingsDrawerBtn';
@@ -27897,6 +28217,15 @@
           idPrefix,
           container,
 
+          loadConfig() {
+            return state.actions.loadConfig();
+          },
+
+          rerender() {
+            if (routeId === 'attack') openAttackSettings();
+            else openRouteSettings(routeId);
+          },
+
           runRouteNow() {
             return state.actions.runRouteNow(routeId);
           },
@@ -28006,6 +28335,43 @@
           renderStandardSettings(ctx, routeConfig);
           route.renderSettings?.(ctx);
         });
+      }
+
+      function openAttackSettings() {
+        const render = (content) => {
+          const config = state.actions.loadConfig();
+          const ctx = createSettingsContext('attack', content, { settings: config.attack });
+          ctx.addSectionTitle('Global attack pattern');
+          const pattern = normalizePattern(config.attack.globalPattern);
+          renderPatternEditor(ctx, {
+            id: 'global-pattern',
+            title: 'Used when “Global attack pattern” is selected for a route',
+            pattern,
+            attacks: availableAttacks(config.attack),
+            onChange(next, rerender) {
+              const latest = state.actions.loadConfig();
+              latest.attack.globalPattern = next;
+              state.actions.saveConfig(latest);
+              if (rerender) render(content);
+            },
+          });
+          content.appendChild(make('div', {
+            className: cls('hint'),
+            text: 'Class attacks appear here after they have been detected on a battle page for this character.',
+          }));
+        };
+        openView('Attack · Settings', render);
+      }
+
+      function buildAttackRow() {
+        const row = make('div', { className: cls('route') });
+        const info = make('div');
+        info.appendChild(make('div', { className: cls('route-name'), text: 'Attack' }));
+        info.appendChild(make('div', { className: cls('countdown'), text: 'Global attack pattern' }));
+        const button = make('button', { className: cls('icon-button'), type: 'button', title: 'Attack settings', text: '⚙' });
+        button.addEventListener('click', openAttackSettings);
+        row.append(info, button);
+        return row;
       }
 
       function renderFeatureSetting(container, definition, rerender) {
@@ -28207,6 +28573,10 @@
         body.appendChild(status);
         body.appendChild(make('div', { className: cls('section-title'), text: 'Pages' }));
         body.appendChild(routeList);
+        body.appendChild(make('div', { className: cls('section-title'), text: 'Combat' }));
+        const attackList = make('div', { className: cls('routes') });
+        attackList.appendChild(buildAttackRow());
+        body.appendChild(attackList);
 
         if (featureSettings && featureGroups.length > 0) {
           const featureList = make('div', { className: cls('routes') });

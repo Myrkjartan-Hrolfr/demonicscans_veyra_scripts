@@ -9,6 +9,7 @@ const { POTION_TYPES, potionsOfType } = require('../core/potions');
 const { formatCountdown } = require('../core/time');
 const { ROUTE_LIST, getRoute } = require('../routes');
 const { MAX_LOOP_MINUTES, MIN_LOOP_MINUTES } = require('./config');
+const { availableAttacks, normalizePattern, renderPatternEditor } = require('./attack-settings');
 
 const UI_ID = 'veyra-automation';
 const SITE_SETTINGS_TRIGGER_ID = 'openSettingsDrawerBtn';
@@ -277,6 +278,15 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
       idPrefix,
       container,
 
+      loadConfig() {
+        return state.actions.loadConfig();
+      },
+
+      rerender() {
+        if (routeId === 'attack') openAttackSettings();
+        else openRouteSettings(routeId);
+      },
+
       runRouteNow() {
         return state.actions.runRouteNow(routeId);
       },
@@ -386,6 +396,43 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
       renderStandardSettings(ctx, routeConfig);
       route.renderSettings?.(ctx);
     });
+  }
+
+  function openAttackSettings() {
+    const render = (content) => {
+      const config = state.actions.loadConfig();
+      const ctx = createSettingsContext('attack', content, { settings: config.attack });
+      ctx.addSectionTitle('Global attack pattern');
+      const pattern = normalizePattern(config.attack.globalPattern);
+      renderPatternEditor(ctx, {
+        id: 'global-pattern',
+        title: 'Used when “Global attack pattern” is selected for a route',
+        pattern,
+        attacks: availableAttacks(config.attack),
+        onChange(next, rerender) {
+          const latest = state.actions.loadConfig();
+          latest.attack.globalPattern = next;
+          state.actions.saveConfig(latest);
+          if (rerender) render(content);
+        },
+      });
+      content.appendChild(make('div', {
+        className: cls('hint'),
+        text: 'Class attacks appear here after they have been detected on a battle page for this character.',
+      }));
+    };
+    openView('Attack · Settings', render);
+  }
+
+  function buildAttackRow() {
+    const row = make('div', { className: cls('route') });
+    const info = make('div');
+    info.appendChild(make('div', { className: cls('route-name'), text: 'Attack' }));
+    info.appendChild(make('div', { className: cls('countdown'), text: 'Global attack pattern' }));
+    const button = make('button', { className: cls('icon-button'), type: 'button', title: 'Attack settings', text: '⚙' });
+    button.addEventListener('click', openAttackSettings);
+    row.append(info, button);
+    return row;
   }
 
   function renderFeatureSetting(container, definition, rerender) {
@@ -587,6 +634,10 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
     body.appendChild(status);
     body.appendChild(make('div', { className: cls('section-title'), text: 'Pages' }));
     body.appendChild(routeList);
+    body.appendChild(make('div', { className: cls('section-title'), text: 'Combat' }));
+    const attackList = make('div', { className: cls('routes') });
+    attackList.appendChild(buildAttackRow());
+    body.appendChild(attackList);
 
     if (featureSettings && featureGroups.length > 0) {
       const featureList = make('div', { className: cls('routes') });

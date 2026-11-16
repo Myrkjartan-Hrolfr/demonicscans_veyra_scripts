@@ -127,14 +127,14 @@ function movePotion(settings, type, index, direction) {
 // healing potions 'health'.
 const BRIDGE_TYPES = Object.freeze([
   { list: 'stamina', type: 'stamina', catalogType: 'stamina', autoFlag: 'autoStamina' },
+  { list: 'mana', type: 'mana', catalogType: 'mana', autoFlag: 'autoMana' },
   { list: 'heal', type: 'health', catalogType: 'heal', autoFlag: 'autoHealth' },
 ]);
 
-// Applies { stamina: [itemIds], heal: [itemIds] }: the listed potions are
+// Applies { stamina: [itemIds], mana: [itemIds], heal: [itemIds] }: the listed potions are
 // enabled in that priority order, every other known potion of that type is
 // disabled, and the type's "use automatically" switch follows whether the
 // list is empty. A list that is not an array leaves that type untouched.
-// Mana potions are not part of the automation interface and stay as set.
 function applyPotionLists(settings, lists, potions = []) {
   for (const { list, type, catalogType, autoFlag } of BRIDGE_TYPES) {
     const requested = lists?.[list];

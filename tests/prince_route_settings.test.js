@@ -46,7 +46,13 @@ test('Castle settings normalize five independent live damage targets', () => {
       },
     },
   }).routes.prince.settings;
-  assert.deepEqual(saved.targets['vizier-hall'], { enabled: false, mode: 'custom', damage: '2.5b' });
+  assert.deepEqual(saved.targets['vizier-hall'], {
+    enabled: false,
+    mode: 'custom',
+    damage: '2.5b',
+    specificPatternEnabled: false,
+    specificPattern: { skillIds: [], useStaminaPotions: false, useManaPotions: false },
+  });
   assert.equal(saved.targets['bloodbound-hall'].mode, 'max-damage');
   assert.equal(saved.skill, '-4');
   assert.equal(saved.attackCooldownMs, 2000);

@@ -155,6 +155,8 @@ test('Crucible settings normalize every mode, skill, cooldown and dynamic monste
     enabled: false,
     mode: 'custom',
     damage: '2.5b',
+    specificPatternEnabled: false,
+    specificPattern: { skillIds: [], useStaminaPotions: false, useManaPotions: false },
   });
 });
 
@@ -171,6 +173,8 @@ test('new live monsters inherit their node default and become individual setting
     enabled: true,
     mode: 'max-exp',
     damage: '9m',
+    specificPatternEnabled: false,
+    specificPattern: { skillIds: [], useStaminaPotions: false, useManaPotions: false },
   });
   assert.equal(
     crucible.settingsForMonster(merged.settings, 'crown_lens', 'Crown Horror').known,

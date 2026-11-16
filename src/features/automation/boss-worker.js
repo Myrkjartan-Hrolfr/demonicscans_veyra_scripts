@@ -791,6 +791,7 @@ function createBossWorker({
     const skills = routeConfig?.settings?.skills?.length ? [...routeConfig.settings.skills] : ['0'];
     const potions = {
       stamina: [...(routeConfig?.potions?.stamina || [])],
+      mana: [...(routeConfig?.potions?.mana || [])],
       heal: [...(routeConfig?.potions?.heal || [])],
     };
 
@@ -805,7 +806,18 @@ function createBossWorker({
     if (state?.running) {
       log(`Monster Auto Battle is already running against ${run.target.name}; watching it.`);
     } else if (!alreadyDone) {
-      if (controller.setAttacks(skills) === false) {
+      const bossSettings = routeConfig?.settings?.bosses?.[run.target.bossId] || {};
+      const attackPlan = {
+        fallbackSkillIds: skills,
+        useGlobal: routeConfig?.settings?.useGlobalPattern === true,
+        globalPattern: normalizeConfig(store.read(CONFIG_KEY)).attack.globalPattern,
+        useSpecific: bossSettings.specificPatternEnabled === true,
+        specificPattern: bossSettings.specificPattern,
+      };
+      const attackConfigured = typeof controller.setAttackPlan === 'function'
+        ? controller.setAttackPlan(attackPlan)
+        : controller.setAttacks(skills);
+      if (attackConfigured === false) {
         detachFight();
         finish(run, 'error', 'None of the configured attacks is available in Monster Auto Battle.', t);
         return;

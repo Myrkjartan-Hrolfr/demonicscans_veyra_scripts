@@ -8,6 +8,7 @@
 const { mapSkillIdsToAttackKeys } = require('./mab-attacks');
 const { formatTargetDisplay, parseTarget } = require('./mab-parse');
 const { applyPotionLists } = require('./mab-potions');
+const { GROUP_STANDARD } = require('./mab-attacks');
 
 // Accepts a number (3e9) or game text ("3b", "3,000,000,000"); 0 means
 // unlimited. Returns the stored text or null for invalid input.
@@ -63,7 +64,45 @@ function createController(engine, syncForm = () => {}) {
       return true;
     },
 
-    // { stamina: [itemIds], heal: [itemIds] } in priority order. Listed
+    // Places a scheduler pattern in the primary slot. A monster-specific
+    // pattern always wins over the route's global selection; the normal
+    // selected attacks remain in slots 1-3 as fallbacks after the pattern.
+    setAttackPlan(plan = {}) {
+      engine.discoverAttacks();
+      const fallbackKeys = mapSkillIdsToAttackKeys(state.attacks, plan.fallbackSkillIds || []);
+      if (fallbackKeys) state.settings.attackKeys = fallbackKeys;
+      const source = plan.useSpecific ? plan.specificPattern : plan.useGlobal ? plan.globalPattern : null;
+      if (!source) {
+        state.settings.primaryMode = 'attack';
+        afterSettingsChange();
+        return Boolean(fallbackKeys);
+      }
+      const attackKeys = [];
+      for (const rawId of source.skillIds || []) {
+        const skillId = String(rawId);
+        const matches = state.attacks.filter((attack) => attack.skillId === skillId);
+        const attack = matches.find((candidate) => candidate.group === GROUP_STANDARD) || matches[0];
+        if (!attack) return false;
+        attackKeys.push(attack.key);
+      }
+      if (!attackKeys.length) return false;
+      const pattern = {
+        attackKeys,
+        useStaminaPotions: source.useStaminaPotions === true,
+        useManaPotions: source.useManaPotions === true,
+      };
+      if (plan.useSpecific) {
+        state.settings.primaryMode = 'monster-pattern';
+        state.settings.monsterPatterns[engine.getMonsterId()] = pattern;
+      } else {
+        state.settings.primaryMode = 'global-pattern';
+        state.settings.globalPattern = pattern;
+      }
+      afterSettingsChange();
+      return true;
+    },
+
+    // { stamina: [itemIds], mana: [itemIds], heal: [itemIds] } in priority order. Listed
     // potions are enabled, all other potions of that type disabled, and
     // automatic use of that type is on exactly when the list is not empty.
     setPotions(lists) {

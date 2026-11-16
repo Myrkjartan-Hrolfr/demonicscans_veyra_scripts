@@ -9,15 +9,13 @@ const {
   normalizeDamageTarget,
   parseGameNumber,
 } = require('../core/numbers');
+const { STANDARD_ATTACKS, availableAttacks, normalizePattern, renderPatternEditor } = require('../scheduler/attack-settings');
 
-const STANDARD_SKILLS = Object.freeze([
-  Object.freeze({ id: '-5', name: 'Skill −5', cost: 1_000 }),
-  Object.freeze({ id: '-4', name: 'Legendary Slash', cost: 200 }),
-  Object.freeze({ id: '-3', name: 'Ultimate Slash', cost: 100 }),
-  Object.freeze({ id: '-2', name: 'Heroic Slash', cost: 50 }),
-  Object.freeze({ id: '-1', name: 'Power Slash', cost: 10 }),
-  Object.freeze({ id: '0', name: 'Slash', cost: 1 }),
-]);
+const STANDARD_SKILLS = Object.freeze(STANDARD_ATTACKS.map((attack) => Object.freeze({
+  id: attack.id,
+  name: attack.name,
+  cost: attack.stamina,
+})));
 
 // Monster Auto Battle has three attack slots.
 const MAX_SKILLS = 3;
@@ -39,6 +37,8 @@ function normalizeBossSettings(value, bossList) {
       name: boss.name,
       enabled: typeof saved?.enabled === 'boolean' ? saved.enabled : boss.defaultEnabled !== false,
       damage: normalizeDamageTarget(saved?.damage, boss.defaultDamage),
+      specificPatternEnabled: saved?.specificPatternEnabled === true,
+      specificPattern: normalizePattern(saved?.specificPattern),
     };
     if (boss.phase3 === true) {
       normalized.phase3Damage = normalizeAdditionalDamageTarget(
@@ -48,13 +48,24 @@ function normalizeBossSettings(value, bossList) {
     }
     bosses[boss.id] = normalized;
   }
-  return { bosses, skills: normalizeSkills(value?.skills) };
+  return { bosses, skills: normalizeSkills(value?.skills), useGlobalPattern: value?.useGlobalPattern === true };
 }
 
 // sections: [{ title, bosses: [boss] }]
 function renderBossSettings(ctx, sections) {
   ctx.addSectionTitle('Attacks');
   const skillGroup = ctx.make('div', { className: ctx.cls('setting') });
+  ctx.addCheckbox({
+    id: 'use-global-pattern',
+    label: 'Global attack pattern (primary attack)',
+    checked: ctx.settings.useGlobalPattern,
+    parent: skillGroup,
+    onChange(checked) {
+      ctx.settings = ctx.updateSettings((settings) => {
+        settings.useGlobalPattern = checked;
+      });
+    },
+  });
   for (const skill of STANDARD_SKILLS) {
     ctx.addCheckbox({
       id: `skill-${skill.id}`,
@@ -112,6 +123,35 @@ function renderBossSettings(ctx, sections) {
           return next.bosses[boss.id].damage;
         },
       });
+      const patternHost = ctx.make('div', { className: ctx.cls('setting') });
+      ctx.addCheckbox({
+        id: `boss-${boss.id}-specific-pattern`,
+        label: `Use specific attack pattern for ${boss.name}`,
+        checked: bossSettings.specificPatternEnabled,
+        parent: patternHost,
+        onChange(checked) {
+          ctx.settings = ctx.updateSettings((settings) => {
+            settings.bosses[boss.id].specificPatternEnabled = checked;
+          });
+        },
+      });
+      const attackConfig = ctx.loadConfig?.()?.attack || {};
+      renderPatternEditor(
+        { ...ctx, container: patternHost },
+        {
+          id: `boss-${boss.id}-pattern`,
+          title: 'Specific attack pattern',
+          pattern: normalizePattern(bossSettings.specificPattern),
+          attacks: availableAttacks(attackConfig),
+          onChange(next, rerender) {
+            ctx.settings = ctx.updateSettings((settings) => {
+              settings.bosses[boss.id].specificPattern = next;
+            });
+            if (rerender) ctx.rerender?.();
+          },
+        },
+      );
+      ctx.container.appendChild(patternHost);
       if (boss.phase3 === true) {
         ctx.addTextInput({
           id: `boss-${boss.id}-phase3-damage`,

@@ -3,6 +3,7 @@
 const { createDefaultPotionSettings, normalizePotionSettings } = require('../core/potions');
 const { PROTOCOL_VERSION } = require('../core/protocol');
 const { ROUTE_LIST, getRoute } = require('../routes');
+const { normalizeAttackSettings } = require('./attack-settings');
 
 const CONFIG_KEY = 'veyra:orchestrator:config:v1';
 const MIN_LOOP_MINUTES = 1;
@@ -35,6 +36,7 @@ function createDefaultConfig() {
   return {
     version: PROTOCOL_VERSION,
     enabled: true,
+    attack: normalizeAttackSettings(null),
     routes,
   };
 }
@@ -50,6 +52,7 @@ function normalizeConfig(value) {
   return {
     version: PROTOCOL_VERSION,
     enabled: value.enabled !== false,
+    attack: normalizeAttackSettings(value.attack),
     routes,
   };
 }

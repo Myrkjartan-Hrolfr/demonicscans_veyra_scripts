@@ -7,6 +7,7 @@ const {
   formatCrucibleDebugLog,
   readCrucibleDebugLog,
 } = require('../core/crucible-debug');
+const { availableAttacks, normalizePattern, renderPatternEditor } = require('../scheduler/attack-settings');
 
 const DEFAULT_DAMAGE = '1m';
 const DEFAULT_ATTACK_COOLDOWN_MS = 100;
@@ -145,6 +146,10 @@ function normalizeTarget(value, fallback = null) {
     enabled: typeof value?.enabled === 'boolean' ? value.enabled : fallback?.enabled !== false,
     mode: PVE_MODE_IDS.has(value?.mode) ? value.mode : fallbackMode,
     damage: normalizeDamageTarget(value?.damage, fallbackDamage),
+    specificPatternEnabled: typeof value?.specificPatternEnabled === 'boolean'
+      ? value.specificPatternEnabled
+      : fallback?.specificPatternEnabled === true,
+    specificPattern: normalizePattern(value?.specificPattern || fallback?.specificPattern),
   };
 }
 
@@ -218,6 +223,7 @@ function normalizeSettings(value) {
     pveEnabled: value?.pveEnabled !== false,
     skill: SKILL_IDS.has(skill) ? skill : '0',
     attackCooldownMs: normalizeCooldown(value?.attackCooldownMs),
+    useGlobalPattern: value?.useGlobalPattern === true,
     nodeDefaults,
     discoveredMonsters,
     targets,
@@ -277,6 +283,17 @@ function setTouchSize(element) {
 function renderSettings(ctx) {
   ctx.addSectionTitle('PvE');
   const pveGeneral = ctx.make('div', { className: ctx.cls('setting') });
+  ctx.addCheckbox({
+    id: 'use-global-pattern',
+    label: 'Global attack pattern (primary attack)',
+    checked: ctx.settings.useGlobalPattern,
+    parent: pveGeneral,
+    onChange(checked) {
+      ctx.settings = ctx.updateSettings((settings) => {
+        settings.useGlobalPattern = checked;
+      });
+    },
+  });
   ctx.addCheckbox({
     id: 'pve-enabled',
     label: 'Enable PvE automation',
@@ -368,6 +385,32 @@ function renderSettings(ctx) {
     );
     setTouchSize(enabledLabel);
     card.appendChild(enabledLabel);
+    ctx.addCheckbox({
+      id: `pve-target-${domKey}-specific-pattern`,
+      label: 'Use specific attack pattern (overrides global)',
+      checked: target.specificPatternEnabled,
+      parent: card,
+      onChange(checked) {
+        updateTarget(kind, key, (next) => {
+          next.specificPatternEnabled = checked;
+        });
+      },
+    });
+    renderPatternEditor(
+      { ...ctx, container: card },
+      {
+        id: `pve-target-${domKey}-pattern`,
+        title: 'Specific attack pattern',
+        pattern: normalizePattern(target.specificPattern),
+        attacks: availableAttacks(ctx.loadConfig?.()?.attack || {}),
+        onChange(next, rerender) {
+          updateTarget(kind, key, (settings) => {
+            settings.specificPattern = next;
+          });
+          if (rerender) ctx.rerender?.();
+        },
+      },
+    );
 
     const modeLabel = ctx.make('label', { text: 'Damage mode' });
     const modeId = `${ctx.idPrefix}-pve-target-${domKey}-mode`;
