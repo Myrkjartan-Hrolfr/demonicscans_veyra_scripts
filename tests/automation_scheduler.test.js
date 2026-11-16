@@ -27,6 +27,7 @@ const { createSchedulerEngine } = require('../src/scheduler/engine');
 const { countdownText } = require('../src/scheduler/ui');
 const {
   availableAttacks,
+  cacheClassAttacks,
   normalizeAttackSettings,
   normalizePattern,
   patternCosts,
@@ -48,6 +49,23 @@ test('scheduler attack patterns preserve order, potion flags and dynamically kno
   assert.deepEqual(normalizePattern(attack.globalPattern).skillIds, ['42', '0', '42']);
   assert.deepEqual(patternCosts(attack.globalPattern, attacks), { stamina: 25, mana: 60 });
   assert.equal(attacks.find((entry) => entry.id === '42').classAttack, true);
+});
+
+test('positive skill ids are cached as class attacks even when the theme omits the class wrapper', () => {
+  const values = new Map([['config', { version: 1, attack: {}, routes: {} }]]);
+  const store = {
+    read: (key) => values.get(key),
+    write: (key, value) => {
+      values.set(key, value);
+      return true;
+    },
+  };
+  assert.equal(cacheClassAttacks(store, 'config', [
+    { skillId: '6', name: 'Back Stab', group: 'Standard Attacks', costs: { stamina: 200, mana: 20 } },
+  ]), true);
+  assert.deepEqual(values.get('config').attack.knownClassAttacks, [
+    { id: '6', name: 'Back Stab', stamina: 200, mana: 20, classAttack: true },
+  ]);
 });
 
 function createStorage(initial = {}) {

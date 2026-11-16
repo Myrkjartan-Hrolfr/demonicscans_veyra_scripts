@@ -10392,7 +10392,11 @@
       // ---- attacks ------------------------------------------------------------
 
       function discoverAttacks() {
-        const attacks = state.card ? queryAll(SEL.attack, state.card).map(attackFromButton) : [];
+        // Class-skill bars are outside the monster card on some battle themes.
+        // The page has only one active combat action area, so read all live attack
+        // buttons and keep their DOM order.
+        const liveButtons = state.card ? queryAll(SEL.attack) : [];
+        const attacks = (liveButtons.length ? liveButtons : queryAll(SEL.attack, state.card)).map(attackFromButton);
         const signature = attackSignature(attacks);
         const changed = signature !== state.attackSignature;
         state.attackSignature = signature;
@@ -10407,7 +10411,9 @@
 
       function findLiveAttackButton(key) {
         if (!state.card) return null;
-        return queryAll(SEL.attack, state.card).find((button) => attackFromButton(button).key === key) || null;
+        const liveButtons = queryAll(SEL.attack);
+        return (liveButtons.length ? liveButtons : queryAll(SEL.attack, state.card))
+          .find((button) => attackFromButton(button).key === key) || null;
       }
 
       function getFastAttackContext(button) {
@@ -12662,6 +12668,7 @@
     const { createController } = require('./mab-controller');
     const { createEngine } = require('./mab-engine');
     const { createPanel, injectStyles } = require('./mab-panel');
+    const { attackFromButton } = require('./mab-attacks');
     const { ID, createResumeStore, createSettingsStore, resumeKey, settingsKey } = require('./mab-settings');
     const { CONFIG_KEY } = require('../../scheduler/config');
     const { cacheClassAttacks } = require('../../scheduler/attack-settings');
@@ -12700,6 +12707,14 @@
       let panel = null;
       let controller = null;
 
+      function cacheVisibleClassAttacks() {
+        // Query the whole document: on some battle layouts the class-skill bar is
+        // a sibling of the monster card rather than a descendant of it.
+        const liveAttacks = [...(doc.querySelectorAll?.('button.attack-btn[data-skill-id]') || [])]
+          .map(attackFromButton);
+        cacheClassAttacks(ctx.store, CONFIG_KEY, liveAttacks.length ? liveAttacks : state.attacks);
+      }
+
       function registerBridge() {
         if (!controller) controller = createController(engine, () => panel?.syncForm());
         registerController(controller);
@@ -12719,7 +12734,7 @@
         doc.getElementById(ID)?.remove();
         engine.setCard(card);
         engine.discoverAttacks();
-        cacheClassAttacks(ctx.store, CONFIG_KEY, state.attacks);
+        cacheVisibleClassAttacks();
         engine.discoverPotions();
         injectStyles(doc);
 
@@ -12769,7 +12784,7 @@
         if (attackChanged) {
           debounce('attacks', 180, () => {
             if (engine.discoverAttacks()) panel?.ui.renderAttackOptions();
-            cacheClassAttacks(ctx.store, CONFIG_KEY, state.attacks);
+            cacheVisibleClassAttacks();
           });
         }
 
@@ -26941,7 +26956,9 @@
 
     function cacheClassAttacks(store, configKey, attacks) {
       const classAttacks = (attacks || [])
-        .filter((attack) => attack.group === 'Class Attacks' && attack.skillId)
+        // Current battle markup documents every class skill with an id > 0.
+        // Keep the group check as a fallback for future non-numeric ids.
+        .filter((attack) => attack.skillId && (attack.group === 'Class Attacks' || Number(attack.skillId) > 0))
         .map((attack) => ({
           id: String(attack.skillId),
           name: attack.name,

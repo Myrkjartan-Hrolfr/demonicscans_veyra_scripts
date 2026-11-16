@@ -15,6 +15,7 @@ const { registerController, unregisterController } = require('./mab-bridge');
 const { createController } = require('./mab-controller');
 const { createEngine } = require('./mab-engine');
 const { createPanel, injectStyles } = require('./mab-panel');
+const { attackFromButton } = require('./mab-attacks');
 const { ID, createResumeStore, createSettingsStore, resumeKey, settingsKey } = require('./mab-settings');
 const { CONFIG_KEY } = require('../../scheduler/config');
 const { cacheClassAttacks } = require('../../scheduler/attack-settings');
@@ -53,6 +54,14 @@ function run(ctx) {
   let panel = null;
   let controller = null;
 
+  function cacheVisibleClassAttacks() {
+    // Query the whole document: on some battle layouts the class-skill bar is
+    // a sibling of the monster card rather than a descendant of it.
+    const liveAttacks = [...(doc.querySelectorAll?.('button.attack-btn[data-skill-id]') || [])]
+      .map(attackFromButton);
+    cacheClassAttacks(ctx.store, CONFIG_KEY, liveAttacks.length ? liveAttacks : state.attacks);
+  }
+
   function registerBridge() {
     if (!controller) controller = createController(engine, () => panel?.syncForm());
     registerController(controller);
@@ -72,7 +81,7 @@ function run(ctx) {
     doc.getElementById(ID)?.remove();
     engine.setCard(card);
     engine.discoverAttacks();
-    cacheClassAttacks(ctx.store, CONFIG_KEY, state.attacks);
+    cacheVisibleClassAttacks();
     engine.discoverPotions();
     injectStyles(doc);
 
@@ -122,7 +131,7 @@ function run(ctx) {
     if (attackChanged) {
       debounce('attacks', 180, () => {
         if (engine.discoverAttacks()) panel?.ui.renderAttackOptions();
-        cacheClassAttacks(ctx.store, CONFIG_KEY, state.attacks);
+        cacheVisibleClassAttacks();
       });
     }
 

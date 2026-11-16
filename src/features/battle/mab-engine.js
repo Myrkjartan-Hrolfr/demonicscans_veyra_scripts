@@ -369,7 +369,11 @@ function createEngine(options) {
   // ---- attacks ------------------------------------------------------------
 
   function discoverAttacks() {
-    const attacks = state.card ? queryAll(SEL.attack, state.card).map(attackFromButton) : [];
+    // Class-skill bars are outside the monster card on some battle themes.
+    // The page has only one active combat action area, so read all live attack
+    // buttons and keep their DOM order.
+    const liveButtons = state.card ? queryAll(SEL.attack) : [];
+    const attacks = (liveButtons.length ? liveButtons : queryAll(SEL.attack, state.card)).map(attackFromButton);
     const signature = attackSignature(attacks);
     const changed = signature !== state.attackSignature;
     state.attackSignature = signature;
@@ -384,7 +388,9 @@ function createEngine(options) {
 
   function findLiveAttackButton(key) {
     if (!state.card) return null;
-    return queryAll(SEL.attack, state.card).find((button) => attackFromButton(button).key === key) || null;
+    const liveButtons = queryAll(SEL.attack);
+    return (liveButtons.length ? liveButtons : queryAll(SEL.attack, state.card))
+      .find((button) => attackFromButton(button).key === key) || null;
   }
 
   function getFastAttackContext(button) {

@@ -55,7 +55,9 @@ function availableAttacks(config) {
 
 function cacheClassAttacks(store, configKey, attacks) {
   const classAttacks = (attacks || [])
-    .filter((attack) => attack.group === 'Class Attacks' && attack.skillId)
+    // Current battle markup documents every class skill with an id > 0.
+    // Keep the group check as a fallback for future non-numeric ids.
+    .filter((attack) => attack.skillId && (attack.group === 'Class Attacks' || Number(attack.skillId) > 0))
     .map((attack) => ({
       id: String(attack.skillId),
       name: attack.name,
