@@ -14,7 +14,13 @@ const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
 const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
 const { RUNTIME_KEY } = require('../../scheduler/runtime');
 const { staminaCost, staminaMultiplier } = require('../shared/asterion');
-const { attackSettingsForStore, availableAttacks, normalizePattern } = require('../../scheduler/attack-settings');
+const {
+  attackSettingsForStore,
+  availableAttacks,
+  effectiveGlobalPattern,
+  effectiveRouteGlobalPattern,
+  normalizePattern,
+} = require('../../scheduler/attack-settings');
 const logic = require('./shadowbridge-logic');
 const { createShadowbridgeStatusView } = require('./shadowbridge-status');
 const {
@@ -224,7 +230,15 @@ function createShadowbridgeWorker({
 
   function routeConfig() {
     const config = normalizeConfig(store.read(CONFIG_KEY));
-    return { ...config.routes[routeId], attack: attackSettingsForStore(config.attack, store) };
+    const route = config.routes[routeId];
+    route.settings.useGlobalPattern = effectiveRouteGlobalPattern(store, routeId, route.settings.useGlobalPattern);
+    return {
+      ...route,
+      attack: {
+        ...attackSettingsForStore(config.attack, store),
+        globalPattern: effectiveGlobalPattern(store, config.attack.globalPattern),
+      },
+    };
   }
 
   async function readDashboard(visitId) {

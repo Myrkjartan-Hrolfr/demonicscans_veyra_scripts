@@ -16,7 +16,13 @@ const { createJsonStore, getStorage } = require('../../core/storage');
 const { sleep } = require('../../core/time');
 const crucibleRoute = require('../../routes/crucible');
 const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
-const { attackSettingsForStore, availableAttacks, normalizePattern } = require('../../scheduler/attack-settings');
+const {
+  attackSettingsForStore,
+  availableAttacks,
+  effectiveGlobalPattern,
+  effectiveRouteGlobalPattern,
+  normalizePattern,
+} = require('../../scheduler/attack-settings');
 const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
 const { staminaCost, staminaMultiplier } = require('../shared/asterion');
 const logic = require('./crucible-logic');
@@ -292,7 +298,15 @@ function createCrucibleWorker({
 
   function routeConfig() {
     const config = normalizeConfig(store.read(CONFIG_KEY));
-    return { ...config.routes[ROUTE_ID], attack: attackSettingsForStore(config.attack, store) };
+    const route = config.routes[ROUTE_ID];
+    route.settings.useGlobalPattern = effectiveRouteGlobalPattern(store, ROUTE_ID, route.settings.useGlobalPattern);
+    return {
+      ...route,
+      attack: {
+        ...attackSettingsForStore(config.attack, store),
+        globalPattern: effectiveGlobalPattern(store, config.attack.globalPattern),
+      },
+    };
   }
 
   function minimalArmyContribution(battleId) {

@@ -289,6 +289,7 @@ function renderSettings(ctx) {
     checked: ctx.settings.useGlobalPattern,
     parent: pveGeneral,
     onChange(checked) {
+      ctx.setUseGlobalPattern?.(checked);
       ctx.settings = ctx.updateSettings((settings) => {
         settings.useGlobalPattern = checked;
       });

@@ -67,6 +67,7 @@ function renderBossSettings(ctx, sections) {
     checked: ctx.settings.useGlobalPattern,
     parent: skillGroup,
     onChange(checked) {
+      ctx.setUseGlobalPattern?.(checked);
       ctx.settings = ctx.updateSettings((settings) => {
         settings.useGlobalPattern = checked;
       });

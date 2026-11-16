@@ -13,8 +13,12 @@ const {
   attackSettingsForStore,
   availableAttacks,
   cacheClassAttacksFromDocument,
+  effectiveGlobalPattern,
+  effectiveRouteGlobalPattern,
   normalizePattern,
   renderPatternEditor,
+  saveGlobalPattern,
+  saveRouteGlobalPattern,
 } = require('./attack-settings');
 
 const UI_ID = 'veyra-automation';
@@ -295,6 +299,11 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
         else openRouteSettings(routeId);
       },
 
+      setUseGlobalPattern(enabled) {
+        saveRouteGlobalPattern(store, routeId, enabled);
+        return enabled === true;
+      },
+
       runRouteNow() {
         return state.actions.runRouteNow(routeId);
       },
@@ -426,6 +435,11 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
     cacheClassAttacksFromDocument(store, CONFIG_KEY, doc);
     openView(`${route.label} · Settings`, (content) => {
       const routeConfig = state.actions.loadConfig().routes[routeId];
+      routeConfig.settings.useGlobalPattern = effectiveRouteGlobalPattern(
+        store,
+        routeId,
+        routeConfig.settings.useGlobalPattern,
+      );
       const ctx = createSettingsContext(routeId, content, routeConfig);
       renderStandardSettings(ctx, routeConfig);
       route.renderSettings?.(ctx);
@@ -444,7 +458,7 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
       const attackSettings = attackSettingsForStore(config.attack, store);
       const ctx = createSettingsContext('attack', content, { settings: config.attack });
       ctx.addSectionTitle('Global attack pattern');
-      const pattern = normalizePattern(config.attack.globalPattern);
+      const pattern = effectiveGlobalPattern(store, config.attack.globalPattern);
       renderPatternEditor(ctx, {
         id: 'global-pattern',
         title: 'Used when “Global attack pattern” is selected for a route',
@@ -454,6 +468,7 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
           const latest = state.actions.loadConfig();
           latest.attack.globalPattern = next;
           state.actions.saveConfig(latest);
+          saveGlobalPattern(store, next);
           if (rerender) render(content);
         },
       });

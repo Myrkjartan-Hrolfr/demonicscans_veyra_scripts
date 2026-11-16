@@ -585,6 +585,18 @@ function createEngine(options) {
           message: result.message,
         };
       }
+      if (result.ok && Number.isFinite(damage) && damage === 0) {
+        return {
+          type: 'success',
+          mode: 'api',
+          damage: 0,
+          totalDamage: result.totalDamage,
+          afterExperience,
+          monsterDead: result.monsterDead,
+          poisonActive: result.poisonActive,
+          message: result.message,
+        };
+      }
       if (result.monsterDead) {
         return { type: 'monster-dead', mode: 'api', afterExperience, message: result.message };
       }
@@ -1330,7 +1342,7 @@ function createEngine(options) {
         const outcome = await performAttack(prepared.attack, button, beforeDamage, beforeExperience, beforeFeedback);
         if (!state.running) break;
 
-        if (outcome.type === 'damage') {
+        if (outcome.type === 'damage' || outcome.type === 'success') {
           resumeStore.clear();
           state.noDamageCount = 0;
           state.forcedAttackIndex = 0;
@@ -1346,17 +1358,24 @@ function createEngine(options) {
             await waitForPlayerLogUpdate(beforePlayerLogEntry);
           }
 
-          const afterExperience =
-            outcome.mode === 'api' ? outcome.afterExperience : await waitForExperienceUpdate(beforeExperience);
-          const calculatedGain = calculateExperienceGain(beforeExperience, afterExperience);
-          state.lastExperienceGain =
-            Number.isFinite(outcome.experienceGain) && outcome.experienceGain > 0
-              ? outcome.experienceGain
-              : Number.isFinite(calculatedGain) && calculatedGain > 0
-                ? calculatedGain
-                : null;
+          const supportOnly = outcome.type === 'success';
+          const afterExperience = supportOnly
+            ? outcome.afterExperience
+            : outcome.mode === 'api'
+              ? outcome.afterExperience
+              : await waitForExperienceUpdate(beforeExperience);
+          const calculatedGain = supportOnly ? null : calculateExperienceGain(beforeExperience, afterExperience);
+          state.lastExperienceGain = supportOnly
+            ? state.lastExperienceGain
+            : Number.isFinite(outcome.experienceGain) && outcome.experienceGain > 0
+                ? outcome.experienceGain
+                : Number.isFinite(calculatedGain) && calculatedGain > 0
+                  ? calculatedGain
+                  : null;
 
-          if (Number.isFinite(state.lastExperienceGain)) {
+          if (supportOnly) {
+            log(`${prepared.attack.name} executed successfully without direct damage.`);
+          } else if (Number.isFinite(state.lastExperienceGain)) {
             log(
               `Hit dealt ${formatNumber(state.lastDamage)} damage and granted ` +
                 `${formatNumber(state.lastExperienceGain)} EXP.`,

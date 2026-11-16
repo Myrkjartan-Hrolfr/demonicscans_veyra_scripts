@@ -29,9 +29,13 @@ const {
   availableAttacks,
   cacheClassAttacks,
   cacheClassAttacksFromDocument,
+  effectiveGlobalPattern,
+  effectiveRouteGlobalPattern,
   normalizeAttackSettings,
   normalizePattern,
   patternCosts,
+  saveGlobalPattern,
+  saveRouteGlobalPattern,
 } = require('../src/scheduler/attack-settings');
 const { build, buildComunityVersion } = require('../build');
 
@@ -68,6 +72,19 @@ test('class attacks can be discovered from the game attack-pattern selects', () 
     { id: '6', name: 'Back Stab' },
     { id: '7', name: 'Killer Instinct' },
   ]);
+});
+
+test('global pattern policy survives independently from scheduler config normalisation', () => {
+  const values = new Map();
+  const store = { read: (key) => values.get(key), write: (key, value) => (values.set(key, value), true) };
+  saveGlobalPattern(store, { skillIds: ['7', '-5'], useManaPotions: true });
+  saveRouteGlobalPattern(store, 'olympus', true);
+  assert.deepEqual(effectiveGlobalPattern(store, null), {
+    skillIds: ['7', '-5'],
+    useStaminaPotions: false,
+    useManaPotions: true,
+  });
+  assert.equal(effectiveRouteGlobalPattern(store, 'olympus', false), true);
 });
 
 test('positive skill ids are cached as class attacks even when the theme omits the class wrapper', () => {

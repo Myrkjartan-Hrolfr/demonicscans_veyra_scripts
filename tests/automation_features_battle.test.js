@@ -573,11 +573,12 @@ test('a global attack pattern advances through every attack and loops', async ()
     search: '?dgmid=11&instance_id=22',
     postForm: async (_url, params) => {
       skillIds.push(params.skill_id);
-      totalDamage += 10;
+      const damage = params.skill_id === '0' ? 0 : 10;
+      totalDamage += damage;
       return {
         ok: true,
         status: 200,
-        text: JSON.stringify({ status: 'success', damage: 10, totaldmgdealt: totalDamage, stamina_after: 100 }),
+        text: JSON.stringify({ status: 'success', damage, totaldmgdealt: totalDamage, stamina_after: 100 }),
         json: null,
       };
     },
@@ -588,7 +589,7 @@ test('a global attack pattern advances through every attack and loops', async ()
     useGlobal: true,
     globalPattern: { skillIds: ['0', '-1'], useStaminaPotions: false, useManaPotions: false },
   }), true);
-  controller.setTargetDamage(40);
+  controller.setTargetDamage(20);
   engine.state.settings.delayMs = 0;
   await engine.start();
   assert.deepEqual(skillIds, ['0', '-1', '0', '-1']);

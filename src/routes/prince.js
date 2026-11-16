@@ -149,6 +149,7 @@ function renderSettings(ctx) {
     label: 'Global attack pattern (primary attack)',
     checked: ctx.settings.useGlobalPattern,
     onChange(checked) {
+      ctx.setUseGlobalPattern?.(checked);
       ctx.settings = ctx.updateSettings((settings) => {
         settings.useGlobalPattern = checked;
       });

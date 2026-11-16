@@ -9,6 +9,7 @@ const STANDARD_ATTACKS = Object.freeze([
   Object.freeze({ id: '0', name: 'Slash', stamina: 1, mana: 0, classAttack: false }),
 ]);
 const CLASS_ATTACKS_KEY = 'veyra:attack:class-catalog:v1';
+const ATTACK_POLICY_KEY = 'veyra:attack:policy:v1';
 
 function createPattern() {
   return { skillIds: [], useStaminaPotions: false, useManaPotions: false };
@@ -57,6 +58,42 @@ function normalizeAttackSettings(value) {
     globalPattern: normalizePattern(value?.globalPattern),
     knownClassAttacks: normalizeKnownAttacks(value?.knownClassAttacks),
   };
+}
+
+function readAttackPolicy(store) {
+  const value = store?.read?.(ATTACK_POLICY_KEY);
+  return {
+    globalPattern: normalizePattern(value?.globalPattern),
+    useGlobalByRoute: value?.useGlobalByRoute && typeof value.useGlobalByRoute === 'object'
+      ? { ...value.useGlobalByRoute }
+      : {},
+  };
+}
+
+function saveGlobalPattern(store, pattern) {
+  const policy = readAttackPolicy(store);
+  policy.globalPattern = normalizePattern(pattern);
+  store?.write?.(ATTACK_POLICY_KEY, policy);
+  return policy.globalPattern;
+}
+
+function saveRouteGlobalPattern(store, routeId, enabled) {
+  const policy = readAttackPolicy(store);
+  policy.useGlobalByRoute[String(routeId)] = enabled === true;
+  store?.write?.(ATTACK_POLICY_KEY, policy);
+  return enabled === true;
+}
+
+function effectiveGlobalPattern(store, fallback) {
+  const saved = readAttackPolicy(store).globalPattern;
+  return saved.skillIds.length ? saved : normalizePattern(fallback);
+}
+
+function effectiveRouteGlobalPattern(store, routeId, fallback = false) {
+  const policy = readAttackPolicy(store);
+  return Object.prototype.hasOwnProperty.call(policy.useGlobalByRoute, routeId)
+    ? policy.useGlobalByRoute[routeId] === true
+    : fallback === true;
 }
 
 function availableAttacks(config) {
@@ -216,17 +253,23 @@ function renderPatternEditor(ctx, { id, title, pattern, attacks, onChange }) {
 }
 
 module.exports = {
+  ATTACK_POLICY_KEY,
   CLASS_ATTACKS_KEY,
   STANDARD_ATTACKS,
   attackSettingsForStore,
   availableAttacks,
   cacheClassAttacks,
   cacheClassAttacksFromDocument,
+  effectiveGlobalPattern,
+  effectiveRouteGlobalPattern,
   createPattern,
   normalizeAttackSettings,
   normalizeKnownAttacks,
   mergeKnownAttacks,
   normalizePattern,
   patternCosts,
+  readAttackPolicy,
   renderPatternEditor,
+  saveGlobalPattern,
+  saveRouteGlobalPattern,
 };

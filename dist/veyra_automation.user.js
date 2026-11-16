@@ -3052,6 +3052,7 @@
     const { COMMAND_KEY, publishWorkerStatus } = require('../../core/protocol');
     const { createJsonStore, getStorage } = require('../../core/storage');
     const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
+    const { effectiveGlobalPattern, effectiveRouteGlobalPattern } = require('../../scheduler/attack-settings');
     const mabBridge = require('../battle/mab-bridge');
     const dom = require('./boss-dom');
     const logic = require('./boss-logic');
@@ -3847,8 +3848,11 @@
           const bossSettings = routeConfig?.settings?.bosses?.[run.target.bossId] || {};
           const attackPlan = {
             fallbackSkillIds: skills,
-            useGlobal: routeConfig?.settings?.useGlobalPattern === true,
-            globalPattern: normalizeConfig(store.read(CONFIG_KEY)).attack.globalPattern,
+            useGlobal: effectiveRouteGlobalPattern(store, run.routeId, routeConfig?.settings?.useGlobalPattern),
+            globalPattern: effectiveGlobalPattern(
+              store,
+              normalizeConfig(store.read(CONFIG_KEY)).attack.globalPattern,
+            ),
             useSpecific: bossSettings.specificPatternEnabled === true,
             specificPattern: bossSettings.specificPattern,
           };
@@ -5403,7 +5407,13 @@
     const { sleep } = require('../../core/time');
     const crucibleRoute = require('../../routes/crucible');
     const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
-    const { attackSettingsForStore, availableAttacks, normalizePattern } = require('../../scheduler/attack-settings');
+    const {
+      attackSettingsForStore,
+      availableAttacks,
+      effectiveGlobalPattern,
+      effectiveRouteGlobalPattern,
+      normalizePattern,
+    } = require('../../scheduler/attack-settings');
     const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
     const { staminaCost, staminaMultiplier } = require('../shared/asterion');
     const logic = require('./crucible-logic');
@@ -5679,7 +5689,15 @@
 
       function routeConfig() {
         const config = normalizeConfig(store.read(CONFIG_KEY));
-        return { ...config.routes[ROUTE_ID], attack: attackSettingsForStore(config.attack, store) };
+        const route = config.routes[ROUTE_ID];
+        route.settings.useGlobalPattern = effectiveRouteGlobalPattern(store, ROUTE_ID, route.settings.useGlobalPattern);
+        return {
+          ...route,
+          attack: {
+            ...attackSettingsForStore(config.attack, store),
+            globalPattern: effectiveGlobalPattern(store, config.attack.globalPattern),
+          },
+        };
       }
 
       function minimalArmyContribution(battleId) {
@@ -8896,7 +8914,13 @@
     const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
     const { RUNTIME_KEY } = require('../../scheduler/runtime');
     const { staminaCost, staminaMultiplier } = require('../shared/asterion');
-    const { attackSettingsForStore, availableAttacks, normalizePattern } = require('../../scheduler/attack-settings');
+    const {
+      attackSettingsForStore,
+      availableAttacks,
+      effectiveGlobalPattern,
+      effectiveRouteGlobalPattern,
+      normalizePattern,
+    } = require('../../scheduler/attack-settings');
     const logic = require('./shadowbridge-logic');
     const { createShadowbridgeStatusView } = require('./shadowbridge-status');
     const {
@@ -9106,7 +9130,15 @@
 
       function routeConfig() {
         const config = normalizeConfig(store.read(CONFIG_KEY));
-        return { ...config.routes[routeId], attack: attackSettingsForStore(config.attack, store) };
+        const route = config.routes[routeId];
+        route.settings.useGlobalPattern = effectiveRouteGlobalPattern(store, routeId, route.settings.useGlobalPattern);
+        return {
+          ...route,
+          attack: {
+            ...attackSettingsForStore(config.attack, store),
+            globalPattern: effectiveGlobalPattern(store, config.attack.globalPattern),
+          },
+        };
       }
 
       async function readDashboard(visitId) {
@@ -10608,6 +10640,18 @@
               message: result.message,
             };
           }
+          if (result.ok && Number.isFinite(damage) && damage === 0) {
+            return {
+              type: 'success',
+              mode: 'api',
+              damage: 0,
+              totalDamage: result.totalDamage,
+              afterExperience,
+              monsterDead: result.monsterDead,
+              poisonActive: result.poisonActive,
+              message: result.message,
+            };
+          }
           if (result.monsterDead) {
             return { type: 'monster-dead', mode: 'api', afterExperience, message: result.message };
           }
@@ -11353,7 +11397,7 @@
             const outcome = await performAttack(prepared.attack, button, beforeDamage, beforeExperience, beforeFeedback);
             if (!state.running) break;
 
-            if (outcome.type === 'damage') {
+            if (outcome.type === 'damage' || outcome.type === 'success') {
               resumeStore.clear();
               state.noDamageCount = 0;
               state.forcedAttackIndex = 0;
@@ -11369,17 +11413,24 @@
                 await waitForPlayerLogUpdate(beforePlayerLogEntry);
               }
 
-              const afterExperience =
-                outcome.mode === 'api' ? outcome.afterExperience : await waitForExperienceUpdate(beforeExperience);
-              const calculatedGain = calculateExperienceGain(beforeExperience, afterExperience);
-              state.lastExperienceGain =
-                Number.isFinite(outcome.experienceGain) && outcome.experienceGain > 0
-                  ? outcome.experienceGain
-                  : Number.isFinite(calculatedGain) && calculatedGain > 0
-                    ? calculatedGain
-                    : null;
+              const supportOnly = outcome.type === 'success';
+              const afterExperience = supportOnly
+                ? outcome.afterExperience
+                : outcome.mode === 'api'
+                  ? outcome.afterExperience
+                  : await waitForExperienceUpdate(beforeExperience);
+              const calculatedGain = supportOnly ? null : calculateExperienceGain(beforeExperience, afterExperience);
+              state.lastExperienceGain = supportOnly
+                ? state.lastExperienceGain
+                : Number.isFinite(outcome.experienceGain) && outcome.experienceGain > 0
+                    ? outcome.experienceGain
+                    : Number.isFinite(calculatedGain) && calculatedGain > 0
+                      ? calculatedGain
+                      : null;
 
-              if (Number.isFinite(state.lastExperienceGain)) {
+              if (supportOnly) {
+                log(`${prepared.attack.name} executed successfully without direct damage.`);
+              } else if (Number.isFinite(state.lastExperienceGain)) {
                 log(
                   `Hit dealt ${formatNumber(state.lastDamage)} damage and granted ` +
                     `${formatNumber(state.lastExperienceGain)} EXP.`,
@@ -24792,6 +24843,7 @@
         checked: ctx.settings.useGlobalPattern,
         parent: skillGroup,
         onChange(checked) {
+          ctx.setUseGlobalPattern?.(checked);
           ctx.settings = ctx.updateSettings((settings) => {
             settings.useGlobalPattern = checked;
           });
@@ -25217,6 +25269,7 @@
         checked: ctx.settings.useGlobalPattern,
         parent: pveGeneral,
         onChange(checked) {
+          ctx.setUseGlobalPattern?.(checked);
           ctx.settings = ctx.updateSettings((settings) => {
             settings.useGlobalPattern = checked;
           });
@@ -25992,6 +26045,7 @@
         label: 'Global attack pattern (primary attack)',
         checked: ctx.settings.useGlobalPattern,
         onChange(checked) {
+          ctx.setUseGlobalPattern?.(checked);
           ctx.settings = ctx.updateSettings((settings) => {
             settings.useGlobalPattern = checked;
           });
@@ -26921,6 +26975,7 @@
       Object.freeze({ id: '0', name: 'Slash', stamina: 1, mana: 0, classAttack: false }),
     ]);
     const CLASS_ATTACKS_KEY = 'veyra:attack:class-catalog:v1';
+    const ATTACK_POLICY_KEY = 'veyra:attack:policy:v1';
 
     function createPattern() {
       return { skillIds: [], useStaminaPotions: false, useManaPotions: false };
@@ -26969,6 +27024,42 @@
         globalPattern: normalizePattern(value?.globalPattern),
         knownClassAttacks: normalizeKnownAttacks(value?.knownClassAttacks),
       };
+    }
+
+    function readAttackPolicy(store) {
+      const value = store?.read?.(ATTACK_POLICY_KEY);
+      return {
+        globalPattern: normalizePattern(value?.globalPattern),
+        useGlobalByRoute: value?.useGlobalByRoute && typeof value.useGlobalByRoute === 'object'
+          ? { ...value.useGlobalByRoute }
+          : {},
+      };
+    }
+
+    function saveGlobalPattern(store, pattern) {
+      const policy = readAttackPolicy(store);
+      policy.globalPattern = normalizePattern(pattern);
+      store?.write?.(ATTACK_POLICY_KEY, policy);
+      return policy.globalPattern;
+    }
+
+    function saveRouteGlobalPattern(store, routeId, enabled) {
+      const policy = readAttackPolicy(store);
+      policy.useGlobalByRoute[String(routeId)] = enabled === true;
+      store?.write?.(ATTACK_POLICY_KEY, policy);
+      return enabled === true;
+    }
+
+    function effectiveGlobalPattern(store, fallback) {
+      const saved = readAttackPolicy(store).globalPattern;
+      return saved.skillIds.length ? saved : normalizePattern(fallback);
+    }
+
+    function effectiveRouteGlobalPattern(store, routeId, fallback = false) {
+      const policy = readAttackPolicy(store);
+      return Object.prototype.hasOwnProperty.call(policy.useGlobalByRoute, routeId)
+        ? policy.useGlobalByRoute[routeId] === true
+        : fallback === true;
     }
 
     function availableAttacks(config) {
@@ -27128,19 +27219,25 @@
     }
 
     module.exports = {
+      ATTACK_POLICY_KEY,
       CLASS_ATTACKS_KEY,
       STANDARD_ATTACKS,
       attackSettingsForStore,
       availableAttacks,
       cacheClassAttacks,
       cacheClassAttacksFromDocument,
+      effectiveGlobalPattern,
+      effectiveRouteGlobalPattern,
       createPattern,
       normalizeAttackSettings,
       normalizeKnownAttacks,
       mergeKnownAttacks,
       normalizePattern,
       patternCosts,
+      readAttackPolicy,
       renderPatternEditor,
+      saveGlobalPattern,
+      saveRouteGlobalPattern,
     };
   },
   "scheduler/config.js": function (module, exports, require) {
@@ -28041,8 +28138,12 @@
       attackSettingsForStore,
       availableAttacks,
       cacheClassAttacksFromDocument,
+      effectiveGlobalPattern,
+      effectiveRouteGlobalPattern,
       normalizePattern,
       renderPatternEditor,
+      saveGlobalPattern,
+      saveRouteGlobalPattern,
     } = require('./attack-settings');
 
     const UI_ID = 'veyra-automation';
@@ -28323,6 +28424,11 @@
             else openRouteSettings(routeId);
           },
 
+          setUseGlobalPattern(enabled) {
+            saveRouteGlobalPattern(store, routeId, enabled);
+            return enabled === true;
+          },
+
           runRouteNow() {
             return state.actions.runRouteNow(routeId);
           },
@@ -28454,6 +28560,11 @@
         cacheClassAttacksFromDocument(store, CONFIG_KEY, doc);
         openView(`${route.label} · Settings`, (content) => {
           const routeConfig = state.actions.loadConfig().routes[routeId];
+          routeConfig.settings.useGlobalPattern = effectiveRouteGlobalPattern(
+            store,
+            routeId,
+            routeConfig.settings.useGlobalPattern,
+          );
           const ctx = createSettingsContext(routeId, content, routeConfig);
           renderStandardSettings(ctx, routeConfig);
           route.renderSettings?.(ctx);
@@ -28472,7 +28583,7 @@
           const attackSettings = attackSettingsForStore(config.attack, store);
           const ctx = createSettingsContext('attack', content, { settings: config.attack });
           ctx.addSectionTitle('Global attack pattern');
-          const pattern = normalizePattern(config.attack.globalPattern);
+          const pattern = effectiveGlobalPattern(store, config.attack.globalPattern);
           renderPatternEditor(ctx, {
             id: 'global-pattern',
             title: 'Used when “Global attack pattern” is selected for a route',
@@ -28482,6 +28593,7 @@
               const latest = state.actions.loadConfig();
               latest.attack.globalPattern = next;
               state.actions.saveConfig(latest);
+              saveGlobalPattern(store, next);
               if (rerender) render(content);
             },
           });
