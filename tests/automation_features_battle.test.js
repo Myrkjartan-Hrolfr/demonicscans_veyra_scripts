@@ -451,6 +451,7 @@ function createBattlePage({
   hp = '100 / 100',
   damage = '0',
   stamina = '100',
+  mana = '100 / 100',
   buttons,
   potions = [],
   search = '',
@@ -469,8 +470,9 @@ function createBattlePage({
     classList: { contains: () => false },
   });
   const staminaNode = { textContent: stamina };
+  const manaNode = { textContent: mana };
   const doc = element({
-    nodes: { '#stamina_span': staminaNode },
+    nodes: { '#stamina_span': staminaNode, '#pManaText': manaNode },
     lists: { '.battle-card.monster-card': [card], '.potion-use-btn': potions },
   });
   const localStorage = createStorage();
@@ -487,7 +489,7 @@ function createBattlePage({
     resumeStore: createResumeStore(sessionStorage, 'resume'),
   });
   engine.setCard(card);
-  return { engine, card, damageNode, hpNode, staminaNode, localStorage };
+  return { engine, card, damageNode, hpNode, staminaNode, manaNode, localStorage };
 }
 
 test('a start on a defeated monster finishes with reason defeated', async () => {
@@ -593,6 +595,42 @@ test('a global attack pattern advances through every attack and loops', async ()
   engine.state.settings.delayMs = 0;
   await engine.start();
   assert.deepEqual(skillIds, ['0', '-1', '0', '-1']);
+});
+
+test('a zero-damage class skill advances a click-mode pattern after spending mana', async () => {
+  const support = attackButton('7', 'Killer Instinct', {
+    skillName: 'Killer Instinct',
+    classSkill: true,
+    cost: '20 MP / 0 STAM',
+  });
+  const strike = attackButton('6', 'Back Stab', {
+    skillName: 'Back Stab',
+    classSkill: true,
+    cost: '0 MP / 5 STAM',
+  });
+  const { engine, damageNode, manaNode } = createBattlePage({ buttons: [support, strike] });
+  const clicks = [];
+  support.click = () => {
+    clicks.push('7');
+    manaNode.textContent = '80 / 100';
+  };
+  strike.click = () => {
+    clicks.push('6');
+    damageNode.textContent = '10';
+  };
+
+  const controller = createController(engine);
+  assert.equal(controller.setAttackPlan({
+    fallbackSkillIds: ['6'],
+    useGlobal: true,
+    globalPattern: { skillIds: ['7', '6'], useStaminaPotions: false, useManaPotions: false },
+  }), true);
+  controller.setTargetDamage(10);
+  engine.state.settings.delayMs = 0;
+  await engine.start();
+
+  assert.deepEqual(clicks, ['7', '6']);
+  assert.equal(controller.getState().reason, 'target');
 });
 
 test('controller maps attacks, potions and target into the saved settings', async () => {

@@ -620,7 +620,7 @@ function createEngine(options) {
       .toLowerCase();
   }
 
-  async function waitForAttackOutcome(beforeDamage, beforeFeedback) {
+  async function waitForAttackOutcome(beforeDamage, beforeFeedback, attack, beforePlayerLogEntry, resourcesBefore) {
     const startedAt = Date.now();
     while (state.running && Date.now() - startedAt < 6500) {
       await sleep(110);
@@ -629,6 +629,27 @@ function createEngine(options) {
         return { type: 'damage', damage: damage - beforeDamage };
       }
       if (isMonsterDead()) return { type: 'monster-dead' };
+      const currentPlayerLogEntry = getLatestPlayerLogEntry();
+      if (
+        currentPlayerLogEntry &&
+        currentPlayerLogEntry !== beforePlayerLogEntry &&
+        normalizeText(currentPlayerLogEntry).toLowerCase().includes(normalizeText(attack?.name).toLowerCase())
+      ) {
+        return { type: 'success', mode: 'click', damage: 0, logEntry: currentPlayerLogEntry };
+      }
+      const stamina = getCurrentStamina();
+      const mana = getCurrentMana();
+      const spentStamina =
+        Number.isFinite(resourcesBefore?.stamina) &&
+        Number.isFinite(stamina) &&
+        stamina < resourcesBefore.stamina;
+      const spentMana =
+        Number.isFinite(resourcesBefore?.mana) &&
+        Number.isFinite(mana) &&
+        mana < resourcesBefore.mana;
+      if (spentStamina || spentMana) {
+        return { type: 'success', mode: 'click', damage: 0, resourceChange: { stamina, mana } };
+      }
       const feedback = getFeedbackText();
       if (feedback && feedback !== beforeFeedback) {
         const type = classifyFeedback(feedback);
@@ -641,12 +662,20 @@ function createEngine(options) {
     };
   }
 
-  async function performAttack(attack, button, beforeDamage, beforeExperience, beforeFeedback) {
+  async function performAttack(
+    attack,
+    button,
+    beforeDamage,
+    beforeExperience,
+    beforeFeedback,
+    beforePlayerLogEntry,
+  ) {
     const fastResult = await performFastAttack(attack, button, beforeDamage, beforeExperience);
     if (!fastResult.unsupported) return fastResult;
     // Battle modes without the direct /damage.php parameters.
+    const resourcesBefore = { stamina: getCurrentStamina(), mana: getCurrentMana() };
     button.click();
-    return waitForAttackOutcome(beforeDamage, beforeFeedback);
+    return waitForAttackOutcome(beforeDamage, beforeFeedback, attack, beforePlayerLogEntry, resourcesBefore);
   }
 
   // ---- potions ------------------------------------------------------------
@@ -1369,7 +1398,14 @@ function createEngine(options) {
         const beforePlayerLogEntry = getLatestPlayerLogEntry();
 
         log(`${attackLabel}: ${prepared.attack.name}.`);
-        const outcome = await performAttack(prepared.attack, button, beforeDamage, beforeExperience, beforeFeedback);
+        const outcome = await performAttack(
+          prepared.attack,
+          button,
+          beforeDamage,
+          beforeExperience,
+          beforeFeedback,
+          beforePlayerLogEntry,
+        );
         debug('attack outcome', {
           attack: prepared.attack.key,
           isPattern: prepared.isPattern === true,
