@@ -6,6 +6,8 @@ const { createJsonStore, getStorage } = require('./core/storage');
 const { FEATURES } = require('./features');
 const { runFeatures, settingGroups } = require('./features/runner');
 const { startScheduler } = require('./scheduler');
+const { CONFIG_KEY } = require('./scheduler/config');
+const { cacheClassAttacksFromDocument } = require('./scheduler/attack-settings');
 
 function main(win) {
   const doc = win.document;
@@ -20,6 +22,7 @@ function main(win) {
     featureGroups: settingGroups(FEATURES),
     featureSettings,
   });
+  cacheClassAttacksFromDocument(store, CONFIG_KEY, doc);
 
   runFeatures({
     win,

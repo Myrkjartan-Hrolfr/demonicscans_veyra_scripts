@@ -16,7 +16,7 @@ const { createJsonStore, getStorage } = require('../../core/storage');
 const { sleep } = require('../../core/time');
 const crucibleRoute = require('../../routes/crucible');
 const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
-const { availableAttacks, normalizePattern } = require('../../scheduler/attack-settings');
+const { attackSettingsForStore, availableAttacks, normalizePattern } = require('../../scheduler/attack-settings');
 const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
 const { staminaCost, staminaMultiplier } = require('../shared/asterion');
 const logic = require('./crucible-logic');
@@ -292,7 +292,7 @@ function createCrucibleWorker({
 
   function routeConfig() {
     const config = normalizeConfig(store.read(CONFIG_KEY));
-    return { ...config.routes[ROUTE_ID], attack: config.attack };
+    return { ...config.routes[ROUTE_ID], attack: attackSettingsForStore(config.attack, store) };
   }
 
   function minimalArmyContribution(battleId) {

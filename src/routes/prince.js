@@ -2,7 +2,7 @@
 
 const { normalizeDamageTarget } = require('../core/numbers');
 const shadowbridge = require('./shadowbridge');
-const { availableAttacks, normalizePattern, renderPatternEditor } = require('../scheduler/attack-settings');
+const { attackSettingsForStore, availableAttacks, normalizePattern, renderPatternEditor } = require('../scheduler/attack-settings');
 
 const DUNGEON_NAME = 'Castle of the Fallen Prince';
 const DEFAULT_DAMAGE = '1m';
@@ -225,7 +225,7 @@ function renderSettings(ctx) {
         id: `target-${definition.id}-pattern`,
         title: 'Specific attack pattern',
         pattern: normalizePattern(target.specificPattern),
-        attacks: availableAttacks(ctx.loadConfig?.()?.attack || {}),
+        attacks: availableAttacks(attackSettingsForStore(ctx.loadConfig?.()?.attack || {}, ctx.store)),
         onChange(next, rerender) {
           ctx.settings = ctx.updateSettings((settings) => {
             settings.targets[definition.id].specificPattern = next;

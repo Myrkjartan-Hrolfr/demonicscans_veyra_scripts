@@ -28,6 +28,7 @@ const { countdownText } = require('../src/scheduler/ui');
 const {
   availableAttacks,
   cacheClassAttacks,
+  cacheClassAttacksFromDocument,
   normalizeAttackSettings,
   normalizePattern,
   patternCosts,
@@ -49,6 +50,24 @@ test('scheduler attack patterns preserve order, potion flags and dynamically kno
   assert.deepEqual(normalizePattern(attack.globalPattern).skillIds, ['42', '0', '42']);
   assert.deepEqual(patternCosts(attack.globalPattern, attacks), { stamina: 25, mana: 60 });
   assert.equal(attacks.find((entry) => entry.id === '42').classAttack, true);
+  assert.equal(attacks.find((entry) => entry.id === '-5').name, 'World Breaker Slash');
+});
+
+test('class attacks can be discovered from the game attack-pattern selects', () => {
+  const values = new Map([['config', { version: 1, attack: {}, routes: {} }]]);
+  const store = { read: (key) => values.get(key), write: (key, value) => (values.set(key, value), true) };
+  const doc = {
+    querySelectorAll: () => [
+      { value: '6', textContent: 'Back Stab · Cost 3 · Attack' },
+      { value: '7', textContent: 'Killer Instinct · Cost 5 · Attack' },
+      { value: 'adv:18', textContent: 'Venom Rend · Cost 8 · Attack' },
+    ],
+  };
+  assert.equal(cacheClassAttacksFromDocument(store, 'config', doc), true);
+  assert.deepEqual(values.get('config').attack.knownClassAttacks.map(({ id, name }) => ({ id, name })), [
+    { id: '6', name: 'Back Stab' },
+    { id: '7', name: 'Killer Instinct' },
+  ]);
 });
 
 test('positive skill ids are cached as class attacks even when the theme omits the class wrapper', () => {

@@ -7,7 +7,7 @@ const {
   formatCrucibleDebugLog,
   readCrucibleDebugLog,
 } = require('../core/crucible-debug');
-const { availableAttacks, normalizePattern, renderPatternEditor } = require('../scheduler/attack-settings');
+const { attackSettingsForStore, availableAttacks, normalizePattern, renderPatternEditor } = require('../scheduler/attack-settings');
 
 const DEFAULT_DAMAGE = '1m';
 const DEFAULT_ATTACK_COOLDOWN_MS = 100;
@@ -402,7 +402,7 @@ function renderSettings(ctx) {
         id: `pve-target-${domKey}-pattern`,
         title: 'Specific attack pattern',
         pattern: normalizePattern(target.specificPattern),
-        attacks: availableAttacks(ctx.loadConfig?.()?.attack || {}),
+        attacks: availableAttacks(attackSettingsForStore(ctx.loadConfig?.()?.attack || {}, ctx.store)),
         onChange(next, rerender) {
           updateTarget(kind, key, (settings) => {
             settings.specificPattern = next;

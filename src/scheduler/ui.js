@@ -9,7 +9,7 @@ const { POTION_TYPES, potionsOfType } = require('../core/potions');
 const { formatCountdown } = require('../core/time');
 const { ROUTE_LIST, getRoute } = require('../routes');
 const { MAX_LOOP_MINUTES, MIN_LOOP_MINUTES } = require('./config');
-const { availableAttacks, normalizePattern, renderPatternEditor } = require('./attack-settings');
+const { attackSettingsForStore, availableAttacks, normalizePattern, renderPatternEditor } = require('./attack-settings');
 
 const UI_ID = 'veyra-automation';
 const SITE_SETTINGS_TRIGGER_ID = 'openSettingsDrawerBtn';
@@ -401,6 +401,7 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
   function openAttackSettings() {
     const render = (content) => {
       const config = state.actions.loadConfig();
+      const attackSettings = attackSettingsForStore(config.attack, store);
       const ctx = createSettingsContext('attack', content, { settings: config.attack });
       ctx.addSectionTitle('Global attack pattern');
       const pattern = normalizePattern(config.attack.globalPattern);
@@ -408,7 +409,7 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
         id: 'global-pattern',
         title: 'Used when “Global attack pattern” is selected for a route',
         pattern,
-        attacks: availableAttacks(config.attack),
+        attacks: availableAttacks(attackSettings),
         onChange(next, rerender) {
           const latest = state.actions.loadConfig();
           latest.attack.globalPattern = next;

@@ -5403,7 +5403,7 @@
     const { sleep } = require('../../core/time');
     const crucibleRoute = require('../../routes/crucible');
     const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
-    const { availableAttacks, normalizePattern } = require('../../scheduler/attack-settings');
+    const { attackSettingsForStore, availableAttacks, normalizePattern } = require('../../scheduler/attack-settings');
     const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
     const { staminaCost, staminaMultiplier } = require('../shared/asterion');
     const logic = require('./crucible-logic');
@@ -5679,7 +5679,7 @@
 
       function routeConfig() {
         const config = normalizeConfig(store.read(CONFIG_KEY));
-        return { ...config.routes[ROUTE_ID], attack: config.attack };
+        return { ...config.routes[ROUTE_ID], attack: attackSettingsForStore(config.attack, store) };
       }
 
       function minimalArmyContribution(battleId) {
@@ -8896,7 +8896,7 @@
     const { LEASE_KEY, TAB_KEY } = require('../../scheduler/engine');
     const { RUNTIME_KEY } = require('../../scheduler/runtime');
     const { staminaCost, staminaMultiplier } = require('../shared/asterion');
-    const { availableAttacks, normalizePattern } = require('../../scheduler/attack-settings');
+    const { attackSettingsForStore, availableAttacks, normalizePattern } = require('../../scheduler/attack-settings');
     const logic = require('./shadowbridge-logic');
     const { createShadowbridgeStatusView } = require('./shadowbridge-status');
     const {
@@ -9106,7 +9106,7 @@
 
       function routeConfig() {
         const config = normalizeConfig(store.read(CONFIG_KEY));
-        return { ...config.routes[routeId], attack: config.attack };
+        return { ...config.routes[routeId], attack: attackSettingsForStore(config.attack, store) };
       }
 
       async function readDashboard(visitId) {
@@ -24583,6 +24583,8 @@
     const { FEATURES } = require('./features');
     const { runFeatures, settingGroups } = require('./features/runner');
     const { startScheduler } = require('./scheduler');
+    const { CONFIG_KEY } = require('./scheduler/config');
+    const { cacheClassAttacksFromDocument } = require('./scheduler/attack-settings');
 
     function main(win) {
       const doc = win.document;
@@ -24597,6 +24599,7 @@
         featureGroups: settingGroups(FEATURES),
         featureSettings,
       });
+      cacheClassAttacksFromDocument(store, CONFIG_KEY, doc);
 
       runFeatures({
         win,
@@ -24729,7 +24732,13 @@
       normalizeDamageTarget,
       parseGameNumber,
     } = require('../core/numbers');
-    const { STANDARD_ATTACKS, availableAttacks, normalizePattern, renderPatternEditor } = require('../scheduler/attack-settings');
+    const {
+      STANDARD_ATTACKS,
+      attackSettingsForStore,
+      availableAttacks,
+      normalizePattern,
+      renderPatternEditor,
+    } = require('../scheduler/attack-settings');
 
     const STANDARD_SKILLS = Object.freeze(STANDARD_ATTACKS.map((attack) => Object.freeze({
       id: attack.id,
@@ -24855,7 +24864,7 @@
               });
             },
           });
-          const attackConfig = ctx.loadConfig?.()?.attack || {};
+          const attackConfig = attackSettingsForStore(ctx.loadConfig?.()?.attack || {}, ctx.store);
           renderPatternEditor(
             { ...ctx, container: patternHost },
             {
@@ -24924,7 +24933,7 @@
       formatCrucibleDebugLog,
       readCrucibleDebugLog,
     } = require('../core/crucible-debug');
-    const { availableAttacks, normalizePattern, renderPatternEditor } = require('../scheduler/attack-settings');
+    const { attackSettingsForStore, availableAttacks, normalizePattern, renderPatternEditor } = require('../scheduler/attack-settings');
 
     const DEFAULT_DAMAGE = '1m';
     const DEFAULT_ATTACK_COOLDOWN_MS = 100;
@@ -25319,7 +25328,7 @@
             id: `pve-target-${domKey}-pattern`,
             title: 'Specific attack pattern',
             pattern: normalizePattern(target.specificPattern),
-            attacks: availableAttacks(ctx.loadConfig?.()?.attack || {}),
+            attacks: availableAttacks(attackSettingsForStore(ctx.loadConfig?.()?.attack || {}, ctx.store)),
             onChange(next, rerender) {
               updateTarget(kind, key, (settings) => {
                 settings.specificPattern = next;
@@ -25834,7 +25843,7 @@
 
     const { normalizeDamageTarget } = require('../core/numbers');
     const shadowbridge = require('./shadowbridge');
-    const { availableAttacks, normalizePattern, renderPatternEditor } = require('../scheduler/attack-settings');
+    const { attackSettingsForStore, availableAttacks, normalizePattern, renderPatternEditor } = require('../scheduler/attack-settings');
 
     const DUNGEON_NAME = 'Castle of the Fallen Prince';
     const DEFAULT_DAMAGE = '1m';
@@ -26057,7 +26066,7 @@
             id: `target-${definition.id}-pattern`,
             title: 'Specific attack pattern',
             pattern: normalizePattern(target.specificPattern),
-            attacks: availableAttacks(ctx.loadConfig?.()?.attack || {}),
+            attacks: availableAttacks(attackSettingsForStore(ctx.loadConfig?.()?.attack || {}, ctx.store)),
             onChange(next, rerender) {
               ctx.settings = ctx.updateSettings((settings) => {
                 settings.targets[definition.id].specificPattern = next;
@@ -26902,13 +26911,14 @@
     'use strict';
 
     const STANDARD_ATTACKS = Object.freeze([
-      Object.freeze({ id: '-5', name: 'Skill −5', stamina: 1_000, mana: 0, classAttack: false }),
+      Object.freeze({ id: '-5', name: 'World Breaker Slash', stamina: 1_000, mana: 0, classAttack: false }),
       Object.freeze({ id: '-4', name: 'Legendary Slash', stamina: 200, mana: 0, classAttack: false }),
       Object.freeze({ id: '-3', name: 'Ultimate Slash', stamina: 100, mana: 0, classAttack: false }),
       Object.freeze({ id: '-2', name: 'Heroic Slash', stamina: 50, mana: 0, classAttack: false }),
       Object.freeze({ id: '-1', name: 'Power Slash', stamina: 10, mana: 0, classAttack: false }),
       Object.freeze({ id: '0', name: 'Slash', stamina: 1, mana: 0, classAttack: false }),
     ]);
+    const CLASS_ATTACKS_KEY = 'veyra:attack:class-catalog:v1';
 
     function createPattern() {
       return { skillIds: [], useStaminaPotions: false, useManaPotions: false };
@@ -26943,6 +26953,15 @@
       return result.slice(0, 100);
     }
 
+    function mergeKnownAttacks(...lists) {
+      const byId = new Map();
+      for (const attack of lists.flat()) {
+        const normalized = normalizeKnownAttacks([attack])[0];
+        if (normalized) byId.set(normalized.id, normalized);
+      }
+      return [...byId.values()].slice(0, 100);
+    }
+
     function normalizeAttackSettings(value) {
       return {
         globalPattern: normalizePattern(value?.globalPattern),
@@ -26952,6 +26971,14 @@
 
     function availableAttacks(config) {
       return [...STANDARD_ATTACKS, ...normalizeKnownAttacks(config?.knownClassAttacks)];
+    }
+
+    function attackSettingsForStore(config, store) {
+      const saved = normalizeKnownAttacks(store?.read?.(CLASS_ATTACKS_KEY)?.attacks);
+      return normalizeAttackSettings({
+        ...config,
+        knownClassAttacks: mergeKnownAttacks(normalizeKnownAttacks(config?.knownClassAttacks), saved),
+      });
     }
 
     function cacheClassAttacks(store, configKey, attacks) {
@@ -26970,10 +26997,24 @@
       const config = store.read(configKey);
       if (!config || typeof config !== 'object') return false;
       const current = normalizeKnownAttacks(config.attack?.knownClassAttacks);
-      const merged = normalizeKnownAttacks([...current, ...classAttacks]);
-      if (JSON.stringify(current) === JSON.stringify(merged)) return false;
+      const merged = mergeKnownAttacks(current, classAttacks);
+      const saved = normalizeKnownAttacks(store.read(CLASS_ATTACKS_KEY)?.attacks);
+      const catalog = mergeKnownAttacks(saved, classAttacks);
+      store.write(CLASS_ATTACKS_KEY, { attacks: catalog });
+      if (JSON.stringify(current) === JSON.stringify(merged)) return JSON.stringify(saved) !== JSON.stringify(catalog);
       config.attack = { ...normalizeAttackSettings(config.attack), knownClassAttacks: merged };
       return store.write(configKey, config);
+    }
+
+    function cacheClassAttacksFromDocument(store, configKey, doc) {
+      const attacks = [];
+      for (const option of doc?.querySelectorAll?.('select[name="pattern_skill_id[]"] option') || []) {
+        const id = String(option.value || option.getAttribute?.('value') || '').trim();
+        if (!/^\d+$/.test(id) || Number(id) <= 0) continue;
+        const name = String(option.textContent || '').split('·')[0].trim();
+        if (name) attacks.push({ skillId: id, name, group: 'Class Attacks', costs: { stamina: 0, mana: 0 } });
+      }
+      return cacheClassAttacks(store, configKey, attacks);
     }
 
     function patternCosts(pattern, attacks) {
@@ -27001,8 +27042,11 @@
         row.style.gap = '5px';
         const select = ctx.make('select', { className: ctx.cls('select') });
         for (const attack of attacks) {
+          const costs = attack.stamina || attack.mana
+            ? `${attack.stamina} STA${attack.mana ? ` / ${attack.mana} MP` : ''}`
+            : 'costs detected in battle';
           const option = ctx.make('option', {
-            text: `${attack.name}${attack.classAttack ? ' · class' : ''} (${attack.stamina} STA${attack.mana ? ` / ${attack.mana} MP` : ''})`,
+            text: `${attack.name}${attack.classAttack ? ' · class' : ''} (${costs})`,
           });
           option.value = attack.id;
           select.appendChild(option);
@@ -27060,12 +27104,16 @@
     }
 
     module.exports = {
+      CLASS_ATTACKS_KEY,
       STANDARD_ATTACKS,
+      attackSettingsForStore,
       availableAttacks,
       cacheClassAttacks,
+      cacheClassAttacksFromDocument,
       createPattern,
       normalizeAttackSettings,
       normalizeKnownAttacks,
+      mergeKnownAttacks,
       normalizePattern,
       patternCosts,
       renderPatternEditor,
@@ -27965,7 +28013,7 @@
     const { formatCountdown } = require('../core/time');
     const { ROUTE_LIST, getRoute } = require('../routes');
     const { MAX_LOOP_MINUTES, MIN_LOOP_MINUTES } = require('./config');
-    const { availableAttacks, normalizePattern, renderPatternEditor } = require('./attack-settings');
+    const { attackSettingsForStore, availableAttacks, normalizePattern, renderPatternEditor } = require('./attack-settings');
 
     const UI_ID = 'veyra-automation';
     const SITE_SETTINGS_TRIGGER_ID = 'openSettingsDrawerBtn';
@@ -28357,6 +28405,7 @@
       function openAttackSettings() {
         const render = (content) => {
           const config = state.actions.loadConfig();
+          const attackSettings = attackSettingsForStore(config.attack, store);
           const ctx = createSettingsContext('attack', content, { settings: config.attack });
           ctx.addSectionTitle('Global attack pattern');
           const pattern = normalizePattern(config.attack.globalPattern);
@@ -28364,7 +28413,7 @@
             id: 'global-pattern',
             title: 'Used when “Global attack pattern” is selected for a route',
             pattern,
-            attacks: availableAttacks(config.attack),
+            attacks: availableAttacks(attackSettings),
             onChange(next, rerender) {
               const latest = state.actions.loadConfig();
               latest.attack.globalPattern = next;

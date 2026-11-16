@@ -9,7 +9,13 @@ const {
   normalizeDamageTarget,
   parseGameNumber,
 } = require('../core/numbers');
-const { STANDARD_ATTACKS, availableAttacks, normalizePattern, renderPatternEditor } = require('../scheduler/attack-settings');
+const {
+  STANDARD_ATTACKS,
+  attackSettingsForStore,
+  availableAttacks,
+  normalizePattern,
+  renderPatternEditor,
+} = require('../scheduler/attack-settings');
 
 const STANDARD_SKILLS = Object.freeze(STANDARD_ATTACKS.map((attack) => Object.freeze({
   id: attack.id,
@@ -135,7 +141,7 @@ function renderBossSettings(ctx, sections) {
           });
         },
       });
-      const attackConfig = ctx.loadConfig?.()?.attack || {};
+      const attackConfig = attackSettingsForStore(ctx.loadConfig?.()?.attack || {}, ctx.store);
       renderPatternEditor(
         { ...ctx, container: patternHost },
         {
