@@ -38,7 +38,23 @@ function potionFromButton(button) {
       .map(parseInteger)
       .find(Number.isFinite) ?? 0;
 
-  return { key: itemId, itemId, name, description, type: getPotionType(name, description), quantity };
+  const refillMatch = description.match(/(?:refills?|restores?)[^\d]*(\d[\d,._\s]*)\s*(?:stamina|mana|hp|health)/i);
+  const refill = /fully\s+refills?/i.test(description)
+    ? Infinity
+    : refillMatch
+      ? parseInteger(refillMatch[1]) || 0
+      : 0;
+  return { key: itemId, itemId, name, description, type: getPotionType(name, description), quantity, refill };
+}
+
+function availablePotionRecovery(settings, potions, type) {
+  let total = 0;
+  for (const potion of potions || []) {
+    if (potion.type !== type || potion.quantity <= 0 || settings.potionEnabled[potion.key] === false) continue;
+    if (potion.refill === Infinity) return Infinity;
+    total += Math.max(0, Number(potion.refill) || 0) * potion.quantity;
+  }
+  return total;
 }
 
 // One entry per item id (the highest quantity wins); unknown types dropped.
@@ -145,6 +161,7 @@ function applyPotionLists(settings, lists, potions = []) {
 
 module.exports = {
   applyPotionLists,
+  availablePotionRecovery,
   collectPotions,
   getActualPotionAmount,
   getConfiguredPotionAmount,

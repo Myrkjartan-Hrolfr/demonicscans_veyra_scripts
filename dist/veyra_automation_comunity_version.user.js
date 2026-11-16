@@ -9909,6 +9909,7 @@
     } = require('./mab-parse');
     const { attackFromButton, attackSignature, findAttack, reconcileAttackKeys } = require('./mab-attacks');
     const {
+      availablePotionRecovery,
       collectPotions,
       pickPotion,
       potionFromButton,
@@ -9916,6 +9917,7 @@
       usageAmount,
     } = require('./mab-potions');
     const { ID } = require('./mab-settings');
+    const { missingPatternKeys, patternCosts, selectedPattern } = require('./mab-patterns');
 
     const MAX_RATE_RETRIES = 8;
     const SEL = Object.freeze({
@@ -10042,6 +10044,7 @@
         lastExperienceGain: null,
         noDamageCount: 0,
         forcedAttackIndex: 0,
+        patternIndex: 0,
         playerName: '',
         poisonActive: false,
         lastPlayerLogEntry: '',
@@ -10181,6 +10184,18 @@
           instance = '';
         }
         return [win?.location?.pathname || '', title, image, instance].join('|');
+      }
+
+      function getMonsterLabel(card = state.card) {
+        return query('.card-title', card)?.textContent?.trim() || 'Current monster';
+      }
+
+      // Deliberately excludes the fight instance so one monster keeps the same
+      // specific pattern on every visit.
+      function getMonsterId(card = state.card) {
+        const title = getMonsterLabel(card);
+        const image = query('#monsterImage, .monster_image', card)?.getAttribute?.('src') || '';
+        return `${title}|${image}`;
       }
 
       function getCurrentDamage() {
@@ -10615,6 +10630,7 @@
           sessionDamage: state.sessionDamage,
           lastDamage: state.lastDamage,
           lastExperienceGain: state.lastExperienceGain,
+          patternIndex: state.patternIndex,
         });
       }
 
@@ -10741,12 +10757,76 @@
         return { attack, index: -1, isPoisonAttack: true };
       }
 
+      async function preparePatternAttack() {
+        const pattern = selectedPattern(state.settings, getMonsterId());
+        if (!pattern) return null;
+        const sequence = pattern.attackKeys.map((key) => findAttack(state.attacks, key)).filter(Boolean);
+        if (!sequence.length) {
+          stop('The selected attack pattern is empty.', 'error', 'error');
+          return { handled: true };
+        }
+
+        // A new loop is admitted only when its complete known costs are already
+        // covered, or the corresponding pattern potion option has an available
+        // potion. During the loop the resource is topped up immediately before
+        // the attack that needs it.
+        if (state.patternIndex === 0) {
+          discoverPotions();
+          const costs = patternCosts(pattern, state.attacks);
+          for (const [type, current, enabled] of [
+            ['stamina', getCurrentStamina(), pattern.useStaminaPotions],
+            ['mana', getCurrentMana(), pattern.useManaPotions],
+          ]) {
+            if (!Number.isFinite(current) || current >= costs[type]) continue;
+            if (!enabled) {
+              stop(
+                `The attack pattern costs ${formatNumber(costs[type])} ${type}, but only ${formatNumber(current)} is available.`,
+                'idle',
+                type === 'stamina' ? 'no-stamina' : 'error',
+              );
+              return { handled: true };
+            }
+            const recovery = availablePotionRecovery(state.settings, state.potions, type);
+            const deficit = costs[type] - current;
+            if (!pickPotion(state.settings, state.potions, type) || recovery < deficit) {
+              stop(
+                `The attack pattern needs ${formatNumber(deficit)} additional ${type}, but the enabled potions do not cover it.`,
+                'error',
+                type === 'stamina' ? 'no-stamina' : 'error',
+              );
+              return { handled: true };
+            }
+          }
+          log(`Starting attack pattern (${sequence.length} attacks, ${formatNumber(costs.stamina)} STA / ${formatNumber(costs.mana)} MP).`);
+        }
+
+        const attack = sequence[state.patternIndex % sequence.length];
+        for (const [type, current, cost, enabled] of [
+          ['mana', getCurrentMana(), attack.costs.mana, pattern.useManaPotions],
+          ['stamina', getCurrentStamina(), attack.costs.stamina, pattern.useStaminaPotions],
+        ]) {
+          if (!Number.isFinite(current) || current >= cost) continue;
+          if (!enabled || !(await usePotion(type))) {
+            stop(`The next pattern attack requires more ${type}.`, 'error', type === 'stamina' ? 'no-stamina' : 'error');
+            return { handled: true };
+          }
+          return { handled: true, retry: true };
+        }
+        return { handled: true, attack, index: 0, isPattern: true, patternLength: sequence.length };
+      }
+
       async function prepareNextAttack() {
         if (discoverAttacks()) ui.renderAttackOptions();
         syncPoisonStatusFromLog();
 
         const poisonAttack = getSelectedPoisonAttack();
         if (state.poisonActive && poisonAttack) return preparePoisonAttack(poisonAttack);
+
+        if (state.settings.primaryMode !== 'attack') {
+          const preparedPattern = await preparePatternAttack();
+          if (preparedPattern?.retry) return { retry: true };
+          if (preparedPattern?.attack || !state.running) return preparedPattern?.attack ? preparedPattern : null;
+        }
 
         const attacks = [getSelectedAttack(0), getSelectedAttack(1), getSelectedAttack(2)];
         const primary = attacks[0];
@@ -10872,6 +10952,7 @@
       async function handleFailedAttack(outcome, prepared) {
         const attackIndex = prepared.index;
         const isPoisonAttack = prepared.isPoisonAttack === true;
+        const pattern = prepared.isPattern ? selectedPattern(state.settings, getMonsterId()) : null;
 
         if (outcome.type === 'monster-dead') {
           stop('Monster defeated.', 'success', 'defeated');
@@ -10888,7 +10969,11 @@
         }
 
         if (outcome.type === 'mana') {
-          if (!state.settings.autoMana) {
+          if (pattern && !pattern.useManaPotions) {
+            stop('Not enough mana for the attack pattern and pattern mana potions are disabled.', 'idle', 'error');
+            return;
+          }
+          if (!pattern && !state.settings.autoMana) {
             stop('Not enough mana and automatic mana potions are disabled.', 'idle', 'error');
             return;
           }
@@ -10902,6 +10987,14 @@
         }
 
         if (outcome.type === 'stamina') {
+          if (pattern) {
+            if (!pattern.useStaminaPotions) {
+              stop('Not enough stamina for the attack pattern and pattern stamina potions are disabled.', 'idle', 'no-stamina');
+            } else if (!(await usePotion('stamina'))) {
+              stop('No enabled stamina potion is available for the attack pattern.', 'error', 'no-stamina');
+            }
+            return;
+          }
           if (isPoisonAttack) {
             await useStaminaAfterFailure(
               'Not enough stamina for the poison attack and automatic stamina potions are disabled.',
@@ -10945,9 +11038,16 @@
         const target = parseTarget(state.settings.targetDamage);
         if (!Number.isFinite(target) || target < 0) return 'Invalid target damage. Examples: 5m, 5b, or 5,000,000.';
         if (!(state.settings.levelMultiplier > 0)) return 'The level-up multiplier must be greater than 0.';
-        for (let index = 0; index < 3; index += 1) {
-          const attack = getSelectedAttack(index);
-          if (!attack || !findLiveAttackButton(attack.key)) return `Please select a valid Attack ${index + 1}.`;
+        if (state.settings.primaryMode !== 'attack') {
+          const pattern = selectedPattern(state.settings, getMonsterId());
+          if (!pattern?.attackKeys.length) return 'Please add at least one attack to the selected pattern.';
+          if (missingPatternKeys(pattern, state.attacks).length) return 'The selected pattern contains an attack unavailable to this class or monster.';
+        }
+        if (state.settings.primaryMode === 'attack') {
+          for (let index = 0; index < 3; index += 1) {
+            const attack = getSelectedAttack(index);
+            if (!attack || !findLiveAttackButton(attack.key)) return `Please select a valid Attack ${index + 1}.`;
+          }
         }
         if (state.settings.poisonAttackKey) {
           const poisonAttack = getSelectedPoisonAttack();
@@ -11040,6 +11140,7 @@
 
         state.noDamageCount = 0;
         state.forcedAttackIndex = 0;
+        state.patternIndex = Number(resumeData?.patternIndex) || 0;
         state.finished = false;
         state.reason = null;
         state.running = true;
@@ -11077,7 +11178,11 @@
             }
 
             const button = findLiveAttackButton(prepared.attack.key);
-            const attackLabel = prepared.isPoisonAttack ? 'Poison attack' : `Attack ${prepared.index + 1}`;
+            const attackLabel = prepared.isPoisonAttack
+              ? 'Poison attack'
+              : prepared.isPattern
+                ? `Pattern attack ${state.patternIndex + 1}/${prepared.patternLength}`
+                : `Attack ${prepared.index + 1}`;
             if (!button) {
               stop(`${attackLabel} is no longer available.`, 'error', 'error');
               break;
@@ -11108,6 +11213,7 @@
               state.forcedAttackIndex = 0;
               state.lastDamage = Math.max(0, outcome.damage || 0);
               state.sessionDamage += state.lastDamage;
+              if (prepared.isPattern) state.patternIndex = (state.patternIndex + 1) % prepared.patternLength;
 
               if (outcome.mode === 'api') {
                 const wasPoisonActive = state.poisonActive;
@@ -11203,6 +11309,8 @@
         getCurrentMana,
         getCurrentStamina,
         getMonsterKey,
+        getMonsterId,
+        getMonsterLabel,
         getRemainingExperience,
         getState,
         refreshMetrics,
@@ -11236,11 +11344,13 @@
     const { cursorAfterFormat, formatNumber, formatTargetDisplay } = require('./mab-parse');
     const { getConfiguredPotionAmount, movePotion, supportsMultiplePotionUse } = require('./mab-potions');
     const { ID } = require('./mab-settings');
+    const { createPattern, normalizePattern, patternCosts } = require('./mab-patterns');
 
     const STYLE_ID = `${ID}-style`;
     const LOG_LIMIT = 60;
     const FORM_FIELDS = Object.freeze([
       '#mabAttack1',
+      '#mabPrimaryMode',
       '#mabAttack2',
       '#mabAttack3',
       '#mabPoisonAttack',
@@ -11305,6 +11415,13 @@
       #${ID} .mab-log > div + div { margin-top: 4px; }
       #${ID} .mab-empty, #${ID} .mab-hint { color: #7883aa; font-size: 10px; line-height: 1.45; }
       #${ID} .mab-hint { margin-top: 9px; }
+      #${ID} .mab-patterns { margin-top: 10px; }
+      #${ID} .mab-pattern-editor { margin-top: 8px; padding: 10px; border: 1px solid #303858; border-radius: 10px; background: #111526; }
+      #${ID} .mab-pattern-editor[hidden] { display: none; }
+      #${ID} .mab-pattern-row { display: grid; grid-template-columns: minmax(0,1fr) auto auto auto; gap: 5px; margin-top: 6px; }
+      #${ID} .mab-pattern-row button { min-width: 30px; border: 1px solid #3a4267; border-radius: 6px; background: #242943; color: #fff; cursor: pointer; }
+      #${ID} .mab-pattern-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin-top: 8px; font-size: 11px; }
+      #${ID} .mab-pattern-cost { color: #b9c5ef; font-variant-numeric: tabular-nums; }
       @media (max-width: 760px) {
         #${ID} .mab-grid, #${ID} .mab-priority-grid { grid-template-columns: 1fr; }
         #${ID} .mab-metrics { grid-template-columns: 1fr 1fr; }
@@ -11328,6 +11445,11 @@
           <div class="mab-grid">
             <label class="mab-field">
               <span>Attack 1 <small>Primary attack</small></span>
+              <select id="mabPrimaryMode">
+                <option value="attack">Single attack</option>
+                <option value="global-pattern">Global attack pattern</option>
+                <option value="monster-pattern">Monster-specific attack pattern</option>
+              </select>
               <select id="mabAttack1"></select>
             </label>
             <label class="mab-field">
@@ -11350,6 +11472,13 @@
               <span>Delay between attacks in ms</span>
               <input id="mabDelay" type="number" inputmode="numeric" min="0" step="50">
             </label>
+          </div>
+          <div class="mab-patterns">
+            <details>
+              <summary>Attack patterns</summary>
+              <div id="mabGlobalPattern" class="mab-pattern-editor"></div>
+              <div id="mabMonsterPattern" class="mab-pattern-editor"></div>
+            </details>
           </div>
           <div class="mab-options">
             <label><input id="mabAutoStamina" type="checkbox"> Use stamina potions automatically</label>
@@ -11449,6 +11578,100 @@
           fillAttackSelect($(`#mabAttack${index + 1}`), state.settings.attackKeys[index], false);
         }
         fillAttackSelect($('#mabPoisonAttack'), state.settings.poisonAttackKey, true);
+        renderPatternEditors();
+      }
+
+      function currentMonsterPattern() {
+        const id = engine.getMonsterId();
+        if (!state.settings.monsterPatterns[id]) state.settings.monsterPatterns[id] = createPattern();
+        return state.settings.monsterPatterns[id];
+      }
+
+      function renderPatternEditor(selector, title, pattern, specific = false) {
+        const container = $(selector);
+        if (!container) return;
+        container.replaceChildren();
+        const heading = doc.createElement('strong');
+        heading.textContent = title;
+        container.appendChild(heading);
+        const normalized = normalizePattern(pattern);
+        Object.assign(pattern, normalized);
+
+        normalized.attackKeys.forEach((key, index) => {
+          const row = doc.createElement('div');
+          row.className = 'mab-pattern-row';
+          const select = doc.createElement('select');
+          fillAttackSelect(select, key, false);
+          select.addEventListener('change', () => {
+            pattern.attackKeys[index] = select.value;
+            engine.saveSettings();
+            renderPatternEditors();
+          });
+          const buttons = [
+            ['↑', () => index > 0 && pattern.attackKeys.splice(index - 1, 0, pattern.attackKeys.splice(index, 1)[0])],
+            ['↓', () => index < pattern.attackKeys.length - 1 && pattern.attackKeys.splice(index + 1, 0, pattern.attackKeys.splice(index, 1)[0])],
+            ['×', () => pattern.attackKeys.splice(index, 1)],
+          ];
+          row.appendChild(select);
+          for (const [label, action] of buttons) {
+            const button = doc.createElement('button');
+            button.type = 'button';
+            button.textContent = label;
+            button.addEventListener('click', () => {
+              action();
+              engine.saveSettings();
+              renderPatternEditors();
+            });
+            row.appendChild(button);
+          }
+          container.appendChild(row);
+        });
+
+        const tools = doc.createElement('div');
+        tools.className = 'mab-pattern-tools';
+        const add = doc.createElement('button');
+        add.type = 'button';
+        add.className = 'mab-button mab-secondary';
+        add.textContent = '+ Add attack';
+        add.disabled = state.attacks.length === 0;
+        add.addEventListener('click', () => {
+          pattern.attackKeys.push(state.attacks[0]?.key || '');
+          engine.saveSettings();
+          renderPatternEditors();
+        });
+        tools.appendChild(add);
+        for (const [key, label] of [
+          ['useStaminaPotions', 'Use stamina potions'],
+          ['useManaPotions', 'Use mana potions'],
+        ]) {
+          const checkboxLabel = doc.createElement('label');
+          const checkbox = doc.createElement('input');
+          checkbox.type = 'checkbox';
+          checkbox.checked = pattern[key] === true;
+          checkbox.addEventListener('change', () => {
+            pattern[key] = checkbox.checked;
+            engine.saveSettings();
+          });
+          checkboxLabel.append(checkbox, ` ${label}`);
+          tools.appendChild(checkboxLabel);
+        }
+        const costs = patternCosts(pattern, state.attacks);
+        const cost = doc.createElement('span');
+        cost.className = 'mab-pattern-cost';
+        cost.textContent = `One loop: ${formatNumber(costs.stamina)} STA / ${formatNumber(costs.mana)} MP`;
+        tools.appendChild(cost);
+        container.appendChild(tools);
+        if (specific) {
+          const hint = doc.createElement('div');
+          hint.className = 'mab-hint';
+          hint.textContent = `Saved only for: ${engine.getMonsterLabel()}`;
+          container.appendChild(hint);
+        }
+      }
+
+      function renderPatternEditors() {
+        renderPatternEditor('#mabGlobalPattern', 'Global pattern (all monsters)', state.settings.globalPattern);
+        renderPatternEditor('#mabMonsterPattern', 'Monster-specific pattern', currentMonsterPattern(), true);
       }
 
       function renderPotionList(type, selector) {
@@ -11595,6 +11818,7 @@
             (number, index) => $(`#mabAttack${number}`)?.value || settings.attackKeys[index] || '',
           ),
         );
+        settings.primaryMode = $('#mabPrimaryMode')?.value || 'attack';
         settings.poisonAttackKey = $('#mabPoisonAttack')?.value || '';
         settings.targetDamage = $('#mabTarget')?.value.trim() || '0';
         settings.delayMs = Math.max(0, Number($('#mabDelay')?.value) || 0);
@@ -11621,6 +11845,10 @@
         if (delay) delay.value = String(settings.delayMs);
         const multiplier = $('#mabMultiplier');
         if (multiplier) multiplier.value = String(settings.levelMultiplier);
+        const primaryMode = $('#mabPrimaryMode');
+        if (primaryMode) primaryMode.value = settings.primaryMode;
+        const attack1 = $('#mabAttack1');
+        if (attack1) attack1.hidden = settings.primaryMode !== 'attack';
         for (const [selector, key] of [
           ['#mabAutoStamina', 'autoStamina'],
           ['#mabAutoMana', 'autoMana'],
@@ -11676,6 +11904,7 @@
           if (!element) continue;
           element.addEventListener('change', () => {
             readForm();
+            if (selector === '#mabPrimaryMode') writeFormValues();
             if (/^#mabAttack\d+$/.test(selector)) renderAttackOptions();
           });
           if (element.matches?.('input[type="text"], input[type="number"]')) element.addEventListener('input', readForm);
@@ -12007,6 +12236,62 @@
       retryAfterToMs,
     };
   },
+  "features/battle/mab-patterns.js": function (module, exports, require) {
+    'use strict';
+
+    const PATTERN_MODES = Object.freeze(['attack', 'global-pattern', 'monster-pattern']);
+
+    function createPattern() {
+      return { attackKeys: [], useStaminaPotions: false, useManaPotions: false };
+    }
+
+    function normalizePattern(value) {
+      const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+      return {
+        attackKeys: Array.isArray(source.attackKeys)
+          ? source.attackKeys.map((key) => String(key ?? '')).filter(Boolean)
+          : [],
+        useStaminaPotions: source.useStaminaPotions === true,
+        useManaPotions: source.useManaPotions === true,
+      };
+    }
+
+    function patternCosts(pattern, attacks) {
+      const byKey = new Map((attacks || []).map((attack) => [attack.key, attack]));
+      return normalizePattern(pattern).attackKeys.reduce(
+        (total, key) => {
+          const attack = byKey.get(key);
+          if (!attack) return total;
+          total.stamina += Number(attack.costs?.stamina) || 0;
+          total.mana += Number(attack.costs?.mana) || 0;
+          return total;
+        },
+        { stamina: 0, mana: 0 },
+      );
+    }
+
+    function missingPatternKeys(pattern, attacks) {
+      const available = new Set((attacks || []).map((attack) => attack.key));
+      return normalizePattern(pattern).attackKeys.filter((key) => !available.has(key));
+    }
+
+    function selectedPattern(settings, monsterId) {
+      if (settings.primaryMode === 'global-pattern') return normalizePattern(settings.globalPattern);
+      if (settings.primaryMode === 'monster-pattern') {
+        return normalizePattern(settings.monsterPatterns?.[monsterId]);
+      }
+      return null;
+    }
+
+    module.exports = {
+      PATTERN_MODES,
+      createPattern,
+      missingPatternKeys,
+      normalizePattern,
+      patternCosts,
+      selectedPattern,
+    };
+  },
   "features/battle/mab-potions.js": function (module, exports, require) {
     'use strict';
 
@@ -12048,7 +12333,23 @@
           .map(parseInteger)
           .find(Number.isFinite) ?? 0;
 
-      return { key: itemId, itemId, name, description, type: getPotionType(name, description), quantity };
+      const refillMatch = description.match(/(?:refills?|restores?)[^\d]*(\d[\d,._\s]*)\s*(?:stamina|mana|hp|health)/i);
+      const refill = /fully\s+refills?/i.test(description)
+        ? Infinity
+        : refillMatch
+          ? parseInteger(refillMatch[1]) || 0
+          : 0;
+      return { key: itemId, itemId, name, description, type: getPotionType(name, description), quantity, refill };
+    }
+
+    function availablePotionRecovery(settings, potions, type) {
+      let total = 0;
+      for (const potion of potions || []) {
+        if (potion.type !== type || potion.quantity <= 0 || settings.potionEnabled[potion.key] === false) continue;
+        if (potion.refill === Infinity) return Infinity;
+        total += Math.max(0, Number(potion.refill) || 0) * potion.quantity;
+      }
+      return total;
     }
 
     // One entry per item id (the highest quantity wins); unknown types dropped.
@@ -12155,6 +12456,7 @@
 
     module.exports = {
       applyPotionLists,
+      availablePotionRecovery,
       collectPotions,
       getActualPotionAmount,
       getConfiguredPotionAmount,
@@ -12177,9 +12479,13 @@
     const ID = 'tm-monster-auto-battle';
     const RESUME_TTL_MS = 60_000;
     const POTION_TYPES = Object.freeze(['stamina', 'mana', 'health']);
+    const { PATTERN_MODES, createPattern, normalizePattern } = require('./mab-patterns');
 
     const DEFAULTS = Object.freeze({
       attackKeys: ['', '', ''],
+      primaryMode: 'attack',
+      globalPattern: createPattern(),
+      monsterPatterns: {},
       poisonAttackKey: '',
       autoStamina: false,
       autoMana: false,
@@ -12219,6 +12525,14 @@
       while (attackKeys.length < 3) attackKeys.push('');
       settings.attackKeys = attackKeys;
       settings.poisonAttackKey = typeof source.poisonAttackKey === 'string' ? source.poisonAttackKey : '';
+      settings.primaryMode = PATTERN_MODES.includes(source.primaryMode) ? source.primaryMode : 'attack';
+      settings.globalPattern = normalizePattern(source.globalPattern);
+      settings.monsterPatterns = {};
+      if (isPlainObject(source.monsterPatterns)) {
+        for (const [monsterId, pattern] of Object.entries(source.monsterPatterns)) {
+          settings.monsterPatterns[String(monsterId)] = normalizePattern(pattern);
+        }
+      }
 
       for (const flag of ['autoStamina', 'autoMana', 'autoHealth', 'stopBeforeLevelUp', 'collapsed']) {
         settings[flag] = source[flag] === true;

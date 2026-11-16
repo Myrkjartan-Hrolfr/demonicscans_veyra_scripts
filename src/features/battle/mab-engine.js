@@ -24,6 +24,7 @@ const {
 } = require('./mab-parse');
 const { attackFromButton, attackSignature, findAttack, reconcileAttackKeys } = require('./mab-attacks');
 const {
+  availablePotionRecovery,
   collectPotions,
   pickPotion,
   potionFromButton,
@@ -31,6 +32,7 @@ const {
   usageAmount,
 } = require('./mab-potions');
 const { ID } = require('./mab-settings');
+const { missingPatternKeys, patternCosts, selectedPattern } = require('./mab-patterns');
 
 const MAX_RATE_RETRIES = 8;
 const SEL = Object.freeze({
@@ -157,6 +159,7 @@ function createEngine(options) {
     lastExperienceGain: null,
     noDamageCount: 0,
     forcedAttackIndex: 0,
+    patternIndex: 0,
     playerName: '',
     poisonActive: false,
     lastPlayerLogEntry: '',
@@ -296,6 +299,18 @@ function createEngine(options) {
       instance = '';
     }
     return [win?.location?.pathname || '', title, image, instance].join('|');
+  }
+
+  function getMonsterLabel(card = state.card) {
+    return query('.card-title', card)?.textContent?.trim() || 'Current monster';
+  }
+
+  // Deliberately excludes the fight instance so one monster keeps the same
+  // specific pattern on every visit.
+  function getMonsterId(card = state.card) {
+    const title = getMonsterLabel(card);
+    const image = query('#monsterImage, .monster_image', card)?.getAttribute?.('src') || '';
+    return `${title}|${image}`;
   }
 
   function getCurrentDamage() {
@@ -730,6 +745,7 @@ function createEngine(options) {
       sessionDamage: state.sessionDamage,
       lastDamage: state.lastDamage,
       lastExperienceGain: state.lastExperienceGain,
+      patternIndex: state.patternIndex,
     });
   }
 
@@ -856,12 +872,76 @@ function createEngine(options) {
     return { attack, index: -1, isPoisonAttack: true };
   }
 
+  async function preparePatternAttack() {
+    const pattern = selectedPattern(state.settings, getMonsterId());
+    if (!pattern) return null;
+    const sequence = pattern.attackKeys.map((key) => findAttack(state.attacks, key)).filter(Boolean);
+    if (!sequence.length) {
+      stop('The selected attack pattern is empty.', 'error', 'error');
+      return { handled: true };
+    }
+
+    // A new loop is admitted only when its complete known costs are already
+    // covered, or the corresponding pattern potion option has an available
+    // potion. During the loop the resource is topped up immediately before
+    // the attack that needs it.
+    if (state.patternIndex === 0) {
+      discoverPotions();
+      const costs = patternCosts(pattern, state.attacks);
+      for (const [type, current, enabled] of [
+        ['stamina', getCurrentStamina(), pattern.useStaminaPotions],
+        ['mana', getCurrentMana(), pattern.useManaPotions],
+      ]) {
+        if (!Number.isFinite(current) || current >= costs[type]) continue;
+        if (!enabled) {
+          stop(
+            `The attack pattern costs ${formatNumber(costs[type])} ${type}, but only ${formatNumber(current)} is available.`,
+            'idle',
+            type === 'stamina' ? 'no-stamina' : 'error',
+          );
+          return { handled: true };
+        }
+        const recovery = availablePotionRecovery(state.settings, state.potions, type);
+        const deficit = costs[type] - current;
+        if (!pickPotion(state.settings, state.potions, type) || recovery < deficit) {
+          stop(
+            `The attack pattern needs ${formatNumber(deficit)} additional ${type}, but the enabled potions do not cover it.`,
+            'error',
+            type === 'stamina' ? 'no-stamina' : 'error',
+          );
+          return { handled: true };
+        }
+      }
+      log(`Starting attack pattern (${sequence.length} attacks, ${formatNumber(costs.stamina)} STA / ${formatNumber(costs.mana)} MP).`);
+    }
+
+    const attack = sequence[state.patternIndex % sequence.length];
+    for (const [type, current, cost, enabled] of [
+      ['mana', getCurrentMana(), attack.costs.mana, pattern.useManaPotions],
+      ['stamina', getCurrentStamina(), attack.costs.stamina, pattern.useStaminaPotions],
+    ]) {
+      if (!Number.isFinite(current) || current >= cost) continue;
+      if (!enabled || !(await usePotion(type))) {
+        stop(`The next pattern attack requires more ${type}.`, 'error', type === 'stamina' ? 'no-stamina' : 'error');
+        return { handled: true };
+      }
+      return { handled: true, retry: true };
+    }
+    return { handled: true, attack, index: 0, isPattern: true, patternLength: sequence.length };
+  }
+
   async function prepareNextAttack() {
     if (discoverAttacks()) ui.renderAttackOptions();
     syncPoisonStatusFromLog();
 
     const poisonAttack = getSelectedPoisonAttack();
     if (state.poisonActive && poisonAttack) return preparePoisonAttack(poisonAttack);
+
+    if (state.settings.primaryMode !== 'attack') {
+      const preparedPattern = await preparePatternAttack();
+      if (preparedPattern?.retry) return { retry: true };
+      if (preparedPattern?.attack || !state.running) return preparedPattern?.attack ? preparedPattern : null;
+    }
 
     const attacks = [getSelectedAttack(0), getSelectedAttack(1), getSelectedAttack(2)];
     const primary = attacks[0];
@@ -987,6 +1067,7 @@ function createEngine(options) {
   async function handleFailedAttack(outcome, prepared) {
     const attackIndex = prepared.index;
     const isPoisonAttack = prepared.isPoisonAttack === true;
+    const pattern = prepared.isPattern ? selectedPattern(state.settings, getMonsterId()) : null;
 
     if (outcome.type === 'monster-dead') {
       stop('Monster defeated.', 'success', 'defeated');
@@ -1003,7 +1084,11 @@ function createEngine(options) {
     }
 
     if (outcome.type === 'mana') {
-      if (!state.settings.autoMana) {
+      if (pattern && !pattern.useManaPotions) {
+        stop('Not enough mana for the attack pattern and pattern mana potions are disabled.', 'idle', 'error');
+        return;
+      }
+      if (!pattern && !state.settings.autoMana) {
         stop('Not enough mana and automatic mana potions are disabled.', 'idle', 'error');
         return;
       }
@@ -1017,6 +1102,14 @@ function createEngine(options) {
     }
 
     if (outcome.type === 'stamina') {
+      if (pattern) {
+        if (!pattern.useStaminaPotions) {
+          stop('Not enough stamina for the attack pattern and pattern stamina potions are disabled.', 'idle', 'no-stamina');
+        } else if (!(await usePotion('stamina'))) {
+          stop('No enabled stamina potion is available for the attack pattern.', 'error', 'no-stamina');
+        }
+        return;
+      }
       if (isPoisonAttack) {
         await useStaminaAfterFailure(
           'Not enough stamina for the poison attack and automatic stamina potions are disabled.',
@@ -1060,9 +1153,16 @@ function createEngine(options) {
     const target = parseTarget(state.settings.targetDamage);
     if (!Number.isFinite(target) || target < 0) return 'Invalid target damage. Examples: 5m, 5b, or 5,000,000.';
     if (!(state.settings.levelMultiplier > 0)) return 'The level-up multiplier must be greater than 0.';
-    for (let index = 0; index < 3; index += 1) {
-      const attack = getSelectedAttack(index);
-      if (!attack || !findLiveAttackButton(attack.key)) return `Please select a valid Attack ${index + 1}.`;
+    if (state.settings.primaryMode !== 'attack') {
+      const pattern = selectedPattern(state.settings, getMonsterId());
+      if (!pattern?.attackKeys.length) return 'Please add at least one attack to the selected pattern.';
+      if (missingPatternKeys(pattern, state.attacks).length) return 'The selected pattern contains an attack unavailable to this class or monster.';
+    }
+    if (state.settings.primaryMode === 'attack') {
+      for (let index = 0; index < 3; index += 1) {
+        const attack = getSelectedAttack(index);
+        if (!attack || !findLiveAttackButton(attack.key)) return `Please select a valid Attack ${index + 1}.`;
+      }
     }
     if (state.settings.poisonAttackKey) {
       const poisonAttack = getSelectedPoisonAttack();
@@ -1155,6 +1255,7 @@ function createEngine(options) {
 
     state.noDamageCount = 0;
     state.forcedAttackIndex = 0;
+    state.patternIndex = Number(resumeData?.patternIndex) || 0;
     state.finished = false;
     state.reason = null;
     state.running = true;
@@ -1192,7 +1293,11 @@ function createEngine(options) {
         }
 
         const button = findLiveAttackButton(prepared.attack.key);
-        const attackLabel = prepared.isPoisonAttack ? 'Poison attack' : `Attack ${prepared.index + 1}`;
+        const attackLabel = prepared.isPoisonAttack
+          ? 'Poison attack'
+          : prepared.isPattern
+            ? `Pattern attack ${state.patternIndex + 1}/${prepared.patternLength}`
+            : `Attack ${prepared.index + 1}`;
         if (!button) {
           stop(`${attackLabel} is no longer available.`, 'error', 'error');
           break;
@@ -1223,6 +1328,7 @@ function createEngine(options) {
           state.forcedAttackIndex = 0;
           state.lastDamage = Math.max(0, outcome.damage || 0);
           state.sessionDamage += state.lastDamage;
+          if (prepared.isPattern) state.patternIndex = (state.patternIndex + 1) % prepared.patternLength;
 
           if (outcome.mode === 'api') {
             const wasPoisonActive = state.poisonActive;
@@ -1318,6 +1424,8 @@ function createEngine(options) {
     getCurrentMana,
     getCurrentStamina,
     getMonsterKey,
+    getMonsterId,
+    getMonsterLabel,
     getRemainingExperience,
     getState,
     refreshMetrics,

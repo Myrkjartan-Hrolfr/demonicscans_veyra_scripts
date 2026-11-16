@@ -7,9 +7,13 @@
 const ID = 'tm-monster-auto-battle';
 const RESUME_TTL_MS = 60_000;
 const POTION_TYPES = Object.freeze(['stamina', 'mana', 'health']);
+const { PATTERN_MODES, createPattern, normalizePattern } = require('./mab-patterns');
 
 const DEFAULTS = Object.freeze({
   attackKeys: ['', '', ''],
+  primaryMode: 'attack',
+  globalPattern: createPattern(),
+  monsterPatterns: {},
   poisonAttackKey: '',
   autoStamina: false,
   autoMana: false,
@@ -49,6 +53,14 @@ function normalizeSettings(saved) {
   while (attackKeys.length < 3) attackKeys.push('');
   settings.attackKeys = attackKeys;
   settings.poisonAttackKey = typeof source.poisonAttackKey === 'string' ? source.poisonAttackKey : '';
+  settings.primaryMode = PATTERN_MODES.includes(source.primaryMode) ? source.primaryMode : 'attack';
+  settings.globalPattern = normalizePattern(source.globalPattern);
+  settings.monsterPatterns = {};
+  if (isPlainObject(source.monsterPatterns)) {
+    for (const [monsterId, pattern] of Object.entries(source.monsterPatterns)) {
+      settings.monsterPatterns[String(monsterId)] = normalizePattern(pattern);
+    }
+  }
 
   for (const flag of ['autoStamina', 'autoMana', 'autoHealth', 'stopBeforeLevelUp', 'collapsed']) {
     settings[flag] = source[flag] === true;

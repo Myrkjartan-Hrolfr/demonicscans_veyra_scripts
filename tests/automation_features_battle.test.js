@@ -20,6 +20,7 @@ const {
 } = require('../src/features/battle/mab-attacks');
 const {
   applyPotionLists,
+  availablePotionRecovery,
   collectPotions,
   getPotionType,
   movePotion,
@@ -30,6 +31,12 @@ const {
 const { createEngine, evaluateStopCondition } = require('../src/features/battle/mab-engine');
 const { createController, normalizeTargetAmount } = require('../src/features/battle/mab-controller');
 const bridge = require('../src/features/battle/mab-bridge');
+const {
+  missingPatternKeys,
+  normalizePattern,
+  patternCosts,
+  selectedPattern,
+} = require('../src/features/battle/mab-patterns');
 const { FEATURES } = require('../src/features');
 
 // ---- stubs -----------------------------------------------------------------
@@ -179,6 +186,43 @@ test('settings keep the v6 storage keys and normalise broken values', () => {
   assert.deepEqual(settings.potionEnabled, { 30: false });
   assert.deepEqual(settings.potionOrder, { stamina: ['30', '251'], mana: [], health: [] });
   assert.equal(settings.extra, 'kept');
+});
+
+test('attack patterns preserve order, calculate one complete loop and select their scope', () => {
+  const attacks = [
+    { key: 'basic', costs: { stamina: 10, mana: 0 } },
+    { key: 'class', costs: { stamina: 25, mana: 40 } },
+  ];
+  const pattern = normalizePattern({
+    attackKeys: ['class', 'basic', 'class'],
+    useStaminaPotions: true,
+    useManaPotions: true,
+  });
+  assert.deepEqual(pattern.attackKeys, ['class', 'basic', 'class']);
+  assert.deepEqual(patternCosts(pattern, attacks), { stamina: 60, mana: 80 });
+  assert.deepEqual(missingPatternKeys({ attackKeys: ['class', 'gone'] }, attacks), ['gone']);
+
+  const settings = {
+    primaryMode: 'global-pattern',
+    globalPattern: pattern,
+    monsterPatterns: { wolf: { attackKeys: ['basic'], useManaPotions: true } },
+  };
+  assert.deepEqual(selectedPattern(settings, 'wolf'), pattern);
+  settings.primaryMode = 'monster-pattern';
+  assert.deepEqual(selectedPattern(settings, 'wolf'), {
+    attackKeys: ['basic'],
+    useStaminaPotions: false,
+    useManaPotions: true,
+  });
+});
+
+test('pattern potion preflight can total fixed and full refill stock', () => {
+  const fixed = potionButton({ item: '162', name: 'Mana Potion S', description: 'Refills 20 Mana.', quantity: 4 });
+  const full = potionButton({ item: '35', name: 'Full Stamina Potion', description: 'Fully Refills Your Stamina.', quantity: 1 });
+  const potions = collectPotions([fixed, full]);
+  const settings = { potionEnabled: {} };
+  assert.equal(availablePotionRecovery(settings, potions, 'mana'), 80);
+  assert.equal(availablePotionRecovery(settings, potions, 'stamina'), Infinity);
 });
 
 test('the settings store survives corrupt JSON and missing storage', () => {

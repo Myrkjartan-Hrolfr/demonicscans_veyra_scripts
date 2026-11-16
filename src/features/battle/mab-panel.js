@@ -9,11 +9,13 @@ const { ATTACK_GROUPS, attackOptionLabel, sortAttackKeysByCost } = require('./ma
 const { cursorAfterFormat, formatNumber, formatTargetDisplay } = require('./mab-parse');
 const { getConfiguredPotionAmount, movePotion, supportsMultiplePotionUse } = require('./mab-potions');
 const { ID } = require('./mab-settings');
+const { createPattern, normalizePattern, patternCosts } = require('./mab-patterns');
 
 const STYLE_ID = `${ID}-style`;
 const LOG_LIMIT = 60;
 const FORM_FIELDS = Object.freeze([
   '#mabAttack1',
+  '#mabPrimaryMode',
   '#mabAttack2',
   '#mabAttack3',
   '#mabPoisonAttack',
@@ -78,6 +80,13 @@ const CSS = `
   #${ID} .mab-log > div + div { margin-top: 4px; }
   #${ID} .mab-empty, #${ID} .mab-hint { color: #7883aa; font-size: 10px; line-height: 1.45; }
   #${ID} .mab-hint { margin-top: 9px; }
+  #${ID} .mab-patterns { margin-top: 10px; }
+  #${ID} .mab-pattern-editor { margin-top: 8px; padding: 10px; border: 1px solid #303858; border-radius: 10px; background: #111526; }
+  #${ID} .mab-pattern-editor[hidden] { display: none; }
+  #${ID} .mab-pattern-row { display: grid; grid-template-columns: minmax(0,1fr) auto auto auto; gap: 5px; margin-top: 6px; }
+  #${ID} .mab-pattern-row button { min-width: 30px; border: 1px solid #3a4267; border-radius: 6px; background: #242943; color: #fff; cursor: pointer; }
+  #${ID} .mab-pattern-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin-top: 8px; font-size: 11px; }
+  #${ID} .mab-pattern-cost { color: #b9c5ef; font-variant-numeric: tabular-nums; }
   @media (max-width: 760px) {
     #${ID} .mab-grid, #${ID} .mab-priority-grid { grid-template-columns: 1fr; }
     #${ID} .mab-metrics { grid-template-columns: 1fr 1fr; }
@@ -101,6 +110,11 @@ const TEMPLATE = `
       <div class="mab-grid">
         <label class="mab-field">
           <span>Attack 1 <small>Primary attack</small></span>
+          <select id="mabPrimaryMode">
+            <option value="attack">Single attack</option>
+            <option value="global-pattern">Global attack pattern</option>
+            <option value="monster-pattern">Monster-specific attack pattern</option>
+          </select>
           <select id="mabAttack1"></select>
         </label>
         <label class="mab-field">
@@ -123,6 +137,13 @@ const TEMPLATE = `
           <span>Delay between attacks in ms</span>
           <input id="mabDelay" type="number" inputmode="numeric" min="0" step="50">
         </label>
+      </div>
+      <div class="mab-patterns">
+        <details>
+          <summary>Attack patterns</summary>
+          <div id="mabGlobalPattern" class="mab-pattern-editor"></div>
+          <div id="mabMonsterPattern" class="mab-pattern-editor"></div>
+        </details>
       </div>
       <div class="mab-options">
         <label><input id="mabAutoStamina" type="checkbox"> Use stamina potions automatically</label>
@@ -222,6 +243,100 @@ function createPanel(engine, doc) {
       fillAttackSelect($(`#mabAttack${index + 1}`), state.settings.attackKeys[index], false);
     }
     fillAttackSelect($('#mabPoisonAttack'), state.settings.poisonAttackKey, true);
+    renderPatternEditors();
+  }
+
+  function currentMonsterPattern() {
+    const id = engine.getMonsterId();
+    if (!state.settings.monsterPatterns[id]) state.settings.monsterPatterns[id] = createPattern();
+    return state.settings.monsterPatterns[id];
+  }
+
+  function renderPatternEditor(selector, title, pattern, specific = false) {
+    const container = $(selector);
+    if (!container) return;
+    container.replaceChildren();
+    const heading = doc.createElement('strong');
+    heading.textContent = title;
+    container.appendChild(heading);
+    const normalized = normalizePattern(pattern);
+    Object.assign(pattern, normalized);
+
+    normalized.attackKeys.forEach((key, index) => {
+      const row = doc.createElement('div');
+      row.className = 'mab-pattern-row';
+      const select = doc.createElement('select');
+      fillAttackSelect(select, key, false);
+      select.addEventListener('change', () => {
+        pattern.attackKeys[index] = select.value;
+        engine.saveSettings();
+        renderPatternEditors();
+      });
+      const buttons = [
+        ['↑', () => index > 0 && pattern.attackKeys.splice(index - 1, 0, pattern.attackKeys.splice(index, 1)[0])],
+        ['↓', () => index < pattern.attackKeys.length - 1 && pattern.attackKeys.splice(index + 1, 0, pattern.attackKeys.splice(index, 1)[0])],
+        ['×', () => pattern.attackKeys.splice(index, 1)],
+      ];
+      row.appendChild(select);
+      for (const [label, action] of buttons) {
+        const button = doc.createElement('button');
+        button.type = 'button';
+        button.textContent = label;
+        button.addEventListener('click', () => {
+          action();
+          engine.saveSettings();
+          renderPatternEditors();
+        });
+        row.appendChild(button);
+      }
+      container.appendChild(row);
+    });
+
+    const tools = doc.createElement('div');
+    tools.className = 'mab-pattern-tools';
+    const add = doc.createElement('button');
+    add.type = 'button';
+    add.className = 'mab-button mab-secondary';
+    add.textContent = '+ Add attack';
+    add.disabled = state.attacks.length === 0;
+    add.addEventListener('click', () => {
+      pattern.attackKeys.push(state.attacks[0]?.key || '');
+      engine.saveSettings();
+      renderPatternEditors();
+    });
+    tools.appendChild(add);
+    for (const [key, label] of [
+      ['useStaminaPotions', 'Use stamina potions'],
+      ['useManaPotions', 'Use mana potions'],
+    ]) {
+      const checkboxLabel = doc.createElement('label');
+      const checkbox = doc.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = pattern[key] === true;
+      checkbox.addEventListener('change', () => {
+        pattern[key] = checkbox.checked;
+        engine.saveSettings();
+      });
+      checkboxLabel.append(checkbox, ` ${label}`);
+      tools.appendChild(checkboxLabel);
+    }
+    const costs = patternCosts(pattern, state.attacks);
+    const cost = doc.createElement('span');
+    cost.className = 'mab-pattern-cost';
+    cost.textContent = `One loop: ${formatNumber(costs.stamina)} STA / ${formatNumber(costs.mana)} MP`;
+    tools.appendChild(cost);
+    container.appendChild(tools);
+    if (specific) {
+      const hint = doc.createElement('div');
+      hint.className = 'mab-hint';
+      hint.textContent = `Saved only for: ${engine.getMonsterLabel()}`;
+      container.appendChild(hint);
+    }
+  }
+
+  function renderPatternEditors() {
+    renderPatternEditor('#mabGlobalPattern', 'Global pattern (all monsters)', state.settings.globalPattern);
+    renderPatternEditor('#mabMonsterPattern', 'Monster-specific pattern', currentMonsterPattern(), true);
   }
 
   function renderPotionList(type, selector) {
@@ -368,6 +483,7 @@ function createPanel(engine, doc) {
         (number, index) => $(`#mabAttack${number}`)?.value || settings.attackKeys[index] || '',
       ),
     );
+    settings.primaryMode = $('#mabPrimaryMode')?.value || 'attack';
     settings.poisonAttackKey = $('#mabPoisonAttack')?.value || '';
     settings.targetDamage = $('#mabTarget')?.value.trim() || '0';
     settings.delayMs = Math.max(0, Number($('#mabDelay')?.value) || 0);
@@ -394,6 +510,10 @@ function createPanel(engine, doc) {
     if (delay) delay.value = String(settings.delayMs);
     const multiplier = $('#mabMultiplier');
     if (multiplier) multiplier.value = String(settings.levelMultiplier);
+    const primaryMode = $('#mabPrimaryMode');
+    if (primaryMode) primaryMode.value = settings.primaryMode;
+    const attack1 = $('#mabAttack1');
+    if (attack1) attack1.hidden = settings.primaryMode !== 'attack';
     for (const [selector, key] of [
       ['#mabAutoStamina', 'autoStamina'],
       ['#mabAutoMana', 'autoMana'],
@@ -449,6 +569,7 @@ function createPanel(engine, doc) {
       if (!element) continue;
       element.addEventListener('change', () => {
         readForm();
+        if (selector === '#mabPrimaryMode') writeFormValues();
         if (/^#mabAttack\d+$/.test(selector)) renderAttackOptions();
       });
       if (element.matches?.('input[type="text"], input[type="number"]')) element.addEventListener('input', readForm);
