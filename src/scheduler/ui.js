@@ -8,8 +8,14 @@
 const { POTION_TYPES, potionsOfType } = require('../core/potions');
 const { formatCountdown } = require('../core/time');
 const { ROUTE_LIST, getRoute } = require('../routes');
-const { MAX_LOOP_MINUTES, MIN_LOOP_MINUTES } = require('./config');
-const { attackSettingsForStore, availableAttacks, normalizePattern, renderPatternEditor } = require('./attack-settings');
+const { CONFIG_KEY, MAX_LOOP_MINUTES, MIN_LOOP_MINUTES } = require('./config');
+const {
+  attackSettingsForStore,
+  availableAttacks,
+  cacheClassAttacksFromDocument,
+  normalizePattern,
+  renderPatternEditor,
+} = require('./attack-settings');
 
 const UI_ID = 'veyra-automation';
 const SITE_SETTINGS_TRIGGER_ID = 'openSettingsDrawerBtn';
@@ -390,6 +396,7 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
     if (!route || !state.actions) return;
 
     state.subRouteId = routeId;
+    cacheClassAttacksFromDocument(store, CONFIG_KEY, doc);
     openView(`${route.label} · Settings`, (content) => {
       const routeConfig = state.actions.loadConfig().routes[routeId];
       const ctx = createSettingsContext(routeId, content, routeConfig);
@@ -400,6 +407,8 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
 
   function openAttackSettings() {
     const render = (content) => {
+      replaceChildren(content);
+      cacheClassAttacksFromDocument(store, CONFIG_KEY, doc);
       const config = state.actions.loadConfig();
       const attackSettings = attackSettingsForStore(config.attack, store);
       const ctx = createSettingsContext('attack', content, { settings: config.attack });

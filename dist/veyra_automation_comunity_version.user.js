@@ -27008,6 +27008,28 @@
 
     function cacheClassAttacksFromDocument(store, configKey, doc) {
       const attacks = [];
+      for (const button of doc?.querySelectorAll?.('button.attack-btn[data-skill-id]') || []) {
+        const id = String(button.dataset?.skillId || button.getAttribute?.('data-skill-id') || '').trim();
+        if (!/^\d+$/.test(id) || Number(id) <= 0) continue;
+        const name = String(button.dataset?.skillName || button.getAttribute?.('data-skill-name') || '')
+          .replace(/\s*\([^)]*(?:stamina|stam|mana|mp)[^)]*\)\s*$/i, '')
+          .trim();
+        const text = `${button.textContent || ''} ${button.querySelector?.('.skill-cost')?.textContent || ''}`;
+        const stamina = Number((text.match(/([\d,]+)\s*(?:stamina|stam)\b/i)?.[1] || '').replace(/\D/g, '')) ||
+          Number(button.dataset?.stamCost) || 0;
+        const mana = Number((text.match(/([\d,]+)\s*(?:mana|mp)\b/i)?.[1] || '').replace(/\D/g, '')) || 0;
+        if (name) attacks.push({ skillId: id, name, group: 'Class Attacks', costs: { stamina, mana } });
+      }
+      for (const option of doc?.querySelectorAll?.('#mabAttack1 optgroup[label="Class Attacks"] option') || []) {
+        const raw = String(option.value || '').split('|');
+        const id = raw.shift()?.trim() || '';
+        if (!/^\d+$/.test(id) || Number(id) <= 0) continue;
+        const label = String(option.textContent || '');
+        const name = (raw.join('|') || label.split('·')[0]).trim();
+        const stamina = Number((label.match(/([\d,]+)\s*STA\b/i)?.[1] || '').replace(/\D/g, '')) || 0;
+        const mana = Number((label.match(/([\d,]+)\s*MP\b/i)?.[1] || '').replace(/\D/g, '')) || 0;
+        if (name) attacks.push({ skillId: id, name, group: 'Class Attacks', costs: { stamina, mana } });
+      }
       for (const option of doc?.querySelectorAll?.('select[name="pattern_skill_id[]"] option') || []) {
         const id = String(option.value || option.getAttribute?.('value') || '').trim();
         if (!/^\d+$/.test(id) || Number(id) <= 0) continue;
@@ -28012,8 +28034,14 @@
     const { POTION_TYPES, potionsOfType } = require('../core/potions');
     const { formatCountdown } = require('../core/time');
     const { ROUTE_LIST, getRoute } = require('../routes');
-    const { MAX_LOOP_MINUTES, MIN_LOOP_MINUTES } = require('./config');
-    const { attackSettingsForStore, availableAttacks, normalizePattern, renderPatternEditor } = require('./attack-settings');
+    const { CONFIG_KEY, MAX_LOOP_MINUTES, MIN_LOOP_MINUTES } = require('./config');
+    const {
+      attackSettingsForStore,
+      availableAttacks,
+      cacheClassAttacksFromDocument,
+      normalizePattern,
+      renderPatternEditor,
+    } = require('./attack-settings');
 
     const UI_ID = 'veyra-automation';
     const SITE_SETTINGS_TRIGGER_ID = 'openSettingsDrawerBtn';
@@ -28394,6 +28422,7 @@
         if (!route || !state.actions) return;
 
         state.subRouteId = routeId;
+        cacheClassAttacksFromDocument(store, CONFIG_KEY, doc);
         openView(`${route.label} · Settings`, (content) => {
           const routeConfig = state.actions.loadConfig().routes[routeId];
           const ctx = createSettingsContext(routeId, content, routeConfig);
@@ -28404,6 +28433,8 @@
 
       function openAttackSettings() {
         const render = (content) => {
+          replaceChildren(content);
+          cacheClassAttacksFromDocument(store, CONFIG_KEY, doc);
           const config = state.actions.loadConfig();
           const attackSettings = attackSettingsForStore(config.attack, store);
           const ctx = createSettingsContext('attack', content, { settings: config.attack });
