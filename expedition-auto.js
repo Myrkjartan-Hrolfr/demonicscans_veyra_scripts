@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Dragon Realm Expedition Auto
 // @namespace    local.veyra.expeditions
-// @version      1.6.1
+// @version      1.6.2
 // @description  Independently starts and completes Dragon Realm expeditions, including party setup, votes, combat, loot and powers.
 // @match        https://demonicscans.org/event_page.php*
 // @match        https://www.demonicscans.org/event_page.php*
@@ -735,10 +735,15 @@
     return /^[a-z0-9_-]{1,32}$/.test(mode) ? mode : '';
   }
 
-  function createEndpoint(origin, mode = '') {
+  function normalizeLodgeMap(value) {
+    const map = Number(value);
+    return Number.isSafeInteger(map) && map > 0 ? map : 24;
+  }
+
+  function createEndpoint(origin, mode = '', lodgeMap = 24) {
     const url = new URL('/event_hunt.php', origin);
     url.searchParams.set('event', '13');
-    url.searchParams.set('lodge_map', '24');
+    url.searchParams.set('lodge_map', String(normalizeLodgeMap(lodgeMap)));
     url.searchParams.set('tab', 'expeditions');
     const normalizedMode = normalizeExpeditionMode(mode);
     if (normalizedMode) url.searchParams.set('mode', normalizedMode);
@@ -809,8 +814,15 @@
   function start(win) {
     const doc = win.document;
     const page = new URL(win.location.href);
-    const lodgePage = /\/event_page\.php$/i.test(page.pathname) && page.searchParams.get('event') === '13' && page.searchParams.get('map') === '24';
-    const huntPage = /\/event_hunt\.php$/i.test(page.pathname) && page.searchParams.get('event') === '13' && (page.searchParams.get('lodge_map') === '24' || doc.getElementById('huntBootstrap')?.dataset?.lodge?.includes('map=24'));
+    const initialBoot = doc.getElementById('huntBootstrap');
+    let bootLodgeMap = 0;
+    try {
+      bootLodgeMap = Number(new URL(initialBoot?.dataset?.lodge || '', win.location.origin).searchParams.get('map')) || 0;
+    } catch {}
+    const pageLodgeMap = Number(page.searchParams.get('lodge_map') || page.searchParams.get('map')) || 0;
+    const activeLodgeMap = normalizeLodgeMap(bootLodgeMap || pageLodgeMap);
+    const lodgePage = /\/event_page\.php$/i.test(page.pathname) && page.searchParams.get('event') === '13' && pageLodgeMap > 0;
+    const huntPage = /\/event_hunt\.php$/i.test(page.pathname) && page.searchParams.get('event') === '13' && Boolean(initialBoot || pageLodgeMap);
     if ((!lodgePage && !huntPage) || win.__veyraExpeditionAutoLoaded) return;
     win.__veyraExpeditionAutoLoaded = true;
 
@@ -819,7 +831,7 @@
     catch { settings = normalizeSettings(null); }
     const runtime = {
       busy: false,
-      boot: doc.getElementById('huntBootstrap') || null,
+      boot: initialBoot || null,
       catalog: null,
       partyId: 0,
       lastActionKey: '',
@@ -990,7 +1002,7 @@
     }
 
     function endpoint() {
-      return createEndpoint(win.location.origin, expeditionMode());
+      return createEndpoint(win.location.origin, expeditionMode(), activeLodgeMap);
     }
 
     function attribute(tag, name) {
@@ -1092,7 +1104,7 @@
       runtime.returning = true;
       win.setTimeout(() => {
         const url = new URL('/event_page.php', win.location.origin);
-        url.search = new URLSearchParams({ event: '13', map: '24', hunt: '1', tab: 'expeditions' });
+        url.search = new URLSearchParams({ event: '13', map: String(activeLodgeMap), hunt: '1', tab: 'expeditions' });
         win.location.replace(url.href);
       }, 1_500);
     }
@@ -1235,6 +1247,7 @@
       isJackInTheBox,
       holdsBeacon,
       normalizeExpeditionMode,
+      normalizeLodgeMap,
       normalizeSettings,
       needsControlResume,
       skillReady,

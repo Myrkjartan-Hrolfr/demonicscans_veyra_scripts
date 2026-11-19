@@ -190,6 +190,13 @@ test('standalone expedition endpoint preserves the active special mode', () => {
   assert.equal(helpers.createEndpoint('https://demonicscans.org', 'bad mode!').searchParams.has('mode'), false);
 });
 
+test('standalone expedition endpoint follows the lodge map used by the page', () => {
+  const endpoint = helpers.createEndpoint('https://demonicscans.org', 'normal', 30);
+  assert.equal(endpoint.searchParams.get('lodge_map'), '30');
+  assert.equal(helpers.normalizeLodgeMap('30'), 30);
+  assert.equal(helpers.normalizeLodgeMap('invalid'), 24);
+});
+
 test('standalone expedition combat uses a cheaper skill when only it can reach an enemy healer', () => {
   const skillCatalog = catalog();
   skillCatalog.skills.expensive.range = 1;
