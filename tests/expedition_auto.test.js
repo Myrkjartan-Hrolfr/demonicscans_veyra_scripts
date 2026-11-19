@@ -324,7 +324,7 @@ test('standalone expedition tank moves to gather enemies while staying near the 
   assert.deepEqual(decision.data.position, { lane: 0, row: 5, col: 2 });
 });
 
-test('standalone expedition party movement closes a gap larger than three tiles to the healer', () => {
+test('standalone expedition ranged attacker attacks at three tiles instead of following the healer', () => {
   const decision = helpers.chooseCombatAction(
     battle({
       actors: [
@@ -337,8 +337,8 @@ test('standalone expedition party movement closes a gap larger than three tiles 
     42,
     { autoRescue: true },
   );
-  assert.equal(decision.action, 'move');
-  assert.deepEqual(decision.data.position, { lane: 0, row: 6, col: 1 });
+  assert.equal(decision.action, 'order');
+  assert.equal(decision.data.order.target, 'e1');
 });
 
 test('standalone expedition party movement takes a shielding position near the healer', () => {
@@ -648,4 +648,71 @@ test('standalone expedition ticker keeps worker and fallback timers active in ba
   assert.deepEqual(revokedUrls, ['blob:expedition-worker']);
   assert.equal(documentListeners.size, 0);
   assert.equal(windowListeners.size, 0);
+});
+
+test('standalone expedition detects server AFK warnings and active AI support', () => {
+  assert.equal(helpers.needsControlResume(actor()), false);
+  assert.equal(helpers.needsControlResume(actor({ afk_missed: 1 })), true);
+  assert.equal(helpers.needsControlResume(actor({ afk_active: true })), true);
+  assert.equal(helpers.needsControlResume(actor({ hp: 0, afk_active: true })), false);
+});
+
+test('standalone expedition targets healer, mage, archer, then remaining enemies', () => {
+  const run = battle({
+    enemies: [
+      enemy('tank', 2, 2, { class: undefined, role: 'Tank' }),
+      enemy('archer', 2, 3, { role: 'Archer' }),
+      enemy('mage', 2, 4, { role: 'Mage' }),
+      enemy('healer', 2, 5, { role: 'Healer' }),
+    ],
+  });
+  assert.equal(helpers.choosePriorityTarget(run).id, 'healer');
+  run.enemies.find((unit) => unit.id === 'healer').hp = 0;
+  assert.equal(helpers.choosePriorityTarget(run).id, 'mage');
+  run.enemies.find((unit) => unit.id === 'mage').hp = 0;
+  assert.equal(helpers.choosePriorityTarget(run).id, 'archer');
+});
+
+test('standalone expedition melee closes to one tile while ranged stops at three', () => {
+  const target = enemy('target', 1, 2, { role: 'Warrior' });
+  const meleeRun = battle({ actors: [actor({ class: 'warrior', row: 6, col: 2 })], enemies: [target] });
+  const rangedRun = battle({ actors: [actor({ class: 'mage', row: 6, col: 2 })], enemies: [target] });
+  assert.deepEqual(helpers.chooseMoveToward(meleeRun, meleeRun.actors[0], target), { lane: 0, row: 5, col: 2 });
+  assert.deepEqual(helpers.chooseMoveToward(rangedRun, rangedRun.actors[0], target), { lane: 0, row: 5, col: 2 });
+  rangedRun.actors[0].row = 4;
+  assert.equal(helpers.chooseMoveToward(rangedRun, rangedRun.actors[0], target), null);
+});
+
+test('standalone expedition attacks barricades before ordinary enemies', () => {
+  const run = battle({
+    enemies: [enemy('warrior', 3, 2, { role: 'Warrior' })],
+    objects: [enemy('barricade', 4, 2, { is_object: true, name: 'Barricade' })],
+  });
+  assert.equal(helpers.choosePriorityTarget(run).id, 'barricade');
+  const decision = helpers.chooseCombatAction(run, catalog(), 42, { autoRescue: true });
+  assert.equal(decision.action, 'order');
+  assert.equal(decision.data.order.target, 'barricade');
+});
+
+test('standalone expedition protects dragon eggs by prioritizing the closest equal-role threat', () => {
+  const run = battle({
+    branch_objective: { type: 'cart' },
+    objects: [enemy('o_cart', 4, 4, { name: 'Dragon eggs' })],
+    enemies: [
+      enemy('far', 0, 0, { role: 'Warrior' }),
+      enemy('near', 3, 4, { role: 'Warrior' }),
+    ],
+  });
+  assert.equal(helpers.choosePriorityTarget(run).id, 'near');
+});
+
+test('standalone expedition moves to a free beacon and stays once it arrives', () => {
+  const run = battle({
+    actors: [actor({ row: 6, col: 2 })],
+    branch_objective: { type: 'beacons', tiles: [{ row: 4, col: 2 }] },
+  });
+  assert.deepEqual(helpers.chooseBeaconMove(run, run.actors[0]), { lane: 0, row: 5, col: 2 });
+  run.actors[0].row = 4;
+  assert.equal(helpers.chooseBeaconMove(run, run.actors[0]), null);
+  assert.equal(helpers.holdsBeacon(run, run.actors[0]), true);
 });

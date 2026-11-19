@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Dragon Realm Expedition Auto
 // @namespace    local.veyra.expeditions
-// @version      1.4.9
+// @version      1.6.0
 // @description  Independently starts and completes Dragon Realm expeditions, including party setup, votes, combat, loot and powers.
 // @match        https://demonicscans.org/event_page.php*
 // @match        https://www.demonicscans.org/event_page.php*
@@ -138,6 +138,10 @@
     return (run?.actors || []).find((actor) => Number(actor?.uid) === Number(userId) && !actor?.bot) || null;
   }
 
+  function needsControlResume(actor) {
+    return Boolean(actor) && Number(actor.hp) > 0 && (actor.afk_active === true || Number(actor.afk_missed || 0) > 0);
+  }
+
   function skillRange(actor, skill) {
     if (skill?.target === 'self') return 0;
     if (Number.isFinite(Number(skill?.range))) return Number(skill.range);
@@ -242,6 +246,81 @@
     return Boolean(unit?.objective || unit?.priority_target || unit?.must_destroy) ||
       isJackInTheBox(unit) ||
       /destroy.*(?:protection|shield)|\b(?:ward|totem|pylon)\b/.test(unitRole(unit));
+  }
+
+  function isBarricade(unit) {
+    return (Boolean(unit?.is_object) && unit?.id !== 'o_cart') ||
+      /\b(?:barricade|barrier|obstacle|blockade|wall)\b/.test(unitRole(unit));
+  }
+
+  function enemyClassPriority(unit) {
+    const role = unitRole(unit);
+    if (isJackInTheBox(unit) || isBattleObjective(unit)) return -3;
+    if (isBarricade(unit)) return -2;
+    if (/\bhealer\b/.test(role)) return 0;
+    if (/\bmage\b/.test(role)) return 1;
+    if (/\barcher\b/.test(role)) return 2;
+    return 3;
+  }
+
+  function protectedObjective(run) {
+    return run?.branch_objective?.type === 'cart'
+      ? (run.objects || []).find((unit) => unit.id === 'o_cart' && Number(unit.hp) > 0) || null
+      : null;
+  }
+
+  function hostileUnits(run) {
+    return [
+      ...(run?.enemies || []),
+      ...(run?.objects || []).filter((unit) => unit.id !== 'o_cart'),
+    ].filter((unit) => Number(unit.hp) > 0);
+  }
+
+  function choosePriorityTarget(run) {
+    const cart = protectedObjective(run);
+    return hostileUnits(run).filter((unit) => !isInvulnerable(unit)).sort(
+      (left, right) =>
+        enemyClassPriority(left) - enemyClassPriority(right) ||
+        (cart ? distance(left, cart) - distance(right, cart) : 0) ||
+        Number(left.hp || 0) - Number(right.hp || 0) ||
+        String(left.id || '').localeCompare(String(right.id || '')),
+    )[0] || null;
+  }
+
+  function movementRange(actor) {
+    return ['mage', 'archer'].includes(String(actor?.class || actor?.combat_class || '').toLowerCase()) ? 3 : 1;
+  }
+
+  function chooseMoveToward(run, actor, target, desiredRange = movementRange(actor)) {
+    if (!target || distance(actor, target) <= desiredRange) return null;
+    const danger = dangerTiles(run);
+    return validMoves(run, actor).filter((position) => !danger.has(pointKey(position))).sort(
+      (left, right) =>
+        Math.abs(distance(left, target) - desiredRange) - Math.abs(distance(right, target) - desiredRange) ||
+        distance(left, target) - distance(right, target) ||
+        left.row - right.row ||
+        left.col - right.col,
+    )[0] || null;
+  }
+
+  function chooseBeaconMove(run, actor) {
+    if (run?.branch_objective?.type !== 'beacons') return null;
+    const tiles = run.branch_objective.tiles || [];
+    if (!tiles.length || tiles.some((tile) => pointKey(tile) === pointKey(actor))) return null;
+    const occupied = new Set((run.actors || []).filter(
+      (unit) => unit.id !== actor.id && Number(unit.hp) > 0,
+    ).map(pointKey));
+    const targets = tiles.filter((tile) => !occupied.has(pointKey(tile)));
+    if (!targets.length) return null;
+    const target = targets.sort(
+      (left, right) => distance(actor, left) - distance(actor, right) || left.row - right.row || left.col - right.col,
+    )[0];
+    return chooseMoveToward(run, actor, target, 0);
+  }
+
+  function holdsBeacon(run, actor) {
+    return run?.branch_objective?.type === 'beacons' &&
+      (run.branch_objective.tiles || []).some((tile) => pointKey(tile) === pointKey(actor));
   }
 
   function isInvulnerable(unit) {
@@ -420,15 +499,13 @@
     skills.forEach((key, skillPriority) => {
       const skill = catalog.skills[key];
       if (skill.target !== 'enemy') return;
-      for (const target of run.enemies || []) {
+      for (const target of hostileUnits(run)) {
         if (targetable(run, actor, target, key, catalog)) candidates.push({ key, skill, skillPriority, target });
       }
     });
     candidates.sort(
       (left, right) =>
-        Number(isJackInTheBox(right.target)) - Number(isJackInTheBox(left.target)) ||
-        Number(isHealer(right.target)) - Number(isHealer(left.target)) ||
-        Number(isBattleObjective(right.target)) - Number(isBattleObjective(left.target)) ||
+        enemyClassPriority(left.target) - enemyClassPriority(right.target) ||
         Number(isInvulnerable(left.target)) - Number(isInvulnerable(right.target)) ||
         left.skillPriority - right.skillPriority ||
         Number(right.target.boss) - Number(left.target.boss) ||
@@ -460,14 +537,29 @@
       };
     }
     if (actedThisRound(run, actor)) {
-      const tactical = chooseTacticalMove(run, actor);
-      if (tactical) {
+      const beaconMove = chooseBeaconMove(run, actor);
+      if (beaconMove) {
         return {
           action: 'move',
-          key: `move:${run.battleSerial}:${run.round}:${pointKey(tactical.position)}`,
-          message: tactical.message,
-          data: { round: run.round, battle: run.battleSerial, position: tactical.position },
+          key: `move:${run.battleSerial}:${run.round}:${pointKey(beaconMove)}`,
+          message: 'Moving onto an objective tile and holding it.',
+          data: { round: run.round, battle: run.battleSerial, position: beaconMove },
         };
+      }
+      if (!holdsBeacon(run, actor)) {
+        const actorClass = String(actor.class || actor.combat_class || '').toLowerCase();
+        const target = actorClass === 'healer' ? null : choosePriorityTarget(run);
+        const targetMove = target ? chooseMoveToward(run, actor, target) : null;
+        const tactical = actorClass === 'healer' ? chooseTacticalMove(run, actor) : null;
+        const movement = targetMove || tactical?.position;
+        if (movement) {
+          return {
+            action: 'move',
+            key: `move:${run.battleSerial}:${run.round}:${pointKey(movement)}`,
+            message: targetMove ? `Closing on ${target?.name || 'the selected target'}.` : tactical.message,
+            data: { round: run.round, battle: run.battleSerial, position: movement },
+          };
+        }
       }
       if (Number(run.pacing_version) === 1) {
         return {
@@ -510,14 +602,36 @@
       const healing = chooseHealerAction(run, catalog, actor, skills);
       if (healing) return healing;
     }
-    const tactical = chooseTacticalMove(run, actor);
-    if (tactical) {
+    const beaconMove = chooseBeaconMove(run, actor);
+    if (beaconMove) {
       return {
         action: 'move',
-        key: `move:${run.battleSerial}:${run.round}:${pointKey(tactical.position)}`,
-        message: tactical.message,
-        data: { round: run.round, battle: run.battleSerial, position: tactical.position },
+        key: `move:${run.battleSerial}:${run.round}:${pointKey(beaconMove)}`,
+        message: 'Moving onto an objective tile and holding it.',
+        data: { round: run.round, battle: run.battleSerial, position: beaconMove },
       };
+    }
+    if (actorClass !== 'healer') {
+      const target = choosePriorityTarget(run);
+      const targetMove = chooseMoveToward(run, actor, target);
+      if (targetMove) {
+        return {
+          action: 'move',
+          key: `move:${run.battleSerial}:${run.round}:${pointKey(targetMove)}`,
+          message: `Closing on ${target?.name || 'the selected target'}.`,
+          data: { round: run.round, battle: run.battleSerial, position: targetMove },
+        };
+      }
+    } else {
+      const tactical = chooseTacticalMove(run, actor);
+      if (tactical) {
+        return {
+          action: 'move',
+          key: `move:${run.battleSerial}:${run.round}:${pointKey(tactical.position)}`,
+          message: tactical.message,
+          data: { round: run.round, battle: run.battleSerial, position: tactical.position },
+        };
+      }
     }
     const attack = chooseAttackAction(run, catalog, actor, skills);
     if (attack) return attack;
@@ -978,6 +1092,23 @@
       const actor = actorFor(run, userId());
       syncSkillControls(actor);
       const section = `Section ${Number(run.section || 0) + 1}/${run.sections?.length || '?'}`;
+      const mapAction = doc.getElementById('mapAction');
+      const mapPage = doc.getElementById('mapPage');
+      if (run.phase === 'battle' && mapAction && mapPage?.hidden === false && /enter\s+battle/i.test(mapAction.textContent || '')) {
+        mapAction.click();
+      }
+      // The server now counts missed rounds and eventually enables its own AI.
+      // Clear both the warning and active-AI states before sending our next
+      // decision, including while the page is being driven by the worker tick.
+      if (needsControlResume(actor)) {
+        const afkState = actor.afk_active ? 'active' : `missed-${Number(actor.afk_missed || 0)}`;
+        return perform(
+          'resume_control',
+          { party: party.id },
+          `resume-control:${party.id}:${run.battleSerial || 0}:${run.round || 0}:${afkState}`,
+          `${section} · Taking control back from AI support…`,
+        );
+      }
       if (run.phase === 'battle') {
         const decision = chooseCombatAction(run, runtime.catalog, userId(), settings);
         if (!decision.action) return setStatus(`${section} · ${decision.message}`);
@@ -1067,7 +1198,10 @@
       actorFor,
       chooseCombatAction,
       chooseEmergencyEscape,
+      chooseBeaconMove,
       chooseMove,
+      chooseMoveToward,
+      choosePriorityTarget,
       chooseTacticalMove,
       choosePower,
       choosePacedPhaseAction,
@@ -1077,10 +1211,13 @@
       createBackgroundTicker,
       createEndpoint,
       isBattleObjective,
+      isBarricade,
       isInvulnerable,
       isJackInTheBox,
+      holdsBeacon,
       normalizeExpeditionMode,
       normalizeSettings,
+      needsControlResume,
       skillReady,
       targetable,
       turnFinished,
