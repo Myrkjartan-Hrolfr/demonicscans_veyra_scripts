@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Dragon Realm Expedition Auto
 // @namespace    local.veyra.expeditions
-// @version      1.6.0
+// @version      1.6.1
 // @description  Independently starts and completes Dragon Realm expeditions, including party setup, votes, combat, loot and powers.
 // @match        https://demonicscans.org/event_page.php*
 // @match        https://www.demonicscans.org/event_page.php*
@@ -839,6 +839,7 @@
     }
 
     const style = doc.createElement('style');
+    style.id = `${PANEL_ID}-style`;
     style.textContent = `
       #${PANEL_ID}{position:fixed;z-index:2147483645;left:12px;bottom:12px;width:min(390px,calc(100vw - 24px));max-height:min(82vh,680px);display:flex;flex-direction:column;background:#171a27;color:#f4f5ff;border:1px solid #58628f;border-radius:14px;box-shadow:0 14px 48px #000b;font:13px/1.4 system-ui,Arial,sans-serif;overflow:hidden}
       #${PANEL_ID} *{box-sizing:border-box}#${PANEL_ID} header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:11px 13px;background:#282d45}#${PANEL_ID} header strong{font-size:14px}
@@ -863,6 +864,17 @@
     const skillSection = root.querySelector('.ea-skill-section');
     const skillTitle = root.querySelector('.ea-skill-title');
     const skillList = root.querySelector('.ea-skill-list');
+
+    function ensureUiMounted() {
+      if (!style.isConnected) doc.head?.appendChild(style);
+      if (!root.isConnected) doc.body?.appendChild(root);
+      // Page view changes must not be able to carry these generic attributes
+      // over to the userscript panel.
+      root.hidden = false;
+      root.style.removeProperty('display');
+      root.style.removeProperty('visibility');
+      root.style.removeProperty('opacity');
+    }
 
     function setStatus(message, delay = 0) {
       runtime.message = String(message || '');
@@ -1169,6 +1181,7 @@
     }
 
     async function tick() {
+      ensureUiMounted();
       if (!settings.enabled || runtime.busy || Date.now() < runtime.nextTickAt) return;
       runtime.busy = true;
       try {
@@ -1187,6 +1200,12 @@
       }
     }
 
+    const uiObserver = typeof win.MutationObserver === 'function'
+      ? new win.MutationObserver(() => {
+          if (!root.isConnected || !style.isConnected) ensureUiMounted();
+        })
+      : null;
+    uiObserver?.observe(doc.documentElement, { childList: true, subtree: true });
     createBackgroundTicker(win, () => void tick(), TICK_MS);
     if (settings.enabled) void tick();
   }
