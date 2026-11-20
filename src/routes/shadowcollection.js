@@ -4,6 +4,8 @@ const TARGETS = Object.freeze([
   ['vanguard', 'Lizardman Vanguard'],
   ['warmage', 'Lizardman Warmage'],
   ['dreadblade', 'Lizardman Dreadblade'],
+  ['juggernaut', 'Lizardman Juggernaut'],
+  ['bloodpriest', 'Lizardman Bloodpriest'],
   ['guardian', 'Lizardman Guardian'],
   ['skarn', 'General Skarn the Radiant Bastion'],
   ['vessir', 'General Vessir the Sunfang Duelist'],

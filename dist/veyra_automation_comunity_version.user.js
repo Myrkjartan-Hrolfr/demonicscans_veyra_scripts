@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation Community Version
 // @namespace    local.veyra.automation.comunity-version
-// @version      0.10.3
+// @version      0.10.4
 // @description  Community version of Veyra Automation without Shadowbridge automation (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -9853,6 +9853,17 @@
     function parseWaveMonsters(doc) {
       const found = [];
       const seen = new Set();
+      for (const card of doc?.querySelectorAll?.('.monster-card[data-monster-id]') || []) {
+        const id = validId(card.getAttribute?.('data-monster-id'));
+        const dead = card.getAttribute?.('data-dead') === '1';
+        const name = String(card.getAttribute?.('data-name') || card.querySelector?.('h3, .card-title')?.textContent || '')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (!id || !name || dead || seen.has(id)) continue;
+        const link = card.querySelector?.('a[href*="battle.php"]');
+        seen.add(id);
+        found.push({ id, name, href: link?.getAttribute?.('href') || `/battle.php?id=${id}` });
+      }
       for (const link of doc?.querySelectorAll?.('a[href*="battle.php?id="]') || []) {
         let url;
         try { url = new URL(link.href || link.getAttribute?.('href'), 'https://demonicscans.org'); } catch { continue; }
@@ -9884,7 +9895,9 @@
       const response = await win.fetch(path, { credentials: 'same-origin', cache: 'no-store' });
       const text = await response.text();
       if (!response.ok) throw new Error(`HTTP ${response.status} for ${path}`);
-      return new win.DOMParser().parseFromString(text, 'text/html');
+      const doc = new win.DOMParser().parseFromString(text, 'text/html');
+      doc.__veyraFetchMeta = { requested: path, responseUrl: response.url || '', title: doc.title || '', bytes: text.length };
+      return doc;
     }
 
     async function runCollection(ctx, visit) {
@@ -9921,6 +9934,7 @@
         available.push(...found);
         writeLog(store, `Gate 3 wave ${wave} scanned.`, {
           found: found.length,
+          page: page.__veyraFetchMeta,
           monsters: found.map((monster) => ({ id: monster.id, name: monster.name })),
         });
       }
@@ -27719,6 +27733,8 @@
       ['vanguard', 'Lizardman Vanguard'],
       ['warmage', 'Lizardman Warmage'],
       ['dreadblade', 'Lizardman Dreadblade'],
+      ['juggernaut', 'Lizardman Juggernaut'],
+      ['bloodpriest', 'Lizardman Bloodpriest'],
       ['guardian', 'Lizardman Guardian'],
       ['skarn', 'General Skarn the Radiant Bastion'],
       ['vessir', 'General Vessir the Sunfang Duelist'],

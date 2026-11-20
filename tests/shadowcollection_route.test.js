@@ -10,7 +10,7 @@ test('Shadow Collection is daily, disabled by default and recognizes only its ma
   assert.equal(route.defaultEnabled, false);
   assert.equal(route.matchesUrl(new URL('https://demonicscans.org/game_dash.php?veyra_route=shadowcollection')), true);
   assert.equal(route.matchesUrl(new URL('https://demonicscans.org/active_wave.php?gate=3&wave=8')), false);
-  assert.equal(route.TARGETS.length, 8);
+  assert.equal(route.TARGETS.length, 10);
 });
 
 test('Shadow Collection clamps the configured daily total to five', () => {
