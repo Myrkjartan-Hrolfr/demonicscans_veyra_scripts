@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.10.6
+// @version      0.10.7
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -9829,7 +9829,7 @@
 
     const TRACKED_KEY = 'veyra:shadowcollection:tracked:v1';
     const VISIT_PARAM = 'veyra_visit';
-    const WORKER_BUILD = '0.10.6';
+    const WORKER_BUILD = '0.10.7';
 
     function writeLog(store, message, detail = null) {
       const entries = Array.isArray(store?.read?.(route.LOG_KEY)) ? store.read(route.LOG_KEY) : [];
@@ -9877,6 +9877,17 @@
         found.push({ id, name, href: `/battle.php?id=${id}` });
       }
       return found;
+    }
+
+    function rawMonsterIdSamples(html, limit = 5) {
+      const samples = [];
+      const source = String(html || '');
+      const pattern = /.{0,100}data-monster-id.{0,180}/gi;
+      for (const match of source.matchAll(pattern)) {
+        samples.push(match[0].replace(/\s+/g, ' ').trim().slice(0, 280));
+        if (samples.length >= limit) break;
+      }
+      return samples;
     }
 
     function parseWaveMonsters(doc) {
@@ -9972,14 +9983,18 @@
 
       const available = [];
       for (let wave = 1; wave <= 8; wave += 1) {
-        const page = await fetchDocument(win, `/active_wave.php?gate=3&wave=${wave}`);
+        // These pages are highly dynamic. A unique query parameter also protects
+        // against intermediary caches that disregard fetch's no-store option.
+        const page = await fetchDocument(win, `/active_wave.php?gate=3&wave=${wave}&veyra_scan=${Date.now()}-${wave}`);
         const found = parseWaveMonsters(page);
+        const rawHtml = String(page.__veyraHtml || '');
         available.push(...found);
         writeLog(store, `Gate 3 wave ${wave} scanned.`, {
           found: found.length,
           page: page.__veyraFetchMeta,
-          rawMonsterCards: (String(page.__veyraHtml || '').match(/monster-card/gi) || []).length,
-          rawMonsterIds: (String(page.__veyraHtml || '').match(/data-monster-id/gi) || []).length,
+          rawMonsterCards: (rawHtml.match(/monster-card/gi) || []).length,
+          rawMonsterIds: (rawHtml.match(/data-monster-id/gi) || []).length,
+          rawSamples: found.length === 0 ? rawMonsterIdSamples(rawHtml) : [],
           monsters: found.map((monster) => ({ id: monster.id, name: monster.name })),
         });
       }
@@ -10022,6 +10037,7 @@
       TRACKED_KEY,
       configuredTargets,
       parseRawWaveMonsters,
+      rawMonsterIdSamples,
       parseWaveMonsters,
       feature: Object.freeze({
         id: 'shadowcollection-worker',

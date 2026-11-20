@@ -67,3 +67,13 @@ test('raw Gate 3 HTML fallback reads live monster-card data attributes', () => {
     { id: '5573', name: 'lizardman warmage', href: '/battle.php?id=5573' },
   ]);
 });
+
+test('raw monster id diagnostics return compact source samples', () => {
+  assert.deepEqual(worker.rawMonsterIdSamples(`
+    <script>document.querySelector('.monster-card[data-monster-id="123"]')</script>
+    <button data-monster-id="456">Attack</button>
+  `), [
+    '<script>document.querySelector(\'.monster-card[data-monster-id="123"]\')</script>',
+    '<button data-monster-id="456">Attack</button>',
+  ]);
+});
