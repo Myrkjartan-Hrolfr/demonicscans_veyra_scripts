@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation Community Version
 // @namespace    local.veyra.automation.comunity-version
-// @version      0.10.4
+// @version      0.10.5
 // @description  Community version of Veyra Automation without Shadowbridge automation (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -9850,6 +9850,34 @@
       return /^\d+$/.test(text) && Number(text) > 0 ? text : '';
     }
 
+    function tagAttribute(tag, name) {
+      const match = String(tag || '').match(new RegExp(`\\b${name}\\s*=\\s*(["'])(.*?)\\1`, 'i'));
+      return match ? match[2] : '';
+    }
+
+    function parseRawWaveMonsters(html) {
+      const found = [];
+      const seen = new Set();
+      const source = String(html || '');
+      for (const match of source.matchAll(/<div\b[^>]*>/gi)) {
+        const tag = match[0];
+        if (!/(?:^|\s)monster-card(?:\s|$)/i.test(tagAttribute(tag, 'class'))) continue;
+        const id = validId(tagAttribute(tag, 'data-monster-id'));
+        const name = tagAttribute(tag, 'data-name').replace(/\s+/g, ' ').trim();
+        if (!id || !name || tagAttribute(tag, 'data-dead') === '1' || seen.has(id)) continue;
+        seen.add(id);
+        found.push({ id, name, href: `/battle.php?id=${id}` });
+      }
+      for (const match of source.matchAll(/<div\b[^>]*class=["'][^"']*auto-summon-card[^"']*["'][^>]*>[\s\S]{0,8000}?class=["'][^"']*auto-summon-name[^"']*["'][^>]*>([^<]+)<[\s\S]{0,8000}?href=["'][^"']*battle\.php\?id=(\d+)[^"']*["']/gi)) {
+        const id = validId(match[2]);
+        const name = String(match[1] || '').replace(/&amp;/gi, '&').replace(/\s+/g, ' ').trim();
+        if (!id || !name || seen.has(id)) continue;
+        seen.add(id);
+        found.push({ id, name, href: `/battle.php?id=${id}` });
+      }
+      return found;
+    }
+
     function parseWaveMonsters(doc) {
       const found = [];
       const seen = new Set();
@@ -9880,6 +9908,7 @@
         seen.add(id);
         found.push({ id, name: text, href: url.pathname + url.search });
       }
+      if (found.length === 0 && doc?.__veyraHtml) return parseRawWaveMonsters(doc.__veyraHtml);
       return found;
     }
 
@@ -9896,6 +9925,7 @@
       const text = await response.text();
       if (!response.ok) throw new Error(`HTTP ${response.status} for ${path}`);
       const doc = new win.DOMParser().parseFromString(text, 'text/html');
+      doc.__veyraHtml = text;
       doc.__veyraFetchMeta = { requested: path, responseUrl: response.url || '', title: doc.title || '', bytes: text.length };
       return doc;
     }
@@ -9976,6 +10006,7 @@
     module.exports = Object.freeze({
       TRACKED_KEY,
       configuredTargets,
+      parseRawWaveMonsters,
       parseWaveMonsters,
       feature: Object.freeze({
         id: 'shadowcollection-worker',

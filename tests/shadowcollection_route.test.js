@@ -56,3 +56,14 @@ test('changing one quantity preserves every previously selected monster', () => 
     { targetId: 'drakzareth', quantity: 3 },
   ]);
 });
+
+test('raw Gate 3 HTML fallback reads live monster-card data attributes', () => {
+  assert.deepEqual(worker.parseRawWaveMonsters(`
+    <div class="monster-card rare" data-monster-id="5571" data-dead="0" data-name="lizardman guardian"><h3>Lizardman Guardian</h3></div>
+    <div class="monster-card" data-monster-id="5572" data-dead="1" data-name="lizardman guardian"></div>
+    <div class="monster-card" data-monster-id="5573" data-dead="0" data-name="lizardman warmage"></div>
+  `), [
+    { id: '5571', name: 'lizardman guardian', href: '/battle.php?id=5571' },
+    { id: '5573', name: 'lizardman warmage', href: '/battle.php?id=5573' },
+  ]);
+});
