@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Dragon Realm Expedition Auto
 // @namespace    local.veyra.expeditions
-// @version      1.6.2
+// @version      1.6.3
 // @description  Independently starts and completes Dragon Realm expeditions, including party setup, votes, combat, loot and powers.
 // @match        https://demonicscans.org/event_page.php*
 // @match        https://www.demonicscans.org/event_page.php*
@@ -135,11 +135,15 @@
   }
 
   function actorFor(run, userId) {
-    return (run?.actors || []).find((actor) => Number(actor?.uid) === Number(userId) && !actor?.bot) || null;
+    // The server may temporarily mark a human actor as bot/AI-controlled after
+    // missed background rounds. The uid remains the reliable identity and is
+    // required so the automation can take control back.
+    return (run?.actors || []).find((actor) => Number(actor?.uid) === Number(userId)) || null;
   }
 
   function needsControlResume(actor) {
-    return Boolean(actor) && Number(actor.hp) > 0 && (actor.afk_active === true || Number(actor.afk_missed || 0) > 0);
+    const aiActive = actor?.afk_active === true || Number(actor?.afk_active || 0) > 0;
+    return Boolean(actor) && Number(actor.hp) > 0 && (aiActive || Number(actor.afk_missed || 0) > 0);
   }
 
   function skillRange(actor, skill) {
@@ -1201,12 +1205,10 @@
         runtime.failures = 0;
       } catch (error) {
         runtime.failures += 1;
-        setStatus(`⛔ ${error?.message || error}`, error?.status === 409 ? 1_000 : 5_000);
-        if (runtime.failures >= 5) {
-          settings.enabled = false;
-          setStatus(`Stopped after repeated errors: ${error?.message || error}`);
-          save();
-        }
+        const retryMs = error?.status === 409
+          ? 1_000
+          : Math.min(30_000, 2_000 * (2 ** Math.min(runtime.failures - 1, 4)));
+        setStatus(`⛔ ${error?.message || error} · Retrying automatically…`, retryMs);
       } finally {
         runtime.busy = false;
       }

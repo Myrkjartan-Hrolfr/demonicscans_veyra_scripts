@@ -661,7 +661,14 @@ test('standalone expedition detects server AFK warnings and active AI support', 
   assert.equal(helpers.needsControlResume(actor()), false);
   assert.equal(helpers.needsControlResume(actor({ afk_missed: 1 })), true);
   assert.equal(helpers.needsControlResume(actor({ afk_active: true })), true);
+  assert.equal(helpers.needsControlResume(actor({ afk_active: 1 })), true);
+  assert.equal(helpers.needsControlResume(actor({ afk_active: '1' })), true);
   assert.equal(helpers.needsControlResume(actor({ hp: 0, afk_active: true })), false);
+});
+
+test('standalone expedition still finds a human actor temporarily controlled by server AI', () => {
+  const controlled = actor({ uid: 42, bot: true, afk_active: 1 });
+  assert.equal(helpers.actorFor({ actors: [controlled] }, 42), controlled);
 });
 
 test('standalone expedition targets healer, mage, archer, then remaining enemies', () => {
