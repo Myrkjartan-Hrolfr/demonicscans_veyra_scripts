@@ -8,9 +8,11 @@ const { cruciblePvpWatcherFeature } = require('./crucible-pvp-watch');
 const { pvpWorkerFeature } = require('./pvp-worker');
 const { princeWorkerFeature } = require('./prince-worker');
 const { shadowbridgeWorkerFeature } = require('./shadowbridge-worker');
+const { feature: shadowcollectionWorkerFeature } = require('./shadowcollection-worker');
 
 module.exports = [
   bossWorkerFeature,
+  shadowcollectionWorkerFeature,
   pvpWorkerFeature,
   adventurersWorkerFeature,
   ...(buildProfile.includeShadowbridge ? [shadowbridgeWorkerFeature] : []),

@@ -16,9 +16,11 @@ const crucible = require('./crucible');
 const shadowbridge = require('./shadowbridge');
 const prince = require('./prince');
 const wave3 = require('./wave3');
+const shadowcollection = require('./shadowcollection');
 
 const ROUTE_LIST = Object.freeze([
   pvp,
+  shadowcollection,
   wave3,
   olympus,
   adventurers,

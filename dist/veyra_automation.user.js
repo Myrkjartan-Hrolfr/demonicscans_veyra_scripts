@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.9.20
+// @version      0.10.0
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -7002,9 +7002,11 @@
     const { pvpWorkerFeature } = require('./pvp-worker');
     const { princeWorkerFeature } = require('./prince-worker');
     const { shadowbridgeWorkerFeature } = require('./shadowbridge-worker');
+    const { feature: shadowcollectionWorkerFeature } = require('./shadowcollection-worker');
 
     module.exports = [
       bossWorkerFeature,
+      shadowcollectionWorkerFeature,
       pvpWorkerFeature,
       adventurersWorkerFeature,
       ...(buildProfile.includeShadowbridge ? [shadowbridgeWorkerFeature] : []),
@@ -9816,6 +9818,150 @@
       readStamina,
       shadowbridgeWorkerFeature,
     };
+  },
+  "features/automation/shadowcollection-worker.js": function (module, exports, require) {
+    'use strict';
+
+    const { COMMAND_KEY, normalizeVisit, publishWorkerStatus } = require('../../core/protocol');
+    const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
+    const { extractShadow } = require('../loot/loot-api');
+    const route = require('../../routes/shadowcollection');
+
+    const TRACKED_KEY = 'veyra:shadowcollection:tracked:v1';
+    const VISIT_PARAM = 'veyra_visit';
+
+    function normalizeName(value) {
+      return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    }
+
+    function validId(value) {
+      const text = String(value || '').trim();
+      return /^\d+$/.test(text) && Number(text) > 0 ? text : '';
+    }
+
+    function parseWaveMonsters(doc) {
+      const found = [];
+      const seen = new Set();
+      for (const link of doc?.querySelectorAll?.('a[href*="battle.php?id="]') || []) {
+        let url;
+        try { url = new URL(link.href || link.getAttribute?.('href'), 'https://demonicscans.org'); } catch { continue; }
+        const id = validId(url.searchParams.get('id'));
+        if (!id || seen.has(id)) continue;
+        const card = link.closest?.('.monster-card, .auto-summon-card, .summon-card, .boss-card, .card') || link.parentElement;
+        const explicitName = card?.getAttribute?.('data-name')
+          || card?.querySelector?.('.auto-summon-name, h3, .card-title')?.textContent;
+        const text = String(explicitName || card?.textContent || link.textContent || '').replace(/\s+/g, ' ').trim();
+        const dead = card?.getAttribute?.('data-dead') === '1'
+          || card?.getAttribute?.('data-alive') === '0'
+          || /\bdead\b/i.test(String(card?.textContent || ''));
+        if (!text || dead) continue;
+        seen.add(id);
+        found.push({ id, name: text, href: url.pathname + url.search });
+      }
+      return found;
+    }
+
+    function configuredTargets(settings) {
+      const byId = new Map(route.TARGETS.map((target) => [target.id, target]));
+      return settings.rows.filter((row) => row.quantity > 0 && byId.has(row.targetId)).map((row) => ({
+        ...byId.get(row.targetId),
+        quantity: row.quantity,
+      }));
+    }
+
+    async function fetchDocument(win, path) {
+      const response = await win.fetch(path, { credentials: 'same-origin', cache: 'no-store' });
+      const text = await response.text();
+      if (!response.ok) throw new Error(`HTTP ${response.status} for ${path}`);
+      return new win.DOMParser().parseFromString(text, 'text/html');
+    }
+
+    async function runCollection(ctx, visit) {
+      const { win, store, postForm } = ctx;
+      const settings = normalizeConfig(store.read(CONFIG_KEY)).routes.shadowcollection.settings;
+      const targets = configuredTargets(settings);
+      const tracked = Array.isArray(store.read(TRACKED_KEY)) ? store.read(TRACKED_KEY) : [];
+      const remaining = [];
+      let extracted = 0;
+
+      for (const entry of tracked) {
+        const id = validId(entry?.monsterId);
+        if (!id) continue;
+        const battle = await fetchDocument(win, `/battle.php?id=${id}`);
+        if (battle.getElementById?.('extract-shadow-btn')) {
+          const result = await extractShadow(postForm, id);
+          if (result.ok) { extracted += 1; continue; }
+        }
+        remaining.push({ monsterId: id, targetId: String(entry.targetId || ''), name: String(entry.name || '') });
+      }
+
+      const available = [];
+      for (let wave = 1; wave <= 8; wave += 1) {
+        const page = await fetchDocument(win, `/active_wave.php?gate=3&wave=${wave}`);
+        available.push(...parseWaveMonsters(page));
+      }
+      const already = new Set(remaining.map((entry) => entry.monsterId));
+      let attacked = 0;
+      for (const target of targets) {
+        const trackedForTarget = remaining.filter((entry) => entry.targetId === target.id).length;
+        const needed = Math.max(0, target.quantity - trackedForTarget);
+        if (needed === 0) continue;
+        const matches = available.filter((monster) => !already.has(monster.id) && normalizeName(monster.name).includes(normalizeName(target.name)));
+        for (const monster of matches.slice(0, needed)) {
+          const joined = await postForm('user_join_battle.php', { monster_id: monster.id });
+          if (!joined.ok) continue;
+          const hit = await postForm('damage.php', { monster_id: monster.id, skill_id: '0', stamina_cost: '1' });
+          const success = hit.ok && String(hit.json?.status || '').trim().toLowerCase() === 'success';
+          if (!success) continue;
+          attacked += 1;
+          already.add(monster.id);
+          remaining.push({ monsterId: monster.id, targetId: target.id, name: target.name });
+        }
+      }
+      store.write(TRACKED_KEY, remaining);
+      publishWorkerStatus(store, route.id, {
+        visitId: visit.visitId,
+        workerId: route.id,
+        state: 'done',
+        safeToLeave: true,
+        message: `${attacked} hit, ${extracted} shadows extracted, ${remaining.length} tracked.`,
+      });
+    }
+
+    module.exports = Object.freeze({
+      TRACKED_KEY,
+      configuredTargets,
+      parseWaveMonsters,
+      feature: Object.freeze({
+        id: 'shadowcollection-worker',
+        group: 'Automation',
+        settings: [],
+        matches(url) { return route.matchesUrl(url); },
+        async run(ctx) {
+          const visit = normalizeVisit(ctx.store.read(COMMAND_KEY), (taskId) => taskId === route.id);
+          if (!visit || visit.phase !== 'running') return;
+          publishWorkerStatus(ctx.store, route.id, {
+            visitId: visit.visitId,
+            workerId: route.id,
+            state: 'busy',
+            safeToLeave: false,
+            message: 'Checking tagged Gate 3 monsters and starting today’s Slashes.',
+          });
+          try {
+            await runCollection(ctx, visit);
+          } catch (error) {
+            publishWorkerStatus(ctx.store, route.id, {
+              visitId: visit.visitId,
+              workerId: route.id,
+              state: 'error',
+              safeToLeave: true,
+              message: `Shadow Collection stopped: ${error.message || error}`,
+            });
+          }
+        },
+      }),
+      runCollection,
+    });
   },
   "features/battle/index.js": function (module, exports, require) {
     'use strict';
@@ -26367,9 +26513,11 @@
     const shadowbridge = require('./shadowbridge');
     const prince = require('./prince');
     const wave3 = require('./wave3');
+    const shadowcollection = require('./shadowcollection');
 
     const ROUTE_LIST = Object.freeze([
       pvp,
+      shadowcollection,
       wave3,
       olympus,
       adventurers,
@@ -27530,6 +27678,102 @@
       normalizeSettings,
       normalizeKillSelectedRequest,
       renderSettings,
+    });
+  },
+  "routes/shadowcollection.js": function (module, exports, require) {
+    'use strict';
+
+    const TARGETS = Object.freeze([
+      ['vanguard', 'Lizardman Vanguard'],
+      ['warmage', 'Lizardman Warmage'],
+      ['dreadblade', 'Lizardman Dreadblade'],
+      ['guardian', 'Lizardman Guardian'],
+      ['skarn', 'General Skarn the Radiant Bastion'],
+      ['vessir', 'General Vessir the Sunfang Duelist'],
+      ['hrazz', 'General Hrazz the Dawnflame Oathkeeper'],
+      ['drakzareth', 'Drakzareth The Tyrant Lizard King'],
+    ].map(([id, name]) => Object.freeze({ id, name })));
+    const TARGET_BY_ID = new Map(TARGETS.map((target) => [target.id, target]));
+    const MAX_TARGETS = 5;
+
+    function normalizeSettings(value) {
+      const rows = [];
+      let remaining = MAX_TARGETS;
+      for (let index = 0; index < MAX_TARGETS; index += 1) {
+        const saved = value?.rows?.[index];
+        const targetId = TARGET_BY_ID.has(saved?.targetId) ? saved.targetId : '';
+        const requested = Math.max(0, Math.min(MAX_TARGETS, Math.trunc(Number(saved?.quantity)) || 0));
+        const quantity = targetId ? Math.min(remaining, requested) : 0;
+        remaining -= quantity;
+        rows.push({ targetId, quantity });
+      }
+      return { rows };
+    }
+
+    function renderSettings(ctx) {
+      ctx.addSectionTitle('Daily Shadow Collection');
+      ctx.container.appendChild(ctx.make('div', {
+        className: ctx.cls('hint'),
+        text: 'Choose up to five Gate 3 monsters in total. Once per day the route hits each selected live monster with exactly one Slash. Dead tagged monsters are checked and their shadows extracted.',
+      }));
+      const rerender = () => ctx.rerender?.();
+      ctx.settings.rows.forEach((row, index) => {
+        const host = ctx.make('div', { className: ctx.cls('setting') });
+        const select = ctx.make('select', { id: `${ctx.idPrefix}-target-${index}`, className: ctx.cls('select') });
+        const empty = ctx.make('option', { text: '— No monster —' });
+        empty.value = '';
+        select.appendChild(empty);
+        for (const target of TARGETS) {
+          const option = ctx.make('option', { text: target.name });
+          option.value = target.id;
+          select.appendChild(option);
+        }
+        select.value = row.targetId;
+        select.addEventListener('change', () => {
+          ctx.settings = ctx.updateSettings((settings) => { settings.rows[index].targetId = select.value; });
+          rerender();
+        });
+        host.appendChild(ctx.make('label', { text: `Monster ${index + 1}` }));
+        host.appendChild(select);
+        const quantity = ctx.make('input', {
+          id: `${ctx.idPrefix}-quantity-${index}`,
+          className: ctx.cls('input'),
+          type: 'number',
+        });
+        quantity.min = '0';
+        quantity.max = '5';
+        quantity.step = '1';
+        quantity.value = String(row.quantity);
+        quantity.addEventListener('change', () => {
+          ctx.settings = ctx.updateSettings((settings) => { settings.rows[index].quantity = quantity.value; });
+          rerender();
+        });
+        host.appendChild(ctx.make('label', { text: 'Daily amount (total max. 5)' }));
+        host.appendChild(quantity);
+        ctx.container.appendChild(host);
+      });
+      const total = ctx.settings.rows.reduce((sum, row) => sum + row.quantity, 0);
+      ctx.container.appendChild(ctx.make('div', { className: ctx.cls('hint'), text: `Configured total: ${total} / ${MAX_TARGETS}` }));
+    }
+
+    module.exports = Object.freeze({
+      id: 'shadowcollection',
+      label: 'Shadow Collection',
+      path: '/active_wave.php?gate=3&wave=8&veyra_route=shadowcollection',
+      defaultEnabled: false,
+      defaultLoopMinutes: 24 * 60,
+      maxVisitMs: 5 * 60_000,
+      initialDelayMs: 60_000,
+      TARGETS,
+      MAX_TARGETS,
+      createDefaultSettings() { return normalizeSettings(null); },
+      normalizeSettings,
+      renderSettings,
+      matchesUrl(url) {
+        return /\/active_wave\.php\/?$/i.test(url.pathname)
+          && url.searchParams.get('gate') === '3'
+          && url.searchParams.get('veyra_route') === 'shadowcollection';
+      },
     });
   },
   "routes/wave3.js": function (module, exports, require) {
