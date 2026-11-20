@@ -6,6 +6,7 @@ module.exports = [
   require('./auto-farm-activate-buttons'),
   require('./power-crystal-quickset'),
   require('./shadow-army-manager'),
+  require('./pet-food-leveler'),
   require('./better-header'),
   require('./custom-navigation'),
   require('./battle-drawer-scroll'),

@@ -8,6 +8,7 @@ const autoBattleExtras = require('../src/features/general/auto-battle-extras');
 const autoFarmActivate = require('../src/features/general/auto-farm-activate-buttons');
 const powerCrystalQuickset = require('../src/features/general/power-crystal-quickset');
 const shadowArmyManager = require('../src/features/general/shadow-army-manager');
+const petFoodLeveler = require('../src/features/general/pet-food-leveler');
 const navigation = require('../src/features/general/custom-navigation');
 const attackButtons = require('../src/features/general/better-attack-buttons');
 const asterion = require('../src/features/general/asterion-detect');
@@ -71,6 +72,7 @@ test('general features keep veyra-hud keys and defaults', () => {
   assert.equal(defaults['veyra:autoFarm:showTargetActivateButtons'], true);
   assert.equal(defaults['veyra:powerCrystals:quicksetEnabled'], true);
   assert.equal(defaults['veyra:shadowArmy:managerEnabled'], true);
+  assert.equal(defaults['veyra:pets:smartFoodLeveler'], true);
   assert.equal(GENERAL[0].id, 'adventurers-guild-layout');
   assert.equal(GENERAL[1].id, 'auto-battle-extras');
   assert.equal(GENERAL[2].id, 'auto-farm-activate-buttons');
@@ -97,6 +99,8 @@ test('features only match their pages', () => {
   assert.equal(powerCrystalQuickset.matches(url('/inventory.php')), false);
   assert.equal(shadowArmyManager.matches(url('/shadow_army.php')), true);
   assert.equal(shadowArmyManager.matches(url('/shadow_army_formation.php')), false);
+  assert.equal(petFoodLeveler.matches(url('/pets.php')), true);
+  assert.equal(petFoodLeveler.matches(url('/pets_shop.php')), false);
 });
 
 test('Auto Farm Activate enables one target and disables the others', () => {

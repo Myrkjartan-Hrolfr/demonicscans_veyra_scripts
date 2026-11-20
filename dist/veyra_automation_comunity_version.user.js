@@ -18610,6 +18610,7 @@
       require('./auto-farm-activate-buttons'),
       require('./power-crystal-quickset'),
       require('./shadow-army-manager'),
+      require('./pet-food-leveler'),
       require('./better-header'),
       require('./custom-navigation'),
       require('./battle-drawer-scroll'),
@@ -18985,6 +18986,288 @@
           added += 1;
         }
         if (added > 0) injectStyle(doc, STYLE_ID, CSS);
+      },
+    });
+  },
+  "features/general/pet-food-leveler.js": function (module, exports, require) {
+    'use strict';
+
+    const { injectStyle, textOf } = require('./dom');
+
+    const ROOT_ID = 'veyra-pet-food-leveler';
+    const STYLE_ID = `${ROOT_ID}-style`;
+    const MAX_LEVEL = 120;
+    const ASCENSIONS = Object.freeze({ 80: 1, 90: 2, 100: 4, 110: 8 });
+
+    const CSS = `
+      #${ROOT_ID} { background:#111522; border:1px solid #3b4264; border-radius:10px; margin-bottom:12px; padding:12px; }
+      #${ROOT_ID}, #${ROOT_ID} * { box-sizing:border-box; }
+      #${ROOT_ID} .pfl-title { font-size:14px; font-weight:800; margin-bottom:5px; }
+      #${ROOT_ID} .pfl-help, #${ROOT_ID} .pfl-status { color:#cfd3ef; font-size:12px; line-height:1.45; }
+      #${ROOT_ID} .pfl-controls { align-items:center; display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+      #${ROOT_ID} label { font-size:12px; font-weight:700; }
+      #${ROOT_ID} input { background:#090c15; border:1px solid #4a5279; border-radius:7px; color:#fff; font:inherit; padding:7px; text-align:center; width:76px; }
+      #${ROOT_ID} button { background:#5b43a5; border:1px solid #9277e8; border-radius:8px; color:#fff; cursor:pointer; font:inherit; font-weight:800; padding:7px 12px; }
+      #${ROOT_ID} button:disabled { cursor:not-allowed; opacity:.45; }
+      #${ROOT_ID} .pfl-status { background:#0b0e18; border-radius:7px; margin-top:9px; min-height:32px; padding:7px 9px; }
+    `;
+
+    function integer(value, fallback = 0) {
+      const number = Math.trunc(Number(value));
+      return Number.isFinite(number) ? number : fallback;
+    }
+
+    function expForLevel(level) {
+      return Math.round(100 + Math.pow(2.5 * (Math.max(1, integer(level, 1)) + 1), 2));
+    }
+
+    function expToTarget(currentLevel, currentExp, targetLevel) {
+      const current = Math.max(1, integer(currentLevel, 1));
+      const target = Math.min(MAX_LEVEL, Math.max(current, integer(targetLevel, current)));
+      if (target <= current) return 0;
+      let needed = -Math.max(0, integer(currentExp));
+      for (let level = current; level < target; level += 1) needed += expForLevel(level);
+      return Math.max(0, needed);
+    }
+
+    function ascensionsToTarget(currentLevel, targetLevel) {
+      const current = Math.max(1, integer(currentLevel, 1));
+      const target = Math.min(MAX_LEVEL, Math.max(current, integer(targetLevel, current)));
+      return Object.entries(ASCENSIONS)
+        .map(([level, fruits]) => ({ level: integer(level), fruits }))
+        .filter((step) => current <= step.level && target > step.level);
+    }
+
+    function gcd(left, right) {
+      let a = Math.abs(integer(left));
+      let b = Math.abs(integer(right));
+      while (b) [a, b] = [b, a % b];
+      return a;
+    }
+
+    function optimalFoodPlan(foods, neededExp) {
+      const available = (foods || []).map((food) => ({
+        id: integer(food?.id),
+        exp: Math.max(0, integer(food?.exp)),
+        count: Math.max(0, integer(food?.count)),
+        name: String(food?.name || `Food ${food?.id || ''}`),
+      })).filter((food) => food.id > 0 && food.exp > 0 && food.count > 0);
+      const needed = Math.max(0, integer(neededExp));
+      if (!available.length || needed === 0) return { items: [], totalExp: 0, waste: 0, reached: needed === 0 };
+
+      const totalAvailable = available.reduce((sum, food) => sum + food.exp * food.count, 0);
+      if (totalAvailable < needed) {
+        return {
+          items: available.map((food) => ({ ...food, quantity: food.count })),
+          totalExp: totalAvailable,
+          waste: 0,
+          reached: false,
+        };
+      }
+
+      const divisor = available.reduce((value, food) => gcd(value, food.exp), 0) || 1;
+      const target = Math.ceil(needed / divisor);
+      const scaled = available.map((food) => ({ ...food, unit: food.exp / divisor }));
+      const cap = target + Math.max(...scaled.map((food) => food.unit)) - 1;
+      const groups = [];
+      scaled.forEach((food, foodIndex) => {
+        let remaining = food.count;
+        let size = 1;
+        while (remaining > 0) {
+          const quantity = Math.min(size, remaining);
+          groups.push({ foodIndex, quantity, value: food.unit * quantity });
+          remaining -= quantity;
+          size *= 2;
+        }
+      });
+
+      let states = new Map([[0, null]]);
+      for (const group of groups) {
+        const next = new Map(states);
+        for (const [sum, node] of states) {
+          const newSum = sum + group.value;
+          if (newSum <= cap && !next.has(newSum)) next.set(newSum, { previous: node, group });
+        }
+        states = next;
+      }
+
+      let best = null;
+      for (const sum of states.keys()) {
+        if (sum >= target && (best === null || sum < best)) best = sum;
+      }
+      if (best === null) best = Math.max(...states.keys());
+      const quantities = Array(available.length).fill(0);
+      let node = states.get(best);
+      while (node) {
+        quantities[node.group.foodIndex] += node.group.quantity;
+        node = node.previous;
+      }
+      const items = available.map((food, index) => ({ ...food, quantity: quantities[index] })).filter((food) => food.quantity > 0);
+      const totalExp = items.reduce((sum, food) => sum + food.exp * food.quantity, 0);
+      return { items, totalExp, waste: Math.max(0, totalExp - needed), reached: totalExp >= needed };
+    }
+
+    function parseFoods(doc) {
+      return [...(doc?.querySelectorAll?.('#petFoodList .card[data-item-id]') || [])].map((card) => {
+        const expMatch = textOf(card).match(/\+\s*([\d,.]+)\s*EXP/i);
+        return {
+          id: integer(card.dataset?.itemId),
+          name: textOf(card.querySelector?.('[style*="font-weight:600"]')) || `Pet Food ${card.dataset?.itemId || ''}`,
+          exp: integer(String(expMatch?.[1] || '').replace(/[,.]/g, '')),
+          count: integer(card.querySelector?.('.food-qty')?.textContent),
+        };
+      }).filter((food) => food.id > 0 && food.exp > 0 && food.count > 0);
+    }
+
+    function petState(doc, id) {
+      const card = doc?.querySelector?.(`.slot-box[data-pet-inv-id="${integer(id)}"]`);
+      if (!card) return null;
+      return {
+        level: integer(card.querySelector?.('.pet-level')?.textContent, 1),
+        exp: integer(card.querySelector?.('[data-exp-current]')?.textContent),
+        name: card.querySelector?.('img')?.alt || `Pet #${id}`,
+      };
+    }
+
+    module.exports = Object.freeze({
+      id: 'pet-food-leveler',
+      group: 'General',
+      settings: [{
+        key: 'veyra:pets:smartFoodLeveler',
+        label: 'Smart pet food leveler',
+        type: 'checkbox',
+        default: true,
+        hint: 'Adds target-level feeding and chooses pet food with the least possible EXP waste.',
+      }],
+      enabledBy: 'veyra:pets:smartFoodLeveler',
+      expForLevel,
+      expToTarget,
+      ascensionsToTarget,
+      optimalFoodPlan,
+      parseFoods,
+
+      matches(url) {
+        return /\/pets\.php$/i.test(url.pathname);
+      },
+
+      run({ doc, win, notify }) {
+        const modal = doc?.getElementById?.('petFoodModal');
+        const list = doc?.getElementById?.('petFoodList');
+        const targetField = doc?.getElementById?.('petFoodTarget');
+        if (!modal || !list || !targetField || doc.getElementById?.(ROOT_ID)) return;
+        injectStyle(doc, STYLE_ID, CSS);
+
+        const root = doc.createElement('section');
+        root.id = ROOT_ID;
+        root.innerHTML = `
+          <div class="pfl-title">Smart Level Up</div>
+          <div class="pfl-help">Choose a target level. Pet food is combined to waste as little EXP as possible.</div>
+          <div class="pfl-controls"><label>Target level <input class="pfl-target" type="number" min="2" max="${MAX_LEVEL}" step="1" value="${MAX_LEVEL}"></label><button type="button" class="pfl-start">Start</button></div>
+          <div class="pfl-status" role="status">Ready.</div>`;
+        list.parentNode.insertBefore(root, list);
+        const input = root.querySelector('.pfl-target');
+        const button = root.querySelector('.pfl-start');
+        const status = root.querySelector('.pfl-status');
+
+        for (const ascendButton of doc.querySelectorAll?.('.ascend-btn') || []) {
+          const card = ascendButton.closest?.('.slot-box[data-pet-inv-id]');
+          if (!card || card.querySelector?.('.pfl-open')) continue;
+          const open = doc.createElement('button');
+          open.type = 'button';
+          open.className = 'btn levelup-btn pfl-open';
+          open.textContent = 'Smart Level Up';
+          open.addEventListener('click', () => {
+            targetField.value = card.dataset.petInvId || '';
+            const pet = petState(doc, targetField.value);
+            if (pet) input.min = String(Math.min(MAX_LEVEL, pet.level + 1));
+            modal.style.display = 'flex';
+          });
+          ascendButton.parentNode?.appendChild(open);
+        }
+
+        button.addEventListener('click', async () => {
+          const petId = integer(targetField.value);
+          const pet = petState(doc, petId);
+          const foods = parseFoods(doc);
+          if (!pet || !foods.length) {
+            status.textContent = !pet ? 'Pet data could not be read.' : 'No pet food is available.';
+            return;
+          }
+          const target = Math.min(MAX_LEVEL, Math.max(pet.level + 1, integer(input.value, MAX_LEVEL)));
+          input.value = String(target);
+          const steps = ascensionsToTarget(pet.level, target);
+          const fruitTotal = steps.reduce((sum, step) => sum + step.fruits, 0);
+          const stepText = steps.length ? `\nAscensions: ${steps.map((step) => `Lv. ${step.level} (${step.fruits} Forbidden Fruit)`).join(', ')}\nTotal Forbidden Fruits: ${fruitTotal}` : '';
+          if (!win.confirm?.(`Automatically level ${pet.name} from level ${pet.level} toward level ${target}?${stepText}\nPet food is recalculated at every ascension cap to minimize wasted EXP.`)) return;
+
+          button.disabled = true;
+          input.disabled = true;
+          try {
+            let level = pet.level;
+            let exp = pet.exp;
+            let stoppedForFood = false;
+            while (level < target) {
+              const fruitCost = ASCENSIONS[level];
+              if (fruitCost && target > level) {
+                status.textContent = `Checking ascension at level ${level} …`;
+                const infoResponse = await win.fetch(`pet_cap_info_ajax.php?pet_inv_id=${encodeURIComponent(petId)}`, { cache: 'no-store' });
+                const info = await infoResponse.json().catch(() => ({}));
+                if (!infoResponse.ok || info.status !== 'success') throw new Error(info.message || 'Ascension information could not be loaded.');
+                const neededFruits = integer(info.required?.need_qty, fruitCost);
+                const ownedFruits = integer(info.required?.user_qty);
+                if (!info.can_ascend || ownedFruits < neededFruits) {
+                  throw new Error(`Ascension at level ${level} needs ${neededFruits} Forbidden Fruits, but only ${ownedFruits} are available.`);
+                }
+                status.textContent = `Ascending at level ${level} with ${neededFruits} Forbidden Fruits …`;
+                const ascendResponse = await win.fetch('pet_cap_break.php', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                  body: new URLSearchParams({ pet_inv_id: String(petId) }).toString(),
+                });
+                const ascend = await ascendResponse.json().catch(() => ({}));
+                if (!ascendResponse.ok || ascend.status !== 'success') throw new Error(ascend.message || `Ascension at level ${level} failed.`);
+              }
+
+              const nextCap = Object.keys(ASCENSIONS).map(integer).find((cap) => cap > level) || MAX_LEVEL;
+              const segmentTarget = Math.min(target, nextCap);
+              const needed = expToTarget(level, exp, segmentTarget);
+              const plan = optimalFoodPlan(foods, needed);
+              if (!plan.items.length) {
+                stoppedForFood = true;
+                break;
+              }
+              for (let index = 0; index < plan.items.length; index += 1) {
+                const item = plan.items[index];
+                status.textContent = `Feeding ${item.quantity}× ${item.name} toward level ${segmentTarget} (${index + 1}/${plan.items.length}) …`;
+                const response = await win.fetch('pet_feed.php', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                  body: new URLSearchParams({ pet_inv_id: String(petId), item_id: String(item.id), qty: String(item.quantity) }).toString(),
+                });
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok || data.status !== 'success') throw new Error(data.message || `HTTP ${response.status}`);
+                const used = Math.min(item.count, Math.max(0, integer(data.qty_used, item.quantity)));
+                const food = foods.find((candidate) => candidate.id === item.id);
+                if (food) food.count = Math.max(0, food.count - used);
+                if (Number.isFinite(Number(data.level))) level = integer(data.level, level);
+                if (Number.isFinite(Number(data.exp_current))) exp = integer(data.exp_current);
+              }
+              if (!plan.reached || level < segmentTarget) {
+                stoppedForFood = true;
+                break;
+              }
+            }
+            status.textContent = level >= target
+              ? `Done. ${pet.name} reached level ${target}. Reloading …`
+              : `${stoppedForFood ? 'Pet food ran out' : 'Leveling stopped'} at level ${level}. Reloading …`;
+            win.setTimeout(() => win.location.reload(), 350);
+          } catch (error) {
+            status.textContent = `Stopped: ${error.message || 'Feeding failed.'}`;
+            notify?.(status.textContent, 'error');
+            button.disabled = false;
+            input.disabled = false;
+          }
+        });
       },
     });
   },
@@ -20099,6 +20382,10 @@
       #${ROOT_ID} .sam-summary { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 14px; }
       #${ROOT_ID} .sam-chip { background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.09); border-radius: 999px; color: #dce5fb; font-size: 11px; padding: 5px 9px; }
       #${ROOT_ID} .sam-status { background: rgba(110,168,255,.09); border: 1px solid rgba(110,168,255,.22); border-radius: 10px; color: #d8e4ff; margin-bottom: 16px; min-height: 38px; padding: 9px 11px; }
+      #${ROOT_ID} .sam-tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+      #${ROOT_ID} .sam-tab { background: rgba(255,255,255,.045); border: 1px solid rgba(255,255,255,.11); border-radius: 10px; color: #b9c5df; cursor: pointer; font: inherit; font-weight: 800; padding: 8px 14px; }
+      #${ROOT_ID} .sam-tab[aria-selected="true"] { background: #4d3a90; border-color: #8569db; color: #fff; }
+      #${ROOT_ID} .sam-tab-panel[hidden] { display: none; }
       #${ROOT_ID} .sam-section + .sam-section { margin-top: 20px; }
       #${ROOT_ID} .sam-section-head { align-items: baseline; display: flex; gap: 8px; justify-content: space-between; margin-bottom: 9px; }
       #${ROOT_ID} .sam-section-head h3 { font-size: 17px; }
@@ -20112,6 +20399,8 @@
       #${ROOT_ID} .sam-meta { color: #93a2c3; font-size: 10px; margin-top: 2px; }
       #${ROOT_ID} .sam-action { align-items: center; background: rgba(0,0,0,.18); border-radius: 9px; display: grid; gap: 6px; grid-template-columns: minmax(0,1fr) auto auto; margin-top: 7px; padding: 6px; }
       #${ROOT_ID} .sam-value { font-size: 12px; font-weight: 800; }
+      #${ROOT_ID} .sam-level-control { align-items: center; display: flex; gap: 5px; min-width: 0; }
+      #${ROOT_ID} .sam-level-input { background: #0b1020; border: 1px solid rgba(255,255,255,.18); border-radius: 7px; color: #fff; font: inherit; font-weight: 800; height: 30px; padding: 3px 5px; text-align: center; width: 60px; }
       #${ROOT_ID} .sam-resource { color: #bdc9e7; font-size: 10px; text-align: right; white-space: nowrap; }
       #${ROOT_ID} .sam-plus { align-items: center; background: #4d3a90; border: 1px solid #8569db; border-radius: 8px; color: #fff; cursor: pointer; display: inline-flex; font-size: 18px; font-weight: 900; height: 30px; justify-content: center; padding: 0; width: 32px; }
       #${ROOT_ID} .sam-plus.sam-star { background: #806020; border-color: #c99b3d; }
@@ -20215,6 +20504,18 @@
       };
     }
 
+    function levelTargetPlan(unit, targetLevel, scrollCount) {
+      const unitMax = Math.max(1, integer(unit?.maxLevel, 1));
+      const maxLevel = unit?.type === 'normal' ? Math.min(80, unitMax) : unitMax;
+      const target = Math.min(maxLevel, Math.max(1, integer(targetLevel, unit?.level)));
+      const quantity = Math.max(0, target - Math.max(1, integer(unit?.level, 1)));
+      return {
+        target,
+        quantity,
+        canSubmit: quantity > 0 && quantity <= Math.max(0, integer(scrollCount)),
+      };
+    }
+
     function normalStarPlan(unit) {
       const needed = Math.max(0, integer(unit?.copiesNeeded));
       const availableIds = (unit?.sacrificeCandidates || [])
@@ -20242,23 +20543,27 @@
       const normal = allNormal
         .filter((unit) => unit.level > 1)
         .sort((left, right) => right.level - left.level || left.title.localeCompare(right.title) || left.id - right.id);
+      const victims = allNormal
+        .filter((unit) => unit.level === 1)
+        .sort((left, right) => left.title.localeCompare(right.title) || left.id - right.id);
       return {
         elite,
         normal,
-        levelOneVictims: allNormal.filter((unit) => unit.level === 1).length,
+        victims,
+        levelOneVictims: victims.length,
         specialScroll,
         normalScroll,
       };
     }
 
-    function actionPayload(unit, kind) {
+    function actionPayload(unit, kind, quantity = 1) {
       const payload = {
         action: kind === 'level' ? 'use_shadow_exp_scroll' : 'star_up_unit',
         unit_type: unit.type,
         unit_id: String(unit.id),
         selected_sacrifice_ids: '',
         item_inv_id: '',
-        scroll_qty: kind === 'level' ? '1' : '',
+        scroll_qty: kind === 'level' ? String(Math.max(1, integer(quantity, 1))) : '',
       };
       if (kind === 'star' && unit.type === 'normal') {
         payload.selected_sacrifice_ids = normalStarPlan(unit).sacrificeIds.join(',');
@@ -20308,6 +20613,7 @@
       actionPayload,
       fillAndSubmit,
       normalStarPlan,
+      levelTargetPlan,
       parseJsonAssignment,
       parsePageState,
       parseResourceAssignment,
@@ -20321,21 +20627,27 @@
         const form = doc?.querySelector?.('#unitActionForm');
         if (!pageWrap || !form || doc.getElementById?.(ROOT_ID)) return;
         const state = parsePageState(doc);
-        if (state.elite.length === 0 && state.normal.length === 0) return;
+        if (state.elite.length === 0 && state.normal.length === 0 && state.victims.length === 0) return;
 
         injectStyle(doc, STYLE_ID, CSS);
         const root = element(doc, 'section');
         root.id = ROOT_ID;
         root.setAttribute('aria-busy', 'false');
         root.innerHTML = `
-          <div class="sam-head"><div><h2>☠ Shadow Manager</h2><p class="sam-help">Elite Shadows and normal Shadows above level 1. Level-1 normal Shadows stay hidden and are reserved as safe Star-Up sacrifices.</p></div></div>
+          <div class="sam-head"><div><h2>☠ Shadow Manager</h2><p class="sam-help">Manage your army and its level-1 sacrifice Shadows separately.</p></div></div>
           <div class="sam-summary"></div>
-          <div class="sam-status" role="status">Ready. Each Level + uses one matching EXP scroll.</div>
-          <div class="sam-sections"></div>`;
+          <div class="sam-tabs" role="tablist">
+            <button class="sam-tab" type="button" role="tab" aria-selected="true" data-tab="army">Army</button>
+            <button class="sam-tab" type="button" role="tab" aria-selected="false" data-tab="victims">Sacrifices (${state.victims.length})</button>
+          </div>
+          <div class="sam-status" role="status">Ready. Enter a target level (normal Shadows up to 80), then press Level +.</div>
+          <div class="sam-tab-panel" role="tabpanel" data-panel="army"><div class="sam-sections"></div></div>
+          <div class="sam-tab-panel" role="tabpanel" data-panel="victims" hidden><div class="sam-victim-sections"></div></div>`;
 
         const summary = root.querySelector('.sam-summary');
         const status = root.querySelector('.sam-status');
         const sections = root.querySelector('.sam-sections');
+        const victimSections = root.querySelector('.sam-victim-sections');
         const chips = [
           `Elite: ${state.elite.length}`,
           `Normal above Lv. 1: ${state.normal.length}`,
@@ -20345,12 +20657,20 @@
         ];
         for (const label of chips) summary.appendChild(element(doc, 'span', 'sam-chip', label));
 
-        const submit = (unit, kind) => {
+        for (const tab of root.querySelectorAll('.sam-tab')) {
+          tab.addEventListener('click', () => {
+            const selected = tab.dataset.tab;
+            for (const candidate of root.querySelectorAll('.sam-tab')) candidate.setAttribute('aria-selected', String(candidate === tab));
+            for (const panel of root.querySelectorAll('.sam-tab-panel')) panel.hidden = panel.dataset.panel !== selected;
+          });
+        }
+
+        const submit = (unit, kind, quantity = 1, targetLevel = null) => {
           const scroll = unit.type === 'special' ? state.specialScroll : state.normalScroll;
           const plan = normalStarPlan(unit);
           let prompt = '';
           if (kind === 'level') {
-            prompt = `Use 1 ${scroll.name} on ${unit.title}? (${scroll.count} available)`;
+            prompt = `Use ${quantity} ${scroll.name}${quantity === 1 ? '' : 's'} on ${unit.title} to reach level ${targetLevel}? (${scroll.count} available)`;
           } else if (unit.type === 'special') {
             prompt = `Star up ${unit.title} using ${unit.copiesNeeded} extra copies?`;
           } else {
@@ -20359,7 +20679,7 @@
           if (!win.confirm?.(prompt)) return;
           root.setAttribute('aria-busy', 'true');
           status.textContent = `${kind === 'level' ? 'Applying EXP scroll to' : 'Starring up'} ${unit.title} …`;
-          if (!fillAndSubmit(form, actionPayload(unit, kind))) {
+          if (!fillAndSubmit(form, actionPayload(unit, kind, quantity))) {
             root.setAttribute('aria-busy', 'false');
             status.textContent = 'The game action form is incomplete. Nothing was submitted.';
           }
@@ -20388,10 +20708,39 @@
           const button = element(doc, 'button', `sam-plus${isLevel ? '' : ' sam-star'}`, '+');
           button.type = 'button';
           button.disabled = !enabled;
-          button.title = isLevel ? `Use one ${scroll.name}` : 'Raise this Shadow by one star';
+          button.title = isLevel ? `Raise this Shadow to the entered target level` : 'Raise this Shadow by one star';
           button.setAttribute('aria-label', `${isLevel ? 'Level' : 'Star'} up ${unit.title}`);
-          button.addEventListener('click', () => submit(unit, kind));
-          row.append(element(doc, 'span', 'sam-value', value), element(doc, 'span', 'sam-resource', resource), button);
+          if (isLevel) {
+            const control = element(doc, 'span', 'sam-level-control');
+            control.appendChild(element(doc, 'span', 'sam-value', value));
+            const input = element(doc, 'input', 'sam-level-input');
+            const inputMax = unit.type === 'normal' ? Math.min(80, unit.maxLevel) : unit.maxLevel;
+            input.type = 'number';
+            input.min = String(Math.min(inputMax, unit.level + 1));
+            input.max = String(inputMax);
+            input.step = '1';
+            input.value = String(inputMax);
+            input.setAttribute('aria-label', `Target level for ${unit.title}`);
+            const refresh = () => {
+              const plan = levelTargetPlan(unit, input.value, scroll.count);
+              input.value = String(plan.target);
+              button.disabled = !plan.canSubmit;
+              resource = `Scrolls: ${plan.quantity} / ${scroll.count}`;
+              resourceNode.textContent = resource;
+            };
+            input.addEventListener('change', refresh);
+            button.addEventListener('click', () => {
+              const plan = levelTargetPlan(unit, input.value, scroll.count);
+              if (plan.canSubmit) submit(unit, kind, plan.quantity, plan.target);
+            });
+            const resourceNode = element(doc, 'span', 'sam-resource', resource);
+            row.append(control, resourceNode, button);
+            control.appendChild(input);
+            refresh();
+          } else {
+            button.addEventListener('click', () => submit(unit, kind));
+            row.append(element(doc, 'span', 'sam-value', value), element(doc, 'span', 'sam-resource', resource), button);
+          }
           return row;
         };
 
@@ -20412,7 +20761,7 @@
           return node;
         };
 
-        const section = (title, units) => {
+        const section = (title, units, container = sections) => {
           const node = element(doc, 'section', 'sam-section');
           const head = element(doc, 'div', 'sam-section-head');
           head.append(element(doc, 'h3', '', title), element(doc, 'span', 'sam-count', `${units.length} shown`));
@@ -20424,11 +20773,12 @@
             for (const unit of units) grid.appendChild(card(unit));
             node.appendChild(grid);
           }
-          sections.appendChild(node);
+          container.appendChild(node);
         };
 
         section('Elite Shadows', state.elite);
         section('Normal Shadows above level 1', state.normal);
+        section('Level-1 sacrifice Shadows', state.victims, victimSections);
         pageWrap.insertBefore(root, pageWrap.querySelector?.('section.panel') || pageWrap.firstChild);
 
         for (const title of ['Special Shadows', 'Normal Shadows']) {

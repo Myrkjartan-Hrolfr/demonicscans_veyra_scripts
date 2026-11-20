@@ -26,11 +26,12 @@ const SOURCE = `
   const normalShadowScroll = { count: 19, exp: 500000, name: "Small Shadow EXP Scroll"};
 `;
 
-test('Shadow manager parses resources and hides level-1 normal Shadows from its managed list', () => {
+test('Shadow manager separates level-1 normal Shadows into its sacrifice list', () => {
   const state = manager.parsePageState(pageDocument(SOURCE));
   assert.equal(state.elite.length, 1);
   assert.equal(state.elite[0].title, 'Elite Five');
   assert.deepEqual(state.normal.map((unit) => unit.id), [10]);
+  assert.deepEqual(state.victims.map((unit) => unit.id), [20, 30]);
   assert.equal(state.levelOneVictims, 2);
   assert.deepEqual(state.specialScroll, { count: 7, exp: 10_000_000, name: 'Shadow EXP Scroll' });
   assert.deepEqual(state.normalScroll, { count: 19, exp: 500_000, name: 'Small Shadow EXP Scroll' });
@@ -63,6 +64,34 @@ test('Level Up spends exactly one scroll on the selected Shadow', () => {
     selected_sacrifice_ids: '',
     item_inv_id: '',
     scroll_qty: '1',
+  });
+});
+
+test('target level plan clamps normal Shadows to level 80 and sends the required scroll quantity', () => {
+  const victim = manager.parsePageState(pageDocument(SOURCE)).victims[0];
+  assert.deepEqual(manager.levelTargetPlan(victim, 12, 19), {
+    target: 12,
+    quantity: 11,
+    canSubmit: true,
+  });
+  assert.deepEqual(manager.levelTargetPlan(victim, 99, 19), {
+    target: 80,
+    quantity: 79,
+    canSubmit: false,
+  });
+  assert.deepEqual(manager.actionPayload(victim, 'level', 11), {
+    action: 'use_shadow_exp_scroll',
+    unit_type: 'normal',
+    unit_id: '20',
+    selected_sacrifice_ids: '',
+    item_inv_id: '',
+    scroll_qty: '11',
+  });
+  const elite = manager.parsePageState(pageDocument(SOURCE)).elite[0];
+  assert.deepEqual(manager.levelTargetPlan(elite, 120, 200), {
+    target: 120,
+    quantity: 108,
+    canSubmit: true,
   });
 });
 

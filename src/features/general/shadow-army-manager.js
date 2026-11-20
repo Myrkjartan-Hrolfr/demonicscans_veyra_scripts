@@ -15,6 +15,10 @@ const CSS = `
   #${ROOT_ID} .sam-summary { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 14px; }
   #${ROOT_ID} .sam-chip { background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.09); border-radius: 999px; color: #dce5fb; font-size: 11px; padding: 5px 9px; }
   #${ROOT_ID} .sam-status { background: rgba(110,168,255,.09); border: 1px solid rgba(110,168,255,.22); border-radius: 10px; color: #d8e4ff; margin-bottom: 16px; min-height: 38px; padding: 9px 11px; }
+  #${ROOT_ID} .sam-tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+  #${ROOT_ID} .sam-tab { background: rgba(255,255,255,.045); border: 1px solid rgba(255,255,255,.11); border-radius: 10px; color: #b9c5df; cursor: pointer; font: inherit; font-weight: 800; padding: 8px 14px; }
+  #${ROOT_ID} .sam-tab[aria-selected="true"] { background: #4d3a90; border-color: #8569db; color: #fff; }
+  #${ROOT_ID} .sam-tab-panel[hidden] { display: none; }
   #${ROOT_ID} .sam-section + .sam-section { margin-top: 20px; }
   #${ROOT_ID} .sam-section-head { align-items: baseline; display: flex; gap: 8px; justify-content: space-between; margin-bottom: 9px; }
   #${ROOT_ID} .sam-section-head h3 { font-size: 17px; }
@@ -28,6 +32,8 @@ const CSS = `
   #${ROOT_ID} .sam-meta { color: #93a2c3; font-size: 10px; margin-top: 2px; }
   #${ROOT_ID} .sam-action { align-items: center; background: rgba(0,0,0,.18); border-radius: 9px; display: grid; gap: 6px; grid-template-columns: minmax(0,1fr) auto auto; margin-top: 7px; padding: 6px; }
   #${ROOT_ID} .sam-value { font-size: 12px; font-weight: 800; }
+  #${ROOT_ID} .sam-level-control { align-items: center; display: flex; gap: 5px; min-width: 0; }
+  #${ROOT_ID} .sam-level-input { background: #0b1020; border: 1px solid rgba(255,255,255,.18); border-radius: 7px; color: #fff; font: inherit; font-weight: 800; height: 30px; padding: 3px 5px; text-align: center; width: 60px; }
   #${ROOT_ID} .sam-resource { color: #bdc9e7; font-size: 10px; text-align: right; white-space: nowrap; }
   #${ROOT_ID} .sam-plus { align-items: center; background: #4d3a90; border: 1px solid #8569db; border-radius: 8px; color: #fff; cursor: pointer; display: inline-flex; font-size: 18px; font-weight: 900; height: 30px; justify-content: center; padding: 0; width: 32px; }
   #${ROOT_ID} .sam-plus.sam-star { background: #806020; border-color: #c99b3d; }
@@ -131,6 +137,18 @@ function normalizeUnit(raw, type) {
   };
 }
 
+function levelTargetPlan(unit, targetLevel, scrollCount) {
+  const unitMax = Math.max(1, integer(unit?.maxLevel, 1));
+  const maxLevel = unit?.type === 'normal' ? Math.min(80, unitMax) : unitMax;
+  const target = Math.min(maxLevel, Math.max(1, integer(targetLevel, unit?.level)));
+  const quantity = Math.max(0, target - Math.max(1, integer(unit?.level, 1)));
+  return {
+    target,
+    quantity,
+    canSubmit: quantity > 0 && quantity <= Math.max(0, integer(scrollCount)),
+  };
+}
+
 function normalStarPlan(unit) {
   const needed = Math.max(0, integer(unit?.copiesNeeded));
   const availableIds = (unit?.sacrificeCandidates || [])
@@ -158,23 +176,27 @@ function parsePageState(doc) {
   const normal = allNormal
     .filter((unit) => unit.level > 1)
     .sort((left, right) => right.level - left.level || left.title.localeCompare(right.title) || left.id - right.id);
+  const victims = allNormal
+    .filter((unit) => unit.level === 1)
+    .sort((left, right) => left.title.localeCompare(right.title) || left.id - right.id);
   return {
     elite,
     normal,
-    levelOneVictims: allNormal.filter((unit) => unit.level === 1).length,
+    victims,
+    levelOneVictims: victims.length,
     specialScroll,
     normalScroll,
   };
 }
 
-function actionPayload(unit, kind) {
+function actionPayload(unit, kind, quantity = 1) {
   const payload = {
     action: kind === 'level' ? 'use_shadow_exp_scroll' : 'star_up_unit',
     unit_type: unit.type,
     unit_id: String(unit.id),
     selected_sacrifice_ids: '',
     item_inv_id: '',
-    scroll_qty: kind === 'level' ? '1' : '',
+    scroll_qty: kind === 'level' ? String(Math.max(1, integer(quantity, 1))) : '',
   };
   if (kind === 'star' && unit.type === 'normal') {
     payload.selected_sacrifice_ids = normalStarPlan(unit).sacrificeIds.join(',');
@@ -224,6 +246,7 @@ module.exports = Object.freeze({
   actionPayload,
   fillAndSubmit,
   normalStarPlan,
+  levelTargetPlan,
   parseJsonAssignment,
   parsePageState,
   parseResourceAssignment,
@@ -237,21 +260,27 @@ module.exports = Object.freeze({
     const form = doc?.querySelector?.('#unitActionForm');
     if (!pageWrap || !form || doc.getElementById?.(ROOT_ID)) return;
     const state = parsePageState(doc);
-    if (state.elite.length === 0 && state.normal.length === 0) return;
+    if (state.elite.length === 0 && state.normal.length === 0 && state.victims.length === 0) return;
 
     injectStyle(doc, STYLE_ID, CSS);
     const root = element(doc, 'section');
     root.id = ROOT_ID;
     root.setAttribute('aria-busy', 'false');
     root.innerHTML = `
-      <div class="sam-head"><div><h2>☠ Shadow Manager</h2><p class="sam-help">Elite Shadows and normal Shadows above level 1. Level-1 normal Shadows stay hidden and are reserved as safe Star-Up sacrifices.</p></div></div>
+      <div class="sam-head"><div><h2>☠ Shadow Manager</h2><p class="sam-help">Manage your army and its level-1 sacrifice Shadows separately.</p></div></div>
       <div class="sam-summary"></div>
-      <div class="sam-status" role="status">Ready. Each Level + uses one matching EXP scroll.</div>
-      <div class="sam-sections"></div>`;
+      <div class="sam-tabs" role="tablist">
+        <button class="sam-tab" type="button" role="tab" aria-selected="true" data-tab="army">Army</button>
+        <button class="sam-tab" type="button" role="tab" aria-selected="false" data-tab="victims">Sacrifices (${state.victims.length})</button>
+      </div>
+      <div class="sam-status" role="status">Ready. Enter a target level (normal Shadows up to 80), then press Level +.</div>
+      <div class="sam-tab-panel" role="tabpanel" data-panel="army"><div class="sam-sections"></div></div>
+      <div class="sam-tab-panel" role="tabpanel" data-panel="victims" hidden><div class="sam-victim-sections"></div></div>`;
 
     const summary = root.querySelector('.sam-summary');
     const status = root.querySelector('.sam-status');
     const sections = root.querySelector('.sam-sections');
+    const victimSections = root.querySelector('.sam-victim-sections');
     const chips = [
       `Elite: ${state.elite.length}`,
       `Normal above Lv. 1: ${state.normal.length}`,
@@ -261,12 +290,20 @@ module.exports = Object.freeze({
     ];
     for (const label of chips) summary.appendChild(element(doc, 'span', 'sam-chip', label));
 
-    const submit = (unit, kind) => {
+    for (const tab of root.querySelectorAll('.sam-tab')) {
+      tab.addEventListener('click', () => {
+        const selected = tab.dataset.tab;
+        for (const candidate of root.querySelectorAll('.sam-tab')) candidate.setAttribute('aria-selected', String(candidate === tab));
+        for (const panel of root.querySelectorAll('.sam-tab-panel')) panel.hidden = panel.dataset.panel !== selected;
+      });
+    }
+
+    const submit = (unit, kind, quantity = 1, targetLevel = null) => {
       const scroll = unit.type === 'special' ? state.specialScroll : state.normalScroll;
       const plan = normalStarPlan(unit);
       let prompt = '';
       if (kind === 'level') {
-        prompt = `Use 1 ${scroll.name} on ${unit.title}? (${scroll.count} available)`;
+        prompt = `Use ${quantity} ${scroll.name}${quantity === 1 ? '' : 's'} on ${unit.title} to reach level ${targetLevel}? (${scroll.count} available)`;
       } else if (unit.type === 'special') {
         prompt = `Star up ${unit.title} using ${unit.copiesNeeded} extra copies?`;
       } else {
@@ -275,7 +312,7 @@ module.exports = Object.freeze({
       if (!win.confirm?.(prompt)) return;
       root.setAttribute('aria-busy', 'true');
       status.textContent = `${kind === 'level' ? 'Applying EXP scroll to' : 'Starring up'} ${unit.title} …`;
-      if (!fillAndSubmit(form, actionPayload(unit, kind))) {
+      if (!fillAndSubmit(form, actionPayload(unit, kind, quantity))) {
         root.setAttribute('aria-busy', 'false');
         status.textContent = 'The game action form is incomplete. Nothing was submitted.';
       }
@@ -304,10 +341,39 @@ module.exports = Object.freeze({
       const button = element(doc, 'button', `sam-plus${isLevel ? '' : ' sam-star'}`, '+');
       button.type = 'button';
       button.disabled = !enabled;
-      button.title = isLevel ? `Use one ${scroll.name}` : 'Raise this Shadow by one star';
+      button.title = isLevel ? `Raise this Shadow to the entered target level` : 'Raise this Shadow by one star';
       button.setAttribute('aria-label', `${isLevel ? 'Level' : 'Star'} up ${unit.title}`);
-      button.addEventListener('click', () => submit(unit, kind));
-      row.append(element(doc, 'span', 'sam-value', value), element(doc, 'span', 'sam-resource', resource), button);
+      if (isLevel) {
+        const control = element(doc, 'span', 'sam-level-control');
+        control.appendChild(element(doc, 'span', 'sam-value', value));
+        const input = element(doc, 'input', 'sam-level-input');
+        const inputMax = unit.type === 'normal' ? Math.min(80, unit.maxLevel) : unit.maxLevel;
+        input.type = 'number';
+        input.min = String(Math.min(inputMax, unit.level + 1));
+        input.max = String(inputMax);
+        input.step = '1';
+        input.value = String(inputMax);
+        input.setAttribute('aria-label', `Target level for ${unit.title}`);
+        const refresh = () => {
+          const plan = levelTargetPlan(unit, input.value, scroll.count);
+          input.value = String(plan.target);
+          button.disabled = !plan.canSubmit;
+          resource = `Scrolls: ${plan.quantity} / ${scroll.count}`;
+          resourceNode.textContent = resource;
+        };
+        input.addEventListener('change', refresh);
+        button.addEventListener('click', () => {
+          const plan = levelTargetPlan(unit, input.value, scroll.count);
+          if (plan.canSubmit) submit(unit, kind, plan.quantity, plan.target);
+        });
+        const resourceNode = element(doc, 'span', 'sam-resource', resource);
+        row.append(control, resourceNode, button);
+        control.appendChild(input);
+        refresh();
+      } else {
+        button.addEventListener('click', () => submit(unit, kind));
+        row.append(element(doc, 'span', 'sam-value', value), element(doc, 'span', 'sam-resource', resource), button);
+      }
       return row;
     };
 
@@ -328,7 +394,7 @@ module.exports = Object.freeze({
       return node;
     };
 
-    const section = (title, units) => {
+    const section = (title, units, container = sections) => {
       const node = element(doc, 'section', 'sam-section');
       const head = element(doc, 'div', 'sam-section-head');
       head.append(element(doc, 'h3', '', title), element(doc, 'span', 'sam-count', `${units.length} shown`));
@@ -340,11 +406,12 @@ module.exports = Object.freeze({
         for (const unit of units) grid.appendChild(card(unit));
         node.appendChild(grid);
       }
-      sections.appendChild(node);
+      container.appendChild(node);
     };
 
     section('Elite Shadows', state.elite);
     section('Normal Shadows above level 1', state.normal);
+    section('Level-1 sacrifice Shadows', state.victims, victimSections);
     pageWrap.insertBefore(root, pageWrap.querySelector?.('section.panel') || pageWrap.firstChild);
 
     for (const title of ['Special Shadows', 'Normal Shadows']) {
