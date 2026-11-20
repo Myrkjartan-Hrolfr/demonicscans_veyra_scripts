@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation Community Version
 // @namespace    local.veyra.automation.comunity-version
-// @version      0.10.10
+// @version      0.10.11
 // @description  Community version of Veyra Automation without Shadowbridge automation (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -9825,11 +9825,12 @@
     const { COMMAND_KEY, normalizeVisit, publishWorkerStatus } = require('../../core/protocol');
     const { CONFIG_KEY, normalizeConfig } = require('../../scheduler/config');
     const { extractShadow } = require('../loot/loot-api');
+    const { attackMonster, getSkill, joinMonster } = require('../wave/attack');
     const route = require('../../routes/shadowcollection');
 
     const TRACKED_KEY = 'veyra:shadowcollection:tracked:v1';
     const VISIT_PARAM = 'veyra_visit';
-    const WORKER_BUILD = '0.10.10';
+    const WORKER_BUILD = '0.10.11';
     const MISSING_TARGET_RETRY_MS = 15 * 60_000;
     const EXTRACTION_GRACE_MS = 60_000;
     const EXTRACTION_RETRY_MS = 5 * 60_000;
@@ -9999,7 +10000,7 @@
     }
 
     async function runCollection(ctx, visit) {
-      const { win, store, postForm } = ctx;
+      const { win, store, postForm, getUserId } = ctx;
       const settings = normalizeConfig(store.read(CONFIG_KEY)).routes.shadowcollection.settings;
       const targets = configuredTargets(settings);
       const tracked = Array.isArray(store.read(TRACKED_KEY)) ? store.read(TRACKED_KEY) : [];
@@ -10093,6 +10094,8 @@
         }
       }
       const already = new Set(remaining.map((entry) => entry.monsterId));
+      const userId = validId(await getUserId?.());
+      if (targets.length > 0 && !userId) throw new Error('Could not determine the user ID required to join battles.');
       let attacked = 0;
       for (const target of targets) {
         const trackedForTarget = remaining.filter((entry) => entry.targetId === target.id).length;
@@ -10104,13 +10107,24 @@
         const matches = available.filter((monster) => !already.has(monster.id) && normalizeName(monster.name).includes(normalizeName(target.name)));
         writeLog(store, 'Target candidates selected.', { target: target.name, needed, matches: matches.map((monster) => monster.id) });
         for (const monster of matches.slice(0, needed)) {
-          const joined = await postForm('user_join_battle.php', { monster_id: monster.id });
-          writeLog(store, 'Join request finished.', { monsterId: monster.id, ok: joined.ok, status: joined.status, response: joined.json });
+          const joined = await joinMonster({ postForm, monsterId: monster.id, userId });
+          writeLog(store, 'Join request finished.', {
+            monsterId: monster.id,
+            userId,
+            ok: joined.ok,
+            status: joined.status,
+            message: joined.msg,
+          });
           if (!joined.ok) continue;
-          const hit = await postForm('damage.php', { monster_id: monster.id, skill_id: '0', stamina_cost: '1' });
-          const success = hit.ok && String(hit.json?.status || '').trim().toLowerCase() === 'success';
-          writeLog(store, 'Slash request finished.', { monsterId: monster.id, ok: hit.ok, status: hit.status, gameStatus: hit.json?.status, message: hit.json?.message });
-          if (!success) continue;
+          const hit = await attackMonster({ postForm, monsterId: monster.id, skill: getSkill('slash') });
+          writeLog(store, 'Slash request finished.', {
+            monsterId: monster.id,
+            ok: hit.ok,
+            status: hit.status,
+            gameStatus: hit.data?.status,
+            message: hit.msg,
+          });
+          if (!hit.ok) continue;
           attacked += 1;
           already.add(monster.id);
           let autoDieAt = validFutureMs(monster.expiresAtMs);
