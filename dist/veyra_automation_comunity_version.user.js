@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation Community Version
 // @namespace    local.veyra.automation.comunity-version
-// @version      0.10.2
+// @version      0.10.3
 // @description  Community version of Veyra Automation without Shadowbridge automation (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -9830,6 +9830,17 @@
     const TRACKED_KEY = 'veyra:shadowcollection:tracked:v1';
     const VISIT_PARAM = 'veyra_visit';
 
+    function writeLog(store, message, detail = null) {
+      const entries = Array.isArray(store?.read?.(route.LOG_KEY)) ? store.read(route.LOG_KEY) : [];
+      let rendered = '';
+      if (detail !== null && detail !== undefined) {
+        try { rendered = typeof detail === 'string' ? detail : JSON.stringify(detail); } catch { rendered = String(detail); }
+      }
+      entries.push({ at: Date.now(), message: String(message || ''), detail: rendered.slice(0, 2000) });
+      store?.write?.(route.LOG_KEY, entries.slice(-100));
+      console.info(`[Veyra:shadowcollection] ${message}`, detail ?? '');
+    }
+
     function normalizeName(value) {
       return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
     }
@@ -9881,15 +9892,23 @@
       const settings = normalizeConfig(store.read(CONFIG_KEY)).routes.shadowcollection.settings;
       const targets = configuredTargets(settings);
       const tracked = Array.isArray(store.read(TRACKED_KEY)) ? store.read(TRACKED_KEY) : [];
+      writeLog(store, 'Run started.', { visitId: visit.visitId, targets, tracked: tracked.length });
       const remaining = [];
       let extracted = 0;
 
       for (const entry of tracked) {
         const id = validId(entry?.monsterId);
         if (!id) continue;
+        writeLog(store, 'Checking tracked battle.', { monsterId: id, name: entry.name });
         const battle = await fetchDocument(win, `/battle.php?id=${id}`);
         if (battle.getElementById?.('extract-shadow-btn')) {
+          writeLog(store, 'Dead monster is eligible for extraction.', { monsterId: id });
           const result = await extractShadow(postForm, id);
+          writeLog(store, result.ok ? 'Shadow extraction succeeded.' : 'Shadow extraction failed.', {
+            monsterId: id,
+            message: result.message,
+            shadow: result.shadow?.NAME || '',
+          });
           if (result.ok) { extracted += 1; continue; }
         }
         remaining.push({ monsterId: id, targetId: String(entry.targetId || ''), name: String(entry.name || '') });
@@ -9898,20 +9917,31 @@
       const available = [];
       for (let wave = 1; wave <= 8; wave += 1) {
         const page = await fetchDocument(win, `/active_wave.php?gate=3&wave=${wave}`);
-        available.push(...parseWaveMonsters(page));
+        const found = parseWaveMonsters(page);
+        available.push(...found);
+        writeLog(store, `Gate 3 wave ${wave} scanned.`, {
+          found: found.length,
+          monsters: found.map((monster) => ({ id: monster.id, name: monster.name })),
+        });
       }
       const already = new Set(remaining.map((entry) => entry.monsterId));
       let attacked = 0;
       for (const target of targets) {
         const trackedForTarget = remaining.filter((entry) => entry.targetId === target.id).length;
         const needed = Math.max(0, target.quantity - trackedForTarget);
-        if (needed === 0) continue;
+        if (needed === 0) {
+          writeLog(store, 'Target already has the configured number of tracked monsters.', { target: target.name, tracked: trackedForTarget });
+          continue;
+        }
         const matches = available.filter((monster) => !already.has(monster.id) && normalizeName(monster.name).includes(normalizeName(target.name)));
+        writeLog(store, 'Target candidates selected.', { target: target.name, needed, matches: matches.map((monster) => monster.id) });
         for (const monster of matches.slice(0, needed)) {
           const joined = await postForm('user_join_battle.php', { monster_id: monster.id });
+          writeLog(store, 'Join request finished.', { monsterId: monster.id, ok: joined.ok, status: joined.status, response: joined.json });
           if (!joined.ok) continue;
           const hit = await postForm('damage.php', { monster_id: monster.id, skill_id: '0', stamina_cost: '1' });
           const success = hit.ok && String(hit.json?.status || '').trim().toLowerCase() === 'success';
+          writeLog(store, 'Slash request finished.', { monsterId: monster.id, ok: hit.ok, status: hit.status, gameStatus: hit.json?.status, message: hit.json?.message });
           if (!success) continue;
           attacked += 1;
           already.add(monster.id);
@@ -9919,6 +9949,7 @@
         }
       }
       store.write(TRACKED_KEY, remaining);
+      writeLog(store, 'Run finished.', { attacked, extracted, tracked: remaining.length });
       publishWorkerStatus(store, route.id, {
         visitId: visit.visitId,
         workerId: route.id,
@@ -9950,6 +9981,7 @@
           try {
             await runCollection(ctx, visit);
           } catch (error) {
+            writeLog(ctx.store, 'Run stopped with an error.', { message: error.message || String(error), stack: error.stack || '' });
             publishWorkerStatus(ctx.store, route.id, {
               visitId: visit.visitId,
               workerId: route.id,
@@ -27695,6 +27727,7 @@
     ].map(([id, name]) => Object.freeze({ id, name })));
     const TARGET_BY_ID = new Map(TARGETS.map((target) => [target.id, target]));
     const MAX_TARGETS = 5;
+    const LOG_KEY = 'veyra:shadowcollection:log:v1';
 
     function normalizeSettings(value) {
       const rows = [];
@@ -27765,6 +27798,28 @@
       });
       ctx.container.appendChild(totalLabel);
       syncControls();
+
+      ctx.addSectionTitle('Diagnostics');
+      const diagnostics = ctx.make('div', { className: ctx.cls('setting') });
+      const output = ctx.make('textarea', { className: ctx.cls('input') });
+      output.readOnly = true;
+      output.rows = 14;
+      output.style.minHeight = '240px';
+      output.style.resize = 'vertical';
+      output.style.fontFamily = 'ui-monospace, SFMono-Regular, Consolas, monospace';
+      output.style.fontSize = '10px';
+      const entries = Array.isArray(ctx.store?.read?.(LOG_KEY)) ? ctx.store.read(LOG_KEY) : [];
+      output.value = entries.length
+        ? entries.map((entry) => `[${new Date(entry.at).toLocaleString()}] ${entry.message}${entry.detail ? `\n${entry.detail}` : ''}`).join('\n').trim()
+        : 'No Shadow Collection run has been logged yet.';
+      diagnostics.appendChild(output);
+      const clear = ctx.make('button', { text: 'Clear log', type: 'button' });
+      clear.addEventListener('click', () => {
+        ctx.store?.remove?.(LOG_KEY);
+        output.value = 'Log cleared.';
+      });
+      diagnostics.appendChild(clear);
+      ctx.container.appendChild(diagnostics);
     }
 
     module.exports = Object.freeze({
@@ -27777,6 +27832,7 @@
       initialDelayMs: 60_000,
       TARGETS,
       MAX_TARGETS,
+      LOG_KEY,
       createDefaultSettings() { return normalizeSettings(null); },
       normalizeSettings,
       renderSettings,

@@ -12,6 +12,7 @@ const TARGETS = Object.freeze([
 ].map(([id, name]) => Object.freeze({ id, name })));
 const TARGET_BY_ID = new Map(TARGETS.map((target) => [target.id, target]));
 const MAX_TARGETS = 5;
+const LOG_KEY = 'veyra:shadowcollection:log:v1';
 
 function normalizeSettings(value) {
   const rows = [];
@@ -82,6 +83,28 @@ function renderSettings(ctx) {
   });
   ctx.container.appendChild(totalLabel);
   syncControls();
+
+  ctx.addSectionTitle('Diagnostics');
+  const diagnostics = ctx.make('div', { className: ctx.cls('setting') });
+  const output = ctx.make('textarea', { className: ctx.cls('input') });
+  output.readOnly = true;
+  output.rows = 14;
+  output.style.minHeight = '240px';
+  output.style.resize = 'vertical';
+  output.style.fontFamily = 'ui-monospace, SFMono-Regular, Consolas, monospace';
+  output.style.fontSize = '10px';
+  const entries = Array.isArray(ctx.store?.read?.(LOG_KEY)) ? ctx.store.read(LOG_KEY) : [];
+  output.value = entries.length
+    ? entries.map((entry) => `[${new Date(entry.at).toLocaleString()}] ${entry.message}${entry.detail ? `\n${entry.detail}` : ''}`).join('\n').trim()
+    : 'No Shadow Collection run has been logged yet.';
+  diagnostics.appendChild(output);
+  const clear = ctx.make('button', { text: 'Clear log', type: 'button' });
+  clear.addEventListener('click', () => {
+    ctx.store?.remove?.(LOG_KEY);
+    output.value = 'Log cleared.';
+  });
+  diagnostics.appendChild(clear);
+  ctx.container.appendChild(diagnostics);
 }
 
 module.exports = Object.freeze({
@@ -94,6 +117,7 @@ module.exports = Object.freeze({
   initialDelayMs: 60_000,
   TARGETS,
   MAX_TARGETS,
+  LOG_KEY,
   createDefaultSettings() { return normalizeSettings(null); },
   normalizeSettings,
   renderSettings,
