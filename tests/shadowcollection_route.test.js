@@ -36,3 +36,23 @@ test('configured targets resolve stable names and quantities', () => {
     { id: 'skarn', name: 'General Skarn the Radiant Bastion', quantity: 1 },
   ]);
 });
+
+test('changing one quantity preserves every previously selected monster', () => {
+  let settings = route.normalizeSettings(null);
+  settings.rows[0].targetId = 'guardian';
+  settings = route.normalizeSettings(settings);
+  settings.rows[1].targetId = 'drakzareth';
+  settings = route.normalizeSettings(settings);
+  settings.rows[0].quantity = '2';
+  settings = route.normalizeSettings(settings);
+  assert.deepEqual(settings.rows.slice(0, 2), [
+    { targetId: 'guardian', quantity: 2 },
+    { targetId: 'drakzareth', quantity: 0 },
+  ]);
+  settings.rows[1].quantity = '3';
+  settings = route.normalizeSettings(settings);
+  assert.deepEqual(settings.rows.slice(0, 2), [
+    { targetId: 'guardian', quantity: 2 },
+    { targetId: 'drakzareth', quantity: 3 },
+  ]);
+});

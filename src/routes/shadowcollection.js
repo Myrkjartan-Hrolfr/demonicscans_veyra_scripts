@@ -33,7 +33,17 @@ function renderSettings(ctx) {
     className: ctx.cls('hint'),
     text: 'Choose up to five Gate 3 monsters in total. Once per day the route hits each selected live monster with exactly one Slash. Dead tagged monsters are checked and their shadows extracted.',
   }));
-  const rerender = () => ctx.rerender?.();
+  const controls = [];
+  const totalLabel = ctx.make('div', { className: ctx.cls('hint') });
+  const syncControls = () => {
+    controls.forEach(({ select, quantity }, index) => {
+      const row = ctx.settings.rows[index];
+      select.value = row.targetId;
+      quantity.value = String(row.quantity);
+    });
+    const total = ctx.settings.rows.reduce((sum, row) => sum + row.quantity, 0);
+    totalLabel.textContent = `Configured total: ${total} / ${MAX_TARGETS}`;
+  };
   ctx.settings.rows.forEach((row, index) => {
     const host = ctx.make('div', { className: ctx.cls('setting') });
     const select = ctx.make('select', { id: `${ctx.idPrefix}-target-${index}`, className: ctx.cls('select') });
@@ -48,7 +58,7 @@ function renderSettings(ctx) {
     select.value = row.targetId;
     select.addEventListener('change', () => {
       ctx.settings = ctx.updateSettings((settings) => { settings.rows[index].targetId = select.value; });
-      rerender();
+      syncControls();
     });
     host.appendChild(ctx.make('label', { text: `Monster ${index + 1}` }));
     host.appendChild(select);
@@ -63,14 +73,15 @@ function renderSettings(ctx) {
     quantity.value = String(row.quantity);
     quantity.addEventListener('change', () => {
       ctx.settings = ctx.updateSettings((settings) => { settings.rows[index].quantity = quantity.value; });
-      rerender();
+      syncControls();
     });
     host.appendChild(ctx.make('label', { text: 'Daily amount (total max. 5)' }));
     host.appendChild(quantity);
     ctx.container.appendChild(host);
+    controls.push({ select, quantity });
   });
-  const total = ctx.settings.rows.reduce((sum, row) => sum + row.quantity, 0);
-  ctx.container.appendChild(ctx.make('div', { className: ctx.cls('hint'), text: `Configured total: ${total} / ${MAX_TARGETS}` }));
+  ctx.container.appendChild(totalLabel);
+  syncControls();
 }
 
 module.exports = Object.freeze({
