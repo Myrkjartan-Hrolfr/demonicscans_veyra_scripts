@@ -4,7 +4,7 @@ const { injectStyle, textOf } = require('./dom');
 
 const ROOT_ID = 'veyra-shadow-army-manager';
 const STYLE_ID = `${ROOT_ID}-style`;
-const RESULT_KEY = 'veyra:shadowArmy:lastLevelResult';
+const JOB_KEY = 'veyra:shadowArmy:levelJob';
 
 const CSS = `
   #${ROOT_ID} { background: linear-gradient(180deg, rgba(19,25,43,.98), rgba(10,14,24,.98)); border: 1px solid rgba(139,92,246,.28); border-radius: 24px; box-shadow: 0 18px 48px rgba(0,0,0,.38); color: #eef4ff; margin-bottom: 22px; padding: 20px; }
@@ -287,11 +287,6 @@ module.exports = Object.freeze({
     const status = root.querySelector('.sam-status');
     const sections = root.querySelector('.sam-sections');
     const victimSections = root.querySelector('.sam-victim-sections');
-    try {
-      const savedResult = JSON.parse(win.sessionStorage?.getItem?.(RESULT_KEY) || 'null');
-      if (savedResult?.message) status.textContent = savedResult.message;
-      win.sessionStorage?.removeItem?.(RESULT_KEY);
-    } catch {}
     const chips = [
       `Elite: ${state.elite.length}`,
       `Normal above Lv. 1: ${state.normal.length}`,
@@ -309,7 +304,50 @@ module.exports = Object.freeze({
       });
     }
 
-    const submit = async (unit, kind, quantity = 1, targetLevel = null) => {
+    const saveJob = (job) => {
+      try {
+        win.sessionStorage?.setItem?.(JOB_KEY, JSON.stringify(job));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const clearJob = () => {
+      try { win.sessionStorage?.removeItem?.(JOB_KEY); } catch {}
+    };
+    const nativeLevelStep = (job, current, currentState) => {
+      const currentScroll = current.type === 'special' ? currentState.specialScroll : currentState.normalScroll;
+      const nextJob = {
+        ...job,
+        used: integer(job.used) + 1,
+        previousLevel: current.level,
+        previousExp: current.exp,
+        previousScrollCount: currentScroll.count,
+      };
+      if (!saveJob(nextJob)) {
+        status.textContent = 'The leveling job could not be saved. No scroll was used.';
+        root.setAttribute('aria-busy', 'false');
+        return;
+      }
+      status.textContent = `Using scroll ${nextJob.used} on ${current.title} (level ${current.level}, target ${job.targetLevel}) …`;
+      // The hidden input named "action" shadows form.action in JavaScript.
+      // Set the HTML attribute explicitly so native submission always posts
+      // back to the current Shadow Army page, never to "[object HTMLInputElement]".
+      form.setAttribute('action', `${win.location.pathname}${win.location.search}`);
+      if (!fillAndSubmit(form, actionPayload(current, 'level', 1))) {
+        clearJob();
+        root.setAttribute('aria-busy', 'false');
+        status.textContent = 'The game action form is incomplete. No scroll was used.';
+      }
+    };
+    const finishJob = (job, current, reason) => {
+      clearJob();
+      const gained = Math.max(0, current.level - integer(job.startLevel, current.level));
+      status.textContent = `${current.title}: gained ${gained} levels (${job.startLevel} → ${current.level}) using ${integer(job.used)} scroll${integer(job.used) === 1 ? '' : 's'}. ${reason}`;
+      root.setAttribute('aria-busy', 'false');
+    };
+
+    const submit = (unit, kind, quantity = 1, targetLevel = null) => {
       const scroll = unit.type === 'special' ? state.specialScroll : state.normalScroll;
       const plan = normalStarPlan(unit);
       let prompt = '';
@@ -323,47 +361,13 @@ module.exports = Object.freeze({
       if (!win.confirm?.(prompt)) return;
       root.setAttribute('aria-busy', 'true');
       if (kind === 'level') {
-        const startLevel = unit.level;
-        let current = unit;
-        let currentState = state;
-        let used = 0;
+        const job = { unitType: unit.type, unitId: unit.id, startLevel: unit.level, targetLevel, used: 0 };
         try {
-          while (current.level < targetLevel && current.level < current.maxLevel) {
-            const currentScroll = current.type === 'special' ? currentState.specialScroll : currentState.normalScroll;
-            if (currentScroll.count <= 0) break;
-            status.textContent = `Using scroll ${used + 1} on ${current.title} (level ${current.level}, target ${targetLevel}) …`;
-            const response = await win.fetch(form.action || win.location.href, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-              body: new URLSearchParams(actionPayload(current, 'level', 1)).toString(),
-            });
-            const html = await response.text();
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const nextDoc = new win.DOMParser().parseFromString(html, 'text/html');
-            const nextState = parsePageState(nextDoc);
-            const next = stateUnit(nextState, current);
-            if (!next) throw new Error('The updated Shadow could not be read from the response.');
-            const nextScroll = next.type === 'special' ? nextState.specialScroll : nextState.normalScroll;
-            if (next.level === current.level && next.exp === current.exp && nextScroll.count >= currentScroll.count) {
-              throw new Error('The game did not confirm that the scroll was consumed.');
-            }
-            used += 1;
-            current = next;
-            currentState = nextState;
-          }
-          const gained = Math.max(0, current.level - startLevel);
-          const reason = current.level >= current.maxLevel
-            ? 'Max level reached.'
-            : current.level >= targetLevel
-              ? 'Target level reached.'
-              : 'No matching EXP scrolls remain.';
-          const message = `${current.title}: gained ${gained} levels (${startLevel} → ${current.level}) using ${used} scroll${used === 1 ? '' : 's'}. ${reason}`;
-          status.textContent = message;
-          try { win.sessionStorage?.setItem?.(RESULT_KEY, JSON.stringify({ message })); } catch {}
-          win.location.reload();
+          nativeLevelStep(job, unit, state);
         } catch (error) {
+          clearJob();
           root.setAttribute('aria-busy', 'false');
-          status.textContent = `Leveling stopped after ${used} scroll${used === 1 ? '' : 's'}: ${error.message || 'Unknown error'}`;
+          status.textContent = `Leveling could not start: ${error.message || 'Unknown error'}`;
         }
         return;
       }
@@ -473,6 +477,30 @@ module.exports = Object.freeze({
     for (const title of ['Special Shadows', 'Normal Shadows']) {
       const original = panelByTitle(doc, title);
       if (original) original.style.display = 'none';
+    }
+
+    let pendingJob = null;
+    try { pendingJob = JSON.parse(win.sessionStorage?.getItem?.(JOB_KEY) || 'null'); } catch {}
+    if (pendingJob?.unitId && pendingJob?.unitType) {
+      const current = stateUnit(state, { id: integer(pendingJob.unitId), type: pendingJob.unitType });
+      if (!current) {
+        clearJob();
+        status.textContent = 'Leveling stopped: the selected Shadow could not be found after reloading.';
+      } else {
+        const currentScroll = current.type === 'special' ? state.specialScroll : state.normalScroll;
+        const unchanged = integer(pendingJob.used) > 0
+          && current.level === integer(pendingJob.previousLevel)
+          && current.exp === integer(pendingJob.previousExp)
+          && currentScroll.count >= integer(pendingJob.previousScrollCount);
+        if (unchanged) finishJob(pendingJob, current, 'The game did not confirm the previous scroll.');
+        else if (current.level >= current.maxLevel) finishJob(pendingJob, current, 'Max level reached.');
+        else if (current.level >= integer(pendingJob.targetLevel)) finishJob(pendingJob, current, 'Target level reached.');
+        else if (currentScroll.count <= 0) finishJob(pendingJob, current, 'No matching EXP scrolls remain.');
+        else {
+          root.setAttribute('aria-busy', 'true');
+          win.setTimeout(() => nativeLevelStep(pendingJob, current, state), 350);
+        }
+      }
     }
   },
 });
