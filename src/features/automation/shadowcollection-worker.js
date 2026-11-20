@@ -8,10 +8,11 @@ const route = require('../../routes/shadowcollection');
 
 const TRACKED_KEY = 'veyra:shadowcollection:tracked:v1';
 const VISIT_PARAM = 'veyra_visit';
-const WORKER_BUILD = '0.10.11';
+const WORKER_BUILD = '0.10.12';
 const MISSING_TARGET_RETRY_MS = 15 * 60_000;
 const EXTRACTION_GRACE_MS = 60_000;
 const EXTRACTION_RETRY_MS = 5 * 60_000;
+const MAX_TRUSTED_HARVEST_DELAY_MS = 24 * 60 * 60_000;
 
 function writeLog(store, message, detail = null) {
   const entries = Array.isArray(store?.read?.(route.LOG_KEY)) ? store.read(route.LOG_KEY) : [];
@@ -196,7 +197,10 @@ async function runCollection(ctx, visit) {
     const id = validId(entry?.monsterId);
     if (!id) continue;
     const savedHarvestAt = validFutureMs(entry?.harvestAt);
-    if (savedHarvestAt > Date.now()) {
+    // v0.10.11 accidentally stored the wave card's data-expire value, which
+    // belongs to dead-card retention rather than the live auto-die timer.
+    // Do not trust such far-future legacy values; refresh the battle instead.
+    if (savedHarvestAt > Date.now() && savedHarvestAt <= Date.now() + MAX_TRUSTED_HARVEST_DELAY_MS) {
       remaining.push({
         monsterId: id,
         targetId: String(entry.targetId || ''),
@@ -221,12 +225,22 @@ async function runCollection(ctx, visit) {
       });
       if (result.ok) { extracted += 1; continue; }
     }
+    const refreshedAutoDieAt = battleAutoDieAt(battle.__veyraHtml);
     remaining.push({
       monsterId: id,
       targetId: String(entry.targetId || ''),
       name: String(entry.name || ''),
-      harvestAt: Date.now() + EXTRACTION_RETRY_MS,
+      harvestAt: refreshedAutoDieAt > Date.now()
+        ? refreshedAutoDieAt + EXTRACTION_GRACE_MS
+        : Date.now() + EXTRACTION_RETRY_MS,
     });
+    if (refreshedAutoDieAt) {
+      writeLog(store, 'Tracked monster auto-die timer refreshed from its battle page.', {
+        monsterId: id,
+        autoDieAt: refreshedAutoDieAt,
+        harvestAt: refreshedAutoDieAt + EXTRACTION_GRACE_MS,
+      });
+    }
   }
 
   const available = [];
@@ -305,11 +319,11 @@ async function runCollection(ctx, visit) {
       if (!hit.ok) continue;
       attacked += 1;
       already.add(monster.id);
-      let autoDieAt = validFutureMs(monster.expiresAtMs);
-      if (!autoDieAt) {
-        const battle = await fetchDocument(win, `/battle.php?id=${monster.id}&veyra_scan=${Date.now()}`);
-        autoDieAt = battleAutoDieAt(battle.__veyraHtml);
-      }
+      // data-expire on wave cards is the retention timer for dead cards, not
+      // the live monster's auto-die timer. The battle page exposes the real
+      // absolute deadline through startNoDamageCountdown(...).
+      const battle = await fetchDocument(win, `/battle.php?id=${monster.id}&veyra_scan=${Date.now()}`);
+      const autoDieAt = battleAutoDieAt(battle.__veyraHtml);
       const harvestAt = autoDieAt > Date.now()
         ? autoDieAt + EXTRACTION_GRACE_MS
         : Date.now() + EXTRACTION_RETRY_MS;

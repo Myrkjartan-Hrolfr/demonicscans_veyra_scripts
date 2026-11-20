@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation Community Version
 // @namespace    local.veyra.automation.comunity-version
-// @version      0.10.11
+// @version      0.10.12
 // @description  Community version of Veyra Automation without Shadowbridge automation (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
