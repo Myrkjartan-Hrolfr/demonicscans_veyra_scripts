@@ -288,6 +288,23 @@ test('countdown text in the menu', () => {
   assert.equal(countdownText('pvp', config, runtime, NOW), 'Inactive');
   runtime.manualRouteId = 'pvp';
   assert.equal(countdownText('pvp', config, runtime, NOW), 'Queued manually');
+
+  runtime.activeVisit = {
+    visitId: 'visit-1',
+    taskId: 'pvp',
+    phase: 'running',
+    returnPath: '/game_dash.php',
+    issuedAt: NOW - 1_000,
+    deadlineAt: NOW + 60_000,
+  };
+  assert.equal(countdownText('pvp', config, runtime, NOW), 'Running now');
+  assert.equal(countdownText('pvp', config, runtime, NOW, {
+    visitId: 'visit-1',
+    workerId: 'pvp',
+    state: 'done',
+    safeToLeave: true,
+    updatedAt: NOW,
+  }), 'Finished');
 });
 
 test('engine starts a due visit and navigates to the page', () => {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation Community Version
 // @namespace    local.veyra.automation.comunity-version
-// @version      0.10.5
+// @version      0.10.6
 // @description  Community version of Veyra Automation without Shadowbridge automation (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -9829,6 +9829,7 @@
 
     const TRACKED_KEY = 'veyra:shadowcollection:tracked:v1';
     const VISIT_PARAM = 'veyra_visit';
+    const WORKER_BUILD = '0.10.6';
 
     function writeLog(store, message, detail = null) {
       const entries = Array.isArray(store?.read?.(route.LOG_KEY)) ? store.read(route.LOG_KEY) : [];
@@ -9908,7 +9909,13 @@
         seen.add(id);
         found.push({ id, name: text, href: url.pathname + url.search });
       }
-      if (found.length === 0 && doc?.__veyraHtml) return parseRawWaveMonsters(doc.__veyraHtml);
+      // Always merge the raw response as well. This deliberately does not rely on
+      // expando properties surviving on the browser-created Document nodes.
+      for (const monster of parseRawWaveMonsters(doc?.__veyraHtml)) {
+        if (seen.has(monster.id)) continue;
+        seen.add(monster.id);
+        found.push(monster);
+      }
       return found;
     }
 
@@ -9935,7 +9942,13 @@
       const settings = normalizeConfig(store.read(CONFIG_KEY)).routes.shadowcollection.settings;
       const targets = configuredTargets(settings);
       const tracked = Array.isArray(store.read(TRACKED_KEY)) ? store.read(TRACKED_KEY) : [];
-      writeLog(store, 'Run started.', { visitId: visit.visitId, targets, tracked: tracked.length });
+      writeLog(store, 'Run started.', {
+        build: WORKER_BUILD,
+        parser: 'dom+raw-v2',
+        visitId: visit.visitId,
+        targets,
+        tracked: tracked.length,
+      });
       const remaining = [];
       let extracted = 0;
 
@@ -9965,6 +9978,8 @@
         writeLog(store, `Gate 3 wave ${wave} scanned.`, {
           found: found.length,
           page: page.__veyraFetchMeta,
+          rawMonsterCards: (String(page.__veyraHtml || '').match(/monster-card/gi) || []).length,
+          rawMonsterIds: (String(page.__veyraHtml || '').match(/data-monster-id/gi) || []).length,
           monsters: found.map((monster) => ({ id: monster.id, name: monster.name })),
         });
       }
@@ -29141,6 +29156,7 @@
       readAttackDebugLog,
     } = require('../core/attack-debug');
     const { formatCountdown } = require('../core/time');
+    const { normalizeWorkerStatus, workerStatusKey } = require('../core/protocol');
     const { ROUTE_LIST, getRoute } = require('../routes');
     const { CONFIG_KEY, MAX_LOOP_MINUTES, MIN_LOOP_MINUTES } = require('./config');
     const {
@@ -29277,8 +29293,16 @@
       }
     `;
 
-    function countdownText(routeId, config, runtime, now) {
+    function countdownText(routeId, config, runtime, now, workerStatus = null) {
       if (runtime?.activeVisit?.taskId === routeId) {
+        const settled = normalizeWorkerStatus(workerStatus);
+        if (
+          settled?.visitId === runtime.activeVisit.visitId
+          && settled.safeToLeave === true
+          && (settled.state === 'done' || settled.state === 'error')
+        ) {
+          return settled.state === 'done' ? 'Finished' : 'Stopped with error';
+        }
         return runtime.activeVisit.phase === 'running' ? 'Running now' : 'Preparing';
       }
       if (runtime?.manualRouteId === routeId) return 'Queued manually';
@@ -29936,7 +29960,10 @@
           const routeToggle = byId(`${UI_ID}-route-${route.id}-enabled`);
           if (routeToggle) routeToggle.checked = config.routes[route.id]?.enabled !== false;
           const countdown = byId(`${UI_ID}-route-${route.id}-countdown`);
-          if (countdown) countdown.textContent = countdownText(route.id, config, runtime, now);
+          if (countdown) {
+            const workerStatus = store?.read?.(workerStatusKey(route.id));
+            countdown.textContent = countdownText(route.id, config, runtime, now, workerStatus);
+          }
         }
         syncTriggerPlacement();
       }

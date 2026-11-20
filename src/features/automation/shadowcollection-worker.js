@@ -7,6 +7,7 @@ const route = require('../../routes/shadowcollection');
 
 const TRACKED_KEY = 'veyra:shadowcollection:tracked:v1';
 const VISIT_PARAM = 'veyra_visit';
+const WORKER_BUILD = '0.10.6';
 
 function writeLog(store, message, detail = null) {
   const entries = Array.isArray(store?.read?.(route.LOG_KEY)) ? store.read(route.LOG_KEY) : [];
@@ -86,7 +87,13 @@ function parseWaveMonsters(doc) {
     seen.add(id);
     found.push({ id, name: text, href: url.pathname + url.search });
   }
-  if (found.length === 0 && doc?.__veyraHtml) return parseRawWaveMonsters(doc.__veyraHtml);
+  // Always merge the raw response as well. This deliberately does not rely on
+  // expando properties surviving on the browser-created Document nodes.
+  for (const monster of parseRawWaveMonsters(doc?.__veyraHtml)) {
+    if (seen.has(monster.id)) continue;
+    seen.add(monster.id);
+    found.push(monster);
+  }
   return found;
 }
 
@@ -113,7 +120,13 @@ async function runCollection(ctx, visit) {
   const settings = normalizeConfig(store.read(CONFIG_KEY)).routes.shadowcollection.settings;
   const targets = configuredTargets(settings);
   const tracked = Array.isArray(store.read(TRACKED_KEY)) ? store.read(TRACKED_KEY) : [];
-  writeLog(store, 'Run started.', { visitId: visit.visitId, targets, tracked: tracked.length });
+  writeLog(store, 'Run started.', {
+    build: WORKER_BUILD,
+    parser: 'dom+raw-v2',
+    visitId: visit.visitId,
+    targets,
+    tracked: tracked.length,
+  });
   const remaining = [];
   let extracted = 0;
 
@@ -143,6 +156,8 @@ async function runCollection(ctx, visit) {
     writeLog(store, `Gate 3 wave ${wave} scanned.`, {
       found: found.length,
       page: page.__veyraFetchMeta,
+      rawMonsterCards: (String(page.__veyraHtml || '').match(/monster-card/gi) || []).length,
+      rawMonsterIds: (String(page.__veyraHtml || '').match(/data-monster-id/gi) || []).length,
       monsters: found.map((monster) => ({ id: monster.id, name: monster.name })),
     });
   }

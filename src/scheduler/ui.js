@@ -13,6 +13,7 @@ const {
   readAttackDebugLog,
 } = require('../core/attack-debug');
 const { formatCountdown } = require('../core/time');
+const { normalizeWorkerStatus, workerStatusKey } = require('../core/protocol');
 const { ROUTE_LIST, getRoute } = require('../routes');
 const { CONFIG_KEY, MAX_LOOP_MINUTES, MIN_LOOP_MINUTES } = require('./config');
 const {
@@ -149,8 +150,16 @@ const STYLES = `
   }
 `;
 
-function countdownText(routeId, config, runtime, now) {
+function countdownText(routeId, config, runtime, now, workerStatus = null) {
   if (runtime?.activeVisit?.taskId === routeId) {
+    const settled = normalizeWorkerStatus(workerStatus);
+    if (
+      settled?.visitId === runtime.activeVisit.visitId
+      && settled.safeToLeave === true
+      && (settled.state === 'done' || settled.state === 'error')
+    ) {
+      return settled.state === 'done' ? 'Finished' : 'Stopped with error';
+    }
     return runtime.activeVisit.phase === 'running' ? 'Running now' : 'Preparing';
   }
   if (runtime?.manualRouteId === routeId) return 'Queued manually';
@@ -808,7 +817,10 @@ function createSchedulerUi({ doc, win, store = null, featureGroups = [], feature
       const routeToggle = byId(`${UI_ID}-route-${route.id}-enabled`);
       if (routeToggle) routeToggle.checked = config.routes[route.id]?.enabled !== false;
       const countdown = byId(`${UI_ID}-route-${route.id}-countdown`);
-      if (countdown) countdown.textContent = countdownText(route.id, config, runtime, now);
+      if (countdown) {
+        const workerStatus = store?.read?.(workerStatusKey(route.id));
+        countdown.textContent = countdownText(route.id, config, runtime, now, workerStatus);
+      }
     }
     syncTriggerPlacement();
   }
