@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.9.17
+// @version      0.9.18
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -20371,6 +20371,7 @@
 
     const ROOT_ID = 'veyra-shadow-army-manager';
     const STYLE_ID = `${ROOT_ID}-style`;
+    const RESULT_KEY = 'veyra:shadowArmy:lastLevelResult';
 
     const CSS = `
       #${ROOT_ID} { background: linear-gradient(180deg, rgba(19,25,43,.98), rgba(10,14,24,.98)); border: 1px solid rgba(139,92,246,.28); border-radius: 24px; box-shadow: 0 18px 48px rgba(0,0,0,.38); color: #eef4ff; margin-bottom: 22px; padding: 20px; }
@@ -20493,6 +20494,7 @@
         rank: String(raw?.rank || (type === 'special' ? 'Elite Shadow' : 'Normal Shadow')),
         level: Math.max(1, integer(raw?.level, 1)),
         maxLevel: Math.max(1, integer(raw?.max_level, 1)),
+        exp: Math.max(0, integer(raw?.exp)),
         stars: Math.max(0, integer(raw?.stars)),
         starsText: String(raw?.stars_text || '★'.repeat(Math.max(0, integer(raw?.stars)))),
         copiesNeeded: Math.max(0, integer(raw?.copies_needed)),
@@ -20508,12 +20510,15 @@
       const unitMax = Math.max(1, integer(unit?.maxLevel, 1));
       const maxLevel = unit?.type === 'normal' ? Math.min(80, unitMax) : unitMax;
       const target = Math.min(maxLevel, Math.max(1, integer(targetLevel, unit?.level)));
-      const quantity = Math.max(0, target - Math.max(1, integer(unit?.level, 1)));
       return {
         target,
-        quantity,
-        canSubmit: quantity > 0 && quantity <= Math.max(0, integer(scrollCount)),
+        canSubmit: target > Math.max(1, integer(unit?.level, 1)) && Math.max(0, integer(scrollCount)) > 0,
       };
+    }
+
+    function stateUnit(state, unit) {
+      return [...(state?.elite || []), ...(state?.normal || []), ...(state?.victims || [])]
+        .find((candidate) => candidate.type === unit.type && candidate.id === unit.id) || null;
     }
 
     function normalStarPlan(unit) {
@@ -20614,6 +20619,7 @@
       fillAndSubmit,
       normalStarPlan,
       levelTargetPlan,
+      stateUnit,
       parseJsonAssignment,
       parsePageState,
       parseResourceAssignment,
@@ -20648,6 +20654,11 @@
         const status = root.querySelector('.sam-status');
         const sections = root.querySelector('.sam-sections');
         const victimSections = root.querySelector('.sam-victim-sections');
+        try {
+          const savedResult = JSON.parse(win.sessionStorage?.getItem?.(RESULT_KEY) || 'null');
+          if (savedResult?.message) status.textContent = savedResult.message;
+          win.sessionStorage?.removeItem?.(RESULT_KEY);
+        } catch {}
         const chips = [
           `Elite: ${state.elite.length}`,
           `Normal above Lv. 1: ${state.normal.length}`,
@@ -20665,12 +20676,12 @@
           });
         }
 
-        const submit = (unit, kind, quantity = 1, targetLevel = null) => {
+        const submit = async (unit, kind, quantity = 1, targetLevel = null) => {
           const scroll = unit.type === 'special' ? state.specialScroll : state.normalScroll;
           const plan = normalStarPlan(unit);
           let prompt = '';
           if (kind === 'level') {
-            prompt = `Use ${quantity} ${scroll.name}${quantity === 1 ? '' : 's'} on ${unit.title} to reach level ${targetLevel}? (${scroll.count} available)`;
+            prompt = `Train ${unit.title} toward level ${targetLevel}, using and checking one ${scroll.name} at a time? (${scroll.count} available)`;
           } else if (unit.type === 'special') {
             prompt = `Star up ${unit.title} using ${unit.copiesNeeded} extra copies?`;
           } else {
@@ -20678,7 +20689,52 @@
           }
           if (!win.confirm?.(prompt)) return;
           root.setAttribute('aria-busy', 'true');
-          status.textContent = `${kind === 'level' ? 'Applying EXP scroll to' : 'Starring up'} ${unit.title} …`;
+          if (kind === 'level') {
+            const startLevel = unit.level;
+            let current = unit;
+            let currentState = state;
+            let used = 0;
+            try {
+              while (current.level < targetLevel && current.level < current.maxLevel) {
+                const currentScroll = current.type === 'special' ? currentState.specialScroll : currentState.normalScroll;
+                if (currentScroll.count <= 0) break;
+                status.textContent = `Using scroll ${used + 1} on ${current.title} (level ${current.level}, target ${targetLevel}) …`;
+                const response = await win.fetch(form.action || win.location.href, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                  body: new URLSearchParams(actionPayload(current, 'level', 1)).toString(),
+                });
+                const html = await response.text();
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const nextDoc = new win.DOMParser().parseFromString(html, 'text/html');
+                const nextState = parsePageState(nextDoc);
+                const next = stateUnit(nextState, current);
+                if (!next) throw new Error('The updated Shadow could not be read from the response.');
+                const nextScroll = next.type === 'special' ? nextState.specialScroll : nextState.normalScroll;
+                if (next.level === current.level && next.exp === current.exp && nextScroll.count >= currentScroll.count) {
+                  throw new Error('The game did not confirm that the scroll was consumed.');
+                }
+                used += 1;
+                current = next;
+                currentState = nextState;
+              }
+              const gained = Math.max(0, current.level - startLevel);
+              const reason = current.level >= current.maxLevel
+                ? 'Max level reached.'
+                : current.level >= targetLevel
+                  ? 'Target level reached.'
+                  : 'No matching EXP scrolls remain.';
+              const message = `${current.title}: gained ${gained} levels (${startLevel} → ${current.level}) using ${used} scroll${used === 1 ? '' : 's'}. ${reason}`;
+              status.textContent = message;
+              try { win.sessionStorage?.setItem?.(RESULT_KEY, JSON.stringify({ message })); } catch {}
+              win.location.reload();
+            } catch (error) {
+              root.setAttribute('aria-busy', 'false');
+              status.textContent = `Leveling stopped after ${used} scroll${used === 1 ? '' : 's'}: ${error.message || 'Unknown error'}`;
+            }
+            return;
+          }
+          status.textContent = `Starring up ${unit.title} …`;
           if (!fillAndSubmit(form, actionPayload(unit, kind, quantity))) {
             root.setAttribute('aria-busy', 'false');
             status.textContent = 'The game action form is incomplete. Nothing was submitted.';
@@ -20725,13 +20781,13 @@
               const plan = levelTargetPlan(unit, input.value, scroll.count);
               input.value = String(plan.target);
               button.disabled = !plan.canSubmit;
-              resource = `Scrolls: ${plan.quantity} / ${scroll.count}`;
+              resource = `Scrolls available: ${scroll.count}`;
               resourceNode.textContent = resource;
             };
             input.addEventListener('change', refresh);
             button.addEventListener('click', () => {
               const plan = levelTargetPlan(unit, input.value, scroll.count);
-              if (plan.canSubmit) submit(unit, kind, plan.quantity, plan.target);
+              if (plan.canSubmit) submit(unit, kind, 1, plan.target);
             });
             const resourceNode = element(doc, 'span', 'sam-resource', resource);
             row.append(control, resourceNode, button);

@@ -67,32 +67,30 @@ test('Level Up spends exactly one scroll on the selected Shadow', () => {
   });
 });
 
-test('target level plan clamps normal Shadows to level 80 and sends the required scroll quantity', () => {
+test('target level plan clamps normal Shadows to level 80 and enables one-at-a-time leveling', () => {
   const victim = manager.parsePageState(pageDocument(SOURCE)).victims[0];
   assert.deepEqual(manager.levelTargetPlan(victim, 12, 19), {
     target: 12,
-    quantity: 11,
     canSubmit: true,
   });
   assert.deepEqual(manager.levelTargetPlan(victim, 99, 19), {
     target: 80,
-    quantity: 79,
-    canSubmit: false,
+    canSubmit: true,
   });
-  assert.deepEqual(manager.actionPayload(victim, 'level', 11), {
+  assert.deepEqual(manager.actionPayload(victim, 'level', 1), {
     action: 'use_shadow_exp_scroll',
     unit_type: 'normal',
     unit_id: '20',
     selected_sacrifice_ids: '',
     item_inv_id: '',
-    scroll_qty: '11',
+    scroll_qty: '1',
   });
   const elite = manager.parsePageState(pageDocument(SOURCE)).elite[0];
   assert.deepEqual(manager.levelTargetPlan(elite, 120, 200), {
     target: 120,
-    quantity: 108,
     canSubmit: true,
   });
+  assert.equal(manager.levelTargetPlan(victim, 80, 0).canSubmit, false);
 });
 
 test('inline parser accepts nested candidate arrays and braces inside JSON strings', () => {
