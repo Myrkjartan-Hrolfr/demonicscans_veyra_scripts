@@ -63,9 +63,22 @@ test('raw Gate 3 HTML fallback reads live monster-card data attributes', () => {
     <div class="monster-card" data-monster-id="5572" data-dead="1" data-name="lizardman guardian"></div>
     <div class="monster-card" data-monster-id="5573" data-dead="0" data-name="lizardman warmage"></div>
   `), [
-    { id: '5571', name: 'lizardman guardian', href: '/battle.php?id=5571' },
-    { id: '5573', name: 'lizardman warmage', href: '/battle.php?id=5573' },
+    { id: '5571', name: 'lizardman guardian', href: '/battle.php?id=5571', expiresAtMs: 0 },
+    { id: '5573', name: 'lizardman warmage', href: '/battle.php?id=5573', expiresAtMs: 0 },
   ]);
+});
+
+test('wave and battle auto-die timestamps are parsed as absolute milliseconds', () => {
+  assert.deepEqual(worker.parseRawWaveMonsters(`
+    <div class="monster-card" data-monster-id="5571" data-dead="0" data-expire="1795195976" data-name="lizardman guardian"></div>
+  `), [{
+    id: '5571',
+    name: 'lizardman guardian',
+    href: '/battle.php?id=5571',
+    expiresAtMs: 1795195976000,
+  }]);
+  assert.equal(worker.battleAutoDieAt("startNoDamageCountdown('nodmgCountdown', 1795195976000);"), 1795195976000);
+  assert.equal(worker.battleAutoDieAt('window.AUTO_DIE_CFG = { nextDieMs: 1795196974000 };'), 1795196974000);
 });
 
 test('raw monster id diagnostics return compact source samples', () => {
@@ -76,4 +89,20 @@ test('raw monster id diagnostics return compact source samples', () => {
     '<script>document.querySelector(\'.monster-card[data-monster-id="123"]\')</script>',
     '<button data-monster-id="456">Attack</button>',
   ]);
+});
+
+test('raw card diagnostics distinguish live and dead monster cards', () => {
+  assert.deepEqual(worker.rawMonsterCardStats(`
+    <div class="monster-card" data-monster-id="11" data-dead="0" data-name="live"></div>
+    <div
+      class="monster-card rare"
+      data-monster-id="12"
+      data-dead="1"
+      data-name="dead"></div>
+  `), { total: 2, alive: 1, dead: 1 });
+});
+
+test('monster view cookie reader returns the selected server view', () => {
+  assert.equal(worker.cookieValue({ cookie: 'foo=x; hide_dead_monsters=0; show_dead_bosses_only=1' }, 'hide_dead_monsters'), '0');
+  assert.equal(worker.cookieValue({ cookie: 'foo=x' }, 'hide_dead_monsters'), null);
 });
