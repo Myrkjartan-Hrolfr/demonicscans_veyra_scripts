@@ -76,7 +76,7 @@ function renderSettings(ctx) {
 module.exports = Object.freeze({
   id: 'shadowcollection',
   label: 'Shadow Collection',
-  path: '/active_wave.php?gate=3&wave=8&veyra_route=shadowcollection',
+  path: '/game_dash.php?veyra_route=shadowcollection',
   defaultEnabled: false,
   defaultLoopMinutes: 24 * 60,
   maxVisitMs: 5 * 60_000,
@@ -87,8 +87,7 @@ module.exports = Object.freeze({
   normalizeSettings,
   renderSettings,
   matchesUrl(url) {
-    return /\/active_wave\.php\/?$/i.test(url.pathname)
-      && url.searchParams.get('gate') === '3'
+    return /\/game_dash\.php\/?$/i.test(url.pathname)
       && url.searchParams.get('veyra_route') === 'shadowcollection';
   },
 });

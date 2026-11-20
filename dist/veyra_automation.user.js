@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.10.0
+// @version      0.10.1
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -27759,7 +27759,7 @@
     module.exports = Object.freeze({
       id: 'shadowcollection',
       label: 'Shadow Collection',
-      path: '/active_wave.php?gate=3&wave=8&veyra_route=shadowcollection',
+      path: '/game_dash.php?veyra_route=shadowcollection',
       defaultEnabled: false,
       defaultLoopMinutes: 24 * 60,
       maxVisitMs: 5 * 60_000,
@@ -27770,8 +27770,7 @@
       normalizeSettings,
       renderSettings,
       matchesUrl(url) {
-        return /\/active_wave\.php\/?$/i.test(url.pathname)
-          && url.searchParams.get('gate') === '3'
+        return /\/game_dash\.php\/?$/i.test(url.pathname)
           && url.searchParams.get('veyra_route') === 'shadowcollection';
       },
     });

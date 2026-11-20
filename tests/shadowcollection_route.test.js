@@ -8,7 +8,7 @@ const worker = require('../src/features/automation/shadowcollection-worker');
 test('Shadow Collection is daily, disabled by default and recognizes only its marked Gate 3 URL', () => {
   assert.equal(route.defaultLoopMinutes, 1440);
   assert.equal(route.defaultEnabled, false);
-  assert.equal(route.matchesUrl(new URL('https://demonicscans.org/active_wave.php?gate=3&wave=8&veyra_route=shadowcollection')), true);
+  assert.equal(route.matchesUrl(new URL('https://demonicscans.org/game_dash.php?veyra_route=shadowcollection')), true);
   assert.equal(route.matchesUrl(new URL('https://demonicscans.org/active_wave.php?gate=3&wave=8')), false);
   assert.equal(route.TARGETS.length, 8);
 });
