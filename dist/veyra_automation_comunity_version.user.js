@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation Community Version
 // @namespace    local.veyra.automation.comunity-version
-// @version      0.10.12
+// @version      0.10.13
 // @description  Community version of Veyra Automation without Shadowbridge automation (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -9830,7 +9830,7 @@
 
     const TRACKED_KEY = 'veyra:shadowcollection:tracked:v1';
     const VISIT_PARAM = 'veyra_visit';
-    const WORKER_BUILD = '0.10.12';
+    const WORKER_BUILD = '0.10.13';
     const MISSING_TARGET_RETRY_MS = 15 * 60_000;
     const EXTRACTION_GRACE_MS = 60_000;
     const EXTRACTION_RETRY_MS = 5 * 60_000;
