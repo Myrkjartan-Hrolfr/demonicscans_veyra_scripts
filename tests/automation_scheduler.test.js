@@ -204,6 +204,31 @@ test('loop length is clamped and drives the next countdown', () => {
   assert.equal(completed.lastResult.state, 'done');
 });
 
+test('waiting for Shadow Collection extraction never blocks another due branch', () => {
+  const config = createDefaultConfig();
+  const runtime = createDefaultRuntime(NOW);
+  runtime.activeVisit = {
+    version: 1,
+    visitId: 'shadow-harvest-wait',
+    taskId: 'shadowcollection',
+    phase: 'running',
+    returnPath: '/game_dash.php',
+    issuedAt: NOW - 1_000,
+    deadlineAt: NOW + 60_000,
+  };
+  runtime.nextRunAt.pvp = NOW - 1;
+  runtime.nextRunAt.wave3 = NOW + 60_000;
+
+  const completed = completeRuntimeVisit(runtime, 'done', NOW, config, {
+    retryAt: NOW + 2 * 60 * 60_000,
+    note: 'Waiting for monster auto-die timer',
+  });
+
+  assert.equal(completed.activeVisit, null);
+  assert.equal(completed.nextRunAt.shadowcollection, NOW + 2 * 60 * 60_000);
+  assert.equal(chooseDueRoute(completed, NOW, config).id, 'pvp');
+});
+
 test('shortening the loop pulls the countdown forward, lengthening does not push it back', () => {
   const runtime = createDefaultRuntime(NOW);
   runtime.nextRunAt.pvp = NOW + 60 * 60_000;
