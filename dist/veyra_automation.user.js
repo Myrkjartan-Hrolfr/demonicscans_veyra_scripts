@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.10.13
+// @version      0.10.14
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -9830,7 +9830,7 @@
 
     const TRACKED_KEY = 'veyra:shadowcollection:tracked:v1';
     const VISIT_PARAM = 'veyra_visit';
-    const WORKER_BUILD = '0.10.13';
+    const WORKER_BUILD = '0.10.14';
     const MISSING_TARGET_RETRY_MS = 15 * 60_000;
     const EXTRACTION_GRACE_MS = 60_000;
     const EXTRACTION_RETRY_MS = 5 * 60_000;
@@ -28850,7 +28850,9 @@
 
         if (currentRouteId) {
           const currentStatus = readWorkerStatus(currentRouteId);
-          if (!isFreshWorkerStatus(currentStatus, now) || currentStatus.safeToLeave !== true) {
+          // Missing/stale status cannot prove that a worker still owns the page.
+          // Only a fresh explicit unsafe heartbeat may delay another branch.
+          if (isFreshWorkerStatus(currentStatus, now) && currentStatus.safeToLeave !== true) {
             setStatus(`Waiting until ${label(currentRouteId)} can be left safely …`);
             return;
           }
@@ -28901,7 +28903,7 @@
 
         const currentRouteId = currentWorkerRouteId(now);
         const currentStatus = currentRouteId ? readWorkerStatus(currentRouteId) : null;
-        if (currentRouteId && (!isFreshWorkerStatus(currentStatus, now) || currentStatus.safeToLeave !== true)) {
+        if (currentRouteId && isFreshWorkerStatus(currentStatus, now) && currentStatus.safeToLeave !== true) {
           setStatus(`${label(visit.taskId)} is disabled; waiting for a safe handover …`);
           return;
         }
@@ -28925,7 +28927,7 @@
         if (currentRouteId) {
           const currentStatus = readWorkerStatus(currentRouteId);
           requestVisitDrain(visit);
-          if (!isFreshWorkerStatus(currentStatus, now) || currentStatus.safeToLeave !== true) {
+          if (isFreshWorkerStatus(currentStatus, now) && currentStatus.safeToLeave !== true) {
             setStatus(`Waiting until ${label(currentRouteId)} can be left safely …`);
             return;
           }

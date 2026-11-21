@@ -348,6 +348,35 @@ test('engine starts a due visit and navigates to the page', () => {
   assert.equal(store.read(COMMAND_KEY).phase, 'running');
 });
 
+test('stale Shadow Collection status cannot strand another branch in draining', () => {
+  const now = Date.now();
+  const config = createDefaultConfig();
+  const runtime = createDefaultRuntime(now);
+  runtime.activeVisit = {
+    version: 1,
+    visitId: 'pvp-after-shadowcollection',
+    taskId: 'pvp',
+    phase: 'draining',
+    returnPath: '/game_dash.php',
+    issuedAt: now,
+    deadlineAt: now + 60_000,
+  };
+  const { engine, store, win, statuses } = createEngine(
+    'https://demonicscans.org/game_dash.php?veyra_route=shadowcollection',
+    {
+      [CONFIG_KEY]: JSON.stringify(config),
+      [RUNTIME_KEY]: JSON.stringify(runtime),
+      [COMMAND_KEY]: JSON.stringify(runtime.activeVisit),
+    },
+  );
+
+  engine.start();
+
+  assert.equal(store.read(RUNTIME_KEY).activeVisit.phase, 'running');
+  assert.deepEqual(win.navigations, ['https://demonicscans.org/pvp.php']);
+  assert.equal(statuses.some((message) => /Waiting until Shadow Collection/i.test(message)), false);
+});
+
 test('idle Shadowbridge returns directly to the fixed home page without creating a visit', () => {
   const now = Date.now();
   const { engine, store, win } = createEngine(

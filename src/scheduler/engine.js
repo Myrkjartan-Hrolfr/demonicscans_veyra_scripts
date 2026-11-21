@@ -338,7 +338,9 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
 
     if (currentRouteId) {
       const currentStatus = readWorkerStatus(currentRouteId);
-      if (!isFreshWorkerStatus(currentStatus, now) || currentStatus.safeToLeave !== true) {
+      // Missing/stale status cannot prove that a worker still owns the page.
+      // Only a fresh explicit unsafe heartbeat may delay another branch.
+      if (isFreshWorkerStatus(currentStatus, now) && currentStatus.safeToLeave !== true) {
         setStatus(`Waiting until ${label(currentRouteId)} can be left safely …`);
         return;
       }
@@ -389,7 +391,7 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
 
     const currentRouteId = currentWorkerRouteId(now);
     const currentStatus = currentRouteId ? readWorkerStatus(currentRouteId) : null;
-    if (currentRouteId && (!isFreshWorkerStatus(currentStatus, now) || currentStatus.safeToLeave !== true)) {
+    if (currentRouteId && isFreshWorkerStatus(currentStatus, now) && currentStatus.safeToLeave !== true) {
       setStatus(`${label(visit.taskId)} is disabled; waiting for a safe handover …`);
       return;
     }
@@ -413,7 +415,7 @@ function createSchedulerEngine({ win, store, sessionStore, ui }) {
     if (currentRouteId) {
       const currentStatus = readWorkerStatus(currentRouteId);
       requestVisitDrain(visit);
-      if (!isFreshWorkerStatus(currentStatus, now) || currentStatus.safeToLeave !== true) {
+      if (isFreshWorkerStatus(currentStatus, now) && currentStatus.safeToLeave !== true) {
         setStatus(`Waiting until ${label(currentRouteId)} can be left safely …`);
         return;
       }
