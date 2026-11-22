@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation Community Version
 // @namespace    local.veyra.automation.comunity-version
-// @version      0.11.6
+// @version      0.11.8
 // @description  Community version of Veyra Automation without Shadowbridge automation (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -9830,13 +9830,15 @@
 
     const TRACKED_KEY = 'veyra:shadowcollection:tracked:v1';
     const VISIT_PARAM = 'veyra_visit';
-    const WORKER_BUILD = '0.11.6';
+    const WORKER_BUILD = '0.11.8';
     const COLLECTION_STATE_VERSION = 3;
     const MISSING_TARGET_RETRY_MS = 60_000;
     const BUSY_HEARTBEAT_MS = 5_000;
     const EXTRACTION_GRACE_MS = 60_000;
     const EXTRACTION_RETRY_MS = 5 * 60_000;
     const MAX_TRUSTED_HARVEST_DELAY_MS = 24 * 60 * 60_000;
+    const runningVisitIds = new Set();
+    const settledVisitIds = new Set();
 
     function writeLog(store, message, detail = null) {
       const entries = Array.isArray(store?.read?.(route.LOG_KEY)) ? store.read(route.LOG_KEY) : [];
@@ -10085,29 +10087,46 @@
       const originalHideDead = cookieValue(win.document, 'hide_dead_monsters');
       const originalDeadBossesOnly = cookieValue(win.document, 'show_dead_bosses_only');
       try {
-        // The unfiltered view contains both alive monsters and defeated monsters
-        // with user damage. It lets the daily cycle extract before spawning any
-        // replacements.
+        // The server paginates dead and alive monsters as two distinct views.
+        // Scan the unclaimed-kills view first so existing configured corpses can
+        // be extracted before replacements are attacked.
         setViewCookie(win.document, 'hide_dead_monsters', '0');
         setViewCookie(win.document, 'show_dead_bosses_only', '0');
         for (const wave of [3, 5, 8]) {
-          const path = () => `/active_wave.php?gate=3&wave=${wave}&veyra_scan=${Date.now()}-${wave}`;
-          const page = await fetchDocument(win, path());
+          const path = `/active_wave.php?gate=3&wave=${wave}&veyra_scan=${Date.now()}-${wave}-dead`;
+          const page = await fetchDocument(win, path);
           const rawHtml = String(page.__veyraHtml || '');
           const cards = rawMonsterCardStats(rawHtml);
-          const found = parseWaveMonsters(page);
           const dead = parseRawDeadWaveMonsters(rawHtml);
-          available.push(...found);
           defeated.push(...dead);
-          writeLog(store, `Gate 3 wave ${wave} scanned.`, {
-            found: found.length,
+          writeLog(store, `Gate 3 wave ${wave} dead view scanned.`, {
             defeated: dead.length,
             page: page.__veyraFetchMeta,
             rawMonsterCards: (rawHtml.match(/monster-card/gi) || []).length,
             rawMonsterIds: (rawHtml.match(/data-monster-id/gi) || []).length,
             cards,
-            monsters: found.map((monster) => ({ id: monster.id, name: monster.name })),
             defeatedMonsters: dead.map((monster) => ({ id: monster.id, name: monster.name })),
+          });
+        }
+
+        // hide_dead_monsters=1 is the server's alive-monster view. Alive cards
+        // are not present in the dead-view response even though the toggle label
+        // can make it appear as if both sets share one page.
+        setViewCookie(win.document, 'hide_dead_monsters', '1');
+        for (const wave of [3, 5, 8]) {
+          const path = `/active_wave.php?gate=3&wave=${wave}&veyra_scan=${Date.now()}-${wave}-alive`;
+          const page = await fetchDocument(win, path);
+          const rawHtml = String(page.__veyraHtml || '');
+          const cards = rawMonsterCardStats(rawHtml);
+          const found = parseWaveMonsters(page);
+          available.push(...found);
+          writeLog(store, `Gate 3 wave ${wave} alive view scanned.`, {
+            found: found.length,
+            page: page.__veyraFetchMeta,
+            rawMonsterCards: (rawHtml.match(/monster-card/gi) || []).length,
+            rawMonsterIds: (rawHtml.match(/data-monster-id/gi) || []).length,
+            cards,
+            monsters: found.map((monster) => ({ id: monster.id, name: monster.name })),
           });
         }
       } finally {
@@ -10327,6 +10346,11 @@
         async run(ctx) {
           const visit = normalizeVisit(ctx.store.read(COMMAND_KEY), (taskId) => taskId === route.id);
           if (!visit || visit.phase !== 'running') return;
+          // The feature runner may invoke this worker again before the scheduler
+          // has consumed its terminal status. Never overwrite done/error with a
+          // new busy heartbeat for the same visit.
+          if (runningVisitIds.has(visit.visitId) || settledVisitIds.has(visit.visitId)) return;
+          runningVisitIds.add(visit.visitId);
           const publishBusy = () => publishWorkerStatus(ctx.store, route.id, {
               visitId: visit.visitId,
               workerId: route.id,
@@ -10349,6 +10373,8 @@
             });
           } finally {
             if (heartbeat !== undefined && heartbeat !== null) ctx.win.clearInterval?.(heartbeat);
+            runningVisitIds.delete(visit.visitId);
+            settledVisitIds.add(visit.visitId);
           }
         },
       }),
