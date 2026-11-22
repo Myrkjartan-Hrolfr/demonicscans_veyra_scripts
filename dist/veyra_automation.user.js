@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.10.14
+// @version      0.11.3
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -9830,8 +9830,9 @@
 
     const TRACKED_KEY = 'veyra:shadowcollection:tracked:v1';
     const VISIT_PARAM = 'veyra_visit';
-    const WORKER_BUILD = '0.10.14';
-    const MISSING_TARGET_RETRY_MS = 15 * 60_000;
+    const WORKER_BUILD = '0.11.3';
+    const MISSING_TARGET_RETRY_MS = 60_000;
+    const BUSY_HEARTBEAT_MS = 5_000;
     const EXTRACTION_GRACE_MS = 60_000;
     const EXTRACTION_RETRY_MS = 5 * 60_000;
     const MAX_TRUSTED_HARVEST_DELAY_MS = 24 * 60 * 60_000;
@@ -9890,6 +9891,36 @@
       return found;
     }
 
+    function parseRawDeadWaveMonsters(html) {
+      const found = [];
+      const seen = new Set();
+      for (const match of String(html || '').matchAll(/<div\b[^>]*>/gi)) {
+        const tag = match[0];
+        if (!/(?:^|\s)monster-card(?:\s|$)/i.test(tagAttribute(tag, 'class'))) continue;
+        const id = validId(tagAttribute(tag, 'data-monster-id'));
+        const name = tagAttribute(tag, 'data-name').replace(/\s+/g, ' ').trim();
+        const userDamage = Number(tagAttribute(tag, 'data-userdmg')) || 0;
+        if (!id || !name || tagAttribute(tag, 'data-dead') !== '1' || userDamage <= 0 || seen.has(id)) continue;
+        seen.add(id);
+        found.push({ id, name, href: `/battle.php?id=${id}` });
+      }
+      return found;
+    }
+
+    function parseRawDeadMonsterIds(html) {
+      const ids = [];
+      const seen = new Set();
+      for (const match of String(html || '').matchAll(/<div\b[^>]*>/gi)) {
+        const tag = match[0];
+        if (!/(?:^|\s)monster-card(?:\s|$)/i.test(tagAttribute(tag, 'class'))) continue;
+        const id = validId(tagAttribute(tag, 'data-monster-id'));
+        if (!id || tagAttribute(tag, 'data-dead') !== '1' || seen.has(id)) continue;
+        seen.add(id);
+        ids.push(id);
+      }
+      return ids;
+    }
+
     function rawMonsterIdSamples(html, limit = 5) {
       const samples = [];
       const source = String(html || '');
@@ -9920,6 +9951,11 @@
       if (countdown) return validFutureMs(countdown[1]);
       const config = source.match(/nextDieMs\s*[:=]\s*(\d{10,16})/i);
       return config ? validFutureMs(config[1]) : 0;
+    }
+
+    function dailyExtractionLimitReached(html) {
+      return /already\s+used\s+all\s+(?:of\s+)?(?:your\s+)?extraction\s+attempts\s+for\s+today/i
+        .test(String(html || ''));
     }
 
     function cookieValue(doc, name) {
@@ -9990,6 +10026,32 @@
       }));
     }
 
+    function normalizeCollectionState(value) {
+      const source = Array.isArray(value) ? { tracked: value } : value && typeof value === 'object' ? value : {};
+      const tracked = (Array.isArray(source.tracked) ? source.tracked : []).map((entry) => ({
+        monsterId: validId(entry?.monsterId),
+        targetId: String(entry?.targetId || ''),
+        name: String(entry?.name || ''),
+        harvestAt: validFutureMs(entry?.harvestAt),
+      })).filter((entry) => entry.monsterId && entry.targetId);
+      const extractedByTarget = {};
+      for (const [targetId, count] of Object.entries(source.extractedByTarget || {})) {
+        const normalized = Math.max(0, Math.min(route.MAX_TARGETS, Math.trunc(Number(count)) || 0));
+        if (normalized) extractedByTarget[targetId] = normalized;
+      }
+      const consumedIds = [...new Set((Array.isArray(source.consumedIds) ? source.consumedIds : []).map(validId).filter(Boolean))]
+        .slice(-50);
+      return { tracked, extractedByTarget, consumedIds };
+    }
+
+    function targetForMonster(targets, monster) {
+      return targets.find((target) => normalizeName(monster?.name).includes(normalizeName(target.name))) || null;
+    }
+
+    function noShadowFailure(message) {
+      return !/network|http\s*\d+|server error|csrf|temporar|try again|rate.?limit/i.test(String(message || ''));
+    }
+
     async function fetchDocument(win, path) {
       const response = await win.fetch(path, { credentials: 'same-origin', cache: 'no-store' });
       const text = await response.text();
@@ -10004,116 +10066,156 @@
       const { win, store, postForm, getUserId } = ctx;
       const settings = normalizeConfig(store.read(CONFIG_KEY)).routes.shadowcollection.settings;
       const targets = configuredTargets(settings);
-      const tracked = Array.isArray(store.read(TRACKED_KEY)) ? store.read(TRACKED_KEY) : [];
+      const state = normalizeCollectionState(store.read(TRACKED_KEY));
+      let tracked = state.tracked;
+      const extractedByTarget = { ...state.extractedByTarget };
+      const consumedIds = new Set(state.consumedIds);
       writeLog(store, 'Run started.', {
         build: WORKER_BUILD,
-        parser: 'dom+raw-v2',
+        parser: 'daily-shadow-cycle-v1',
         visitId: visit.visitId,
         targets,
         tracked: tracked.length,
+        extractedByTarget,
+        consumed: consumedIds.size,
       });
-      const remaining = [];
       let extracted = 0;
-
-      for (const entry of tracked) {
-        const id = validId(entry?.monsterId);
-        if (!id) continue;
-        const savedHarvestAt = validFutureMs(entry?.harvestAt);
-        // v0.10.11 accidentally stored the wave card's data-expire value, which
-        // belongs to dead-card retention rather than the live auto-die timer.
-        // Do not trust such far-future legacy values; refresh the battle instead.
-        if (savedHarvestAt > Date.now() && savedHarvestAt <= Date.now() + MAX_TRUSTED_HARVEST_DELAY_MS) {
-          remaining.push({
-            monsterId: id,
-            targetId: String(entry.targetId || ''),
-            name: String(entry.name || ''),
-            harvestAt: savedHarvestAt,
-          });
-          writeLog(store, 'Tracked monster is still alive; extraction is scheduled.', {
-            monsterId: id,
-            harvestAt: savedHarvestAt,
-          });
-          continue;
-        }
-        writeLog(store, 'Checking tracked battle.', { monsterId: id, name: entry.name });
-        const battle = await fetchDocument(win, `/battle.php?id=${id}`);
-        if (battle.getElementById?.('extract-shadow-btn')) {
-          writeLog(store, 'Dead monster is eligible for extraction.', { monsterId: id });
-          const result = await extractShadow(postForm, id);
-          writeLog(store, result.ok ? 'Shadow extraction succeeded.' : 'Shadow extraction failed.', {
-            monsterId: id,
-            message: result.message,
-            shadow: result.shadow?.NAME || '',
-          });
-          if (result.ok) { extracted += 1; continue; }
-        }
-        const refreshedAutoDieAt = battleAutoDieAt(battle.__veyraHtml);
-        remaining.push({
-          monsterId: id,
-          targetId: String(entry.targetId || ''),
-          name: String(entry.name || ''),
-          harvestAt: refreshedAutoDieAt > Date.now()
-            ? refreshedAutoDieAt + EXTRACTION_GRACE_MS
-            : Date.now() + EXTRACTION_RETRY_MS,
-        });
-        if (refreshedAutoDieAt) {
-          writeLog(store, 'Tracked monster auto-die timer refreshed from its battle page.', {
-            monsterId: id,
-            autoDieAt: refreshedAutoDieAt,
-            harvestAt: refreshedAutoDieAt + EXTRACTION_GRACE_MS,
-          });
-        }
-      }
-
       const available = [];
+      const defeated = [];
+      const deadProbeIds = [];
       const originalHideDead = cookieValue(win.document, 'hide_dead_monsters');
       const originalDeadBossesOnly = cookieValue(win.document, 'show_dead_bosses_only');
-      let aliveViewEnabled = false;
-      // Gate 3's three actual pages use the global wave IDs 3, 5 and 8.
       try {
+        // The unfiltered view contains both alive monsters and defeated monsters
+        // with user damage. It lets the daily cycle extract before spawning any
+        // replacements.
+        setViewCookie(win.document, 'hide_dead_monsters', '0');
+        setViewCookie(win.document, 'show_dead_bosses_only', '0');
         for (const wave of [3, 5, 8]) {
           const path = () => `/active_wave.php?gate=3&wave=${wave}&veyra_scan=${Date.now()}-${wave}`;
-          let page = await fetchDocument(win, path());
-          let rawHtml = String(page.__veyraHtml || '');
-          let cards = rawMonsterCardStats(rawHtml);
-
-          if (!aliveViewEnabled && cards.dead > 0) {
-            setViewCookie(win.document, 'hide_dead_monsters', '1');
-            setViewCookie(win.document, 'show_dead_bosses_only', '0');
-            aliveViewEnabled = true;
-            writeLog(store, 'Dead monster view detected; switching to Show Alive Monsters.', { wave, cards });
-            page = await fetchDocument(win, path());
-            rawHtml = String(page.__veyraHtml || '');
-            cards = rawMonsterCardStats(rawHtml);
-          }
-
+          const page = await fetchDocument(win, path());
+          const rawHtml = String(page.__veyraHtml || '');
+          const cards = rawMonsterCardStats(rawHtml);
           const found = parseWaveMonsters(page);
+          const dead = parseRawDeadWaveMonsters(rawHtml);
+          const probeIds = parseRawDeadMonsterIds(rawHtml);
           available.push(...found);
+          defeated.push(...dead);
+          deadProbeIds.push(...probeIds);
           writeLog(store, `Gate 3 wave ${wave} scanned.`, {
             found: found.length,
+            defeated: dead.length,
+            deadForLimitProbe: probeIds.length,
             page: page.__veyraFetchMeta,
-            aliveView: aliveViewEnabled,
             rawMonsterCards: (rawHtml.match(/monster-card/gi) || []).length,
             rawMonsterIds: (rawHtml.match(/data-monster-id/gi) || []).length,
             cards,
-            rawSamples: found.length === 0 ? rawMonsterIdSamples(rawHtml) : [],
             monsters: found.map((monster) => ({ id: monster.id, name: monster.name })),
+            defeatedMonsters: dead.map((monster) => ({ id: monster.id, name: monster.name })),
           });
         }
       } finally {
-        if (aliveViewEnabled) {
-          restoreViewCookie(win.document, 'hide_dead_monsters', originalHideDead);
-          restoreViewCookie(win.document, 'show_dead_bosses_only', originalDeadBossesOnly);
-          writeLog(store, 'Previous monster view restored.');
+        restoreViewCookie(win.document, 'hide_dead_monsters', originalHideDead);
+        restoreViewCookie(win.document, 'show_dead_bosses_only', originalDeadBossesOnly);
+      }
+
+      const candidates = [];
+      const candidateIds = new Set();
+      for (const entry of tracked) {
+        if (entry.harvestAt > Date.now() && entry.harvestAt <= Date.now() + MAX_TRUSTED_HARVEST_DELAY_MS) continue;
+        candidates.push(entry);
+        candidateIds.add(entry.monsterId);
+      }
+      for (const monster of defeated) {
+        if (candidateIds.has(monster.id) || consumedIds.has(monster.id)) continue;
+        const target = targetForMonster(targets, monster);
+        if (!target) continue;
+        const neededDeadForTarget = Math.max(0, target.quantity - Number(extractedByTarget[target.id] || 0));
+        const knownDeadForTarget = tracked.filter((entry) => entry.targetId === target.id).length;
+        if (knownDeadForTarget >= neededDeadForTarget) continue;
+        const candidate = { monsterId: monster.id, targetId: target.id, name: target.name, harvestAt: 0 };
+        candidates.push(candidate);
+        tracked.push(candidate);
+        candidateIds.add(monster.id);
+      }
+
+      let endDay = false;
+      // The server renders the daily-limit message on every dead battle page.
+      // This probe does not need to match the configured target or belong to the
+      // current user; it never posts an extraction request.
+      const probe = deadProbeIds[0] || tracked[0]?.monsterId || [...consumedIds][0] || '';
+      if (probe) {
+        const probeBattle = await fetchDocument(win, `/battle.php?id=${probe}&veyra_limit_probe=${Date.now()}`);
+        if (dailyExtractionLimitReached(probeBattle.__veyraHtml)) {
+          endDay = true;
+          writeLog(store, 'Server reports that the daily extraction limit has been reached.', { probeMonsterId: probe });
         }
       }
-      const already = new Set(remaining.map((entry) => entry.monsterId));
+      for (const candidate of candidates) {
+        if (endDay) break;
+        const target = targets.find((entry) => entry.id === candidate.targetId);
+        if (!target || Number(extractedByTarget[target.id] || 0) >= target.quantity) continue;
+        const battle = await fetchDocument(win, `/battle.php?id=${candidate.monsterId}&veyra_scan=${Date.now()}`);
+        if (dailyExtractionLimitReached(battle.__veyraHtml)) {
+          endDay = true;
+          writeLog(store, 'Server reports that the daily extraction limit has been reached.', {
+            probeMonsterId: candidate.monsterId,
+          });
+          break;
+        }
+        let result = { ok: false, message: 'No extractable shadow is available.', shadow: null };
+        if (battle.getElementById?.('extract-shadow-btn')) result = await extractShadow(postForm, candidate.monsterId);
+        writeLog(store, result.ok ? 'Shadow extraction succeeded.' : 'Shadow extraction failed.', {
+          monsterId: candidate.monsterId,
+          target: target.name,
+          message: result.message,
+          shadow: result.shadow?.NAME || '',
+        });
+        tracked = tracked.filter((entry) => entry.monsterId !== candidate.monsterId);
+        if (result.ok) {
+          extracted += 1;
+          extractedByTarget[target.id] = Number(extractedByTarget[target.id] || 0) + 1;
+          continue;
+        }
+        if (!noShadowFailure(result.message)) {
+          tracked.push({ ...candidate, harvestAt: Date.now() + EXTRACTION_RETRY_MS });
+          continue;
+        }
+        consumedIds.add(candidate.monsterId);
+        writeLog(store, 'Defeated monster had no shadow and will be replaced.', {
+          target: target.name,
+          monsterId: candidate.monsterId,
+        });
+        break;
+      }
+
+      const dailyGoal = targets.reduce((sum, target) => sum + target.quantity, 0);
+      const extractedToday = Object.values(extractedByTarget).reduce((sum, count) => sum + Number(count || 0), 0);
+      if (endDay || extractedToday >= dailyGoal) {
+        store.write(TRACKED_KEY, { tracked: [], extractedByTarget: {}, consumedIds: [] });
+        writeLog(store, 'Daily Shadow Collection cycle finished and reset.', {
+          extractedToday,
+          dailyGoal,
+          serverLimitReached: endDay,
+        });
+        publishWorkerStatus(store, route.id, {
+          visitId: visit.visitId,
+          workerId: route.id,
+          state: 'done',
+          safeToLeave: true,
+          message: `${extractedToday} shadows extracted; daily cycle finished.`,
+        });
+        return;
+      }
+
+      const already = new Set(tracked.map((entry) => entry.monsterId));
       const userId = validId(await getUserId?.());
       if (targets.length > 0 && !userId) throw new Error('Could not determine the user ID required to join battles.');
       let attacked = 0;
       for (const target of targets) {
-        const trackedForTarget = remaining.filter((entry) => entry.targetId === target.id).length;
-        const needed = Math.max(0, target.quantity - trackedForTarget);
+        const trackedForTarget = tracked.filter((entry) => entry.targetId === target.id).length;
+        const successfulForTarget = Number(extractedByTarget[target.id] || 0);
+        const needed = Math.max(0, target.quantity - successfulForTarget - trackedForTarget);
         if (needed === 0) {
           writeLog(store, 'Target already has the configured number of tracked monsters.', { target: target.name, tracked: trackedForTarget });
           continue;
@@ -10149,7 +10251,7 @@
           const harvestAt = autoDieAt > Date.now()
             ? autoDieAt + EXTRACTION_GRACE_MS
             : Date.now() + EXTRACTION_RETRY_MS;
-          remaining.push({ monsterId: monster.id, targetId: target.id, name: target.name, harvestAt });
+          tracked.push({ monsterId: monster.id, targetId: target.id, name: target.name, harvestAt });
           writeLog(store, 'Shadow extraction scheduled from the monster auto-die timer.', {
             monsterId: monster.id,
             autoDieAt,
@@ -10157,26 +10259,26 @@
           });
         }
       }
-      store.write(TRACKED_KEY, remaining);
+      store.write(TRACKED_KEY, { tracked, extractedByTarget, consumedIds: [...consumedIds] });
       const outstanding = targets.reduce((sum, target) => {
-        const trackedForTarget = remaining.filter((entry) => entry.targetId === target.id).length;
-        return sum + Math.max(0, target.quantity - trackedForTarget);
+        const trackedForTarget = tracked.filter((entry) => entry.targetId === target.id).length;
+        return sum + Math.max(0, target.quantity - Number(extractedByTarget[target.id] || 0) - trackedForTarget);
       }, 0);
-      const nextHarvestAt = remaining
+      const nextHarvestAt = tracked
         .map((entry) => validFutureMs(entry.harvestAt))
         .filter((timestamp) => timestamp > Date.now())
         .sort((left, right) => left - right)[0] || 0;
       const missingRetryAt = outstanding > 0 ? Date.now() + MISSING_TARGET_RETRY_MS : 0;
       const retryAt = [nextHarvestAt, missingRetryAt].filter(Boolean).sort((left, right) => left - right)[0] || 0;
-      writeLog(store, 'Run finished.', { attacked, extracted, tracked: remaining.length, outstanding, retryAt });
+      writeLog(store, 'Run finished.', { attacked, extracted, extractedToday, tracked: tracked.length, outstanding, retryAt });
       publishWorkerStatus(store, route.id, {
         visitId: visit.visitId,
         workerId: route.id,
         state: 'done',
         safeToLeave: true,
         message: outstanding > 0
-          ? `${attacked} hit, ${outstanding} selected monsters unavailable; retrying in 15 minutes.`
-          : `${attacked} hit, ${extracted} shadows extracted, ${remaining.length} tracked.`,
+          ? `${attacked} hit, ${outstanding} selected monsters unavailable; retrying in 1 minute.`
+          : `${attacked} hit, ${extracted} shadows extracted, ${tracked.length} tracked.`,
         retryAt,
         note: outstanding > 0
           ? `Waiting for ${outstanding} selected monster${outstanding === 1 ? '' : 's'}`
@@ -10188,10 +10290,15 @@
       TRACKED_KEY,
       configuredTargets,
       parseRawWaveMonsters,
+      parseRawDeadWaveMonsters,
+      parseRawDeadMonsterIds,
       rawMonsterIdSamples,
       rawMonsterCardStats,
       battleAutoDieAt,
+      dailyExtractionLimitReached,
       cookieValue,
+      normalizeCollectionState,
+      noShadowFailure,
       parseWaveMonsters,
       feature: Object.freeze({
         id: 'shadowcollection-worker',
@@ -10201,13 +10308,15 @@
         async run(ctx) {
           const visit = normalizeVisit(ctx.store.read(COMMAND_KEY), (taskId) => taskId === route.id);
           if (!visit || visit.phase !== 'running') return;
-          publishWorkerStatus(ctx.store, route.id, {
-            visitId: visit.visitId,
-            workerId: route.id,
-            state: 'busy',
-            safeToLeave: false,
-            message: 'Checking tagged Gate 3 monsters and starting today’s Slashes.',
-          });
+          const publishBusy = () => publishWorkerStatus(ctx.store, route.id, {
+              visitId: visit.visitId,
+              workerId: route.id,
+              state: 'busy',
+              safeToLeave: false,
+              message: 'Shadow Collection is actively scanning, extracting or attacking.',
+            });
+          publishBusy();
+          const heartbeat = ctx.win.setInterval?.(publishBusy, BUSY_HEARTBEAT_MS);
           try {
             await runCollection(ctx, visit);
           } catch (error) {
@@ -10219,6 +10328,8 @@
               safeToLeave: true,
               message: `Shadow Collection stopped: ${error.message || error}`,
             });
+          } finally {
+            if (heartbeat !== undefined && heartbeat !== null) ctx.win.clearInterval?.(heartbeat);
           }
         },
       }),

@@ -68,6 +68,47 @@ test('raw Gate 3 HTML fallback reads live monster-card data attributes', () => {
   ]);
 });
 
+test('defeated target parser keeps only dead monsters damaged by the user', () => {
+  assert.deepEqual(worker.parseRawDeadWaveMonsters(`
+    <div class="monster-card" data-monster-id="11" data-dead="1" data-userdmg="123" data-name="lizardman guardian"></div>
+    <div class="monster-card" data-monster-id="12" data-dead="1" data-userdmg="0" data-name="lizardman guardian"></div>
+    <div class="monster-card" data-monster-id="13" data-dead="0" data-userdmg="123" data-name="lizardman guardian"></div>
+  `), [{ id: '11', name: 'lizardman guardian', href: '/battle.php?id=11' }]);
+});
+
+test('daily limit probe accepts any dead monster regardless of type or user damage', () => {
+  assert.deepEqual(worker.parseRawDeadMonsterIds(`
+    <div class="monster-card" data-monster-id="11" data-dead="1" data-userdmg="0" data-name="unrelated monster"></div>
+    <div class="monster-card" data-monster-id="12" data-dead="0" data-userdmg="99" data-name="live monster"></div>
+    <div class="monster-card" data-monster-id="13" data-dead="1" data-userdmg="99" data-name="another monster"></div>
+  `), ['11', '13']);
+});
+
+test('daily collection state migrates the old tracked array and keeps success counts', () => {
+  assert.deepEqual(worker.normalizeCollectionState([
+    { monsterId: '11', targetId: 'guardian', name: 'Guardian', harvestAt: 1234 },
+  ]), {
+    tracked: [{ monsterId: '11', targetId: 'guardian', name: 'Guardian', harvestAt: 1234 }],
+    extractedByTarget: {},
+    consumedIds: [],
+  });
+  assert.deepEqual(worker.normalizeCollectionState({
+    tracked: [],
+    extractedByTarget: { guardian: 2 },
+    consumedIds: ['44', '44', 'bad'],
+  }), {
+    tracked: [],
+    extractedByTarget: { guardian: 2 },
+    consumedIds: ['44'],
+  });
+});
+
+test('no-shadow failures are separated from temporary technical failures', () => {
+  assert.equal(worker.noShadowFailure('No shadow answered your call.'), true);
+  assert.equal(worker.noShadowFailure('Network error: connection lost'), false);
+  assert.equal(worker.noShadowFailure('Server error. Try again.'), false);
+});
+
 test('wave and battle auto-die timestamps are parsed as absolute milliseconds', () => {
   assert.deepEqual(worker.parseRawWaveMonsters(`
     <div class="monster-card" data-monster-id="5571" data-dead="0" data-expire="1795195976" data-name="lizardman guardian"></div>
@@ -79,6 +120,13 @@ test('wave and battle auto-die timestamps are parsed as absolute milliseconds', 
   }]);
   assert.equal(worker.battleAutoDieAt("startNoDamageCountdown('nodmgCountdown', 1795195976000);"), 1795195976000);
   assert.equal(worker.battleAutoDieAt('window.AUTO_DIE_CFG = { nextDieMs: 1795196974000 };'), 1795196974000);
+});
+
+test('server-rendered daily extraction limit is recognized without posting an extraction', () => {
+  assert.equal(worker.dailyExtractionLimitReached(`
+    <p class="extract-copy">You have already used all your extraction attempts for today.</p>
+  `), true);
+  assert.equal(worker.dailyExtractionLimitReached('<button id="extract-shadow-btn">Extraction</button>'), false);
 });
 
 test('raw monster id diagnostics return compact source samples', () => {
