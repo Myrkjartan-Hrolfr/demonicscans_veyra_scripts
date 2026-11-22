@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Dragon Realm Expedition Auto
 // @namespace    local.veyra.expeditions
-// @version      1.6.3
+// @version      1.6.4
 // @description  Independently starts and completes Dragon Realm expeditions, including party setup, votes, combat, loot and powers.
 // @match        https://demonicscans.org/event_page.php*
 // @match        https://www.demonicscans.org/event_page.php*
@@ -531,16 +531,16 @@
     if (Number(actor.hp) <= 0) return { action: '', message: 'Your hunter is down; waiting for Rescue.' };
     if (turnFinished(run, actor)) return { action: '', message: `Round ${run.round}: turn finished.` };
 
-    const escape = chooseEmergencyEscape(run, actor);
-    if (escape) {
-      return {
-        action: 'move',
-        key: `move:${run.battleSerial}:${run.round}:${pointKey(escape)}`,
-        message: 'Leaving a lethal or persistent special-effect tile.',
-        data: { round: run.round, battle: run.battleSerial, position: escape },
-      };
-    }
     if (actedThisRound(run, actor)) {
+      const escape = chooseEmergencyEscape(run, actor);
+      if (escape) {
+        return {
+          action: 'move',
+          key: `move:${run.battleSerial}:${run.round}:${pointKey(escape)}`,
+          message: 'Leaving a lethal or persistent special-effect tile after attacking.',
+          data: { round: run.round, battle: run.battleSerial, position: escape },
+        };
+      }
       const beaconMove = chooseBeaconMove(run, actor);
       if (beaconMove) {
         return {
@@ -606,6 +606,18 @@
       const healing = chooseHealerAction(run, catalog, actor, skills);
       if (healing) return healing;
     }
+    const attack = chooseAttackAction(run, catalog, actor, skills);
+    if (attack) return attack;
+
+    const escape = chooseEmergencyEscape(run, actor);
+    if (escape) {
+      return {
+        action: 'move',
+        key: `move:${run.battleSerial}:${run.round}:${pointKey(escape)}`,
+        message: 'No attack target is reachable; leaving a lethal or persistent special-effect tile.',
+        data: { round: run.round, battle: run.battleSerial, position: escape },
+      };
+    }
     const beaconMove = chooseBeaconMove(run, actor);
     if (beaconMove) {
       return {
@@ -637,8 +649,6 @@
         };
       }
     }
-    const attack = chooseAttackAction(run, catalog, actor, skills);
-    if (attack) return attack;
     const support = chooseSupportAction(run, catalog, actor, skills, 0.8);
     if (support) return support;
     const move = actorClass === 'healer' ? null : chooseMove(run, actor);

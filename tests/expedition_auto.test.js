@@ -314,19 +314,24 @@ test('standalone expedition healer attacks when healing is not currently possibl
   assert.equal(decision.data.order.target, 'e1');
 });
 
-test('standalone expedition tank moves to gather enemies while staying near the healer', () => {
-  const decision = helpers.chooseCombatAction(
-    battle({
-      actors: [
-        actor({ class: 'tank', row: 6, col: 2 }),
-        actor({ id: 'healer', uid: 99, class: 'healer', row: 7, col: 2 }),
-      ],
-      enemies: [enemy('left', 5, 1), enemy('right', 5, 3)],
-    }),
+test('standalone expedition tank attacks before moving to gather enemies near the healer', () => {
+  const run = battle({
+    actors: [
+      actor({ class: 'tank', row: 6, col: 2 }),
+      actor({ id: 'healer', uid: 99, class: 'healer', row: 7, col: 2 }),
+    ],
+    enemies: [enemy('left', 5, 1), enemy('right', 5, 3)],
+  });
+  const attack = helpers.chooseCombatAction(
+    run,
     catalog(),
     42,
     { autoRescue: true },
   );
+  assert.equal(attack.action, 'order');
+
+  run.actors[0].acted_on = '7:3';
+  const decision = helpers.chooseCombatAction(run, catalog(), 42, { autoRescue: true });
   assert.equal(decision.action, 'move');
   assert.deepEqual(decision.data.position, { lane: 0, row: 5, col: 2 });
 });
@@ -365,19 +370,24 @@ test('standalone expedition party movement takes a shielding position near the h
   assert.deepEqual(decision.data.position, { lane: 0, row: 6, col: 3 });
 });
 
-test('standalone expedition healer moves to bring more teammates into heal range', () => {
-  const decision = helpers.chooseCombatAction(
-    battle({
-      actors: [
-        actor({ class: 'healer', row: 6, col: 2, skills: ['cheap', 'heal'] }),
-        actor({ id: 'wounded', uid: 99, class: 'warrior', hp: 200, maxHp: 1_000, row: 6, col: 6 }),
-      ],
-      enemies: [enemy('e1', 3, 2)],
-    }),
+test('standalone expedition healer attacks before moving to bring teammates into heal range', () => {
+  const run = battle({
+    actors: [
+      actor({ class: 'healer', row: 6, col: 2, skills: ['cheap', 'heal'] }),
+      actor({ id: 'wounded', uid: 99, class: 'warrior', hp: 200, maxHp: 1_000, row: 6, col: 6 }),
+    ],
+    enemies: [enemy('e1', 3, 2)],
+  });
+  const attack = helpers.chooseCombatAction(
+    run,
     catalog(),
     42,
     { autoRescue: true },
   );
+  assert.equal(attack.action, 'order');
+
+  run.actors[0].acted_on = '7:3';
+  const decision = helpers.chooseCombatAction(run, catalog(), 42, { autoRescue: true });
   assert.equal(decision.action, 'move');
   assert.deepEqual(decision.data.position, { lane: 0, row: 6, col: 3 });
 });
@@ -439,15 +449,30 @@ test('standalone expedition healer moves into attack range when nobody needs hea
   assert.deepEqual(decision.data.position, { lane: 0, row: 5, col: 2 });
 });
 
-test('standalone expedition combat escapes danger and rescues humans first', () => {
+test('standalone expedition combat attacks before escaping danger', () => {
   const escape = helpers.chooseCombatAction(
     battle({ ground_warning: [{ row: 6, col: 2 }] }),
     catalog(),
     42,
     { autoRescue: true },
   );
-  assert.equal(escape.action, 'move');
+  assert.equal(escape.action, 'order');
+  assert.equal(escape.data.order.target, 'e1');
 
+  const afterAttack = helpers.chooseCombatAction(
+    battle({
+      actors: [actor({ acted_on: '7:3' })],
+      ground_warning: [{ row: 6, col: 2 }],
+    }),
+    catalog(),
+    42,
+    { autoRescue: true },
+  );
+  assert.equal(afterAttack.action, 'move');
+  assert.deepEqual(afterAttack.data.position, { lane: 0, row: 5, col: 2 });
+});
+
+test('standalone expedition combat rescues humans first', () => {
   const rescue = helpers.chooseCombatAction(
     battle({
       actors: [
@@ -464,7 +489,7 @@ test('standalone expedition combat escapes danger and rescues humans first', () 
   assert.equal(rescue.data.order.target, 'human');
 });
 
-test('standalone expedition combat leaves active lethal boss-hazard tiles before acting', () => {
+test('standalone expedition combat leaves active lethal boss-hazard tiles after attacking', () => {
   const run = battle({
     enemies: [enemy('clown', 3, 2, {
       boss: true,
@@ -478,14 +503,16 @@ test('standalone expedition combat leaves active lethal boss-hazard tiles before
   });
   assert.equal(helpers.dangerTiles(run).has('6:2'), true);
   assert.deepEqual(helpers.chooseEmergencyEscape(run, run.actors[0]), { lane: 0, row: 5, col: 2 });
+  run.actors[0].acted_on = '7:3';
   const decision = helpers.chooseCombatAction(run, catalog(), 42, { autoRescue: true });
   assert.equal(decision.action, 'move');
   assert.deepEqual(decision.data.position, { lane: 0, row: 5, col: 2 });
   assert.match(decision.message, /special-effect tile/i);
 });
 
-test('standalone expedition combat also leaves persistent ground effects immediately', () => {
+test('standalone expedition combat leaves persistent ground effects after attacking', () => {
   const run = battle({
+    actors: [actor({ acted_on: '7:3' })],
     ground_warning: [{ row: 6, col: 2 }, { row: 6, col: 1 }],
   });
   const decision = helpers.chooseCombatAction(run, catalog(), 42, { autoRescue: true });
