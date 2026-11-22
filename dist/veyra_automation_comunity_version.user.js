@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation Community Version
 // @namespace    local.veyra.automation.comunity-version
-// @version      0.11.4
+// @version      0.11.5
 // @description  Community version of Veyra Automation without Shadowbridge automation (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -9830,8 +9830,8 @@
 
     const TRACKED_KEY = 'veyra:shadowcollection:tracked:v1';
     const VISIT_PARAM = 'veyra_visit';
-    const WORKER_BUILD = '0.11.4';
-    const COLLECTION_STATE_VERSION = 2;
+    const WORKER_BUILD = '0.11.5';
+    const COLLECTION_STATE_VERSION = 3;
     const MISSING_TARGET_RETRY_MS = 60_000;
     const BUSY_HEARTBEAT_MS = 5_000;
     const EXTRACTION_GRACE_MS = 60_000;
@@ -9949,9 +9949,7 @@
     function battleAutoDieAt(html) {
       const source = String(html || '');
       const countdown = source.match(/startNoDamageCountdown\(\s*["'][^"']+["']\s*,\s*(\d{10,16})\s*\)/i);
-      if (countdown) return validFutureMs(countdown[1]);
-      const config = source.match(/nextDieMs\s*[:=]\s*(\d{10,16})/i);
-      return config ? validFutureMs(config[1]) : 0;
+      return countdown ? validFutureMs(countdown[1]) : 0;
     }
 
     function dailyExtractionLimitReached(html) {

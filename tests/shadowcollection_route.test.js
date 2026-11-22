@@ -88,7 +88,7 @@ test('daily collection state migrates the old tracked array and keeps success co
   assert.deepEqual(worker.normalizeCollectionState([
     { monsterId: '11', targetId: 'guardian', name: 'Guardian', harvestAt: 1234 },
   ]), {
-    version: 2,
+    version: 3,
     tracked: [{ monsterId: '11', targetId: 'guardian', name: 'Guardian', harvestAt: 0 }],
     extractedByTarget: {},
     consumedIds: [],
@@ -98,7 +98,7 @@ test('daily collection state migrates the old tracked array and keeps success co
     extractedByTarget: { guardian: 2 },
     consumedIds: ['44', '44', 'bad'],
   }), {
-    version: 2,
+    version: 3,
     tracked: [],
     extractedByTarget: { guardian: 2 },
     consumedIds: ['44'],
@@ -110,7 +110,7 @@ test('legacy collection timers are invalidated once while versioned timers are p
     tracked: [{ monsterId: '11', targetId: 'guardian', harvestAt: 999999 }],
   });
   const current = worker.normalizeCollectionState({
-    version: 2,
+    version: 3,
     tracked: [{ monsterId: '11', targetId: 'guardian', harvestAt: 999999 }],
   });
   assert.equal(legacy.tracked[0].harvestAt, 0);
@@ -133,7 +133,7 @@ test('wave and battle auto-die timestamps are parsed as absolute milliseconds', 
     expiresAtMs: 1795195976000,
   }]);
   assert.equal(worker.battleAutoDieAt("startNoDamageCountdown('nodmgCountdown', 1795195976000);"), 1795195976000);
-  assert.equal(worker.battleAutoDieAt('window.AUTO_DIE_CFG = { nextDieMs: 1795196974000 };'), 1795196974000);
+  assert.equal(worker.battleAutoDieAt('window.AUTO_DIE_CFG = { nextDieMs: 1795196974000 };'), 0);
 });
 
 test('server-rendered daily extraction limit is recognized without posting an extraction', () => {
