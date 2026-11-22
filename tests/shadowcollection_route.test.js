@@ -88,7 +88,8 @@ test('daily collection state migrates the old tracked array and keeps success co
   assert.deepEqual(worker.normalizeCollectionState([
     { monsterId: '11', targetId: 'guardian', name: 'Guardian', harvestAt: 1234 },
   ]), {
-    tracked: [{ monsterId: '11', targetId: 'guardian', name: 'Guardian', harvestAt: 1234 }],
+    version: 2,
+    tracked: [{ monsterId: '11', targetId: 'guardian', name: 'Guardian', harvestAt: 0 }],
     extractedByTarget: {},
     consumedIds: [],
   });
@@ -97,10 +98,23 @@ test('daily collection state migrates the old tracked array and keeps success co
     extractedByTarget: { guardian: 2 },
     consumedIds: ['44', '44', 'bad'],
   }), {
+    version: 2,
     tracked: [],
     extractedByTarget: { guardian: 2 },
     consumedIds: ['44'],
   });
+});
+
+test('legacy collection timers are invalidated once while versioned timers are preserved', () => {
+  const legacy = worker.normalizeCollectionState({
+    tracked: [{ monsterId: '11', targetId: 'guardian', harvestAt: 999999 }],
+  });
+  const current = worker.normalizeCollectionState({
+    version: 2,
+    tracked: [{ monsterId: '11', targetId: 'guardian', harvestAt: 999999 }],
+  });
+  assert.equal(legacy.tracked[0].harvestAt, 0);
+  assert.equal(current.tracked[0].harvestAt, 999999);
 });
 
 test('no-shadow failures are separated from temporary technical failures', () => {

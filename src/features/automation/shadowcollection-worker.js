@@ -8,7 +8,8 @@ const route = require('../../routes/shadowcollection');
 
 const TRACKED_KEY = 'veyra:shadowcollection:tracked:v1';
 const VISIT_PARAM = 'veyra_visit';
-const WORKER_BUILD = '0.11.3';
+const WORKER_BUILD = '0.11.4';
+const COLLECTION_STATE_VERSION = 2;
 const MISSING_TARGET_RETRY_MS = 60_000;
 const BUSY_HEARTBEAT_MS = 5_000;
 const EXTRACTION_GRACE_MS = 60_000;
@@ -206,11 +207,12 @@ function configuredTargets(settings) {
 
 function normalizeCollectionState(value) {
   const source = Array.isArray(value) ? { tracked: value } : value && typeof value === 'object' ? value : {};
+  const trustedTimers = Number(source.version) === COLLECTION_STATE_VERSION;
   const tracked = (Array.isArray(source.tracked) ? source.tracked : []).map((entry) => ({
     monsterId: validId(entry?.monsterId),
     targetId: String(entry?.targetId || ''),
     name: String(entry?.name || ''),
-    harvestAt: validFutureMs(entry?.harvestAt),
+    harvestAt: trustedTimers ? validFutureMs(entry?.harvestAt) : 0,
   })).filter((entry) => entry.monsterId && entry.targetId);
   const extractedByTarget = {};
   for (const [targetId, count] of Object.entries(source.extractedByTarget || {})) {
@@ -219,7 +221,7 @@ function normalizeCollectionState(value) {
   }
   const consumedIds = [...new Set((Array.isArray(source.consumedIds) ? source.consumedIds : []).map(validId).filter(Boolean))]
     .slice(-50);
-  return { tracked, extractedByTarget, consumedIds };
+  return { version: COLLECTION_STATE_VERSION, tracked, extractedByTarget, consumedIds };
 }
 
 function targetForMonster(targets, monster) {
@@ -327,6 +329,8 @@ async function runCollection(ctx, visit) {
     if (dailyExtractionLimitReached(probeBattle.__veyraHtml)) {
       endDay = true;
       writeLog(store, 'Server reports that the daily extraction limit has been reached.', { probeMonsterId: probe });
+    } else {
+      writeLog(store, 'Server reports that daily extraction attempts are still available.', { probeMonsterId: probe });
     }
   }
   for (const candidate of candidates) {
@@ -340,6 +344,18 @@ async function runCollection(ctx, visit) {
         probeMonsterId: candidate.monsterId,
       });
       break;
+    }
+    const activeAutoDieAt = battleAutoDieAt(battle.__veyraHtml);
+    if (!battle.getElementById?.('extract-shadow-btn') && activeAutoDieAt > Date.now()) {
+      tracked = tracked.map((entry) => entry.monsterId === candidate.monsterId
+        ? { ...entry, harvestAt: activeAutoDieAt + EXTRACTION_GRACE_MS }
+        : entry);
+      writeLog(store, 'Legacy tracked monster timer repaired from its battle page.', {
+        monsterId: candidate.monsterId,
+        autoDieAt: activeAutoDieAt,
+        harvestAt: activeAutoDieAt + EXTRACTION_GRACE_MS,
+      });
+      continue;
     }
     let result = { ok: false, message: 'No extractable shadow is available.', shadow: null };
     if (battle.getElementById?.('extract-shadow-btn')) result = await extractShadow(postForm, candidate.monsterId);
@@ -370,7 +386,12 @@ async function runCollection(ctx, visit) {
   const dailyGoal = targets.reduce((sum, target) => sum + target.quantity, 0);
   const extractedToday = Object.values(extractedByTarget).reduce((sum, count) => sum + Number(count || 0), 0);
   if (endDay || extractedToday >= dailyGoal) {
-    store.write(TRACKED_KEY, { tracked: [], extractedByTarget: {}, consumedIds: [] });
+    store.write(TRACKED_KEY, {
+      version: COLLECTION_STATE_VERSION,
+      tracked: [],
+      extractedByTarget: {},
+      consumedIds: [],
+    });
     writeLog(store, 'Daily Shadow Collection cycle finished and reset.', {
       extractedToday,
       dailyGoal,
@@ -437,7 +458,12 @@ async function runCollection(ctx, visit) {
       });
     }
   }
-  store.write(TRACKED_KEY, { tracked, extractedByTarget, consumedIds: [...consumedIds] });
+  store.write(TRACKED_KEY, {
+    version: COLLECTION_STATE_VERSION,
+    tracked,
+    extractedByTarget,
+    consumedIds: [...consumedIds],
+  });
   const outstanding = targets.reduce((sum, target) => {
     const trackedForTarget = tracked.filter((entry) => entry.targetId === target.id).length;
     return sum + Math.max(0, target.quantity - Number(extractedByTarget[target.id] || 0) - trackedForTarget);
