@@ -8,7 +8,7 @@ const route = require('../../routes/shadowcollection');
 
 const TRACKED_KEY = 'veyra:shadowcollection:tracked:v1';
 const VISIT_PARAM = 'veyra_visit';
-const WORKER_BUILD = '0.11.5';
+const WORKER_BUILD = '0.11.6';
 const COLLECTION_STATE_VERSION = 3;
 const MISSING_TARGET_RETRY_MS = 60_000;
 const BUSY_HEARTBEAT_MS = 5_000;
@@ -260,7 +260,6 @@ async function runCollection(ctx, visit) {
   let extracted = 0;
   const available = [];
   const defeated = [];
-  const deadProbeIds = [];
   const originalHideDead = cookieValue(win.document, 'hide_dead_monsters');
   const originalDeadBossesOnly = cookieValue(win.document, 'show_dead_bosses_only');
   try {
@@ -276,14 +275,11 @@ async function runCollection(ctx, visit) {
       const cards = rawMonsterCardStats(rawHtml);
       const found = parseWaveMonsters(page);
       const dead = parseRawDeadWaveMonsters(rawHtml);
-      const probeIds = parseRawDeadMonsterIds(rawHtml);
       available.push(...found);
       defeated.push(...dead);
-      deadProbeIds.push(...probeIds);
       writeLog(store, `Gate 3 wave ${wave} scanned.`, {
         found: found.length,
         defeated: dead.length,
-        deadForLimitProbe: probeIds.length,
         page: page.__veyraFetchMeta,
         rawMonsterCards: (rawHtml.match(/monster-card/gi) || []).length,
         rawMonsterIds: (rawHtml.match(/data-monster-id/gi) || []).length,
@@ -318,19 +314,6 @@ async function runCollection(ctx, visit) {
   }
 
   let endDay = false;
-  // The server renders the daily-limit message on every dead battle page.
-  // This probe does not need to match the configured target or belong to the
-  // current user; it never posts an extraction request.
-  const probe = deadProbeIds[0] || tracked[0]?.monsterId || [...consumedIds][0] || '';
-  if (probe) {
-    const probeBattle = await fetchDocument(win, `/battle.php?id=${probe}&veyra_limit_probe=${Date.now()}`);
-    if (dailyExtractionLimitReached(probeBattle.__veyraHtml)) {
-      endDay = true;
-      writeLog(store, 'Server reports that the daily extraction limit has been reached.', { probeMonsterId: probe });
-    } else {
-      writeLog(store, 'Server reports that daily extraction attempts are still available.', { probeMonsterId: probe });
-    }
-  }
   for (const candidate of candidates) {
     if (endDay) break;
     const target = targets.find((entry) => entry.id === candidate.targetId);
@@ -339,7 +322,8 @@ async function runCollection(ctx, visit) {
     if (dailyExtractionLimitReached(battle.__veyraHtml)) {
       endDay = true;
       writeLog(store, 'Server reports that the daily extraction limit has been reached.', {
-        probeMonsterId: candidate.monsterId,
+        monsterId: candidate.monsterId,
+        target: target.name,
       });
       break;
     }
@@ -363,6 +347,17 @@ async function runCollection(ctx, visit) {
       message: result.message,
       shadow: result.shadow?.NAME || '',
     });
+    // A normal GET battle page does not reliably reveal the exhausted daily
+    // limit. Only trust the response from an actual extraction attempt, and
+    // only make that attempt for one of the configured target monsters.
+    if (dailyExtractionLimitReached(result.message)) {
+      endDay = true;
+      writeLog(store, 'Server reports that the daily extraction limit has been reached.', {
+        monsterId: candidate.monsterId,
+        target: target.name,
+      });
+      break;
+    }
     tracked = tracked.filter((entry) => entry.monsterId !== candidate.monsterId);
     if (result.ok) {
       extracted += 1;

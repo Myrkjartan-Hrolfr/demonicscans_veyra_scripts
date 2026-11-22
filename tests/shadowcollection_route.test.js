@@ -136,7 +136,7 @@ test('wave and battle auto-die timestamps are parsed as absolute milliseconds', 
   assert.equal(worker.battleAutoDieAt('window.AUTO_DIE_CFG = { nextDieMs: 1795196974000 };'), 0);
 });
 
-test('server-rendered daily extraction limit is recognized without posting an extraction', () => {
+test('daily extraction limit is recognized in the configured monster extraction response', () => {
   assert.equal(worker.dailyExtractionLimitReached(`
     <p class="extract-copy">You have already used all your extraction attempts for today.</p>
   `), true);
