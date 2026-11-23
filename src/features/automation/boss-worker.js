@@ -601,15 +601,15 @@ function createBossWorker({
 
     const phaseDuel = dom.findPhaseDuelControl(doc, win.location.origin);
     const ascended = dom.isAscendedBattle(doc);
-    if (run.routeId === 'olympus' && run.target.phased && phaseDuel) {
+    if (run.target.phased && phaseDuel) {
       run = captureActualPhaseOneDamage(run, t);
-    } else if (run.routeId === 'olympus' && run.target.phased && ascended) {
+    } else if (run.target.phased && ascended) {
       // On an already-running Phase 3 page, total damage alone is ambiguous.
       // Subtract the live "Phase DMG" value so the stored Phase 1 base never
       // grows with every Phase 3 attack.
       run = captureActualPhaseOneDamage(run, t, true);
     }
-    if (phaseDuel && run.routeId === 'olympus' && run.target.phased) {
+    if (phaseDuel && run.target.phased) {
       if (phaseDuel.activeId !== run.target.monsterId) {
         saveRun(
           logic.failTarget(
@@ -955,15 +955,15 @@ function createBossWorker({
 
     run = acquire(run, t, url);
     if (!run) {
-      log('Another tab owns the active Olympus phase duel; this tab is waiting.');
+      log('Another tab owns the active boss phase duel; this tab is waiting.');
       return;
     }
     if (cmd.kind !== 'running' || cmd.visitId !== run.visitId) {
       stopAndFinish(run, cmd, t);
       return;
     }
-    if (!run.target || run.routeId !== 'olympus' || !run.target.phased) {
-      log('No phased Olympus boss owns this duel; returning to the domain.', 'warn');
+    if (!run.target || !logic.BOSS_ROUTE_IDS.includes(run.routeId) || !run.target.phased) {
+      log('No phased boss owns this duel; returning to the domain.', 'warn');
       returnToHub(run);
       return;
     }

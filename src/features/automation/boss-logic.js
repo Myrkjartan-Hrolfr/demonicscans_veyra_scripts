@@ -148,7 +148,7 @@ function buildPlan(routeId, routeConfig) {
       const saved = configured[boss.id];
       const phase1Damage = String(saved?.damage || boss.defaultDamage || '3b');
       const phase1DamageValue = parseGameNumber(phase1Damage) || parseGameNumber(boss.defaultDamage) || 3e9;
-      const phased = routeId === 'olympus' && boss.phase3 === true;
+      const phased = boss.phase3 === true;
       const phase3Damage = phased
         ? String(saved?.phase3Damage ?? boss.defaultPhase3Damage ?? '0')
         : '0';
@@ -323,7 +323,7 @@ function phaseDuelTargetKey(state) {
   return String(target?.key || '');
 }
 
-// Olympus phase duels are solo matches. Power Slash is preferred for as long
+// Boss phase duels are solo matches. Power Slash is preferred for as long
 // as its current token cost is affordable; Slash is the deterministic fallback.
 function decidePhaseDuelAction(state, userId = '') {
   const outcome = phaseDuelOutcome(state);

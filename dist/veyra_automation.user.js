@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.11.8
+// @version      0.11.9
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -2524,7 +2524,7 @@
           const saved = configured[boss.id];
           const phase1Damage = String(saved?.damage || boss.defaultDamage || '3b');
           const phase1DamageValue = parseGameNumber(phase1Damage) || parseGameNumber(boss.defaultDamage) || 3e9;
-          const phased = routeId === 'olympus' && boss.phase3 === true;
+          const phased = boss.phase3 === true;
           const phase3Damage = phased
             ? String(saved?.phase3Damage ?? boss.defaultPhase3Damage ?? '0')
             : '0';
@@ -2699,7 +2699,7 @@
       return String(target?.key || '');
     }
 
-    // Olympus phase duels are solo matches. Power Slash is preferred for as long
+    // Boss phase duels are solo matches. Power Slash is preferred for as long
     // as its current token cost is affordable; Slash is the deterministic fallback.
     function decidePhaseDuelAction(state, userId = '') {
       const outcome = phaseDuelOutcome(state);
@@ -3710,15 +3710,15 @@
 
         const phaseDuel = dom.findPhaseDuelControl(doc, win.location.origin);
         const ascended = dom.isAscendedBattle(doc);
-        if (run.routeId === 'olympus' && run.target.phased && phaseDuel) {
+        if (run.target.phased && phaseDuel) {
           run = captureActualPhaseOneDamage(run, t);
-        } else if (run.routeId === 'olympus' && run.target.phased && ascended) {
+        } else if (run.target.phased && ascended) {
           // On an already-running Phase 3 page, total damage alone is ambiguous.
           // Subtract the live "Phase DMG" value so the stored Phase 1 base never
           // grows with every Phase 3 attack.
           run = captureActualPhaseOneDamage(run, t, true);
         }
-        if (phaseDuel && run.routeId === 'olympus' && run.target.phased) {
+        if (phaseDuel && run.target.phased) {
           if (phaseDuel.activeId !== run.target.monsterId) {
             saveRun(
               logic.failTarget(
@@ -4064,15 +4064,15 @@
 
         run = acquire(run, t, url);
         if (!run) {
-          log('Another tab owns the active Olympus phase duel; this tab is waiting.');
+          log('Another tab owns the active boss phase duel; this tab is waiting.');
           return;
         }
         if (cmd.kind !== 'running' || cmd.visitId !== run.visitId) {
           stopAndFinish(run, cmd, t);
           return;
         }
-        if (!run.target || run.routeId !== 'olympus' || !run.target.phased) {
-          log('No phased Olympus boss owns this duel; returning to the domain.', 'warn');
+        if (!run.target || !logic.BOSS_ROUTE_IDS.includes(run.routeId) || !run.target.phased) {
+          log('No phased boss owns this duel; returning to the domain.', 'warn');
           returnToHub(run);
           return;
         }
@@ -28243,21 +28243,29 @@
         id: 'skarn',
         name: 'General Skarn the Radiant Bastion',
         defaultDamage: '3b',
+        phase3: true,
+        defaultPhase3Damage: '0',
       }),
       vessir: Object.freeze({
         id: 'vessir',
         name: 'General Vessir the Sunfang Duelist',
         defaultDamage: '3b',
+        phase3: true,
+        defaultPhase3Damage: '0',
       }),
       hrazz: Object.freeze({
         id: 'hrazz',
         name: 'General Hrazz the Dawnflame Oathkeeper',
         defaultDamage: '3b',
+        phase3: true,
+        defaultPhase3Damage: '0',
       }),
       drakzareth: Object.freeze({
         id: 'drakzareth',
         name: 'Drakzareth The Tyrant Lizard King',
         defaultDamage: '3b',
+        phase3: true,
+        defaultPhase3Damage: '0',
       }),
     });
 
@@ -28273,7 +28281,7 @@
       id: 'wave3',
       label: 'Wave 3',
       path: '/active_wave.php?gate=3&wave=8',
-      visitPathnames: Object.freeze(['/battle.php']),
+      visitPathnames: Object.freeze(['/battle.php', '/pvp_style_battle.php']),
       defaultLoopMinutes: 30,
       maxVisitMs: 15 * 60_000,
       initialDelayMs: 30 * 60_000,
