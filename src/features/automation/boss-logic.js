@@ -109,6 +109,9 @@ function battlePath(monsterId) {
 }
 
 function battleDamageTarget(target, ascended = false) {
+  if (target?.continuousPhases === true) {
+    return { phase: 2, damage: target.damage, damageValue: target.damageValue };
+  }
   const useCombined = target?.phased === true && ascended === true;
   const phaseOneActual = Number(target?.phase1ActualDamageValue);
   const phaseOneBase = Number.isFinite(phaseOneActual) && phaseOneActual > 0
@@ -149,20 +152,28 @@ function buildPlan(routeId, routeConfig) {
       const phase1Damage = String(saved?.damage || boss.defaultDamage || '3b');
       const phase1DamageValue = parseGameNumber(phase1Damage) || parseGameNumber(boss.defaultDamage) || 3e9;
       const phased = boss.phase3 === true;
+      const continuousPhases = boss.phase2 === true;
+      const phase2Damage = continuousPhases
+        ? String(saved?.phase2Damage ?? boss.defaultPhase2Damage ?? '0')
+        : '0';
+      const phase2DamageValue = continuousPhases ? (parseGameNumber(phase2Damage) ?? 0) : 0;
       const phase3Damage = phased
         ? String(saved?.phase3Damage ?? boss.defaultPhase3Damage ?? '0')
         : '0';
       const phase3DamageValue = phased ? (parseGameNumber(phase3Damage) ?? 0) : 0;
-      const damageValue = phase1DamageValue + phase3DamageValue;
+      const damageValue = phase1DamageValue + phase2DamageValue + phase3DamageValue;
       return {
         id: boss.id,
         name: boss.name,
         enabled: saved?.enabled === true,
         phased,
-        damage: phased ? formatGameNumber(damageValue) : phase1Damage,
+        continuousPhases,
+        damage: phased || continuousPhases ? formatGameNumber(damageValue) : phase1Damage,
         damageValue,
         phase1Damage,
         phase1DamageValue,
+        phase2Damage,
+        phase2DamageValue,
         phase3Damage,
         phase3DamageValue,
       };
@@ -245,10 +256,13 @@ function matchHubBosses({ bosses = [], summons = [], cards = [] }) {
       bossId: boss.id,
       name: boss.name,
       phased: boss.phased === true,
+      continuousPhases: boss.continuousPhases === true,
       damage: boss.damage,
       damageValue: boss.damageValue,
       phase1Damage: boss.phase1Damage,
       phase1DamageValue: boss.phase1DamageValue,
+      phase2Damage: boss.phase2Damage,
+      phase2DamageValue: boss.phase2DamageValue,
       phase3Damage: boss.phase3Damage,
       phase3DamageValue: boss.phase3DamageValue,
     };
@@ -440,6 +454,7 @@ function normalizeTarget(value) {
   const damageValue = Number(value.damageValue);
   if (!monsterId || !Number.isFinite(damageValue) || damageValue <= 0) return null;
   const phased = value.phased === true;
+  const continuousPhases = value.continuousPhases === true;
   const phase1DamageValue = Number(value.phase1DamageValue);
   const normalizedPhase1 = Number.isFinite(phase1DamageValue) && phase1DamageValue > 0
     ? phase1DamageValue
@@ -448,7 +463,15 @@ function normalizeTarget(value) {
   const normalizedPhase3 = phased && Number.isFinite(phase3DamageValue) && phase3DamageValue >= 0
     ? phase3DamageValue
     : 0;
-  const combinedValue = phased ? normalizedPhase1 + normalizedPhase3 : damageValue;
+  const phase2DamageValue = Number(value.phase2DamageValue);
+  const normalizedPhase2 = continuousPhases && Number.isFinite(phase2DamageValue) && phase2DamageValue >= 0
+    ? phase2DamageValue
+    : 0;
+  const combinedValue = phased
+    ? normalizedPhase1 + normalizedPhase3
+    : continuousPhases
+      ? normalizedPhase1 + normalizedPhase2
+      : damageValue;
   const actualPhase1 = Number(value.phase1ActualDamageValue);
   const normalizedActualPhase1 = phased && Number.isFinite(actualPhase1) && actualPhase1 > 0
     ? actualPhase1
@@ -462,10 +485,13 @@ function normalizeTarget(value) {
     name: String(value.name || ''),
     domainId: String(value.domainId || ''),
     phased,
+    continuousPhases,
     damage: formatGameNumber(effectiveCombinedValue),
     damageValue: effectiveCombinedValue,
     phase1Damage: String(value.phase1Damage || value.damage || formatGameNumber(normalizedPhase1)),
     phase1DamageValue: normalizedPhase1,
+    phase2Damage: String(value.phase2Damage ?? '0'),
+    phase2DamageValue: normalizedPhase2,
     phase3Damage: String(value.phase3Damage ?? '0'),
     phase3DamageValue: normalizedPhase3,
     phase1ActualDamageValue: normalizedActualPhase1,

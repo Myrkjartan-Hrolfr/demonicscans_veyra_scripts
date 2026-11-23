@@ -405,17 +405,17 @@ test('phased Olympus gods keep Phase 1 and Phase 3 separate but use their sum on
   });
 });
 
-test('Wave 3 bosses use the same three-phase damage plan as Olympus', () => {
+test('Wave 3 bosses use two continuous damage phases without a duel', () => {
   const config = createDefaultConfig();
   config.routes.wave3.settings.bosses.skarn.enabled = true;
   config.routes.wave3.settings.bosses.skarn.damage = '3b';
-  config.routes.wave3.settings.bosses.skarn.phase3Damage = '2b';
+  config.routes.wave3.settings.bosses.skarn.phase2Damage = '2b';
   const skarn = logic.buildPlan('wave3', config.routes.wave3)[0].bosses.find((boss) => boss.id === 'skarn');
-  assert.equal(skarn.phased, true);
+  assert.equal(skarn.phased, false);
+  assert.equal(skarn.continuousPhases, true);
   assert.equal(skarn.phase1DamageValue, 3e9);
-  assert.equal(skarn.phase3DamageValue, 2e9);
-  assert.deepEqual(logic.battleDamageTarget(skarn, false), { phase: 1, damage: '3b', damageValue: 3e9 });
-  assert.deepEqual(logic.battleDamageTarget(skarn, true), { phase: 3, damage: '5b', damageValue: 5e9 });
+  assert.equal(skarn.phase2DamageValue, 2e9);
+  assert.deepEqual(logic.battleDamageTarget(skarn, false), { phase: 2, damage: '5b', damageValue: 5e9 });
 });
 
 test('Olympus duel logic prefers affordable Power Slash and falls back to Slash', () => {
@@ -948,36 +948,6 @@ test('a phased Olympus battle records actual Phase 1 damage before opening Phase
   assert.equal(env.run().phase, 'duel');
   assert.equal(env.run().target.phase1ActualDamageValue, 3_509_177_599);
   assert.equal(env.run().target.damageValue, 7_509_177_599);
-});
-
-test('a phased Wave 3 battle opens and automates Phase 2 like Olympus', async () => {
-  const env = createEnv({ routeId: 'wave3' });
-  phasedBattleRun(env, {
-    routeId: 'wave3',
-    domainId: 'wave3',
-    bossId: 'skarn',
-    name: 'General Skarn the Radiant Bastion',
-  });
-  const phaseLink = el({ attrs: { href: 'pvp_style_battle.php?source=monster_phase&active_id=557845671' } });
-  let page = env.page(
-    'https://demonicscans.org/battle.php?id=557845671&veyra_visit=v1',
-    fakeDoc({ selectors: { [dom.SELECTORS.phaseDuel]: phaseLink, [dom.SELECTORS.playerDamage]: el({ text: '3,500,000,000' }) } }),
-  );
-  page.worker.tick();
-  assert.deepEqual(page.win.replaced, [
-    'https://demonicscans.org/pvp_style_battle.php?source=monster_phase&active_id=557845671&veyra_visit=v1',
-  ]);
-  assert.equal(env.run().phase, 'duel');
-
-  env.phaseStates.push(livePhaseState(40));
-  page = env.page(
-    'https://demonicscans.org/pvp_style_battle.php?source=monster_phase&active_id=557845671&veyra_visit=v1',
-    fakeDoc(),
-  );
-  page.worker.tick();
-  await flush();
-  assert.equal(env.posts.at(-1).params.skill_id, '-1');
-  assert.equal(env.status('wave3').state, 'busy');
 });
 
 test('a later visit reuses recorded Phase 1 damage when deciding whether Phase 3 is complete', () => {

@@ -52,6 +52,12 @@ function normalizeBossSettings(value, bossList) {
         boss.defaultPhase3Damage,
       );
     }
+    if (boss.phase2 === true) {
+      normalized.phase2Damage = normalizeAdditionalDamageTarget(
+        saved?.phase2Damage,
+        boss.defaultPhase2Damage,
+      );
+    }
     bosses[boss.id] = normalized;
   }
   return { bosses, skills: normalizeSkills(value?.skills), useGlobalPattern: value?.useGlobalPattern === true };
@@ -113,23 +119,6 @@ function renderBossSettings(ctx, sections) {
         },
       });
       let updateCombinedHint = () => {};
-      ctx.addTextInput({
-        id: `boss-${boss.id}-damage`,
-        label: boss.phase3 === true
-          ? 'Phase 1 damage target (e.g. 500m, 3b)'
-          : 'Damage target (e.g. 500m, 3b)',
-        value: bossSettings.damage,
-        placeholder: boss.defaultDamage,
-        inputMode: 'decimal',
-        onChange(value) {
-          const next = ctx.updateSettings((settings) => {
-            settings.bosses[boss.id].damage = normalizeDamageTarget(value, boss.defaultDamage);
-          });
-          ctx.settings = next;
-          updateCombinedHint(next.bosses[boss.id]);
-          return next.bosses[boss.id].damage;
-        },
-      });
       const patternHost = ctx.make('div', { className: ctx.cls('setting') });
       ctx.addCheckbox({
         id: `boss-${boss.id}-specific-pattern`,
@@ -159,32 +148,53 @@ function renderBossSettings(ctx, sections) {
         },
       );
       ctx.container.appendChild(patternHost);
-      if (boss.phase3 === true) {
+      const hasAdditionalPhase = boss.phase2 === true || boss.phase3 === true;
+      ctx.addTextInput({
+        id: `boss-${boss.id}-damage`,
+        label: hasAdditionalPhase
+          ? 'Phase 1 damage target (e.g. 500m, 3b)'
+          : 'Damage target (e.g. 500m, 3b)',
+        value: bossSettings.damage,
+        placeholder: boss.defaultDamage,
+        inputMode: 'decimal',
+        onChange(value) {
+          const next = ctx.updateSettings((settings) => {
+            settings.bosses[boss.id].damage = normalizeDamageTarget(value, boss.defaultDamage);
+          });
+          ctx.settings = next;
+          updateCombinedHint(next.bosses[boss.id]);
+          return next.bosses[boss.id].damage;
+        },
+      });
+      if (hasAdditionalPhase) {
+        const phaseNumber = boss.phase2 === true ? 2 : 3;
+        const damageKey = boss.phase2 === true ? 'phase2Damage' : 'phase3Damage';
+        const defaultDamage = boss.phase2 === true ? boss.defaultPhase2Damage : boss.defaultPhase3Damage;
         ctx.addTextInput({
-          id: `boss-${boss.id}-phase3-damage`,
-          label: 'Phase 3 additional damage target (e.g. 500m, 4b)',
-          value: bossSettings.phase3Damage,
-          placeholder: boss.defaultPhase3Damage || '0',
+          id: `boss-${boss.id}-phase${phaseNumber}-damage`,
+          label: `Phase ${phaseNumber} damage target (e.g. 500m, 4b)`,
+          value: bossSettings[damageKey],
+          placeholder: defaultDamage || '0',
           inputMode: 'decimal',
           onChange(value) {
             const next = ctx.updateSettings((settings) => {
-              settings.bosses[boss.id].phase3Damage = normalizeAdditionalDamageTarget(
+              settings.bosses[boss.id][damageKey] = normalizeAdditionalDamageTarget(
                 value,
-                boss.defaultPhase3Damage,
+                defaultDamage,
               );
             });
             ctx.settings = next;
             updateCombinedHint(next.bosses[boss.id]);
-            return next.bosses[boss.id].phase3Damage;
+            return next.bosses[boss.id][damageKey];
           },
         });
         const combinedHint = ctx.make('div', { className: ctx.cls('hint') });
         updateCombinedHint = (settings) => {
           const phase1 = parseGameNumber(settings?.damage) || 0;
-          const phase3 = parseGameNumber(settings?.phase3Damage) || 0;
+          const additional = parseGameNumber(settings?.[damageKey]) || 0;
           combinedHint.textContent =
-            `Phase 1 stops at about ${formatGameNumber(phase1)}. Phase 3 then adds ` +
-            `${formatGameNumber(phase3)} to the damage actually dealt in Phase 1.`;
+            `Phase 1 target: ${formatGameNumber(phase1)}. Phase ${phaseNumber} target: ` +
+            `${formatGameNumber(additional)}. Combined target: ${formatGameNumber(phase1 + additional)}.`;
         };
         updateCombinedHint(bossSettings);
         ctx.container.appendChild(combinedHint);

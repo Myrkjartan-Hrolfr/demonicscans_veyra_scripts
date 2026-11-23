@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.11.9
+// @version      0.11.10
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -2485,6 +2485,9 @@
     }
 
     function battleDamageTarget(target, ascended = false) {
+      if (target?.continuousPhases === true) {
+        return { phase: 2, damage: target.damage, damageValue: target.damageValue };
+      }
       const useCombined = target?.phased === true && ascended === true;
       const phaseOneActual = Number(target?.phase1ActualDamageValue);
       const phaseOneBase = Number.isFinite(phaseOneActual) && phaseOneActual > 0
@@ -2525,20 +2528,28 @@
           const phase1Damage = String(saved?.damage || boss.defaultDamage || '3b');
           const phase1DamageValue = parseGameNumber(phase1Damage) || parseGameNumber(boss.defaultDamage) || 3e9;
           const phased = boss.phase3 === true;
+          const continuousPhases = boss.phase2 === true;
+          const phase2Damage = continuousPhases
+            ? String(saved?.phase2Damage ?? boss.defaultPhase2Damage ?? '0')
+            : '0';
+          const phase2DamageValue = continuousPhases ? (parseGameNumber(phase2Damage) ?? 0) : 0;
           const phase3Damage = phased
             ? String(saved?.phase3Damage ?? boss.defaultPhase3Damage ?? '0')
             : '0';
           const phase3DamageValue = phased ? (parseGameNumber(phase3Damage) ?? 0) : 0;
-          const damageValue = phase1DamageValue + phase3DamageValue;
+          const damageValue = phase1DamageValue + phase2DamageValue + phase3DamageValue;
           return {
             id: boss.id,
             name: boss.name,
             enabled: saved?.enabled === true,
             phased,
-            damage: phased ? formatGameNumber(damageValue) : phase1Damage,
+            continuousPhases,
+            damage: phased || continuousPhases ? formatGameNumber(damageValue) : phase1Damage,
             damageValue,
             phase1Damage,
             phase1DamageValue,
+            phase2Damage,
+            phase2DamageValue,
             phase3Damage,
             phase3DamageValue,
           };
@@ -2621,10 +2632,13 @@
           bossId: boss.id,
           name: boss.name,
           phased: boss.phased === true,
+          continuousPhases: boss.continuousPhases === true,
           damage: boss.damage,
           damageValue: boss.damageValue,
           phase1Damage: boss.phase1Damage,
           phase1DamageValue: boss.phase1DamageValue,
+          phase2Damage: boss.phase2Damage,
+          phase2DamageValue: boss.phase2DamageValue,
           phase3Damage: boss.phase3Damage,
           phase3DamageValue: boss.phase3DamageValue,
         };
@@ -2816,6 +2830,7 @@
       const damageValue = Number(value.damageValue);
       if (!monsterId || !Number.isFinite(damageValue) || damageValue <= 0) return null;
       const phased = value.phased === true;
+      const continuousPhases = value.continuousPhases === true;
       const phase1DamageValue = Number(value.phase1DamageValue);
       const normalizedPhase1 = Number.isFinite(phase1DamageValue) && phase1DamageValue > 0
         ? phase1DamageValue
@@ -2824,7 +2839,15 @@
       const normalizedPhase3 = phased && Number.isFinite(phase3DamageValue) && phase3DamageValue >= 0
         ? phase3DamageValue
         : 0;
-      const combinedValue = phased ? normalizedPhase1 + normalizedPhase3 : damageValue;
+      const phase2DamageValue = Number(value.phase2DamageValue);
+      const normalizedPhase2 = continuousPhases && Number.isFinite(phase2DamageValue) && phase2DamageValue >= 0
+        ? phase2DamageValue
+        : 0;
+      const combinedValue = phased
+        ? normalizedPhase1 + normalizedPhase3
+        : continuousPhases
+          ? normalizedPhase1 + normalizedPhase2
+          : damageValue;
       const actualPhase1 = Number(value.phase1ActualDamageValue);
       const normalizedActualPhase1 = phased && Number.isFinite(actualPhase1) && actualPhase1 > 0
         ? actualPhase1
@@ -2838,10 +2861,13 @@
         name: String(value.name || ''),
         domainId: String(value.domainId || ''),
         phased,
+        continuousPhases,
         damage: formatGameNumber(effectiveCombinedValue),
         damageValue: effectiveCombinedValue,
         phase1Damage: String(value.phase1Damage || value.damage || formatGameNumber(normalizedPhase1)),
         phase1DamageValue: normalizedPhase1,
+        phase2Damage: String(value.phase2Damage ?? '0'),
+        phase2DamageValue: normalizedPhase2,
         phase3Damage: String(value.phase3Damage ?? '0'),
         phase3DamageValue: normalizedPhase3,
         phase1ActualDamageValue: normalizedActualPhase1,
@@ -26038,6 +26064,12 @@
             boss.defaultPhase3Damage,
           );
         }
+        if (boss.phase2 === true) {
+          normalized.phase2Damage = normalizeAdditionalDamageTarget(
+            saved?.phase2Damage,
+            boss.defaultPhase2Damage,
+          );
+        }
         bosses[boss.id] = normalized;
       }
       return { bosses, skills: normalizeSkills(value?.skills), useGlobalPattern: value?.useGlobalPattern === true };
@@ -26099,23 +26131,6 @@
             },
           });
           let updateCombinedHint = () => {};
-          ctx.addTextInput({
-            id: `boss-${boss.id}-damage`,
-            label: boss.phase3 === true
-              ? 'Phase 1 damage target (e.g. 500m, 3b)'
-              : 'Damage target (e.g. 500m, 3b)',
-            value: bossSettings.damage,
-            placeholder: boss.defaultDamage,
-            inputMode: 'decimal',
-            onChange(value) {
-              const next = ctx.updateSettings((settings) => {
-                settings.bosses[boss.id].damage = normalizeDamageTarget(value, boss.defaultDamage);
-              });
-              ctx.settings = next;
-              updateCombinedHint(next.bosses[boss.id]);
-              return next.bosses[boss.id].damage;
-            },
-          });
           const patternHost = ctx.make('div', { className: ctx.cls('setting') });
           ctx.addCheckbox({
             id: `boss-${boss.id}-specific-pattern`,
@@ -26145,32 +26160,53 @@
             },
           );
           ctx.container.appendChild(patternHost);
-          if (boss.phase3 === true) {
+          const hasAdditionalPhase = boss.phase2 === true || boss.phase3 === true;
+          ctx.addTextInput({
+            id: `boss-${boss.id}-damage`,
+            label: hasAdditionalPhase
+              ? 'Phase 1 damage target (e.g. 500m, 3b)'
+              : 'Damage target (e.g. 500m, 3b)',
+            value: bossSettings.damage,
+            placeholder: boss.defaultDamage,
+            inputMode: 'decimal',
+            onChange(value) {
+              const next = ctx.updateSettings((settings) => {
+                settings.bosses[boss.id].damage = normalizeDamageTarget(value, boss.defaultDamage);
+              });
+              ctx.settings = next;
+              updateCombinedHint(next.bosses[boss.id]);
+              return next.bosses[boss.id].damage;
+            },
+          });
+          if (hasAdditionalPhase) {
+            const phaseNumber = boss.phase2 === true ? 2 : 3;
+            const damageKey = boss.phase2 === true ? 'phase2Damage' : 'phase3Damage';
+            const defaultDamage = boss.phase2 === true ? boss.defaultPhase2Damage : boss.defaultPhase3Damage;
             ctx.addTextInput({
-              id: `boss-${boss.id}-phase3-damage`,
-              label: 'Phase 3 additional damage target (e.g. 500m, 4b)',
-              value: bossSettings.phase3Damage,
-              placeholder: boss.defaultPhase3Damage || '0',
+              id: `boss-${boss.id}-phase${phaseNumber}-damage`,
+              label: `Phase ${phaseNumber} damage target (e.g. 500m, 4b)`,
+              value: bossSettings[damageKey],
+              placeholder: defaultDamage || '0',
               inputMode: 'decimal',
               onChange(value) {
                 const next = ctx.updateSettings((settings) => {
-                  settings.bosses[boss.id].phase3Damage = normalizeAdditionalDamageTarget(
+                  settings.bosses[boss.id][damageKey] = normalizeAdditionalDamageTarget(
                     value,
-                    boss.defaultPhase3Damage,
+                    defaultDamage,
                   );
                 });
                 ctx.settings = next;
                 updateCombinedHint(next.bosses[boss.id]);
-                return next.bosses[boss.id].phase3Damage;
+                return next.bosses[boss.id][damageKey];
               },
             });
             const combinedHint = ctx.make('div', { className: ctx.cls('hint') });
             updateCombinedHint = (settings) => {
               const phase1 = parseGameNumber(settings?.damage) || 0;
-              const phase3 = parseGameNumber(settings?.phase3Damage) || 0;
+              const additional = parseGameNumber(settings?.[damageKey]) || 0;
               combinedHint.textContent =
-                `Phase 1 stops at about ${formatGameNumber(phase1)}. Phase 3 then adds ` +
-                `${formatGameNumber(phase3)} to the damage actually dealt in Phase 1.`;
+                `Phase 1 target: ${formatGameNumber(phase1)}. Phase ${phaseNumber} target: ` +
+                `${formatGameNumber(additional)}. Combined target: ${formatGameNumber(phase1 + additional)}.`;
             };
             updateCombinedHint(bossSettings);
             ctx.container.appendChild(combinedHint);
@@ -28243,29 +28279,29 @@
         id: 'skarn',
         name: 'General Skarn the Radiant Bastion',
         defaultDamage: '3b',
-        phase3: true,
-        defaultPhase3Damage: '0',
+        phase2: true,
+        defaultPhase2Damage: '0',
       }),
       vessir: Object.freeze({
         id: 'vessir',
         name: 'General Vessir the Sunfang Duelist',
         defaultDamage: '3b',
-        phase3: true,
-        defaultPhase3Damage: '0',
+        phase2: true,
+        defaultPhase2Damage: '0',
       }),
       hrazz: Object.freeze({
         id: 'hrazz',
         name: 'General Hrazz the Dawnflame Oathkeeper',
         defaultDamage: '3b',
-        phase3: true,
-        defaultPhase3Damage: '0',
+        phase2: true,
+        defaultPhase2Damage: '0',
       }),
       drakzareth: Object.freeze({
         id: 'drakzareth',
         name: 'Drakzareth The Tyrant Lizard King',
         defaultDamage: '3b',
-        phase3: true,
-        defaultPhase3Damage: '0',
+        phase2: true,
+        defaultPhase2Damage: '0',
       }),
     });
 
@@ -28281,7 +28317,7 @@
       id: 'wave3',
       label: 'Wave 3',
       path: '/active_wave.php?gate=3&wave=8',
-      visitPathnames: Object.freeze(['/battle.php', '/pvp_style_battle.php']),
+      visitPathnames: Object.freeze(['/battle.php']),
       defaultLoopMinutes: 30,
       maxVisitMs: 15 * 60_000,
       initialDelayMs: 30 * 60_000,
