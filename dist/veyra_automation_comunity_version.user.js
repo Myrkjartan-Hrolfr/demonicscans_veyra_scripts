@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation Community Version
 // @namespace    local.veyra.automation.comunity-version
-// @version      0.11.10
+// @version      0.11.12
 // @description  Community version of Veyra Automation without Shadowbridge automation (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -2203,6 +2203,7 @@
       battleCard: '.battle-card.monster-card[data-monster-id]',
       battleTitle: '.battle-card.monster-card .card-title',
       monsterImage: '#monsterImage',
+      activeDamagePhase: '.monster-hp-wrap--gold',
       playerHp: '#pHpText',
       playerDamage: '#yourDamageValue',
       phaseDamageChip: '.phase-loot-section .chip',
@@ -2332,10 +2333,20 @@
       }
     }
 
-    function isAscendedBattle(doc) {
+    function monsterImageSource(doc) {
+      return attr(doc?.querySelector?.(SELECTORS.monsterImage), 'src').trim();
+    }
+
+    function isAscendedBattle(doc, previousImage = '') {
       const title = String(doc?.querySelector?.(SELECTORS.battleTitle)?.textContent || '').toLowerCase();
-      const image = attr(doc?.querySelector?.(SELECTORS.monsterImage), 'src').toLowerCase();
-      return title.includes('ascended') || image.includes('ascended pve');
+      const image = monsterImageSource(doc);
+      const normalizedImage = image.toLowerCase();
+      return Boolean(
+        doc?.querySelector?.(SELECTORS.activeDamagePhase) ||
+        title.includes('ascended') ||
+        normalizedImage.includes('ascended pve') ||
+        (previousImage && image && image !== previousImage)
+      );
     }
 
     function setCookie(doc, name, value, days = 30) {
@@ -2362,6 +2373,7 @@
       findPhaseDuelControl,
       hasBossList,
       isAscendedBattle,
+      monsterImageSource,
       monsterIdFromHref,
       readCookieText,
       readActualPhaseOneDamage,
@@ -2486,7 +2498,18 @@
 
     function battleDamageTarget(target, ascended = false) {
       if (target?.continuousPhases === true) {
-        return { phase: 2, damage: target.damage, damageValue: target.damageValue };
+        const phaseOneActual = Number(target?.phase1ActualDamageValue);
+        const phaseOneBase = Number.isFinite(phaseOneActual) && phaseOneActual > 0
+          ? phaseOneActual
+          : Number(target?.phase1DamageValue);
+        const damageValue = ascended
+          ? phaseOneBase + Number(target?.phase2DamageValue || 0)
+          : phaseOneBase;
+        return {
+          phase: ascended ? 2 : 1,
+          damage: ascended ? formatGameNumber(damageValue) : String(target.phase1Damage),
+          damageValue,
+        };
       }
       const useCombined = target?.phased === true && ascended === true;
       const phaseOneActual = Number(target?.phase1ActualDamageValue);
@@ -2506,9 +2529,16 @@
 
     function withActualPhaseOneDamage(target, actualDamage) {
       const actual = Number(actualDamage);
-      if (!target || target.phased !== true || !Number.isFinite(actual) || actual <= 0) return target;
-      const phase3 = Math.max(0, Number(target.phase3DamageValue) || 0);
-      const damageValue = actual + phase3;
+      if (
+        !target ||
+        (target.phased !== true && target.continuousPhases !== true) ||
+        !Number.isFinite(actual) ||
+        actual <= 0
+      ) return target;
+      const additional = target.continuousPhases === true
+        ? Math.max(0, Number(target.phase2DamageValue) || 0)
+        : Math.max(0, Number(target.phase3DamageValue) || 0);
+      const damageValue = actual + additional;
       return {
         ...target,
         phase1ActualDamageValue: actual,
@@ -3305,7 +3335,11 @@
 
       function captureActualPhaseOneDamage(run, t = now(), requirePhaseThree = false) {
         const actual = dom.readActualPhaseOneDamage(doc, { requirePhaseThree });
-        if (!Number.isFinite(actual) || actual <= 0 || !run.target?.phased) return run;
+        if (
+          !Number.isFinite(actual) ||
+          actual <= 0 ||
+          (run.target?.phased !== true && run.target?.continuousPhases !== true)
+        ) return run;
         const remembered = phaseOneDamageRecords(t)?.[run.target.monsterId]?.damage;
         if (remembered !== actual) rememberPhaseOneDamage(run.target.monsterId, actual, t);
         if (Number(run.target.phase1ActualDamageValue) === actual) return run;
@@ -3638,7 +3672,14 @@
 
       function attachFight(controller, monsterId, damageTarget) {
         detachFight();
-        const fight = { controller, monsterId, damageTarget, handled: false, unsubscribe: null };
+        const fight = {
+          controller,
+          monsterId,
+          damageTarget,
+          initialMonsterImage: dom.monsterImageSource(doc),
+          handled: false,
+          unsubscribe: null,
+        };
         rt.fight = fight;
         try {
           fight.unsubscribe = controller.onChange?.(() => checkFight()) || null;
@@ -3742,6 +3783,8 @@
           // On an already-running Phase 3 page, total damage alone is ambiguous.
           // Subtract the live "Phase DMG" value so the stored Phase 1 base never
           // grows with every Phase 3 attack.
+          run = captureActualPhaseOneDamage(run, t, true);
+        } else if (run.target.continuousPhases && ascended) {
           run = captureActualPhaseOneDamage(run, t, true);
         }
         if (phaseDuel && run.target.phased) {
@@ -4016,6 +4059,18 @@
         detachFight();
         const label = logic.routeLabel(run.routeId);
         const decision = logic.decideAfterFight(state.reason);
+        if (
+          decision === 'complete' &&
+          state.reason === 'target' &&
+          run.target.continuousPhases === true &&
+          fight.damageTarget.phase === 1 &&
+          dom.isAscendedBattle(doc, fight.initialMonsterImage)
+        ) {
+          const next = captureActualPhaseOneDamage(run, t, true);
+          log(`${run.target.name} entered Phase 2; preparing the Phase 2 damage target.`);
+          saveRun(logic.clearAction(next));
+          return;
+        }
         if (decision === 'complete') {
           saveRun(logic.completeTarget(run, t));
           log(

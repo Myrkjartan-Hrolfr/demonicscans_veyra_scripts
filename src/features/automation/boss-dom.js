@@ -15,6 +15,7 @@ const SELECTORS = Object.freeze({
   battleCard: '.battle-card.monster-card[data-monster-id]',
   battleTitle: '.battle-card.monster-card .card-title',
   monsterImage: '#monsterImage',
+  activeDamagePhase: '.monster-hp-wrap--gold',
   playerHp: '#pHpText',
   playerDamage: '#yourDamageValue',
   phaseDamageChip: '.phase-loot-section .chip',
@@ -144,10 +145,20 @@ function findPhaseDuelControl(doc, base = 'https://demonicscans.org') {
   }
 }
 
-function isAscendedBattle(doc) {
+function monsterImageSource(doc) {
+  return attr(doc?.querySelector?.(SELECTORS.monsterImage), 'src').trim();
+}
+
+function isAscendedBattle(doc, previousImage = '') {
   const title = String(doc?.querySelector?.(SELECTORS.battleTitle)?.textContent || '').toLowerCase();
-  const image = attr(doc?.querySelector?.(SELECTORS.monsterImage), 'src').toLowerCase();
-  return title.includes('ascended') || image.includes('ascended pve');
+  const image = monsterImageSource(doc);
+  const normalizedImage = image.toLowerCase();
+  return Boolean(
+    doc?.querySelector?.(SELECTORS.activeDamagePhase) ||
+    title.includes('ascended') ||
+    normalizedImage.includes('ascended pve') ||
+    (previousImage && image && image !== previousImage)
+  );
 }
 
 function setCookie(doc, name, value, days = 30) {
@@ -174,6 +185,7 @@ module.exports = {
   findPhaseDuelControl,
   hasBossList,
   isAscendedBattle,
+  monsterImageSource,
   monsterIdFromHref,
   readCookieText,
   readActualPhaseOneDamage,

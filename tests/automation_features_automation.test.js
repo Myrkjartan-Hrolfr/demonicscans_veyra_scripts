@@ -415,7 +415,10 @@ test('Wave 3 bosses use two continuous damage phases without a duel', () => {
   assert.equal(skarn.continuousPhases, true);
   assert.equal(skarn.phase1DamageValue, 3e9);
   assert.equal(skarn.phase2DamageValue, 2e9);
-  assert.deepEqual(logic.battleDamageTarget(skarn, false), { phase: 2, damage: '5b', damageValue: 5e9 });
+  assert.deepEqual(logic.battleDamageTarget(skarn, false), { phase: 1, damage: '3b', damageValue: 3e9 });
+  assert.deepEqual(logic.battleDamageTarget(skarn, true), { phase: 2, damage: '5b', damageValue: 5e9 });
+  const actual = logic.withActualPhaseOneDamage(skarn, 3_250_000_000);
+  assert.deepEqual(logic.battleDamageTarget(actual, true), { phase: 2, damage: '5.25b', damageValue: 5.25e9 });
 });
 
 test('Olympus duel logic prefers affordable Power Slash and falls back to Slash', () => {
@@ -605,6 +608,14 @@ test('DOM readers recognize the Olympus phase-duel link and Ascended PvE form', 
     dom.isAscendedBattle(fakeDoc({ selectors: { [dom.SELECTORS.battleTitle]: el({ text: 'Zeus, Ascended Sovereign' }) } })),
     true,
   );
+  assert.equal(
+    dom.isAscendedBattle(fakeDoc({ selectors: { [dom.SELECTORS.activeDamagePhase]: el() } })),
+    true,
+  );
+  const changedImage = fakeDoc({
+    selectors: { [dom.SELECTORS.monsterImage]: el({ attrs: { src: '/images/monsters/Skarn-The-Molten-General.webp' } }) },
+  });
+  assert.equal(dom.isAscendedBattle(changedImage, 'images/monsters/skarn-phase-1.webp'), true);
   const ascended = fakeDoc({
     selectors: {
       [dom.SELECTORS.playerDamage]: el({ text: '3,759,177,599' }),

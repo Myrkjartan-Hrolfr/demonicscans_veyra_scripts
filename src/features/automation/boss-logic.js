@@ -110,7 +110,18 @@ function battlePath(monsterId) {
 
 function battleDamageTarget(target, ascended = false) {
   if (target?.continuousPhases === true) {
-    return { phase: 2, damage: target.damage, damageValue: target.damageValue };
+    const phaseOneActual = Number(target?.phase1ActualDamageValue);
+    const phaseOneBase = Number.isFinite(phaseOneActual) && phaseOneActual > 0
+      ? phaseOneActual
+      : Number(target?.phase1DamageValue);
+    const damageValue = ascended
+      ? phaseOneBase + Number(target?.phase2DamageValue || 0)
+      : phaseOneBase;
+    return {
+      phase: ascended ? 2 : 1,
+      damage: ascended ? formatGameNumber(damageValue) : String(target.phase1Damage),
+      damageValue,
+    };
   }
   const useCombined = target?.phased === true && ascended === true;
   const phaseOneActual = Number(target?.phase1ActualDamageValue);
@@ -130,9 +141,16 @@ function battleDamageTarget(target, ascended = false) {
 
 function withActualPhaseOneDamage(target, actualDamage) {
   const actual = Number(actualDamage);
-  if (!target || target.phased !== true || !Number.isFinite(actual) || actual <= 0) return target;
-  const phase3 = Math.max(0, Number(target.phase3DamageValue) || 0);
-  const damageValue = actual + phase3;
+  if (
+    !target ||
+    (target.phased !== true && target.continuousPhases !== true) ||
+    !Number.isFinite(actual) ||
+    actual <= 0
+  ) return target;
+  const additional = target.continuousPhases === true
+    ? Math.max(0, Number(target.phase2DamageValue) || 0)
+    : Math.max(0, Number(target.phase3DamageValue) || 0);
+  const damageValue = actual + additional;
   return {
     ...target,
     phase1ActualDamageValue: actual,

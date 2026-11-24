@@ -170,7 +170,11 @@ function createBossWorker({
 
   function captureActualPhaseOneDamage(run, t = now(), requirePhaseThree = false) {
     const actual = dom.readActualPhaseOneDamage(doc, { requirePhaseThree });
-    if (!Number.isFinite(actual) || actual <= 0 || !run.target?.phased) return run;
+    if (
+      !Number.isFinite(actual) ||
+      actual <= 0 ||
+      (run.target?.phased !== true && run.target?.continuousPhases !== true)
+    ) return run;
     const remembered = phaseOneDamageRecords(t)?.[run.target.monsterId]?.damage;
     if (remembered !== actual) rememberPhaseOneDamage(run.target.monsterId, actual, t);
     if (Number(run.target.phase1ActualDamageValue) === actual) return run;
@@ -503,7 +507,14 @@ function createBossWorker({
 
   function attachFight(controller, monsterId, damageTarget) {
     detachFight();
-    const fight = { controller, monsterId, damageTarget, handled: false, unsubscribe: null };
+    const fight = {
+      controller,
+      monsterId,
+      damageTarget,
+      initialMonsterImage: dom.monsterImageSource(doc),
+      handled: false,
+      unsubscribe: null,
+    };
     rt.fight = fight;
     try {
       fight.unsubscribe = controller.onChange?.(() => checkFight()) || null;
@@ -607,6 +618,8 @@ function createBossWorker({
       // On an already-running Phase 3 page, total damage alone is ambiguous.
       // Subtract the live "Phase DMG" value so the stored Phase 1 base never
       // grows with every Phase 3 attack.
+      run = captureActualPhaseOneDamage(run, t, true);
+    } else if (run.target.continuousPhases && ascended) {
       run = captureActualPhaseOneDamage(run, t, true);
     }
     if (phaseDuel && run.target.phased) {
@@ -881,6 +894,18 @@ function createBossWorker({
     detachFight();
     const label = logic.routeLabel(run.routeId);
     const decision = logic.decideAfterFight(state.reason);
+    if (
+      decision === 'complete' &&
+      state.reason === 'target' &&
+      run.target.continuousPhases === true &&
+      fight.damageTarget.phase === 1 &&
+      dom.isAscendedBattle(doc, fight.initialMonsterImage)
+    ) {
+      const next = captureActualPhaseOneDamage(run, t, true);
+      log(`${run.target.name} entered Phase 2; preparing the Phase 2 damage target.`);
+      saveRun(logic.clearAction(next));
+      return;
+    }
     if (decision === 'complete') {
       saveRun(logic.completeTarget(run, t));
       log(
