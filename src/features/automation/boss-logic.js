@@ -183,6 +183,7 @@ function buildPlan(routeId, routeConfig) {
       return {
         id: boss.id,
         name: boss.name,
+        aliases: Array.isArray(boss.aliases) ? [...boss.aliases] : [],
         enabled: saved?.enabled === true,
         phased,
         continuousPhases,
@@ -236,8 +237,11 @@ function bossNamePrefix(value) {
 //   [{ monsterId, bossId, name, damage, damageValue, joined, userDamage, source }]
 function matchHubBosses({ bosses = [], summons = [], cards = [] }) {
   const aliveCards = cards.filter((card) => card && !card.dead && card.monsterId);
-  const fullNames = new Map(bosses.map((boss) => [boss.id, normalizeBossName(boss.name)]));
-  const exactNames = new Set(fullNames.values());
+  const fullNames = new Map(bosses.map((boss) => [
+    boss.id,
+    [boss.name, ...(boss.aliases || [])].map(normalizeBossName),
+  ]));
+  const exactNames = new Set([...fullNames.values()].flat());
   const prefixCounts = new Map();
   for (const boss of bosses) {
     const prefix = bossNamePrefix(boss.name);
@@ -254,11 +258,11 @@ function matchHubBosses({ bosses = [], summons = [], cards = [] }) {
 
   for (const boss of bosses) {
     if (!boss.enabled) continue;
-    const fullName = fullNames.get(boss.id);
+    const names = fullNames.get(boss.id) || [];
     const prefix = bossNamePrefix(boss.name);
-    const summon = summons.find((candidate) => normalizeBossName(candidate.name) === fullName) || null;
+    const summon = summons.find((candidate) => names.includes(normalizeBossName(candidate.name))) || null;
 
-    let matched = aliveCards.filter((card) => normalizeBossName(card.name) === fullName);
+    let matched = aliveCards.filter((card) => names.includes(normalizeBossName(card.name)));
     // An alive Sovereign god can carry a different monster-card name
     // ("zeus, duelist of the storm throne"). Fall back to the part before the
     // first comma, but only while the auto-summon card says the boss is alive
@@ -320,6 +324,11 @@ function reachedTarget(userDamage, damageValue) {
 function needsWork(match) {
   if (!match) return false;
   if (match.joined === false) return true;
+  // The Wave 3 hub exposes only total damage across both continuous phases.
+  // A large Phase 1 overshoot can therefore exceed the combined configured
+  // target while Phase 2 is still below its own target. Open each live Wave 3
+  // boss once per run and let the battle page's Phase DMG decide accurately.
+  if (match.continuousPhases === true) return true;
   return !reachedTarget(match.userDamage, match.damageValue);
 }
 
@@ -491,11 +500,11 @@ function normalizeTarget(value) {
       ? normalizedPhase1 + normalizedPhase2
       : damageValue;
   const actualPhase1 = Number(value.phase1ActualDamageValue);
-  const normalizedActualPhase1 = phased && Number.isFinite(actualPhase1) && actualPhase1 > 0
+  const normalizedActualPhase1 = (phased || continuousPhases) && Number.isFinite(actualPhase1) && actualPhase1 > 0
     ? actualPhase1
     : null;
-  const effectiveCombinedValue = phased && normalizedActualPhase1 !== null
-    ? normalizedActualPhase1 + normalizedPhase3
+  const effectiveCombinedValue = normalizedActualPhase1 !== null
+    ? normalizedActualPhase1 + (continuousPhases ? normalizedPhase2 : normalizedPhase3)
     : combinedValue;
   return {
     monsterId,
@@ -513,6 +522,7 @@ function normalizeTarget(value) {
     phase3Damage: String(value.phase3Damage ?? '0'),
     phase3DamageValue: normalizedPhase3,
     phase1ActualDamageValue: normalizedActualPhase1,
+    phase1Complete: continuousPhases && value.phase1Complete === true,
   };
 }
 

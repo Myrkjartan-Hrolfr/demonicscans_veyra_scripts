@@ -338,7 +338,46 @@ test('Wave 3 bosses are matched by exact name, ordinary monsters never', () => {
   });
   assert.deepEqual(matches.map((match) => match.monsterId), ['557578482']);
   assert.equal(matches[0].damageValue, 3e9);
-  assert.equal(logic.needsWork(matches[0]), false, '3.25b already reached the 3b target');
+  assert.equal(
+    logic.needsWork(matches[0]),
+    true,
+    'Wave 3 must be checked on the battle page because hub damage does not separate its phases',
+  );
+});
+
+test('Wave 3 Phase 2 boss names map back to their configured Phase 1 bosses', () => {
+  const plan = logic.buildPlan('wave3', createDefaultConfig().routes.wave3);
+  const phaseTwoNames = [
+    ['skarn', 'Skarn, The Molten General'],
+    ['vessir', 'Vessir, The Solar Inferna Empress'],
+    ['hrazz', 'Hrazz The Dawnflame Seraph'],
+    ['drakzareth', 'Drakzareth The Cataclysmic Half Dragon King'],
+  ];
+  const matches = logic.matchHubBosses({
+    bosses: plan[0].bosses,
+    summons: [],
+    cards: phaseTwoNames.map(([bossId, name], index) => ({
+      monsterId: String(index + 1),
+      name,
+      dead: false,
+      joined: true,
+      userDamage: 3e9,
+      bossId,
+    })),
+  });
+  assert.deepEqual(matches.map((match) => match.bossId), phaseTwoNames.map(([bossId]) => bossId));
+  assert.equal(matches.every((match) => match.continuousPhases === true), true);
+});
+
+test('Wave 3 is not skipped when Phase 1 overshoot hides incomplete Phase 2 damage', () => {
+  assert.equal(logic.needsWork({
+    joined: true,
+    continuousPhases: true,
+    userDamage: 9_048_046_366,
+    damageValue: 5e9,
+    phase1DamageValue: 3e9,
+    phase2DamageValue: 2e9,
+  }), true);
 });
 
 test('damage target checks: unjoined or unknown damage always needs a fight', () => {
@@ -822,6 +861,30 @@ function phasedBattleRun(env, {
   env.store.write(logic.RUN_KEY, { ...run, ownerId: '' });
 }
 
+function continuousWave3BattleRun(env, { monsterId = '557845671' } = {}) {
+  let run = logic.createRunState({ visitId: 'v1', routeId: 'wave3', ownerId: 'other-tab', now: env.clock.time });
+  run = logic.enterDomain(run, 'wave3', env.clock.time);
+  run = logic.selectTarget(
+    run,
+    {
+      monsterId,
+      bossId: 'skarn',
+      name: 'General Skarn the Radiant Bastion',
+      continuousPhases: true,
+      damage: '5b',
+      damageValue: 5e9,
+      phase1Damage: '3b',
+      phase1DamageValue: 3e9,
+      phase2Damage: '2b',
+      phase2DamageValue: 2e9,
+    },
+    'wave3',
+    env.clock.time,
+  );
+  run = logic.beginFight(run, env.clock.time);
+  env.store.write(logic.RUN_KEY, { ...run, ownerId: '' });
+}
+
 function livePhaseState(tokens = 40) {
   return {
     ok: true,
@@ -869,6 +932,40 @@ test('the battle page drives Monster Auto Battle and returns to the domain hub',
   const run = env.run();
   assert.deepEqual(run.processed, ['557125237']);
   assert.equal(run.target, null);
+});
+
+test('Wave 3 reloads after Phase 1 and starts Phase 2 only on the active gold form', async () => {
+  const env = createEnv({ routeId: 'wave3' });
+  continuousWave3BattleRun(env);
+  env.controller = stubController();
+  const href = 'https://demonicscans.org/battle.php?id=557845671&veyra_visit=v1';
+  const phaseOneImage = el({ attrs: { src: '/images/monsters/skarn-phase-1.webp' } });
+  let page = env.page(href, fakeDoc({ selectors: { [dom.SELECTORS.monsterImage]: phaseOneImage } }));
+  page.worker.tick();
+  await flush();
+  assert.equal(env.controller.calls[0][0], 'target');
+  assert.equal(env.controller.calls[0][1], 3e9);
+
+  env.controller.emit({ running: false, finished: true, reason: 'target', yourDamage: 3.1e9 });
+  assert.deepEqual(page.win.replaced, [href]);
+  assert.equal(env.run().target.phase1Complete, true);
+  assert.equal(env.run().target.phase1ActualDamageValue, 3.1e9);
+
+  page = env.page(href, fakeDoc({
+    selectors: {
+      [dom.SELECTORS.activeDamagePhase]: el(),
+      [dom.SELECTORS.monsterImage]: el({ attrs: { src: '/images/monsters/Skarn-The-Molten-General.webp' } }),
+      [dom.SELECTORS.playerDamage]: el({ text: '3,100,000,000' }),
+      [dom.SELECTORS.phaseDamageChip]: [el({ text: 'Phase DMG: 0' })],
+    },
+  }));
+  page.worker.tick();
+  await flush();
+  assert.deepEqual(env.controller.calls.filter((call) => call[0] === 'target'), [
+    ['target', 3e9],
+    ['target', 5.1e9],
+  ]);
+  assert.equal(env.status('wave3').state, 'busy');
 });
 
 test('a zero-HP boss battle uses the selected healing potion before Monster Auto Battle', async () => {

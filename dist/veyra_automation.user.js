@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - Automation
 // @namespace    local.veyra.automation
-// @version      0.11.12
+// @version      0.11.14
 // @description  Schedules and automates Veyra pages from one menu (desktop and mobile).
 // @match        https://demonicscans.org/*
 // @match        https://www.demonicscans.org/*
@@ -2571,6 +2571,7 @@
           return {
             id: boss.id,
             name: boss.name,
+            aliases: Array.isArray(boss.aliases) ? [...boss.aliases] : [],
             enabled: saved?.enabled === true,
             phased,
             continuousPhases,
@@ -2624,8 +2625,11 @@
     //   [{ monsterId, bossId, name, damage, damageValue, joined, userDamage, source }]
     function matchHubBosses({ bosses = [], summons = [], cards = [] }) {
       const aliveCards = cards.filter((card) => card && !card.dead && card.monsterId);
-      const fullNames = new Map(bosses.map((boss) => [boss.id, normalizeBossName(boss.name)]));
-      const exactNames = new Set(fullNames.values());
+      const fullNames = new Map(bosses.map((boss) => [
+        boss.id,
+        [boss.name, ...(boss.aliases || [])].map(normalizeBossName),
+      ]));
+      const exactNames = new Set([...fullNames.values()].flat());
       const prefixCounts = new Map();
       for (const boss of bosses) {
         const prefix = bossNamePrefix(boss.name);
@@ -2642,11 +2646,11 @@
 
       for (const boss of bosses) {
         if (!boss.enabled) continue;
-        const fullName = fullNames.get(boss.id);
+        const names = fullNames.get(boss.id) || [];
         const prefix = bossNamePrefix(boss.name);
-        const summon = summons.find((candidate) => normalizeBossName(candidate.name) === fullName) || null;
+        const summon = summons.find((candidate) => names.includes(normalizeBossName(candidate.name))) || null;
 
-        let matched = aliveCards.filter((card) => normalizeBossName(card.name) === fullName);
+        let matched = aliveCards.filter((card) => names.includes(normalizeBossName(card.name)));
         // An alive Sovereign god can carry a different monster-card name
         // ("zeus, duelist of the storm throne"). Fall back to the part before the
         // first comma, but only while the auto-summon card says the boss is alive
@@ -2708,6 +2712,11 @@
     function needsWork(match) {
       if (!match) return false;
       if (match.joined === false) return true;
+      // The Wave 3 hub exposes only total damage across both continuous phases.
+      // A large Phase 1 overshoot can therefore exceed the combined configured
+      // target while Phase 2 is still below its own target. Open each live Wave 3
+      // boss once per run and let the battle page's Phase DMG decide accurately.
+      if (match.continuousPhases === true) return true;
       return !reachedTarget(match.userDamage, match.damageValue);
     }
 
@@ -2879,11 +2888,11 @@
           ? normalizedPhase1 + normalizedPhase2
           : damageValue;
       const actualPhase1 = Number(value.phase1ActualDamageValue);
-      const normalizedActualPhase1 = phased && Number.isFinite(actualPhase1) && actualPhase1 > 0
+      const normalizedActualPhase1 = (phased || continuousPhases) && Number.isFinite(actualPhase1) && actualPhase1 > 0
         ? actualPhase1
         : null;
-      const effectiveCombinedValue = phased && normalizedActualPhase1 !== null
-        ? normalizedActualPhase1 + normalizedPhase3
+      const effectiveCombinedValue = normalizedActualPhase1 !== null
+        ? normalizedActualPhase1 + (continuousPhases ? normalizedPhase2 : normalizedPhase3)
         : combinedValue;
       return {
         monsterId,
@@ -2901,6 +2910,7 @@
         phase3Damage: String(value.phase3Damage ?? '0'),
         phase3DamageValue: normalizedPhase3,
         phase1ActualDamageValue: normalizedActualPhase1,
+        phase1Complete: continuousPhases && value.phase1Complete === true,
       };
     }
 
@@ -3787,6 +3797,12 @@
         } else if (run.target.continuousPhases && ascended) {
           run = captureActualPhaseOneDamage(run, t, true);
         }
+        if (run.target.continuousPhases && run.target.phase1Complete && !ascended) {
+          saveRun(logic.completeTarget(run, t));
+          log(`${run.target.name} did not enter Phase 2 after Phase 1; returning to the hub.`);
+          returnToHub(run);
+          return;
+        }
         if (phaseDuel && run.target.phased) {
           if (phaseDuel.activeId !== run.target.monsterId) {
             saveRun(
@@ -4063,12 +4079,16 @@
           decision === 'complete' &&
           state.reason === 'target' &&
           run.target.continuousPhases === true &&
-          fight.damageTarget.phase === 1 &&
-          dom.isAscendedBattle(doc, fight.initialMonsterImage)
+          fight.damageTarget.phase === 1
         ) {
-          const next = captureActualPhaseOneDamage(run, t, true);
-          log(`${run.target.name} entered Phase 2; preparing the Phase 2 damage target.`);
-          saveRun(logic.clearAction(next));
+          const actualDamage = Number(state.yourDamage) || dom.readPlayerDamage(doc);
+          const target = {
+            ...logic.withActualPhaseOneDamage(run.target, actualDamage),
+            phase1Complete: true,
+          };
+          saveRun(logic.clearAction({ ...run, target }));
+          log(`${run.target.name} reached its Phase 1 target; reloading to enter Phase 2.`);
+          reloadPage();
           return;
         }
         if (decision === 'complete') {
@@ -28333,6 +28353,7 @@
       skarn: Object.freeze({
         id: 'skarn',
         name: 'General Skarn the Radiant Bastion',
+        aliases: Object.freeze(['Skarn, The Molten General']),
         defaultDamage: '3b',
         phase2: true,
         defaultPhase2Damage: '0',
@@ -28340,6 +28361,7 @@
       vessir: Object.freeze({
         id: 'vessir',
         name: 'General Vessir the Sunfang Duelist',
+        aliases: Object.freeze(['Vessir, The Solar Inferna Empress']),
         defaultDamage: '3b',
         phase2: true,
         defaultPhase2Damage: '0',
@@ -28347,6 +28369,7 @@
       hrazz: Object.freeze({
         id: 'hrazz',
         name: 'General Hrazz the Dawnflame Oathkeeper',
+        aliases: Object.freeze(['Hrazz The Dawnflame Seraph']),
         defaultDamage: '3b',
         phase2: true,
         defaultPhase2Damage: '0',
@@ -28354,6 +28377,7 @@
       drakzareth: Object.freeze({
         id: 'drakzareth',
         name: 'Drakzareth The Tyrant Lizard King',
+        aliases: Object.freeze(['Drakzareth The Cataclysmic Half Dragon King']),
         defaultDamage: '3b',
         phase2: true,
         defaultPhase2Damage: '0',

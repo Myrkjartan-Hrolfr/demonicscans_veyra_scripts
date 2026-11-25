@@ -622,6 +622,12 @@ function createBossWorker({
     } else if (run.target.continuousPhases && ascended) {
       run = captureActualPhaseOneDamage(run, t, true);
     }
+    if (run.target.continuousPhases && run.target.phase1Complete && !ascended) {
+      saveRun(logic.completeTarget(run, t));
+      log(`${run.target.name} did not enter Phase 2 after Phase 1; returning to the hub.`);
+      returnToHub(run);
+      return;
+    }
     if (phaseDuel && run.target.phased) {
       if (phaseDuel.activeId !== run.target.monsterId) {
         saveRun(
@@ -898,12 +904,16 @@ function createBossWorker({
       decision === 'complete' &&
       state.reason === 'target' &&
       run.target.continuousPhases === true &&
-      fight.damageTarget.phase === 1 &&
-      dom.isAscendedBattle(doc, fight.initialMonsterImage)
+      fight.damageTarget.phase === 1
     ) {
-      const next = captureActualPhaseOneDamage(run, t, true);
-      log(`${run.target.name} entered Phase 2; preparing the Phase 2 damage target.`);
-      saveRun(logic.clearAction(next));
+      const actualDamage = Number(state.yourDamage) || dom.readPlayerDamage(doc);
+      const target = {
+        ...logic.withActualPhaseOneDamage(run.target, actualDamage),
+        phase1Complete: true,
+      };
+      saveRun(logic.clearAction({ ...run, target }));
+      log(`${run.target.name} reached its Phase 1 target; reloading to enter Phase 2.`);
+      reloadPage();
       return;
     }
     if (decision === 'complete') {

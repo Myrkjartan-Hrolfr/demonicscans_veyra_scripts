@@ -9,6 +9,7 @@ const WAVE3_BOSSES = Object.freeze({
   skarn: Object.freeze({
     id: 'skarn',
     name: 'General Skarn the Radiant Bastion',
+    aliases: Object.freeze(['Skarn, The Molten General']),
     defaultDamage: '3b',
     phase2: true,
     defaultPhase2Damage: '0',
@@ -16,6 +17,7 @@ const WAVE3_BOSSES = Object.freeze({
   vessir: Object.freeze({
     id: 'vessir',
     name: 'General Vessir the Sunfang Duelist',
+    aliases: Object.freeze(['Vessir, The Solar Inferna Empress']),
     defaultDamage: '3b',
     phase2: true,
     defaultPhase2Damage: '0',
@@ -23,6 +25,7 @@ const WAVE3_BOSSES = Object.freeze({
   hrazz: Object.freeze({
     id: 'hrazz',
     name: 'General Hrazz the Dawnflame Oathkeeper',
+    aliases: Object.freeze(['Hrazz The Dawnflame Seraph']),
     defaultDamage: '3b',
     phase2: true,
     defaultPhase2Damage: '0',
@@ -30,6 +33,7 @@ const WAVE3_BOSSES = Object.freeze({
   drakzareth: Object.freeze({
     id: 'drakzareth',
     name: 'Drakzareth The Tyrant Lizard King',
+    aliases: Object.freeze(['Drakzareth The Cataclysmic Half Dragon King']),
     defaultDamage: '3b',
     phase2: true,
     defaultPhase2Damage: '0',
