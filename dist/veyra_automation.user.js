@@ -27719,15 +27719,14 @@
       };
     }
 
-    function cleanDungeonSettings(value) {
-      const settings = normalizeSettings(value);
-      for (const monster of SHADOWBRIDGE_MONSTERS) {
-        settings.monsters[monster.id].enabled = true;
-        settings.monsters[monster.id].mode = 'kill';
-      }
-      settings.bossRoom.enabled = true;
-      settings.bossRoom.mode = 'kill';
-      return settings;
+    function createCleanDungeonRequest(now = Date.now(), requestId = '') {
+      return {
+        version: 1,
+        requestId: String(requestId || `clean-${now}-${Math.random().toString(36).slice(2)}`),
+        createdAt: now,
+        targetIds: [...MONSTER_IDS],
+        includeBoss: false,
+      };
     }
 
     function createKillSelectedRequest(value, now = Date.now(), requestId = '') {
@@ -27877,7 +27876,7 @@
         className: ctx.cls('primary'),
         type: 'button',
         text: 'Clean Dungeon',
-        title: 'Enable every target and set it to Kill',
+        title: 'Kill every monster except the boss during the next run without changing saved settings',
       });
       setTouchSize(cleanButton);
       actionGroup.appendChild(cleanButton);
@@ -28134,11 +28133,24 @@
         renderOrder();
       }
 
+      function startOneTimeKill(request, label) {
+        if (!ctx.store?.write?.(KILL_SELECTED_KEY, request)) {
+          killSelectedStatus.textContent = `The temporary ${label} request could not be saved.`;
+          return;
+        }
+        const scheduled = ctx.runRouteNow?.();
+        if (!scheduled?.ok) {
+          const saved = normalizeKillSelectedRequest(ctx.store.read?.(KILL_SELECTED_KEY));
+          if (saved?.requestId === request.requestId) ctx.store.remove?.(KILL_SELECTED_KEY);
+          killSelectedStatus.textContent = scheduled?.message || `${label} could not be started.`;
+          return;
+        }
+        const targetCount = request.targetIds.length + (request.includeBoss ? 1 : 0);
+        killSelectedStatus.textContent = `${label} ${scheduled.queued ? 'queued' : 'started'} for ${targetCount} target${targetCount === 1 ? '' : 's'}. Saved settings remain unchanged.`;
+      }
+
       cleanButton.addEventListener('click', () => {
-        ctx.settings = ctx.updateSettings((settings) => {
-          Object.assign(settings, cleanDungeonSettings(settings));
-        });
-        syncControls();
+        startOneTimeKill(createCleanDungeonRequest(), 'Clean Dungeon');
       });
 
       killSelectedButton.addEventListener('click', () => {
@@ -28154,18 +28166,7 @@
         ) {
           return;
         }
-        if (!ctx.store?.write?.(KILL_SELECTED_KEY, request)) {
-          killSelectedStatus.textContent = 'The temporary Kill Selected request could not be saved.';
-          return;
-        }
-        const scheduled = ctx.runRouteNow?.();
-        if (!scheduled?.ok) {
-          const saved = normalizeKillSelectedRequest(ctx.store.read?.(KILL_SELECTED_KEY));
-          if (saved?.requestId === request.requestId) ctx.store.remove?.(KILL_SELECTED_KEY);
-          killSelectedStatus.textContent = scheduled?.message || 'Kill Selected could not be started.';
-          return;
-        }
-        killSelectedStatus.textContent = `Kill Selected ${scheduled.queued ? 'queued' : 'started'} for ${targetCount} target${targetCount === 1 ? '' : 's'}. Saved settings remain unchanged.`;
+        startOneTimeKill(request, 'Kill Selected');
       });
 
       renderOrder();
@@ -28190,7 +28191,7 @@
       KILL_SELECTED_KEY,
       KILL_SELECTED_MAX_AGE_MS,
       applyKillSelectedRequest,
-      cleanDungeonSettings,
+      createCleanDungeonRequest,
       createKillSelectedRequest,
 
       matchesUrl(url) {

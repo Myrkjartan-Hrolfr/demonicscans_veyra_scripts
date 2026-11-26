@@ -203,7 +203,7 @@ test('Shadowbridge settings normalize order, targets, skill, damage and cooldown
   assert.equal(invalid.attackCooldownMs, 100);
 });
 
-test('Clean Dungeon enables every target in kill mode without discarding other settings', () => {
+test('Clean Dungeon creates a one-time all-monster kill plan without changing settings or including the boss', () => {
   const custom = shadowbridge.normalizeSettings({
     order: ['zorgra-frost-vein'],
     skill: '-2',
@@ -212,16 +212,14 @@ test('Clean Dungeon enables every target in kill mode without discarding other s
     monsters: { 'talla-flint-stem': { enabled: false, mode: 'custom', damage: '9m' } },
     bossRoom: { enabled: false, mode: 'max-exp', damage: '20m' },
   });
-  const cleaned = shadowbridge.cleanDungeonSettings(custom);
-  assert.equal(Object.values(cleaned.monsters).every((target) => target.enabled && target.mode === 'kill'), true);
-  assert.equal(cleaned.bossRoom.enabled, true);
-  assert.equal(cleaned.bossRoom.mode, 'kill');
-  assert.equal(cleaned.monsters['talla-flint-stem'].damage, '9m');
-  assert.equal(cleaned.bossRoom.damage, '20m');
-  assert.equal(cleaned.skill, '-2');
-  assert.equal(cleaned.alternativeSkill, '-4');
-  assert.equal(cleaned.attackCooldownMs, 450);
-  assert.deepEqual(cleaned.order, custom.order);
+  const before = structuredClone(custom);
+  const request = shadowbridge.createCleanDungeonRequest(1_800_000_000_000, 'clean-dungeon');
+  const effective = shadowbridge.applyKillSelectedRequest(custom, request);
+  assert.equal(request.targetIds.length, shadowbridge.SHADOWBRIDGE_MONSTERS.length);
+  assert.equal(request.includeBoss, false);
+  assert.equal(Object.values(effective.monsters).every((target) => target.enabled && target.mode === 'kill'), true);
+  assert.equal(effective.bossRoom.enabled, false);
+  assert.deepEqual(custom, before);
 });
 
 test('Kill Selected creates a one-time kill plan without changing saved target settings', () => {
@@ -315,13 +313,15 @@ test('Shadowbridge menu exposes English touch controls, live modes, ordering, Cl
   assert.equal(cooldown.value, '2000');
   assert.equal(harness.getSettings().attackCooldownMs, 2_000);
 
+  const settingsBeforeClean = structuredClone(harness.getSettings());
+  const updatesBeforeClean = harness.updateCount();
   cleanButton.dispatch('click');
-  assert.equal(
-    Object.values(harness.getSettings().monsters).every((target) => target.enabled && target.mode === 'kill'),
-    true,
-  );
-  assert.equal(harness.getSettings().bossRoom.mode, 'kill');
-  assert.ok(harness.updateCount() >= 4);
+  const cleanRequest = harness.readStored(shadowbridge.KILL_SELECTED_KEY);
+  assert.equal(cleanRequest.targetIds.length, shadowbridge.SHADOWBRIDGE_MONSTERS.length);
+  assert.equal(cleanRequest.includeBoss, false);
+  assert.equal(harness.runCount(), 1);
+  assert.equal(harness.updateCount(), updatesBeforeClean);
+  assert.deepEqual(harness.getSettings(), settingsBeforeClean);
 });
 
 test('desktop drag events persist the same canonical order used by touch buttons', () => {
